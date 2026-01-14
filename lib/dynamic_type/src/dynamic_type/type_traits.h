@@ -46,25 +46,18 @@ namespace dynamic_type {
 // Implementation detail
 namespace can_use_args_impl {
 
-// For how to use std::void_t for SFINAE, see
-// https://en.cppreference.com/w/cpp/types/void_t
-
-template <typename, typename Fun, typename... Ts>
-struct CanUseArg : std::false_type {};
-
+// Concept to check if a function Fun can be called with arguments Ts...
 template <typename Fun, typename... Ts>
-struct CanUseArg<
-    std::void_t<decltype(std::declval<Fun>()(std::declval<Ts>()...))>,
-    Fun,
-    Ts...> : std::true_type {};
+concept CanUseArg = requires(Fun f, Ts... args) {
+  { f(args...) };
+};
 
 } // namespace can_use_args_impl
 
 // Check if a function Fun can be called with arguments Ts...
 
 template <typename Fun, typename... Ts>
-constexpr bool can_use_args =
-    can_use_args_impl::CanUseArg<void, Fun, Ts...>::value;
+constexpr bool can_use_args = can_use_args_impl::CanUseArg<Fun, Ts...>;
 
 // For example, `float sin(float)` can be called with int, but not with float*
 // so:
@@ -82,24 +75,15 @@ namespace opcheck_impl {
 // A type that is purposely made implicitly convertible from OperatorChecker
 struct CastableFromOperatorChecker {};
 
-template <typename T, typename = void>
-struct HasArrowOperator : std::false_type {};
-
 template <typename T>
-struct HasArrowOperator<
-    T,
-    std::void_t<decltype(std::declval<decltype(&T::operator->)>())>>
-    : std::true_type {};
-
-template <typename From, typename To, typename = void>
-struct HasExplicitConversion : std::false_type {};
+concept HasArrowOperator = requires {
+  { &T::operator-> };
+};
 
 template <typename From, typename To>
-struct HasExplicitConversion<
-    From,
-    To,
-    std::void_t<decltype(std::declval<decltype(&From::operator To)>())>>
-    : std::true_type {};
+concept HasExplicitConversion = requires {
+  { &From::operator To };
+};
 
 struct TrueType {
   static constexpr bool value() {
@@ -141,17 +125,13 @@ struct OperatorChecker {
   }
   // NOLINTEND(cppcoreguidelines-c-copy-assignment-signature)
 
-  template <
-      typename T1 = int,
-      typename... Ts,
-      std::enable_if_t<can_use_args<T, Ts...>, T1> = 0>
+  template <typename... Ts>
+    requires can_use_args<T, Ts...>
   constexpr bool operator()(OperatorChecker<Ts>... args) const {
     return true;
   }
-  template <
-      typename T1 = int,
-      typename... Ts,
-      std::enable_if_t<!can_use_args<T, Ts...>, T1> = 0>
+  template <typename... Ts>
+    requires (!can_use_args<T, Ts...>)
   constexpr bool operator()(OperatorChecker<Ts>... args) const {
     return false;
   }
@@ -165,16 +145,14 @@ struct OperatorChecker {
     return false;
   }
 
-  template <
-      typename T1 = int,
-      std::enable_if_t<HasArrowOperator<T>::value, T1> = 0>
-  constexpr auto operator->() const -> TrueType* {
+  constexpr auto operator->() const -> TrueType*
+    requires HasArrowOperator<T>
+  {
     return nullptr;
   }
-  template <
-      typename T1 = int,
-      std::enable_if_t<!HasArrowOperator<T>::value, T1> = 0>
-  constexpr auto operator->() const -> FalseType* {
+  constexpr auto operator->() const -> FalseType*
+    requires (!HasArrowOperator<T>)
+  {
     return nullptr;
   }
 
@@ -196,9 +174,8 @@ struct OperatorChecker {
     return false;
   }
 
-  template <
-      typename T1,
-      typename = std::enable_if_t<HasExplicitConversion<T, T1>::value>>
+  template <typename T1>
+    requires HasExplicitConversion<T, T1>
   constexpr bool hasExplicitCastTo(OperatorChecker<T1>) const {
     return true;
   }
