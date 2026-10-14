@@ -197,10 +197,13 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
             (int64_t)max_vectorize_factor)
       : selected_vect_factor;
   const int64_t four_warps = 4 * threads_per_warp;
-  // A future model may choose a wider legal vector than the old preference;
-  // keep the downstream unroll target positive for that choice.
-  int64_t target_inner_unroll =
-      std::max<int64_t>(1, target_vect_unroll / vect_factor);
+  // Preserve the native quotient in off/record mode. A remote model may
+  // choose a wider legal vector than the old performance target, so clamp
+  // only that alternative to keep downstream unroll arithmetic positive.
+  int64_t target_inner_unroll = target_vect_unroll / vect_factor;
+  if (jev_mode == scheduler::jev::Mode::Remote) {
+    target_inner_unroll = std::max<int64_t>(1, target_inner_unroll);
+  }
   int64_t after_vect = total_reduction_numel / vect_factor;
 
   // Empirical CTA size, both values allow thread uses 255 registers, so we
