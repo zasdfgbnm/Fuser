@@ -364,7 +364,6 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
 
   const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
       prop.largest_out, prop.has_reshapes, data_cache);
-  const auto jev_mode = scheduler::jev::mode();
   int64_t vectorization_factor = 0;
   if (jev_mode != scheduler::jev::Mode::Remote) {
     // Retain the original calculation in off and record modes. Remote mode
