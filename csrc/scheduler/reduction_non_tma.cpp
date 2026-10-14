@@ -9,6 +9,7 @@
 #include "scheduler/reduction_non_tma.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 
 #include "debug.h"
 #include "instrumentation.h"
@@ -96,13 +97,91 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
       n_tensor_inputs,
       max_dtype_size_bit_for_vectorization);
 
-  // Set target_vect_unroll
-  auto target_vect_unroll = reduction_scheduler_utils::getVectUnroll(
-      max_dtype_size_bit_for_vectorization,
-      max_vectorize_factor,
-      n_tensor_inputs,
-      target_threads_per_sm,
-      has_mufu_computation);
+  // RD3.width asks the local model for the performance width within the
+  // layout-derived native maximum. The remaining unroll/launch preference
+  // still uses getVectUnroll, and will be routed in a later RD3 iteration.
+  const auto jev_mode = scheduler::jev::mode();
+  int64_t target_vect_unroll = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    target_vect_unroll = reduction_scheduler_utils::getVectUnroll(
+        max_dtype_size_bit_for_vectorization,
+        max_vectorize_factor,
+        n_tensor_inputs,
+        target_threads_per_sm,
+        has_mufu_computation);
+  }
+
+  int64_t selected_vect_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    NVF_ERROR(max_vectorize_factor > 0, "RD3.width requires a positive layout limit");
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t width = 1;; width *= 2) {
+      options.push_back(
+          {"w" + std::to_string(width),
+           "Vectorize " + std::to_string(width) + " element(s) per thread"});
+      if (width > max_vectorize_factor / 2) {
+        break;
+      }
+    }
+    // Preserve source min(lastPow2(target), layout_max) if a synthetic
+    // non-power-of-two layout cap reaches this path.
+    if (scheduler_utils::lastPow2(max_vectorize_factor) !=
+        max_vectorize_factor) {
+      options.push_back(
+          {"w" + std::to_string(max_vectorize_factor),
+           "Use the native layout width cap"});
+    }
+
+    int memory_clock_khz = 0;
+    const int64_t memory_bus_bits = has_mufu_computation
+        ? 0
+        : static_cast<int64_t>(dev_prop->memoryBusWidth);
+    if (!has_mufu_computation) {
+      NVF_ERROR(
+          cudaDeviceGetAttribute(
+              &memory_clock_khz,
+              cudaDevAttrMemoryClockRate,
+              at::cuda::current_device()) == cudaSuccess,
+          "RD3.width could not read CUDA memory clock");
+    }
+    std::string state = "reduction.inner_width.v1\n";
+    state += "layout_max=" + std::to_string(max_vectorize_factor) + '\n';
+    state += "max_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+    state += "n_tensor_inputs=" + std::to_string(n_tensor_inputs) + '\n';
+    state += "has_mufu=" + std::to_string(has_mufu_computation ? 1 : 0) + '\n';
+    state += "sm_count=" + std::to_string(sm_count) + '\n';
+    state += "max_threads_per_sm=" +
+        std::to_string(max_threads_per_sm) + '\n';
+    state += "memory_bus_bits=" + std::to_string(memory_bus_bits) + '\n';
+    state += "memory_clock_khz=" + std::to_string(memory_clock_khz) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "w" + std::to_string(std::min(
+                     scheduler_utils::lastPow2(target_vect_unroll),
+                     max_vectorize_factor))
+        : std::string();
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD3.width", state, options, native_choice);
+    bool matched = false;
+    for (const auto& option : options) {
+      if (selected == option.id) {
+        selected_vect_factor = std::stoll(selected.substr(1));
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "RD3.width response is outside native layout bounds");
+  }
+  if (jev_mode == scheduler::jev::Mode::Remote) {
+    // Only the downstream unroll/launch analysis needs this native target.
+    // It is computed after the remote width decision and never sent to Jev.
+    target_vect_unroll = reduction_scheduler_utils::getVectUnroll(
+        max_dtype_size_bit_for_vectorization,
+        max_vectorize_factor,
+        n_tensor_inputs,
+        target_threads_per_sm,
+        has_mufu_computation);
+  }
 
   // redu = [i-remainder, i-Unroll, TIDx, Vect]
   int64_t inner_unroll = 1, bdimx = 1, vect_factor = 1;
@@ -112,11 +191,16 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   };
 
   // Max vectorization factor
-  vect_factor = std::min(
-      scheduler_utils::lastPow2(target_vect_unroll),
-      (int64_t)max_vectorize_factor);
+  vect_factor = jev_mode == scheduler::jev::Mode::Off
+      ? std::min(
+            scheduler_utils::lastPow2(target_vect_unroll),
+            (int64_t)max_vectorize_factor)
+      : selected_vect_factor;
   const int64_t four_warps = 4 * threads_per_warp;
-  int64_t target_inner_unroll = target_vect_unroll / vect_factor;
+  // A future model may choose a wider legal vector than the old preference;
+  // keep the downstream unroll target positive for that choice.
+  int64_t target_inner_unroll =
+      std::max<int64_t>(1, target_vect_unroll / vect_factor);
   int64_t after_vect = total_reduction_numel / vect_factor;
 
   // Empirical CTA size, both values allow thread uses 255 registers, so we
