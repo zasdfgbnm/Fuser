@@ -42,6 +42,7 @@
 #include "runtime/executor_params.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/utils.h"
@@ -5733,7 +5734,7 @@ TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
 
   Fusion fusion;
   FusionGuard fg(&fusion);
-  TensorView* input = makeSymbolicTensor(3);
+  TensorView* input = makeContigTensor(3);
   fusion.addInput(input);
   TensorView* output = reductionOp(
       BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
@@ -5745,7 +5746,13 @@ TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
       at::randn({outer_reduction, outputs, inner_reduction}, options);
   auto results =
       scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
-  ASSERT_TRUE(results.heuristic_params->as<ReductionParams>()->schedule_3d);
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_GT(rparams->unroll_factor_inner_reduction, 1);
+  // The forced remote w1 choice deliberately turns vectorization into unrolling.
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Remote) {
+    ASSERT_TRUE(rparams->vectorize_inner_reduction);
+  }
   auto reference =
       aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
   testValidate(
