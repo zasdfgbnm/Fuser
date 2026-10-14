@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <fstream>
@@ -124,6 +125,50 @@ int main() {
           "record lacks Choice instructions");
   require(readFile(path).find("\"criteria\":{\"bp0\":\"one dimensional\",\"bp1\":\"split\"}") != std::string::npos,
           "record lacks candidate descriptions");
+  const std::string first_record = readFile(path);
+  require(chooseDecision("PW2", state, options, "bp1", "case-1b") == "bp1",
+          "second record changed choice");
+  const std::string appended = readFile(path);
+  require(appended.starts_with(first_record) &&
+              appended.find("\"case_key\":\"case-1b\"") != std::string::npos &&
+              appended.size() > first_record.size(),
+          "record mode did not append to a regular log file");
+
+  const std::string link_path = std::string(path) + ".link";
+  require(::symlink(path, link_path.c_str()) == 0, "symlink creation failed");
+  ::setenv("NVFUSER_JEV_LOG", link_path.c_str(), 1);
+  bool link_rejected = false;
+  try { (void)chooseDecision("PW2", state, options, "bp0", "symlink"); }
+  catch (const std::runtime_error&) { link_rejected = true; }
+  require(link_rejected && readFile(path) == appended,
+          "symlink log path was followed or changed its target");
+  ::unlink(link_path.c_str());
+
+  const std::string missing_target = std::string(path) + ".missing";
+  require(::symlink(missing_target.c_str(), link_path.c_str()) == 0,
+          "dangling symlink creation failed");
+  bool dangling_link_rejected = false;
+  try { (void)chooseDecision("PW2", state, options, "bp0", "dangling"); }
+  catch (const std::runtime_error&) { dangling_link_rejected = true; }
+  require(dangling_link_rejected && ::access(missing_target.c_str(), F_OK) != 0,
+          "dangling symlink log path created its target");
+  ::unlink(link_path.c_str());
+
+  const std::string fifo_path = std::string(path) + ".fifo";
+  require(::mkfifo(fifo_path.c_str(), 0600) == 0, "named pipe creation failed");
+  ::setenv("NVFUSER_JEV_LOG", fifo_path.c_str(), 1);
+  bool fifo_rejected = false;
+  try { (void)chooseDecision("PW2", state, options, "bp0", "fifo"); }
+  catch (const std::runtime_error&) { fifo_rejected = true; }
+  require(fifo_rejected, "named pipe log path was accepted");
+  ::unlink(fifo_path.c_str());
+
+  ::setenv("NVFUSER_JEV_LOG", "/dev/null", 1);
+  bool device_rejected = false;
+  try { (void)chooseDecision("PW2", state, options, "bp0", "device"); }
+  catch (const std::runtime_error&) { device_rejected = true; }
+  require(device_rejected, "non-regular device log path was accepted");
+  ::setenv("NVFUSER_JEV_LOG", path, 1);
 
   ::setenv("NVFUSER_JEV_MODE", "remote", 1);
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,

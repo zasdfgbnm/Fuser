@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -378,7 +379,15 @@ void appendLog(std::string_view line) {
   if (path.empty()) fail("NVFUSER_JEV_LOG is required in record/remote mode");
   static std::mutex mutex;
   std::lock_guard<std::mutex> guard(mutex);
-  Fd file(::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644));
+  // Resolve the final component without following a symlink. O_NONBLOCK also
+  // prevents a named pipe supplied as the log path from stalling the caller.
+  Fd file(::open(path.c_str(),
+                 O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC | O_NOFOLLOW |
+                     O_NONBLOCK,
+                 0644));
+  struct stat file_stat {};
+  if (::fstat(file.get(), &file_stat) != 0 || !S_ISREG(file_stat.st_mode))
+    fail("NVFUSER_JEV_LOG must be a regular file");
   std::string record(line);
   record += '\n';
   size_t written = 0;
