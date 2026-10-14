@@ -92,6 +92,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_grid: bool = False,
                            require_outer_width: bool = False,
                            require_outer_cta: bool = False,
+                           require_inner_width: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False,
@@ -304,6 +305,46 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError(f"alternate warp did not reach the grid plan: {rd8}")
         if not any(issue["site"] in {"RD9.stride", "RD8"} for issue in issues):
             raise ValueError("alternate warp did not alter downstream grid analysis")
+    elif require_inner_width:
+        if (site != "IP5.width" or event["native"] != "w4" or
+                alternate != "w1" or
+                set(event["candidates"]) != {"w1", "w2", "w4"}):
+            raise ValueError("2D register fixture lacks its checked width menu")
+        expected = sorted((
+            ("winner_mismatch", "IP5.width"),
+            ("record_only_state", "IP5.targets"),
+            ("remote_only_state", "IP5.targets"),
+            ("record_only_state", "IP5.batch"),
+            ("remote_only_state", "IP5.batch"),
+        ))
+        if sorted((issue["kind"], issue["site"]) for issue in issues) != expected:
+            raise ValueError(f"unexpected dependent inner-width issues: {issues}")
+        for nested_site, native_parallel, selected_parallel in (
+                ("IP5.targets", 256, 1024),
+                ("IP5.batch", 256, 1024)):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == nested_site]
+            if len(rows) != 2:
+                raise ValueError(f"expected replaced {nested_site} states: {rows}")
+            for row in rows:
+                record_count = sum(row["record"].values())
+                remote_count = sum(row["remote"].values())
+                if (record_count, remote_count) not in {(1, 0), (0, 1)}:
+                    raise ValueError(f"duplicate/shared dependent state: {row}")
+                fields = dict(line.split("=", 1) for line in
+                              row["request"]["state"].splitlines()[1:]
+                              if line.count("=") == 1 and
+                              not line.startswith(("policy=", "plan=")))
+                expected_parallel = (native_parallel if record_count
+                                     else selected_parallel)
+                if int(fields["parallel_after_vectorize"]) != expected_parallel:
+                    raise ValueError(f"{nested_site} ignored selected width: {fields}")
+        width_fields = dict(line.split("=", 1) for line in
+                            event["state"].splitlines()[1:] if line.count("=") == 1
+                            and not line.startswith("plan="))
+        if (width_fields.get("max_legal_width") != "4" or
+                width_fields.get("inner_numel") != "1024"):
+            raise ValueError(f"unexpected layout-safe width bound: {width_fields}")
     elif require_inner_targets:
         if (site != "IP5.targets" or event["native"] != "o16_w28" or
                 alternate != "o32_w16" or
@@ -487,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-width", action="store_true")
     parser.add_argument("--require-outer-cta", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
+    parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -592,6 +634,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_width=args.require_outer_width,
             require_outer_cta=args.require_outer_cta,
             require_inner_targets=args.require_inner_targets,
+            require_inner_width=args.require_inner_width,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,

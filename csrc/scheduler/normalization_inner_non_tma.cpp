@@ -730,6 +730,143 @@ void innerPersistentHeuristic2DPlan(
       LaunchParams::UNINITIALIZED_VAL);
 }
 
+// A smaller power-of-two width preserves the alignment, contiguity, and
+// vectorization breakpoint proved by getVectorizationFactor. Recompute the
+// complete register-backed batch/CTA/register/grid menu before offering it;
+// the width Choice must not rely on a later policy to make a plan legal.
+PersistentKernelProperties chooseInner2DVectorWidth(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t native_overhead,
+    int64_t native_warps) {
+  const auto jev_mode = scheduler::jev::mode();
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    return properties;
+  }
+
+  const int64_t max_width = properties.vectorize_factor;
+  const bool valid_max = max_width > 0 && max_width <= 128 &&
+      (max_width & (max_width - 1)) == 0 &&
+      properties.inner_most_dimension_numel > 0 &&
+      properties.total_reduction_numel == properties.inner_most_dimension_numel &&
+      properties.inner_most_dimension_numel % max_width == 0 &&
+      properties.max_persistent_buffer_size_bit > 0;
+  NVF_ERROR(
+      valid_max || jev_mode == scheduler::jev::Mode::Record,
+      "Inner persistent width has no proved layout maximum");
+  if (!valid_max) {
+    scheduler::jev::recordCoverageSkip(
+        "IP5.width", "No proved 2D register vectorization maximum");
+    return properties;
+  }
+
+  struct WidthPlan {
+    int64_t width;
+    Inner2DPolicyResources resources;
+  };
+  std::vector<WidthPlan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  // Build the native plan first, but serialize and offer candidates in
+  // ascending width order so the request does not encode its preference.
+  Inner2DPolicyResources native_resources;
+  ReductionParams native_preview(base);
+  innerPersistentHeuristic2DPlan(
+      properties,
+      &native_preview,
+      native_overhead,
+      native_warps,
+      false,
+      &native_resources);
+  NVF_ERROR(
+      native_resources.supported_menu ||
+          jev_mode == scheduler::jev::Mode::Record,
+      "Native inner persistent width lacks a proved batch menu");
+  if (!native_resources.supported_menu) {
+    scheduler::jev::recordCoverageSkip(
+        "IP5.width", "Native width has no proved 2D register plan");
+    return properties;
+  }
+  const bool native_axis_fits = native_resources.batch_max > 0 &&
+      native_resources.batch_max <=
+          std::numeric_limits<int64_t>::max() / max_width;
+  NVF_ERROR(
+      native_axis_fits || jev_mode == scheduler::jev::Mode::Record,
+      "Native 2D register vector extent exceeds arithmetic bounds");
+  if (!native_axis_fits) {
+    scheduler::jev::recordCoverageSkip(
+        "IP5.width", "Native vector extent exceeds arithmetic bounds");
+    return properties;
+  }
+
+  std::string state =
+      "inner_persistent.reg_width.v1\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit) +
+      "\nmax_legal_width=" + std::to_string(max_width) +
+      "\nnative_batch_max=" +
+      std::to_string(native_resources.batch_max) +
+      "\nmax_threads_per_block=" +
+      std::to_string(at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock);
+  for (int64_t width = 1; width <= max_width; width *= 2) {
+    auto candidate_properties = properties;
+    candidate_properties.vectorize_factor = width;
+    Inner2DPolicyResources resources;
+    if (width == max_width) {
+      resources = native_resources;
+    } else {
+      ReductionParams preview(base);
+      innerPersistentHeuristic2DPlan(
+          candidate_properties,
+          &preview,
+          native_overhead,
+          native_warps,
+          false,
+          &resources);
+    }
+    // A smaller width cannot allocate more persistent values per thread than
+    // the proved native maximum. Batch-menu validation already checks every
+    // completed CTA, register count, and grid coordinate against hardware.
+    if (!resources.supported_menu ||
+        resources.batch_max >
+            native_resources.batch_max * max_width / width) {
+      continue;
+    }
+    plans.push_back({width, resources});
+    options.push_back({
+        "w" + std::to_string(width),
+        "Vector width " + std::to_string(width) +
+            ", checked persistent batches " +
+            std::to_string(resources.batch_min) + " through " +
+            std::to_string(resources.batch_max)});
+    state += "\nplan=" + std::to_string(width) + ":" +
+        std::to_string(resources.batch_min) + ":" +
+        std::to_string(resources.batch_max);
+  }
+  NVF_ERROR(!plans.empty(), "No legal 2D register vector width");
+  NVF_ERROR(
+      state.size() <= 16 * 1024,
+      "Inner persistent width request exceeds safe size");
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record
+      ? "w" + std::to_string(max_width)
+      : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP5.width", state, options, native_choice);
+  const auto plan_it = std::find_if(
+      plans.begin(), plans.end(), [&](const auto& plan) {
+        return selected == "w" + std::to_string(plan.width);
+      });
+  NVF_ERROR(plan_it != plans.end(), "Unknown inner persistent vector width");
+  auto chosen = properties;
+  chosen.vectorize_factor = plan_it->width;
+  return chosen;
+}
+
 void innerPersistentHeuristic2D(
     const PersistentKernelProperties& properties,
     ReductionParams* rparams) {
@@ -2317,7 +2454,13 @@ std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
         fusion, prop, data_cache, runtime_info, rparams.get());
   } else if (prop.total_reduction_numel == prop.inner_most_dimension_numel) {
     rparams->tag = "2D Register Inner Persistent Heuristic.\n";
-    innerPersistentHeuristic2D(prop, rparams.get());
+    const int64_t native_overhead = prop.has_exp_op ? 32l : 16l;
+    const bool high_bandwidth = scheduler_utils::isHighBandwidthFlopsRatio();
+    const int64_t native_warps =
+        high_bandwidth && prop.disable_project_to_avoid_recompute ? 16l : 28l;
+    const auto width_properties = chooseInner2DVectorWidth(
+        prop, *rparams, native_overhead, native_warps);
+    innerPersistentHeuristic2D(width_properties, rparams.get());
   } else {
     rparams->tag = "3D Register Inner Persistent Heuristic.\n";
     rparams = innerPersistentHeuristic3D(prop, *rparams);

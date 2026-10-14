@@ -1283,6 +1283,17 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_inner_targets --require-inner-targets)
   set_tests_properties(jev_alternate_numeric_inner_targets PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_register_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.width --alternate w1
+      --gtest Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA
+      --case-key jev_alternate_numeric_inner_register_width
+      --require-inner-width)
+  set_tests_properties(jev_alternate_numeric_inner_register_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner3d_persistent_warp
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
