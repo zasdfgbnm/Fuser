@@ -27,6 +27,7 @@
 #include "mma_type.h"
 #include "options.h"
 #include "runtime/executor_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/matmul_heuristic.h"
 #include "scheduler/matmul_heuristic_plugin.h"
 #include "scheduler/mma_utils.h"
@@ -540,6 +541,51 @@ bool fillDefaultHopperHeuristic(
   // TODO: Use only 1D grid traversal factor for now
   grid_traversal_factor = 1;
   mparams->grid_traversal_factor = {grid_traversal_factor, 1};
+
+  // The plugin owns its own raster and cluster plan. On the default Hopper
+  // path, both orders traverse the same finalized CGA tiles; the native
+  // cluster divisibility and the forced 1x1 swizzle remain fixed.
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Off &&
+      !matmul_heuristic_plugin::hasPlugin() &&
+      mparams->tiling_strategy ==
+          MatmulParams::TilingStrategy::DistributeTilesAcrossSMs) {
+    NVF_ERROR(
+        mparams->cluster_dims.m > 0 && mparams->cluster_dims.n > 0 &&
+            Mtiles % mparams->cluster_dims.m == 0 &&
+            Ntiles % mparams->cluster_dims.n == 0,
+        "MM3 raster plan requires a divisible native cluster");
+    const std::string state =
+        "matmul.hopper_raster.v1\nm_extent=" +
+        std::to_string(problem_shape[(size_t)MatmulDimRole::M]) +
+        "\nn_extent=" + std::to_string(problem_shape[(size_t)MatmulDimRole::N]) +
+        "\ncta_m=" + std::to_string(cta_tile.m) +
+        "\ncta_n=" + std::to_string(cta_tile.n) +
+        "\nsm_count=" + std::to_string(
+            at::cuda::getCurrentDeviceProperties()->multiProcessorCount) +
+        "\ncluster_m=" + std::to_string(mparams->cluster_dims.m) +
+        "\ncluster_n=" + std::to_string(mparams->cluster_dims.n) +
+        "\nswizzle_x=1\nswizzle_y=1";
+    const std::string fixed_plan =
+        "; cluster=" + std::to_string(mparams->cluster_dims.m) + "x" +
+        std::to_string(mparams->cluster_dims.n) + "; swizzle=1x1";
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"column", "column-major raster" + fixed_plan},
+        {"row", "row-major raster" + fixed_plan},
+    };
+    const auto selected = scheduler::jev::chooseDecision(
+        "MM3.raster",
+        state,
+        options,
+        scheduler::jev::mode() == scheduler::jev::Mode::Record
+            ? (Mtiles <= Ntiles ? "column" : "row")
+            : "");
+    NVF_ERROR(
+        selected == "column" || selected == "row",
+        "MM3 raster response is outside native plan bounds");
+    mparams->cta_order = selected == "column"
+        ? MatmulParams::TileRasterizationOrder::ColumnMajor
+        : MatmulParams::TileRasterizationOrder::RowMajor;
+  }
 
   return true;
 }
