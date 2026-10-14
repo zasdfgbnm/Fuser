@@ -7848,7 +7848,9 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   if (device->major != 8 || device->minor != 9) {
     GTEST_SKIP() << "SM89-specific magic-zero Choice fixture";
   }
-  constexpr int64_t feature = 1028;
+  // Four-way vectorization leaves 1025 elements per row, requiring at least
+  // two persistent batches per CTA and an unrolled batch index in codegen.
+  constexpr int64_t feature = 4100;
   Fusion fusion;
   FusionGuard fg(&fusion);
   TensorView* input = makeContigTensor(2, DataType::Half);
@@ -7868,6 +7870,7 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   ASSERT_TRUE(rparams->persistent_kernel);
   ASSERT_FALSE(rparams->project_persistent_buffers);
   ASSERT_TRUE(rparams->smem_persistent_buffers.empty());
+  ASSERT_GT(rparams->batches_per_block_inner_reduction, 1);
   const bool expect_zero = scheduler::jev::mode() != scheduler::jev::Mode::Remote;
   EXPECT_EQ(rparams->cparams.enable_magic_zero, expect_zero);
   const auto code = results.kernel_executor->compiledKernel()->kernelString();
