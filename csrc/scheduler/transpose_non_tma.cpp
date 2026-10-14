@@ -355,30 +355,95 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
   scan_max_dtype_size(fusion->inputs());
   scan_max_dtype_size(fusion->outputs());
 
-  auto max_unroll_factor = ceilDiv(
-      // Available unrolling based on size of data type
-      kSixteen / max_io_dtype_size,
-      // Reduce max unrolling factor if we have many inputs/outputs to unroll
-      // as it could start consuming a lot of registers.
-      std::max(
-          (scheduler_utils::lastPow2(
-               (int64_t)grouped_inputs_outputs[0].size() +
-               (int64_t)grouped_inputs_outputs[1].size()) >>
-           2),
-          (int64_t)1));
+  int64_t max_unroll_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Keep the original numeric cap in off/record modes. The vectorization
+    // helper applies maxVectorizationWidth to it, so its effective cap may be
+    // smaller than the raw value when the latter has an odd factor.
+    max_unroll_factor = ceilDiv(
+        // Available unrolling based on size of data type
+        kSixteen / max_io_dtype_size,
+        // Reduce max unrolling factor if we have many inputs/outputs to unroll
+        // as it could start consuming a lot of registers.
+        std::max(
+            (scheduler_utils::lastPow2(
+                 (int64_t)grouped_inputs_outputs[0].size() +
+                 (int64_t)grouped_inputs_outputs[1].size()) >>
+             2),
+            (int64_t)1));
 
-  // Don't unroll at the cost of getting a full wave on the GPU
-  auto max_unroll_factor_occupancy = ceilDiv(
-      n_elems,
-      device_multiprocessor_count * (int64_t)tparams->tile_size1 *
-          (int64_t)tparams->tile_size2);
-  max_unroll_factor = std::min(max_unroll_factor, max_unroll_factor_occupancy);
+    // Don't unroll at the cost of getting a full wave on the GPU
+    auto max_unroll_factor_occupancy = ceilDiv(
+        n_elems,
+        device_multiprocessor_count * (int64_t)tparams->tile_size1 *
+            (int64_t)tparams->tile_size2);
+    max_unroll_factor =
+        std::min(max_unroll_factor, max_unroll_factor_occupancy);
 
-  // Don't unroll at the cost of getting a full warp, useful for the case where
-  // tile sizes are small
-  auto max_unroll_factor_block =
-      ceilDiv((int64_t)tparams->tile_size1 * (int64_t)tparams->tile_size2, 32l);
-  max_unroll_factor = std::min(max_unroll_factor, max_unroll_factor_block);
+    // Don't unroll at the cost of getting a full warp, useful for the case
+    // where tile sizes are small
+    auto max_unroll_factor_block = ceilDiv(
+        (int64_t)tparams->tile_size1 * (int64_t)tparams->tile_size2, 32l);
+    max_unroll_factor = std::min(max_unroll_factor, max_unroll_factor_block);
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // A cap above 16 bytes per I/O element can form a vector instruction that
+    // the native rule never offers. The tile and byte limits are structural;
+    // neither uses the native register, wave, or warp preference.
+    const int64_t tile_elements =
+        (int64_t)tparams->tile_size1 * (int64_t)tparams->tile_size2;
+    const int64_t hard_cap =
+        std::min(tile_elements, kSixteen / max_io_dtype_size);
+    std::vector<scheduler::jev::ChoiceOption> options;
+    if (hard_cap == 0) {
+      // Preserve the legacy zero cap for an I/O dtype wider than 16 bytes.
+      options.push_back({"u0", "Use the native zero vector cap"});
+    } else {
+      for (int64_t factor = 1; factor <= hard_cap; factor *= 2) {
+        options.push_back(
+            {"u" + std::to_string(factor),
+             "Limit the per-thread vector/unroll cap to " +
+                 std::to_string(factor)});
+      }
+    }
+
+    const std::string state =
+        "transpose.unroll_cap.v1\nmax_io_dtype_bytes=" +
+        std::to_string(max_io_dtype_size) + "\ngroup1_io=" +
+        std::to_string(grouped_inputs_outputs[0].size()) + "\ngroup2_io=" +
+        std::to_string(grouped_inputs_outputs[1].size()) + "\nn_elems=" +
+        std::to_string(n_elems) + "\nsm_count=" +
+        std::to_string(device_multiprocessor_count) + "\ntile1=" +
+        std::to_string(tparams->tile_size1) + "\ntile2=" +
+        std::to_string(tparams->tile_size2);
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "u" + std::to_string(
+                    max_unroll_factor == 0
+                        ? 0
+                        : scheduler_utils::maxVectorizationWidth(
+                              max_unroll_factor))
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR2.unroll", state, options, native_choice);
+    if (jev_mode == scheduler::jev::Mode::Remote) {
+      bool found = false;
+      if (hard_cap == 0 && selected == "u0") {
+        max_unroll_factor = 0;
+        found = true;
+      } else {
+        for (int64_t factor = 1; factor <= hard_cap; factor *= 2) {
+          if (selected == "u" + std::to_string(factor)) {
+            max_unroll_factor = factor;
+            found = true;
+            break;
+          }
+        }
+      }
+      NVF_ERROR(found, "TR2.unroll response is outside native hard bounds");
+    }
+  }
 
   // Note: [Computing Vectorization Width for Transpose]
   //
