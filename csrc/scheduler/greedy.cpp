@@ -861,6 +861,8 @@ class HeuristicsBuilder : private IterVisitor {
     const auto constrained_ops = getAllConstrainedOps(fusion);
     single_scan_ = constrained_ops.size() == 1 &&
         constrained_ops.front()->isA<ScanOp>();
+    single_argsort_ = constrained_ops.size() == 1 &&
+        constrained_ops.front()->isA<ArgsortOp>();
 
     traverse(fusion);
   }
@@ -869,7 +871,10 @@ class HeuristicsBuilder : private IterVisitor {
     addHeuristicsFor(
         ir_utils::getTvOutput(argsort),
         ir_utils::getTvOutput(argsort)->getLogicalDomain(),
-        {argsort->dim()});
+        {argsort->dim()},
+        /*consumer=*/nullptr,
+        /*allow_scan_choice=*/false,
+        /*argsort_input=*/ir_utils::getTvInput(argsort));
   }
 
   // TODO: Support batching
@@ -933,7 +938,8 @@ class HeuristicsBuilder : private IterVisitor {
       const std::vector<IterDomain*>& domain_to_schedule,
       const std::vector<int64_t>& constrained_id_offsets,
       TensorView* consumer = nullptr,
-      bool allow_scan_choice = false) {
+      bool allow_scan_choice = false,
+      TensorView* argsort_input = nullptr) {
     const bool as_consumer = consumer == nullptr;
 
     int64_t size_of_constrained_ids = 1;
@@ -1052,6 +1058,107 @@ class HeuristicsBuilder : private IterVisitor {
       }
     }
 
+    // A single Argsort has no other constrained op with a coupled TIDx
+    // extent. Keep all runtime eligibility and the original batch unchanged
+    // in Off mode; the Choice only ranks complete, candidate-checked plans.
+    if (single_argsort_ && argsort_input != nullptr &&
+        jev_mode != scheduler::jev::Mode::Off) {
+      const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+      const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+      const int64_t max_threads_x = dev_prop->maxThreadsDim[0];
+      const int64_t warp_size = dev_prop->warpSize;
+      const int64_t key_bytes = dataTypeSizeByte(argsort_input->dtype());
+      const int64_t index_bytes = dataTypeSizeByte(constrained_tv->dtype());
+      const int64_t registers = dev_prop->regsPerBlock;
+      const int64_t shmem = dev_prop->sharedMemPerBlock;
+      std::vector<scheduler::jev::ChoiceOption> options;
+      std::vector<int64_t> batches;
+
+      auto storage_fits = [&](int64_t threads, int64_t batch) {
+        scheduler_tools::CubSharedMemoryBuffer storage;
+        storage.registerArgsort(threads, batch, argsort_input->dtype());
+        const int64_t required = storage.getTotalSizeInBytes();
+        return required <= shmem && (required + 127) / 128 * 128 <= shmem;
+      };
+      auto add_option = [&](int64_t candidate_batch, int64_t threads) {
+        options.push_back({
+            "b" + std::to_string(candidate_batch),
+            "Use " + std::to_string(candidate_batch) +
+                " argsort items per thread with " +
+                std::to_string(threads) + " TIDx threads"});
+        batches.push_back(candidate_batch);
+      };
+
+      if (size_of_constrained_ids > 0 && max_threads > 0 && batch_size > 0 &&
+          key_bytes > 0 && index_bytes == 8) {
+        const int64_t native_threads =
+            ceilDiv(size_of_constrained_ids, batch_size);
+        // The native plan may have a padded last Group item. Alternatives
+        // must divide the Argsort extent exactly so CUB receives a full tile.
+        if (native_threads <= max_threads_x &&
+            storage_fits(native_threads, batch_size)) {
+          add_option(batch_size, native_threads);
+          for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+            if (batch_size > std::numeric_limits<int64_t>::max() / factor) {
+              continue;
+            }
+            const int64_t candidate_batch = batch_size * factor;
+            if (size_of_constrained_ids % candidate_batch != 0) {
+              continue;
+            }
+            const int64_t threads =
+                size_of_constrained_ids / candidate_batch;
+            // Argsort retains input keys, temporary CUB keys and int64
+            // indices. Reserve 20 more registers for unrelated kernel work.
+            const int64_t bytes_per_item = 2 * key_bytes + index_bytes;
+            if (warp_size != 32 || threads < warp_size ||
+                threads > max_threads || threads > max_threads_x ||
+                threads % warp_size != 0 ||
+                candidate_batch > (255 - 20) * 4 / bytes_per_item) {
+              continue;
+            }
+            const int64_t estimated_registers =
+                ceilDiv(candidate_batch * bytes_per_item, int64_t{4}) + 20;
+            if (estimated_registers > 255 ||
+                estimated_registers > registers / threads ||
+                !storage_fits(threads, candidate_batch)) {
+              continue;
+            }
+            add_option(candidate_batch, threads);
+          }
+        }
+      }
+
+      if (options.empty()) {
+        NVF_ERROR(
+            jev_mode != scheduler::jev::Mode::Remote,
+            "Unable to prove native Greedy Argsort CUB capacity");
+      } else {
+        const std::string state =
+            "greedy.argsort_batch.v1\nextent=" +
+            std::to_string(size_of_constrained_ids) +
+            "\nmax_threads_per_block=" + std::to_string(max_threads) +
+            "\nmax_threads_x=" + std::to_string(max_threads_x) +
+            "\nwarp_size=" + std::to_string(warp_size) +
+            "\nkey_bytes=" + std::to_string(key_bytes) +
+            "\nindex_bytes=" + std::to_string(index_bytes) +
+            "\nregs_per_block=" + std::to_string(registers) +
+            "\nsmem_per_block_bytes=" + std::to_string(shmem);
+        const auto selected = scheduler::jev::chooseDecision(
+            "GR1.argsort_batch",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? options.front().id
+                                                      : "");
+        const auto option_it = std::find_if(
+            options.begin(),
+            options.end(),
+            [&](const auto& option) { return option.id == selected; });
+        NVF_ERROR(option_it != options.end(), "Unknown Greedy Argsort batch");
+        batch_size = batches.at(std::distance(options.begin(), option_it));
+      }
+    }
+
     if (as_consumer) {
       NVF_ERROR(
           params_->setConsumerParams(constrained_tv, {batch_size}),
@@ -1070,6 +1177,7 @@ class HeuristicsBuilder : private IterVisitor {
 
   std::unique_ptr<GreedyParams> params_;
   bool single_scan_ = false;
+  bool single_argsort_ = false;
 };
 
 // Propagate all reshape transformations throughout the fusion.

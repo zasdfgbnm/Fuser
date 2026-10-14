@@ -800,6 +800,27 @@ TEST_P(GreedySchedulerTestConstraintSize, ArgsortLargeConstrainedIDs) {
   }
 }
 
+// The local API's alternate-batch CTest forces b4 after independently
+// validating the menu. testValidate compares the result with ATen argsort.
+TEST_F(GreedySchedulerTest, JevAlternateArgsortBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto sorted_indices = argsort(input_tv, -1);
+  fusion.addOutput(sorted_indices);
+
+  auto input = at::randn(
+      shape, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  EXPECT_FALSE(executor_cache.getMostRecentKernelRuntime()->isSegmented());
+}
+
 TEST_P(GreedySchedulerTestConstraintSize, ScanLargeConstrainedIDs) {
   auto fusion_ptr = std::make_unique<Fusion>();
   Fusion& fusion = *fusion_ptr.get();

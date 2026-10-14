@@ -1325,6 +1325,16 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_outer_redu_unroll_four)
   set_tests_properties(jev_alternate_numeric_outer_redu_unroll_four PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_greedy_argsort_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site GR1.argsort_batch --alternate b4
+      --gtest GreedySchedulerTest.JevAlternateArgsortBatch_CUDA
+      --case-key jev_alternate_numeric_greedy_argsort_batch)
+  set_tests_properties(jev_alternate_numeric_greedy_argsort_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()
