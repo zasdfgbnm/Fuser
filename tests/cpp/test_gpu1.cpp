@@ -6446,6 +6446,45 @@ TEST_F(Gpu1Test, JevAlternateInner3dPersistentRegisterOverhead_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// A small 3D reduction with many outputs makes the empirical 4-warp CTA
+// floor put two outputs in one block. The 1-warp floor retains a resource-safe
+// plan with one output per block and must give the same numerical result.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentCtaFloor_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 256, 16}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_EQ(
+      rparams->multiple_reds_per_blk,
+      scheduler::jev::mode() != scheduler::jev::Mode::Remote);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // This test checks if our system could correctly handles the case where both
 // reduction and trivial reduction exist in the fusion. Trivial reduction
 // deserve testing because trivial reduction is handled by doing a squeeze

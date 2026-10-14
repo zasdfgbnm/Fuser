@@ -1617,7 +1617,8 @@ void innerPersistentHeuristic3DPlan(
     int64_t occupancy_target = 28,
     int64_t outer_unroll_cap = std::numeric_limits<int64_t>::max(),
     int64_t register_overhead_override = -1,
-    bool unroll_first = true) {
+    bool unroll_first = true,
+    int64_t min_threads_override = -1) {
   // Define two free parameters used in this heuristic.
   // register_overhead is all registers except those for the persistent
   // buffers. The register in each thread = register_overhead +
@@ -1841,7 +1842,9 @@ void innerPersistentHeuristic3DPlan(
   // (2) Two warps, so we can achieve 100% occupancy since most GPUs allow 32
   //     blocks per SM.
   // (3) Four warps, number recommended by the cuda-c-best-practices-guide.
-  const int64_t min_threads_per_block = 4l * dev_prop->warpSize;
+  const int64_t min_threads_per_block = min_threads_override > 0
+      ? min_threads_override
+      : 4l * dev_prop->warpSize;
 
   // start bdimx with min_threads_per_block then increase if we have too many
   // persistent buffer batches per block
@@ -2373,6 +2376,175 @@ Inner3DChosenOccupancy chooseInner3DOccupancyTarget(
   return {plan_it->target, std::move(plan_it->params), plan_it->resources};
 }
 
+std::unique_ptr<ReductionParams> chooseInner3DCtaFloor(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t wave_cap,
+    int64_t warp_target,
+    int64_t occupancy_target,
+    int64_t outer_unroll_cap,
+    int64_t register_overhead,
+    bool unroll_first,
+    std::unique_ptr<ReductionParams> native,
+    const Inner3DPlanResources& native_resources,
+    const cudaDeviceProp& device) {
+  const int64_t native_floor = 4 * device.warpSize;
+  if (!isNativeValidInner3DAlternative(
+          properties, *native, *native, native_resources, device)) {
+    NVF_ERROR(
+        scheduler::jev::mode() != scheduler::jev::Mode::Remote,
+        "Cannot prove the native inner 3D CTA floor plan");
+    scheduler::jev::recordCoverageSkip(
+        "IP6.cta_floor", "native 3D CTA floor failed complete resource preflight");
+    return native;
+  }
+
+  // This 1/2/4-warp floor is an empirical performance policy. Recompute the
+  // final plan after all earlier 3D choices and keep correctness, capacity and
+  // launch checks in C++. Its 18 measured fields also let the local service
+  // reconstruct the same complete-plan menu without a native winner hint.
+  auto complete_plan = [](const ReductionParams& params,
+                          const Inner3DPlanResources& resources) {
+    return std::to_string(params.batches_per_block_inner_reduction) + "," +
+        std::to_string(params.unroll_factor_inner_reduction) + "," +
+        std::to_string(params.batches_per_block_outer_reduction) + "," +
+        std::to_string(params.unroll_factor_outer_reduction) + "," +
+        std::to_string(resources.padded_threads_x) + "," +
+        std::to_string(resources.threads_y) + "," +
+        std::to_string(resources.threads_z) + "," +
+        std::to_string(resources.padded_threads_per_block) + "," +
+        std::to_string(resources.registers_per_thread) + "," +
+        std::to_string(resources.grid_blocks) + "," +
+        std::to_string(params.schedule_3d) + "," +
+        std::to_string(params.persistent_kernel) + "," +
+        std::to_string(params.cross_block_inner_reduction) + "," +
+        std::to_string(params.cross_block_outer_reduction) + "," +
+        std::to_string(params.cross_grid_inner_reduction) + "," +
+        std::to_string(params.cross_grid_outer_reduction) + "," +
+        std::to_string(params.block_dim_inner_reduction == ParallelType::TIDx) +
+        "," +
+        std::to_string(params.block_dim_outer_reduction == ParallelType::TIDz);
+  };
+  struct Plan {
+    int64_t floor;
+    std::unique_ptr<ReductionParams> params;
+  };
+  std::vector<Plan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  std::string plan_state;
+  const std::string native_measurements =
+      complete_plan(*native, native_resources);
+  std::vector<std::string> offered_measurements = {native_measurements};
+  plan_state += "\nplan" + std::to_string(native_floor) + "=" +
+      native_measurements;
+  options.push_back({
+      "floor" + std::to_string(native_floor),
+      "Set planner CTA floor to " + std::to_string(native_floor) +
+          " threads; completed CTA=" +
+          std::to_string(native_resources.padded_threads_per_block) +
+          ", register cap=" +
+          std::to_string(native_resources.registers_per_thread) +
+          ", grid blocks=" + std::to_string(native_resources.grid_blocks)});
+  plans.push_back({native_floor, std::move(native)});
+
+  for (const int64_t floor : {2 * device.warpSize, device.warpSize}) {
+    auto params = std::make_unique<ReductionParams>(base);
+    Inner3DPlanResources resources;
+    try {
+      innerPersistentHeuristic3DPlan(
+          properties,
+          wave_cap,
+          params.get(),
+          &resources,
+          warp_target,
+          occupancy_target,
+          outer_unroll_cap,
+          register_overhead,
+          unroll_first,
+          floor);
+    } catch (const std::exception&) {
+      NVF_ERROR(
+          scheduler::jev::mode() != scheduler::jev::Mode::Remote,
+          "Cannot materialize all inner 3D CTA floor candidates");
+      scheduler::jev::recordCoverageSkip(
+          "IP6.cta_floor", "alternate 3D CTA floor failed planning");
+      return std::move(plans.front().params);
+    }
+    const std::string measurements = complete_plan(*params, resources);
+    plan_state += "\nplan" + std::to_string(floor) + "=" + measurements;
+    if (std::find(
+            offered_measurements.begin(),
+            offered_measurements.end(),
+            measurements) == offered_measurements.end() &&
+        isNativeValidInner3DAlternative(
+            properties,
+            *params,
+            *plans.front().params,
+            resources,
+            device)) {
+      options.push_back({
+          "floor" + std::to_string(floor),
+          "Set planner CTA floor to " + std::to_string(floor) +
+              " threads; completed CTA=" +
+              std::to_string(resources.padded_threads_per_block) +
+              ", register cap=" +
+              std::to_string(resources.registers_per_thread) +
+              ", grid blocks=" + std::to_string(resources.grid_blocks)});
+      offered_measurements.push_back(measurements);
+      plans.push_back({floor, std::move(params)});
+    }
+  }
+  if (options.size() == 1) {
+    if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP6.cta_floor", "no distinct, resource-valid 3D CTA floor");
+    }
+    return std::move(plans.front().params);
+  }
+
+  const std::string state =
+      "inner_persistent.3d_cta_floor.v1\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nselected_vector_width=" +
+      std::to_string(properties.vectorize_factor) +
+      "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      "\nselected_occupancy_target=" +
+      std::to_string(occupancy_target) +
+      "\nselected_warp_target=" + std::to_string(warp_target) +
+      "\nselected_outer_unroll=" + std::to_string(outer_unroll_cap) +
+      "\nselected_register_overhead=" +
+      std::to_string(register_overhead) +
+      "\nselected_unroll_first=" + std::to_string(unroll_first) +
+      "\nwarp_size=" + std::to_string(device.warpSize) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit) +
+      "\nmax_threads_x=" + std::to_string(device.maxThreadsDim[0]) +
+      "\nmax_threads_y=" + std::to_string(device.maxThreadsDim[1]) +
+      "\nmax_threads_z=" + std::to_string(device.maxThreadsDim[2]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(device.maxThreadsPerBlock) +
+      "\nregisters_per_block=" + std::to_string(device.regsPerBlock) +
+      "\nmax_grid_x=" + std::to_string(device.maxGridSize[0]) + plan_state;
+  const std::string native_choice =
+      scheduler::jev::mode() == scheduler::jev::Mode::Record
+      ? "floor" + std::to_string(native_floor)
+      : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP6.cta_floor", state, options, native_choice);
+  const auto plan_it = std::find_if(
+      plans.begin(),
+      plans.end(),
+      [&](const auto& plan) {
+        return "floor" + std::to_string(plan.floor) == selected;
+      });
+  NVF_ERROR(plan_it != plans.end(), "Unknown inner 3D CTA floor");
+  return std::move(plan_it->params);
+}
+
 std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
     const PersistentKernelProperties& properties,
     const ReductionParams& base,
@@ -2389,6 +2561,7 @@ std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
   struct Plan {
     int64_t overhead;
     std::unique_ptr<ReductionParams> params;
+    Inner3DPlanResources resources;
   };
   std::vector<Plan> plans;
   std::vector<scheduler::jev::ChoiceOption> options;
@@ -2427,7 +2600,7 @@ std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
               std::to_string(resources.registers_per_thread) +
               ", grid blocks=" + std::to_string(resources.grid_blocks)});
     }
-    plans.push_back({overhead, std::move(params)});
+    plans.push_back({overhead, std::move(params), resources});
   };
   add_plan(native_overhead, std::move(native), native_resources, true);
 
@@ -2518,7 +2691,18 @@ std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
         return "r" + std::to_string(plan.overhead) == selected;
       });
   NVF_ERROR(plan_it != plans.end(), "Missing inner 3D register plan");
-  return std::move(plan_it->params);
+  return chooseInner3DCtaFloor(
+      properties,
+      base,
+      wave_cap,
+      warp_target,
+      occupancy_target,
+      outer_unroll_cap,
+      plan_it->overhead,
+      unroll_first,
+      std::move(plan_it->params),
+      plan_it->resources,
+      device);
 }
 
 std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
