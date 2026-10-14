@@ -333,7 +333,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // sends the MUFU fact and occupancy inputs so the service can compute it.
   if (jev_mode != scheduler::jev::Mode::Remote) {
     target_threads_per_block = std::max(
-        has_mufu_computation ? 128 : 256, min_threads_per_block);
+        has_mufu_computation ? int64_t{128} : int64_t{256},
+        min_threads_per_block);
   }
 
   if (jev_mode != scheduler::jev::Mode::Off) {
@@ -782,20 +783,81 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       inner_most_dimension_numel,
       bdimx * inner_reduction_unroll_factor * target_iterations);
 
-  // If we haven't gotten to the max_unroll case, try to take it out of the
-  // iteration domain
-  if (inner_reduction_unroll_factor * outer_reduction_unroll_factor <
-      max_unroll) {
-    // Don't go over a combined inner/outer unroll of max_unroll
-    auto unroll_available = ceilDiv(
-        max_unroll,
-        inner_reduction_unroll_factor * outer_reduction_unroll_factor);
+  // RD5.iter_unroll chooses a performance factor after the inner and outer
+  // reduction factors are fixed. The source still owns the register-budget
+  // bound, grid construction, and the grid-reduction compatibility rollback.
+  const auto jev_mode_3d = scheduler::jev::mode();
+  const int64_t pre_unroll_godim = godim;
+  if (jev_mode_3d != scheduler::jev::Mode::Remote) {
+    // If we haven't gotten to the max_unroll case, try to take it out of the
+    // iteration domain.
+    if (inner_reduction_unroll_factor * outer_reduction_unroll_factor <
+        max_unroll) {
+      // Don't go over a combined inner/outer unroll of max_unroll.
+      auto unroll_available = ceilDiv(
+          max_unroll,
+          inner_reduction_unroll_factor * outer_reduction_unroll_factor);
 
-    if (unroll_available > 1 && godim > 2 * device_multiprocessor_count) {
-      unroll_available = std::min(
-          unroll_available, ceilDiv(godim, 2 * device_multiprocessor_count));
-      iter_unroll_factor = unroll_available;
+      if (unroll_available > 1 && godim > 2 * device_multiprocessor_count) {
+        unroll_available = std::min(
+            unroll_available,
+            ceilDiv(godim, 2 * device_multiprocessor_count));
+        iter_unroll_factor = unroll_available;
+      }
     }
+  }
+  if (jev_mode_3d != scheduler::jev::Mode::Off) {
+    NVF_ERROR(
+        pre_unroll_godim > 0 && device_multiprocessor_count > 0 &&
+            max_unroll > 0,
+        "RD5.iter_unroll requires positive iteration and device extents");
+    const int64_t reduction_unroll =
+        inner_reduction_unroll_factor * outer_reduction_unroll_factor;
+    const int64_t budget_limit = reduction_unroll < max_unroll
+        ? ceilDiv(max_unroll, reduction_unroll)
+        : 1;
+    // Never unroll beyond the number of pre-unroll output blocks. Every
+    // offered factor remains within the same native register budget.
+    const int64_t hard_limit =
+        std::min({budget_limit, pre_unroll_godim, int64_t{255}});
+    NVF_ERROR(
+        jev_mode_3d != scheduler::jev::Mode::Record ||
+            iter_unroll_factor <= hard_limit,
+        "RD5.iter_unroll native factor exceeds the bounded option set");
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t factor = 1; factor <= hard_limit; ++factor) {
+      options.push_back(
+          {"u" + std::to_string(factor),
+           "Unroll " + std::to_string(factor) + " output(s) per thread"});
+    }
+    const std::string state =
+        "reduction.inner3d_iter_unroll.v1\niteration_numel=" +
+        std::to_string(total_iteration_numel) +
+        "\nbdimy=" + std::to_string(bdimy) +
+        "\npre_unroll_godim=" + std::to_string(pre_unroll_godim) +
+        "\nmax_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+        "\ninner_unroll=" +
+        std::to_string(inner_reduction_unroll_factor) +
+        "\nouter_unroll=" +
+        std::to_string(outer_reduction_unroll_factor) +
+        "\nsm_count=" + std::to_string(device_multiprocessor_count);
+    const std::string native_choice =
+        jev_mode_3d == scheduler::jev::Mode::Record
+        ? "u" + std::to_string(iter_unroll_factor)
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD5.iter_unroll", state, options, native_choice);
+    bool matched = false;
+    for (int64_t factor = 1; factor <= hard_limit; ++factor) {
+      if (selected == "u" + std::to_string(factor)) {
+        iter_unroll_factor = factor;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "RD5.iter_unroll response exceeds native bounds");
   }
 
   godim = ceilDiv(total_iteration_numel, bdimy * iter_unroll_factor);
