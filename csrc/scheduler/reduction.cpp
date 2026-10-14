@@ -218,7 +218,8 @@ bool hasIterationAxis(Fusion* fusion) {
 // applied after both complete scheduler parameter plans are available.
 bool canUseTmaInner(
     Fusion* fusion,
-    const reduction_scheduler_utils::FusionRuntimeProperties& props) {
+    const reduction_scheduler_utils::FusionRuntimeProperties& props,
+    bool require_iteration_axis) {
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
 
   if (dev_prop->major < 9) {
@@ -230,7 +231,8 @@ bool canUseTmaInner(
   }
 
   // Require the reduction shape is 2D inner reduction: [I, R]
-  if (!props.fastest_dim_reduction || !hasIterationAxis(fusion) ||
+  if (!props.fastest_dim_reduction ||
+      (require_iteration_axis && !hasIterationAxis(fusion)) ||
       props.total_reduction_numel != props.inner_most_dimension_numel) {
     return false;
   }
@@ -273,7 +275,8 @@ bool canUseTmaInner(
 
 bool canUseTmaOuter(
     Fusion* fusion,
-    const reduction_scheduler_utils::FusionRuntimeProperties& props) {
+    const reduction_scheduler_utils::FusionRuntimeProperties& props,
+    bool require_iteration_axis) {
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
 
   if (dev_prop->major < 9) {
@@ -285,7 +288,8 @@ bool canUseTmaOuter(
   }
 
   // Require outer reduction
-  if (props.fastest_dim_reduction || !hasIterationAxis(fusion)) {
+  if (props.fastest_dim_reduction ||
+      (require_iteration_axis && !hasIterationAxis(fusion))) {
     return false;
   }
 
@@ -351,10 +355,16 @@ std::unique_ptr<HeuristicParams> ReductionScheduler::computeHeuristics(
 
   bool tma_enabled = isOptionEnabled(EnableOption::TmaReduction);
 
-  const bool outer_tma_legal = tma_enabled && canUseTmaOuter(fusion, props);
-  const bool inner_tma_legal =
-      !outer_tma_legal && tma_enabled && canUseTmaInner(fusion, props);
   const auto jev_mode = scheduler::jev::mode();
+  // The legacy off path has no iteration-axis guard. Expanded candidates in
+  // record/remote must have the axis required by both TMA schedulers.
+  const bool require_iteration_axis =
+      jev_mode != scheduler::jev::Mode::Off;
+  const bool outer_tma_legal =
+      tma_enabled && canUseTmaOuter(fusion, props, require_iteration_axis);
+  const bool inner_tma_legal =
+      !outer_tma_legal && tma_enabled &&
+      canUseTmaInner(fusion, props, require_iteration_axis);
 
   // Preserve the original fast path and its fallback behavior in off mode.
   if (jev_mode == scheduler::jev::Mode::Off ||
