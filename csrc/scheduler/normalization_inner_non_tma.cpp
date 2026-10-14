@@ -1728,6 +1728,112 @@ bool isNativeValidInner3DAlternative(
           std::min<int64_t>(scheduler_utils::x_grid_limit, device.maxGridSize[0]);
 }
 
+PersistentKernelProperties chooseInner3DVectorWidth(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    const cudaDeviceProp& device) {
+  struct Plan {
+    int64_t width;
+    ReductionParams params;
+    Inner3DPlanResources resources;
+  };
+  std::vector<Plan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  std::string plan_state;
+  const int64_t layout_max = properties.vectorize_factor;
+  if (layout_max <= 0 || (layout_max & (layout_max - 1)) != 0 ||
+      properties.inner_most_dimension_numel % layout_max != 0) {
+    NVF_ERROR(
+        scheduler::jev::mode() != scheduler::jev::Mode::Remote,
+        "Cannot prove a safe inner 3D vector-width menu");
+    scheduler::jev::recordCoverageSkip(
+        "IP6.width", "native vector width is not a divisible power of two");
+    return properties;
+  }
+
+  // The source analysis already found the maximum safe alignment width. Try
+  // only divisors of it, keeping the original four-wave policy fixed during
+  // preflight. This makes every menu member a complete native-valid plan and
+  // avoids nested API calls for candidates that are never selected.
+  for (int64_t width = layout_max; width >= 1; width /= 2) {
+    auto candidate_properties = properties;
+    candidate_properties.vectorize_factor = width;
+    auto candidate = base;
+    Inner3DPlanResources resources;
+    innerPersistentHeuristic3DPlan(
+        candidate_properties, 4, &candidate, &resources);
+    plan_state += "\nplan" + std::to_string(width) + "=" +
+        std::to_string(candidate.batches_per_block_inner_reduction) + "," +
+        std::to_string(candidate.unroll_factor_inner_reduction) + "," +
+        std::to_string(candidate.batches_per_block_outer_reduction) + "," +
+        std::to_string(candidate.unroll_factor_outer_reduction) + "," +
+        std::to_string(resources.padded_threads_x) + "," +
+        std::to_string(resources.threads_y) + "," +
+        std::to_string(resources.threads_z) + "," +
+        std::to_string(resources.padded_threads_per_block) + "," +
+        std::to_string(resources.registers_per_thread) + "," +
+        std::to_string(resources.grid_blocks) + "," +
+        std::to_string(candidate.schedule_3d) + "," +
+        std::to_string(candidate.persistent_kernel) + "," +
+        std::to_string(candidate.cross_block_inner_reduction) + "," +
+        std::to_string(candidate.cross_block_outer_reduction) + "," +
+        std::to_string(candidate.cross_grid_inner_reduction) + "," +
+        std::to_string(candidate.cross_grid_outer_reduction) + "," +
+        std::to_string(candidate.block_dim_inner_reduction == ParallelType::TIDx) +
+        "," +
+        std::to_string(candidate.block_dim_outer_reduction == ParallelType::TIDz);
+    if (width == layout_max || isNativeValidInner3DAlternative(
+                                   properties,
+                                   candidate,
+                                   plans.front().params,
+                                   resources,
+                                   device)) {
+      options.push_back({
+          "w" + std::to_string(width),
+          "Vectorize " + std::to_string(width) +
+              " inner element(s) per thread; completed CTA=" +
+              std::to_string(resources.padded_threads_per_block) +
+              ", register cap=" +
+              std::to_string(resources.registers_per_thread) +
+              ", grid blocks=" + std::to_string(resources.grid_blocks)});
+    }
+    plans.push_back({width, std::move(candidate), resources});
+  }
+
+  const std::string state =
+      "inner_persistent.3d_vector_width.v1\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nlayout_max=" + std::to_string(layout_max) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit) +
+      "\nmax_threads_x=" + std::to_string(device.maxThreadsDim[0]) +
+      "\nmax_threads_y=" + std::to_string(device.maxThreadsDim[1]) +
+      "\nmax_threads_z=" + std::to_string(device.maxThreadsDim[2]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(device.maxThreadsPerBlock) +
+      "\nregisters_per_block=" + std::to_string(device.regsPerBlock) +
+      "\nmax_grid_x=" + std::to_string(device.maxGridSize[0]) + plan_state;
+  const std::string native_choice =
+      scheduler::jev::mode() == scheduler::jev::Mode::Record
+      ? "w" + std::to_string(layout_max)
+      : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP6.width", state, options, native_choice);
+  const auto option_it = std::find_if(
+      options.begin(),
+      options.end(),
+      [&](const auto& option) { return option.id == selected; });
+  NVF_ERROR(option_it != options.end(), "Unknown inner 3D vector width");
+  const int64_t width = std::stoll(selected.substr(1));
+  auto selected_properties = properties;
+  selected_properties.vectorize_factor = width;
+  return selected_properties;
+}
+
 struct Inner3DChosenOccupancy {
   int64_t target;
   std::unique_ptr<ReductionParams> params;
@@ -1740,7 +1846,8 @@ Inner3DChosenOccupancy chooseInner3DOccupancyTarget(
     int64_t wave_cap,
     std::unique_ptr<ReductionParams> native,
     const Inner3DPlanResources& native_resources,
-    const cudaDeviceProp& device) {
+    const cudaDeviceProp& device,
+    int64_t layout_max) {
   struct Plan {
     int64_t target;
     std::unique_ptr<ReductionParams> params;
@@ -1800,13 +1907,19 @@ Inner3DChosenOccupancy chooseInner3DOccupancyTarget(
   }
 
   const std::string state =
-      "inner_persistent.3d_occupancy_target.v1\nreduction_numel=" +
+      (properties.vectorize_factor == layout_max
+           ? "inner_persistent.3d_occupancy_target.v1\nreduction_numel="
+           : "inner_persistent.3d_occupancy_target.v2\nreduction_numel=") +
       std::to_string(properties.total_reduction_numel) +
       "\ninner_numel=" +
       std::to_string(properties.inner_most_dimension_numel) +
       "\niteration_numel=" +
       std::to_string(properties.total_iteration_numel) +
       "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      (properties.vectorize_factor == layout_max
+           ? std::string()
+           : "\nselected_vector_width=" +
+                 std::to_string(properties.vectorize_factor)) +
       "\npersistent_buffer_bits=" +
       std::to_string(properties.max_persistent_buffer_size_bit) +
       "\nmax_threads_x=" + std::to_string(device.maxThreadsDim[0]) +
@@ -1842,7 +1955,8 @@ std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
     std::unique_ptr<ReductionParams> native,
     const Inner3DPlanResources& native_resources,
     const cudaDeviceProp& device,
-    int64_t occupancy_target) {
+    int64_t occupancy_target,
+    int64_t layout_max) {
   const int64_t native_warp = getInner3DNativeWarpTarget(properties, device);
   struct Plan {
     std::unique_ptr<ReductionParams> params;
@@ -1882,15 +1996,23 @@ std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
   }
 
   const std::string state =
-      (occupancy_target == 28
-           ? "inner_persistent.3d_warp_target.v1\nreduction_numel="
-           : "inner_persistent.3d_warp_target.v2\nreduction_numel=") +
+      (properties.vectorize_factor == layout_max
+           ? (occupancy_target == 28
+                  ? "inner_persistent.3d_warp_target.v1\nreduction_numel="
+                  : "inner_persistent.3d_warp_target.v2\nreduction_numel=")
+           : (occupancy_target == 28
+                  ? "inner_persistent.3d_warp_target.v3\nreduction_numel="
+                  : "inner_persistent.3d_warp_target.v4\nreduction_numel=")) +
       std::to_string(properties.total_reduction_numel) +
       "\ninner_numel=" +
       std::to_string(properties.inner_most_dimension_numel) +
       "\niteration_numel=" +
       std::to_string(properties.total_iteration_numel) +
       "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      (properties.vectorize_factor == layout_max
+           ? std::string()
+           : "\nselected_vector_width=" +
+                 std::to_string(properties.vectorize_factor)) +
       (occupancy_target == 28
            ? std::string()
            : "\nselected_occupancy_target=" + std::to_string(occupancy_target)) +
@@ -1925,6 +2047,8 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
   }
 
   const auto device = at::cuda::getCurrentDeviceProperties();
+  const auto selected_properties =
+      chooseInner3DVectorWidth(properties, base, *device);
   struct Plan {
     int64_t waves;
     std::unique_ptr<ReductionParams> params;
@@ -1939,10 +2063,10 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
                              : std::make_unique<ReductionParams>(base);
     Inner3DPlanResources resources;
     innerPersistentHeuristic3DPlan(
-        properties, waves, params.get(), &resources);
+        selected_properties, waves, params.get(), &resources);
     if (waves != 4 &&
         !isNativeValidInner3DAlternative(
-            properties,
+            selected_properties,
             *params,
             *plans.front().params,
             resources,
@@ -1962,11 +2086,11 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
 
   const std::string state =
       "inner_persistent.3d_wave_cap.v1\nreduction_numel=" +
-      std::to_string(properties.total_reduction_numel) +
+      std::to_string(selected_properties.total_reduction_numel) +
       "\ninner_numel=" +
-      std::to_string(properties.inner_most_dimension_numel) +
+      std::to_string(selected_properties.inner_most_dimension_numel) +
       "\niteration_numel=" +
-      std::to_string(properties.total_iteration_numel) +
+      std::to_string(selected_properties.total_iteration_numel) +
       "\nsm_count=" + std::to_string(device->multiProcessorCount) +
       "\nwarp_size=" + std::to_string(device->warpSize) +
       "\nmax_threads_per_block=" +
@@ -1974,11 +2098,11 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
       "\nmax_threads_per_sm=" +
       std::to_string(device->maxThreadsPerMultiProcessor) +
       "\nregisters_per_block=" + std::to_string(device->regsPerBlock) +
-      "\nmax_dtype_bits=" + std::to_string(properties.max_dtype_size_bit) +
-      "\nn_tensor_inputs=" + std::to_string(properties.n_tensor_inputs) +
-      "\nvector_width=" + std::to_string(properties.vectorize_factor) +
+      "\nmax_dtype_bits=" + std::to_string(selected_properties.max_dtype_size_bit) +
+      "\nn_tensor_inputs=" + std::to_string(selected_properties.n_tensor_inputs) +
+      "\nvector_width=" + std::to_string(selected_properties.vectorize_factor) +
       "\npersistent_buffer_bits=" +
-      std::to_string(properties.max_persistent_buffer_size_bit);
+      std::to_string(selected_properties.max_persistent_buffer_size_bit);
   const std::string native_choice =
       jev_mode == scheduler::jev::Mode::Record ? "waves4" : "";
   const std::string selected = scheduler::jev::chooseDecision(
@@ -1991,20 +2115,22 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
   const auto plan_index = std::distance(options.begin(), option_it);
   auto& chosen_plan = plans.at(plan_index);
   auto chosen_occupancy = chooseInner3DOccupancyTarget(
-      properties,
+      selected_properties,
       base,
       chosen_plan.waves,
       std::move(chosen_plan.params),
       chosen_plan.resources,
-      *device);
+      *device,
+      properties.vectorize_factor);
   return chooseInner3DWarpTarget(
-      properties,
+      selected_properties,
       base,
       chosen_plan.waves,
       std::move(chosen_occupancy.params),
       chosen_occupancy.resources,
       *device,
-      chosen_occupancy.target);
+      chosen_occupancy.target,
+      properties.vectorize_factor);
 }
 
 } // namespace

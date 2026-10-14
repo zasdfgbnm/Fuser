@@ -93,7 +93,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_width: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
-                           require_inner3d_occupancy: bool = False) -> dict[str, Any]:
+                           require_inner3d_occupancy: bool = False,
+                           require_inner3d_width: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -295,6 +296,54 @@ def check_alternate_report(report: dict[str, Any],
                     f"\npolicy_register_overhead={expected_overhead}\n" not in state or
                     f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
                 raise ValueError(f"nested batch did not use selected target policy: {row}")
+    elif require_inner3d_width:
+        if (site != "IP6.width" or event["native"] != "w4" or
+                alternate != "w2" or
+                not {"w4", "w2"} <= set(event["candidates"])):
+            raise ValueError("inner 3D fixture lacks a legal smaller width")
+        state = dict(line.split("=", 1) for line in event["state"].splitlines()[1:]
+                     if not line.startswith("plan"))
+        if state.get("layout_max") != "4":
+            raise ValueError(f"width did not preserve the layout maximum: {state}")
+        expected = [intended]
+        for nested_site, record_prefix, remote_prefix in (
+                ("IP6.waves", "inner_persistent.3d_wave_cap.v1\n",
+                 "inner_persistent.3d_wave_cap.v1\n"),
+                ("IP6.occupancy", "inner_persistent.3d_occupancy_target.v1\n",
+                 "inner_persistent.3d_occupancy_target.v2\n"),
+                ("IP6.warp", "inner_persistent.3d_warp_target.v1\n",
+                 "inner_persistent.3d_warp_target.v3\n")):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == nested_site]
+            record_only = [row for row in rows
+                           if sum(row["record"].values()) == 1 and
+                           not row["remote"]]
+            remote_only = [row for row in rows
+                           if sum(row["remote"].values()) == 1 and
+                           not row["record"]]
+            if len(rows) != 2 or len(record_only) != 1 or len(remote_only) != 1:
+                raise ValueError(f"expected one replaced {nested_site}: {rows}")
+            for row, prefix, width in ((record_only[0], record_prefix, "4"),
+                                       (remote_only[0], remote_prefix, "2")):
+                text = row["request"]["state"]
+                if not text.startswith(prefix):
+                    raise ValueError(f"unexpected {nested_site} version: {text}")
+                fields = dict(line.split("=", 1) for line in text.splitlines()[1:]
+                              if not line.startswith("plan"))
+                key = ("vector_width" if nested_site == "IP6.waves"
+                       else "selected_vector_width")
+                if width == "2" and fields.get(key) != width:
+                    raise ValueError(f"{nested_site} omitted selected width: {fields}")
+                if width == "4" and nested_site == "IP6.waves" and fields.get(key) != width:
+                    raise ValueError(f"{nested_site} omitted native width: {fields}")
+            expected.extend((
+                {"kind": "record_only_state", "site": nested_site,
+                 "request_sha256": record_only[0]["request_sha256"]},
+                {"kind": "remote_only_state", "site": nested_site,
+                 "request_sha256": remote_only[0]["request_sha256"]},
+            ))
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected width-dependent issues: {issues}")
     elif require_inner3d_warp:
         if (site != "IP6.warp" or event["native"] != "warp8" or
                 alternate != "warp16" or
@@ -370,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
+    parser.add_argument("--require-inner3d-width", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -471,7 +521,8 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_width=args.require_outer_width,
             require_inner_targets=args.require_inner_targets,
             require_inner3d_warp=args.require_inner3d_warp,
-            require_inner3d_occupancy=args.require_inner3d_occupancy)
+            require_inner3d_occupancy=args.require_inner3d_occupancy,
+            require_inner3d_width=args.require_inner3d_width)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)
