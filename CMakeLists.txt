@@ -307,6 +307,7 @@ list(APPEND NVFUSER_SRCS
   ${NVFUSER_SRCS_DIR}/scheduler/cache_policy_refiner.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/cutlass.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/heuristic.cpp
+  ${NVFUSER_SRCS_DIR}/scheduler/jev_client.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/greedy.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/mark_aliases.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/matmul.cpp
@@ -1099,6 +1100,16 @@ if(BUILD_TEST)
     add_test(test_profiler "${NVFUSER_ROOT}/tests/cpp/test_fusion_profiler.cpp" "")
     list(APPEND TEST_BINARIES test_profiler)
   endif()
+
+  # Protocol tests run without a CUDA context or the codegen library.
+  add_executable(test_jev_client_standalone
+    ${NVFUSER_ROOT}/tests/cpp/test_jev_client_standalone.cpp
+    ${NVFUSER_SRCS_DIR}/scheduler/jev_client.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(test_jev_client_standalone PRIVATE Threads::Threads)
+  target_include_directories(test_jev_client_standalone PRIVATE ${NVFUSER_SRCS_DIR})
+  set_property(TARGET test_jev_client_standalone PROPERTY CXX_STANDARD ${NVFUSER_CPP_STANDARD})
+  list(APPEND TEST_BINARIES test_jev_client_standalone)
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()

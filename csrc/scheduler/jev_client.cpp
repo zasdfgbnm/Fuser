@@ -1,0 +1,497 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include <scheduler/jev_client.h>
+
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <charconv>
+#include <chrono>
+#include <cerrno>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace nvfuser::scheduler::jev {
+namespace {
+
+constexpr size_t kMaxRequest = 64 * 1024;
+constexpr size_t kMaxResponse = 64 * 1024;
+constexpr size_t kMaxHeaders = 8 * 1024;
+constexpr auto kTimeout = std::chrono::milliseconds(2000);
+
+[[noreturn]] void fail(std::string_view detail) {
+  throw std::runtime_error("nvFuser Jev client: " + std::string(detail));
+}
+
+std::string env(std::string_view name) {
+  // All callers use static, NUL-terminated names.
+  const char* value = std::getenv(name.data());
+  return value == nullptr ? std::string() : std::string(value);
+}
+
+std::string quote(std::string_view value) {
+  constexpr char hex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(value.size() + 2);
+  result += '"';
+  for (unsigned char c : value) {
+    switch (c) {
+      case '"': result += "\\\""; break;
+      case '\\': result += "\\\\"; break;
+      case '\b': result += "\\b"; break;
+      case '\f': result += "\\f"; break;
+      case '\n': result += "\\n"; break;
+      case '\r': result += "\\r"; break;
+      case '\t': result += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          result += "\\u00";
+          result += hex[c >> 4];
+          result += hex[c & 15];
+        } else {
+          result += static_cast<char>(c);
+        }
+    }
+  }
+  result += '"';
+  return result;
+}
+
+// A small complete JSON reader keeps the experimental client independent of
+// Python/Torch serialization and rejects malformed or ambiguous API replies.
+struct Json {
+  enum class Kind { Null, Boolean, Number, String, Object, Array } kind;
+  std::string text;
+  std::map<std::string, Json> object;
+  std::vector<Json> array;
+
+  const Json& at(std::string_view key) const {
+    if (kind != Kind::Object) fail("expected JSON object");
+    auto it = object.find(std::string(key));
+    if (it == object.end()) fail("missing JSON field " + std::string(key));
+    return it->second;
+  }
+  std::string_view asString() const {
+    if (kind != Kind::String) fail("expected JSON string");
+    return text;
+  }
+};
+
+class JsonReader {
+ public:
+  explicit JsonReader(std::string_view input) : input_(input) {}
+
+  Json parse() {
+    Json result = value(0);
+    space();
+    if (pos_ != input_.size()) fail("trailing JSON data");
+    return result;
+  }
+
+ private:
+  std::string_view input_;
+  size_t pos_ = 0;
+
+  void space() {
+    while (pos_ < input_.size() &&
+           (input_[pos_] == ' ' || input_[pos_] == '\n' ||
+            input_[pos_] == '\r' || input_[pos_] == '\t')) ++pos_;
+  }
+  bool take(char c) {
+    space();
+    if (pos_ < input_.size() && input_[pos_] == c) {
+      ++pos_;
+      return true;
+    }
+    return false;
+  }
+  void expect(char c) {
+    if (!take(c)) fail("invalid JSON syntax");
+  }
+  bool literal(std::string_view token) {
+    if (input_.substr(pos_, token.size()) != token) return false;
+    pos_ += token.size();
+    return true;
+  }
+  static int hexDigit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    fail("invalid JSON Unicode escape");
+  }
+  unsigned codeUnit() {
+    if (input_.size() - pos_ < 4) fail("short JSON Unicode escape");
+    unsigned unit = 0;
+    for (int i = 0; i < 4; ++i) unit = unit * 16 + hexDigit(input_[pos_++]);
+    return unit;
+  }
+  static void appendUtf8(std::string& out, unsigned codepoint) {
+    if (codepoint <= 0x7f) out += static_cast<char>(codepoint);
+    else if (codepoint <= 0x7ff) {
+      out += static_cast<char>(0xc0 | (codepoint >> 6));
+      out += static_cast<char>(0x80 | (codepoint & 63));
+    } else if (codepoint <= 0xffff) {
+      out += static_cast<char>(0xe0 | (codepoint >> 12));
+      out += static_cast<char>(0x80 | ((codepoint >> 6) & 63));
+      out += static_cast<char>(0x80 | (codepoint & 63));
+    } else {
+      out += static_cast<char>(0xf0 | (codepoint >> 18));
+      out += static_cast<char>(0x80 | ((codepoint >> 12) & 63));
+      out += static_cast<char>(0x80 | ((codepoint >> 6) & 63));
+      out += static_cast<char>(0x80 | (codepoint & 63));
+    }
+  }
+  std::string string() {
+    expect('"');
+    std::string out;
+    while (pos_ < input_.size()) {
+      unsigned char c = input_[pos_++];
+      if (c == '"') return out;
+      if (c < 0x20) fail("unescaped JSON control byte");
+      if (c != '\\') { out += static_cast<char>(c); continue; }
+      if (pos_ == input_.size()) fail("short JSON escape");
+      char escaped = input_[pos_++];
+      switch (escaped) {
+        case '"': case '\\': case '/': out += escaped; break;
+        case 'b': out += '\b'; break;
+        case 'f': out += '\f'; break;
+        case 'n': out += '\n'; break;
+        case 'r': out += '\r'; break;
+        case 't': out += '\t'; break;
+        case 'u': {
+          unsigned point = codeUnit();
+          if (point >= 0xd800 && point <= 0xdbff) {
+            if (input_.substr(pos_, 2) != "\\u") fail("missing JSON low surrogate");
+            pos_ += 2;
+            unsigned low = codeUnit();
+            if (low < 0xdc00 || low > 0xdfff) fail("invalid JSON low surrogate");
+            point = 0x10000 + ((point - 0xd800) << 10) + low - 0xdc00;
+          } else if (point >= 0xdc00 && point <= 0xdfff) {
+            fail("unpaired JSON low surrogate");
+          }
+          appendUtf8(out, point);
+          break;
+        }
+        default: fail("invalid JSON escape");
+      }
+    }
+    fail("unterminated JSON string");
+  }
+  Json number() {
+    const size_t start = pos_;
+    if (input_[pos_] == '-') ++pos_;
+    if (pos_ == input_.size()) fail("short JSON number");
+    if (input_[pos_] == '0') ++pos_;
+    else {
+      if (input_[pos_] < '1' || input_[pos_] > '9') fail("invalid JSON number");
+      while (pos_ < input_.size() && input_[pos_] >= '0' && input_[pos_] <= '9') ++pos_;
+    }
+    if (pos_ < input_.size() && input_[pos_] == '.') {
+      ++pos_;
+      const size_t begin = pos_;
+      while (pos_ < input_.size() && input_[pos_] >= '0' && input_[pos_] <= '9') ++pos_;
+      if (pos_ == begin) fail("invalid JSON fraction");
+    }
+    if (pos_ < input_.size() && (input_[pos_] == 'e' || input_[pos_] == 'E')) {
+      ++pos_;
+      if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-')) ++pos_;
+      const size_t begin = pos_;
+      while (pos_ < input_.size() && input_[pos_] >= '0' && input_[pos_] <= '9') ++pos_;
+      if (pos_ == begin) fail("invalid JSON exponent");
+    }
+    return {Json::Kind::Number, std::string(input_.substr(start, pos_ - start)), {}, {}};
+  }
+  Json value(int depth) {
+    if (depth > 32) fail("JSON nesting exceeds limit");
+    space();
+    if (pos_ == input_.size()) fail("missing JSON value");
+    if (take('{')) {
+      Json result{Json::Kind::Object, {}, {}, {}};
+      if (take('}')) return result;
+      do {
+        space();
+        if (pos_ == input_.size() || input_[pos_] != '"') fail("invalid JSON object key");
+        std::string key = string();
+        expect(':');
+        if (!result.object.emplace(std::move(key), value(depth + 1)).second)
+          fail("duplicate JSON object key");
+      } while (take(','));
+      expect('}');
+      return result;
+    }
+    if (take('[')) {
+      Json result{Json::Kind::Array, {}, {}, {}};
+      if (take(']')) return result;
+      do { result.array.push_back(value(depth + 1)); } while (take(','));
+      expect(']');
+      return result;
+    }
+    if (input_[pos_] == '"') return {Json::Kind::String, string(), {}, {}};
+    if (literal("true")) return {Json::Kind::Boolean, "true", {}, {}};
+    if (literal("false")) return {Json::Kind::Boolean, "false", {}, {}};
+    if (literal("null")) return {Json::Kind::Null, {}, {}, {}};
+    if (input_[pos_] == '-' || (input_[pos_] >= '0' && input_[pos_] <= '9')) return number();
+    fail("invalid JSON value");
+  }
+};
+
+class Fd {
+ public:
+  explicit Fd(int fd) : fd_(fd) { if (fd_ < 0) fail(std::strerror(errno)); }
+  ~Fd() { if (fd_ >= 0) ::close(fd_); }
+  Fd(const Fd&) = delete;
+  Fd& operator=(const Fd&) = delete;
+  int get() const { return fd_; }
+ private:
+  int fd_;
+};
+
+using Clock = std::chrono::steady_clock;
+void ready(int fd, short event, Clock::time_point deadline) {
+  while (true) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+    if (remaining <= 0) fail("loopback API timeout");
+    pollfd pfd{fd, event, 0};
+    int result = ::poll(&pfd, 1, static_cast<int>(remaining));
+    if (result > 0) {
+      if (pfd.revents & POLLNVAL) fail("invalid loopback socket");
+      if (pfd.revents & (event | POLLERR | POLLHUP)) return;
+      fail("unexpected loopback socket event");
+    }
+    if (result == 0) fail("loopback API timeout");
+    if (errno != EINTR) fail(std::strerror(errno));
+  }
+}
+
+unsigned portFromEnv() {
+  const std::string text = env("NVFUSER_JEV_PORT");
+  if (text.empty()) return 8765;
+  unsigned port = 0;
+  auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), port);
+  if (error != std::errc{} || end != text.data() + text.size() || port == 0 || port > 65535)
+    fail("NVFUSER_JEV_PORT must be an integer in 1..65535");
+  return port;
+}
+
+std::string post(std::string_view body) {
+  if (body.size() > kMaxRequest) fail("request exceeds 64 KiB");
+  Fd socket(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<uint16_t>(portFromEnv()));
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  const auto deadline = Clock::now() + kTimeout;
+  int rc = ::connect(socket.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address));
+  if (rc < 0 && errno != EINPROGRESS) fail(std::strerror(errno));
+  if (rc < 0) {
+    ready(socket.get(), POLLOUT, deadline);
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (::getsockopt(socket.get(), SOL_SOCKET, SO_ERROR, &error, &length) < 0 || error != 0)
+      fail(error == 0 ? std::strerror(errno) : std::strerror(error));
+  }
+  const std::string request =
+      "POST /v1/systemone HTTP/1.0\r\nHost: 127.0.0.1\r\n"
+      "Content-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) +
+      "\r\nConnection: close\r\n\r\n" + std::string(body);
+  size_t sent = 0;
+  while (sent < request.size()) {
+    ready(socket.get(), POLLOUT, deadline);
+    const ssize_t count = ::send(socket.get(), request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
+    if (count > 0) sent += static_cast<size_t>(count);
+    else if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    else fail("loopback API send failed");
+  }
+  std::string response;
+  std::array<char, 4096> buffer{};
+  size_t header_end = std::string::npos;
+  size_t body_size = 0;
+  while (true) {
+    if (header_end != std::string::npos && response.size() >= header_end + body_size)
+      break;
+    ready(socket.get(), POLLIN, deadline);
+    ssize_t count = ::recv(socket.get(), buffer.data(), buffer.size(), 0);
+    if (count == 0) fail("truncated loopback API response");
+    if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    if (count < 0) fail(std::strerror(errno));
+    response.append(buffer.data(), static_cast<size_t>(count));
+    if (response.size() > kMaxHeaders + kMaxResponse) fail("loopback API response too large");
+    if (header_end == std::string::npos) {
+      size_t split = response.find("\r\n\r\n");
+      if (split == std::string::npos) {
+        if (response.size() > kMaxHeaders) fail("loopback API headers too large");
+        continue;
+      }
+      if (split > kMaxHeaders) fail("loopback API headers too large");
+      header_end = split + 4;
+      const size_t first_line_end = response.find("\r\n");
+      const std::string status = response.substr(0, first_line_end);
+      if (status != "HTTP/1.0 200 OK" && status != "HTTP/1.1 200 OK")
+        fail("loopback API returned " + status);
+      bool has_length = false;
+      bool has_type = false;
+      size_t offset = first_line_end + 2;
+      while (offset < split) {
+        size_t end = response.find("\r\n", offset);
+        if (end == std::string::npos || end > split) fail("malformed HTTP header");
+        std::string line = response.substr(offset, end - offset);
+        std::transform(line.begin(), line.end(), line.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (line.rfind("content-length: ", 0) == 0) {
+          if (has_length) fail("duplicate Content-Length");
+          std::string_view value(line.data() + 16, line.size() - 16);
+          auto [ptr, error] = std::from_chars(value.data(), value.data() + value.size(), body_size);
+          if (error != std::errc{} || ptr != value.data() + value.size() || body_size > kMaxResponse)
+            fail("invalid Content-Length");
+          has_length = true;
+        } else if (line == "content-type: application/json") {
+          if (has_type) fail("duplicate Content-Type");
+          has_type = true;
+        } else if (line.rfind("transfer-encoding:", 0) == 0) {
+          fail("chunked loopback API response unsupported");
+        }
+        offset = end + 2;
+      }
+      if (!has_length || !has_type) fail("missing JSON HTTP headers");
+    }
+  }
+  if (response.size() != header_end + body_size) fail("extra loopback API response bytes");
+  return response.substr(header_end, body_size);
+}
+
+void appendLog(std::string_view line) {
+  const std::string path = env("NVFUSER_JEV_LOG");
+  if (path.empty()) fail("NVFUSER_JEV_LOG is required in record/remote mode");
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> guard(mutex);
+  Fd file(::open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644));
+  std::string record(line);
+  record += '\n';
+  size_t written = 0;
+  while (written < record.size()) {
+    ssize_t count = ::write(file.get(), record.data() + written, record.size() - written);
+    if (count > 0) written += static_cast<size_t>(count);
+    else if (count < 0 && errno == EINTR) continue;
+    else fail("failed to write NVFUSER_JEV_LOG");
+  }
+}
+
+std::string selectedFromResponse(
+    std::string_view response,
+    std::string_view site,
+    const std::vector<ChoiceOption>& options) {
+  Json root = JsonReader(response).parse();
+  if (root.at("model").asString() != "nvfuser-analysis-v1") fail("unexpected local model");
+  const Json& answers = root.at("answers");
+  if (answers.kind != Json::Kind::Object || answers.object.size() != 1)
+    fail("expected exactly one Choice answer");
+  const Json& answer = answers.at(site);
+  if (answer.at("type").asString() != "choice") fail("answer is not Choice");
+  const std::string choice(answer.at("choice").asString());
+  const bool allowed = std::any_of(options.begin(), options.end(), [&](const ChoiceOption& option) {
+    return option.id == choice;
+  });
+  if (!allowed) fail("API selected a choice outside the allowed candidates");
+  const Json& confidence = answer.at("confidence");
+  if (confidence.kind != Json::Kind::Number) fail("invalid Choice confidence");
+  auto probability = [](const Json& value) {
+    if (value.kind != Json::Kind::Number) fail("expected numeric probability");
+    double number = 0.0;
+    try { number = std::stod(value.text); }
+    catch (const std::exception&) { fail("invalid numeric probability"); }
+    if (!std::isfinite(number) || number < 0.0 || number > 1.0)
+      fail("Choice probability outside 0..1");
+  };
+  probability(confidence);
+  const Json& probabilities = answer.at("probabilities");
+  if (probabilities.kind != Json::Kind::Object || probabilities.object.size() != options.size())
+    fail("invalid Choice probabilities");
+  for (const auto& option : options) {
+    probability(probabilities.at(option.id));
+  }
+  const Json& usage = root.at("usage");
+  if (usage.at("input_tokens").kind != Json::Kind::Number ||
+      usage.at("output_tokens").kind != Json::Kind::Number)
+    fail("invalid API usage");
+  return choice;
+}
+
+} // namespace
+
+Mode mode() {
+  const std::string configured = env("NVFUSER_JEV_MODE");
+  if (configured.empty() || configured == "off") return Mode::Off;
+  if (configured == "record") return Mode::Record;
+  if (configured == "remote") return Mode::Remote;
+  fail("NVFUSER_JEV_MODE must be off, record, or remote");
+}
+
+std::string chooseDecision(
+    std::string_view site,
+    std::string_view state,
+    const std::vector<ChoiceOption>& options,
+    std::string_view native_choice,
+    std::string_view case_key) {
+  const Mode current_mode = mode();
+  if (current_mode == Mode::Off) {
+    if (native_choice.empty()) fail("native choice is required in off mode");
+    return std::string(native_choice);
+  }
+  if (env("NVFUSER_JEV_LOG").empty())
+    fail("NVFUSER_JEV_LOG is required in record/remote mode");
+  if (site.empty() || options.empty() || options.size() > 255) fail("invalid Choice site or candidates");
+  std::map<std::string, bool> seen;
+  for (const auto& option : options) {
+    if (option.id.empty() || !seen.emplace(option.id, true).second)
+      fail("Choice candidates must have distinct nonempty IDs");
+  }
+  if (current_mode == Mode::Record && !seen.count(std::string(native_choice)))
+    fail("native choice is not an allowed candidate");
+  const std::string log_case_key =
+      case_key.empty() ? env("NVFUSER_JEV_CASE_KEY") : std::string(case_key);
+
+  std::string selected(native_choice);
+  int64_t roundtrip_us = 0;
+  if (current_mode == Mode::Remote) {
+    std::string request = "{\"model\":\"jev-latest\",\"state\":" + quote(state) +
+        ",\"questions\":{" + quote(site) + ":{\"type\":\"choice\",\"instructions\":" +
+        quote("Choose nvFuser scheduler decision " + std::string(site)) + ",\"criteria\":{";
+    for (size_t i = 0; i < options.size(); ++i) {
+      if (i != 0) request += ',';
+      request += quote(options[i].id) + ':' + quote(options[i].description);
+    }
+    request += "}}}}";
+    const auto begin = Clock::now();
+    const std::string response = post(request);
+    roundtrip_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count();
+    selected = selectedFromResponse(response, site, options);
+  }
+  std::string candidates = "[";
+  for (size_t i = 0; i < options.size(); ++i) {
+    if (i != 0) candidates += ',';
+    candidates += quote(options[i].id);
+  }
+  candidates += ']';
+  appendLog("{\"site\":" + quote(site) + ",\"case_key\":" + quote(log_case_key) +
+      ",\"state\":" + quote(state) + ",\"candidates\":" + candidates +
+      ",\"selected\":" + quote(selected) + ",\"mode\":" +
+      quote(current_mode == Mode::Record ? "record" : "remote") +
+      ",\"roundtrip_us\":" + std::to_string(roundtrip_us) + '}');
+  return selected;
+}
+
+} // namespace nvfuser::scheduler::jev
