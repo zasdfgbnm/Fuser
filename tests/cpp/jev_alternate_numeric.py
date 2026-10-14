@@ -666,6 +666,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner_width: bool = False,
                            require_inner_batch_cap: bool = False,
                            require_inner_targets: bool = False,
+                           require_inner_storage: bool = False,
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False,
                            require_inner3d_width: bool = False,
@@ -1469,6 +1470,40 @@ def check_alternate_report(report: dict[str, Any],
                     *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer warp issues: {issues}")
+    elif require_inner_storage:
+        from jev_shim import parse_inner_storage_state, parse_inner_smem_cta_state
+
+        if (site != "IP4.storage" or event["native"] != "register" or
+                alternate != "shared" or
+                set(event["candidates"]) != {"register", "shared"}):
+            raise ValueError("inner storage fixture lacks both proved plans")
+        storage = parse_inner_storage_state(event["state"])
+        if (storage.reduction_numel != 8192 or
+                storage.iteration_numel != 256 or
+                storage.persistent_buffer_bits != 262144):
+            raise ValueError("inner storage did not receive fixture measurements")
+        expected = [intended]
+        for nested_site, side in (("IP5.width", "record"),
+                                  ("IP5.targets", "record"),
+                                  ("IP5.batch", "record"),
+                                  ("IP8.cta", "remote")):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == nested_site]
+            if (len(rows) != 1 or rows[0][side] == {} or
+                    rows[0]["remote" if side == "record" else "record"] or
+                    sum(rows[0][side].values()) != 1):
+                raise ValueError(f"storage did not take {side} {nested_site}: {rows}")
+            expected.append({
+                "kind": f"{side}_only_state", "site": nested_site,
+                "request_sha256": rows[0]["request_sha256"]})
+            if nested_site == "IP8.cta":
+                cta = parse_inner_smem_cta_state(rows[0]["request"]["state"])
+                if (cta.reduction_numel != storage.reduction_numel or
+                        cta.vector_width != storage.vector_width or
+                        cta.persistent_buffer_bits != storage.persistent_buffer_bits):
+                    raise ValueError("shared CTA ignored the selected storage plan")
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected storage-dependent decisions: {issues}")
     elif require_inner_batch_cap:
         if (site != "IP5.batch" or alternate != "b12" or
                 event["native"] == alternate):
@@ -1944,6 +1979,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-grid-base", action="store_true")
     parser.add_argument("--require-outer-unroll", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
+    parser.add_argument("--require-inner-storage", action="store_true")
     parser.add_argument("--require-inner-iter-unroll", action="store_true")
     parser.add_argument("--require-inner-warp-target", action="store_true")
     parser.add_argument("--require-inner-cta-envelope", action="store_true")
@@ -2069,6 +2105,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_grid_base=args.require_outer_grid_base,
             require_outer_unroll=args.require_outer_unroll,
             require_inner_targets=args.require_inner_targets,
+            require_inner_storage=args.require_inner_storage,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
             require_inner_warp_target=args.require_inner_warp_target,
             require_inner_cta_envelope=args.require_inner_cta_envelope,

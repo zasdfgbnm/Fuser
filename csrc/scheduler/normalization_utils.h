@@ -315,6 +315,18 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
     int64_t candidate_batch = 0,
     int64_t candidate_padded_threads = 0);
 
+// Pure shared-memory capacity for a particular inner-persistent CTA plan.
+// Unlike getMaxRegOrSharedMemorySizeBitForPersistentBuffer, this cannot let
+// register capacity mask an overfull shared-memory allocation.
+int64_t getMaxSharedMemorySizeBitForPersistentBuffer(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    bool project_to_inputs,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads);
+
 enum class BufferProjectionStrategy {
   // Recompute persistent buffers from inputs, only need to cache inputs in
   // registers or shared memories, usually used when size of required cached

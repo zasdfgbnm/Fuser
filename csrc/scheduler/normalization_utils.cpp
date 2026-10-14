@@ -1344,25 +1344,17 @@ int64_t sharedMemoryRoundUpOverheadBit(
 }
 } // namespace
 
-int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+int64_t getMaxSharedMemorySizeBitForPersistentBuffer(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     const std::vector<TensorView*>& reduction_tvs,
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
-    const bool can_use_smem_persistent,
     const bool project_to_inputs,
     int64_t candidate_batch,
     int64_t candidate_padded_threads) {
   NVF_ERROR(
       candidate_batch == 0 || candidate_padded_threads > 0,
       "Candidate batch requires positive padded TIDx");
-  // Init to register file size, which is half of the full register file size
-  int64_t available_persistent_buffer_size_bit =
-      scheduler_utils::register_file_size_bit;
-  // shared memory persistent is not implemented for 3D inner reduction
-  if (!can_use_smem_persistent) {
-    return available_persistent_buffer_size_bit;
-  }
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
   int64_t smem_overhead_bit =
       scheduler_utils::getReductionSmemWorkspaceBit(fusion, reduction_tvs);
@@ -1376,12 +1368,35 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
 
   smem_overhead_bit += scheduler_utils::static_smem_usage_in_bits;
 
-  int64_t available_shared_memory_size_bit =
-      (int64_t)dev_prop->sharedMemPerBlockOptin * 8 - smem_overhead_bit;
+  return (int64_t)dev_prop->sharedMemPerBlockOptin * 8 - smem_overhead_bit;
+}
 
-  available_persistent_buffer_size_bit = std::max(
-      available_persistent_buffer_size_bit, available_shared_memory_size_bit);
-  return available_persistent_buffer_size_bit;
+int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    const bool can_use_smem_persistent,
+    const bool project_to_inputs,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads) {
+  NVF_ERROR(
+      candidate_batch == 0 || candidate_padded_threads > 0,
+      "Candidate batch requires positive padded TIDx");
+  // Shared memory persistence is not implemented for 3D inner reduction.
+  if (!can_use_smem_persistent) {
+    return scheduler_utils::register_file_size_bit;
+  }
+  return std::max(
+      scheduler_utils::register_file_size_bit,
+      getMaxSharedMemorySizeBitForPersistentBuffer(
+          fusion,
+          runtime_info,
+          reduction_tvs,
+          persistent_buffer_info,
+          project_to_inputs,
+          candidate_batch,
+          candidate_padded_threads));
 }
 
 // Returns BufferProjectionStrategy based on buffer size, hardware, and fusion

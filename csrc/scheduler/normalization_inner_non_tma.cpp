@@ -19,6 +19,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "instrumentation.h"
+#include "ir/utils.h"
 #include "scheduler/debug_utils.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
@@ -1266,12 +1267,11 @@ void innerPersistentHeuristicSharedMemory(
         // static shared-memory reserve. The original topology gate and buffer
         // projection remain native.
         const int64_t available_bits = normalization_scheduler_utils::
-            getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+            getMaxSharedMemorySizeBitForPersistentBuffer(
                 fusion,
                 runtime_info,
                 reduction_tvs,
                 persistent_buffer_info,
-                /*can_use_smem_persistent=*/true,
                 properties.project_persistent_buffers,
                 batch,
                 padded_threads);
@@ -2651,6 +2651,125 @@ std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
   rparams->fastest_dim = true;
   rparams->project_persistent_buffers = prop.project_persistent_buffers;
   rparams->cparams.index_type = prop.index_type;
+  // The register budget is a hard capacity gate, but below it both physical
+  // storage modes may be legal. Build the native register plan without a
+  // nested Choice, and check the complete shared-memory allocation at the
+  // shared planner's native batch/CTA before offering either mode.
+  bool choose_shared_storage = false;
+  const auto jev_mode = scheduler::jev::mode();
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const int64_t register_file_bits = scheduler_utils::register_file_size_bit;
+  if (jev_mode != scheduler::jev::Mode::Off &&
+      prop.max_persistent_buffer_size_bit > 0 &&
+      prop.max_persistent_buffer_size_bit <= register_file_bits &&
+      prop.total_reduction_numel == prop.inner_most_dimension_numel &&
+      !prop.project_persistent_buffers && device->major < 9 &&
+      scheduler_utils::getMaxClusterSize() == 1 &&
+      prop.vectorize_factor > 0 &&
+      prop.total_reduction_numel % prop.vectorize_factor == 0 &&
+      device->warpSize > 0 && device->maxThreadsPerBlock > 0 &&
+      device->maxThreadsPerBlock >= device->warpSize &&
+      (device->warpSize & (device->warpSize - 1)) == 0 &&
+      (device->maxThreadsPerBlock & (device->maxThreadsPerBlock - 1)) == 0 &&
+      device->maxThreadsPerBlock <= device->maxThreadsDim[0] &&
+      prop.total_reduction_numel /
+              prop.vectorize_factor >= device->maxThreadsPerBlock &&
+      prop.total_iteration_numel > 0 &&
+      prop.total_iteration_numel <= device->maxGridSize[0]) {
+    const int64_t register_overhead = prop.has_exp_op ? 32l : 16l;
+    const bool high_bandwidth =
+        scheduler_utils::isHighBandwidthFlopsRatio();
+    const int64_t target_warps =
+        high_bandwidth && prop.disable_project_to_avoid_recompute ? 16l : 28l;
+    Inner2DPolicyResources register_resources;
+    ReductionParams register_preview(*rparams);
+    innerPersistentHeuristic2DPlan(
+        prop,
+        &register_preview,
+        register_overhead,
+        target_warps,
+        false,
+        &register_resources);
+    if (register_resources.supported_menu) {
+      auto buffer_info_entry =
+          HeuristicDataCacheEntry<HeuristicCompileTime::PersistentBufferInfo>(
+              data_cache, [&fusion]() {
+                return std::make_unique<scheduler_utils::PersistentBufferInfo>(
+                    scheduler_utils::persistentBuffers(fusion));
+              });
+      const auto& buffer_info = buffer_info_entry.get();
+      const auto reduction_tvs = scheduler_utils::getReductionTvs(fusion);
+      const int64_t after_vectorize =
+          prop.total_reduction_numel / prop.vectorize_factor;
+      const int64_t shared_batch =
+          ceilDiv(after_vectorize, (int64_t)device->maxThreadsPerBlock);
+      const int64_t actual_threads = ceilDiv(after_vectorize, shared_batch);
+      const int64_t padded_threads =
+          ceilDiv(actual_threads, (int64_t)device->warpSize) * device->warpSize;
+      const int64_t shared_capacity = normalization_scheduler_utils::
+          getMaxSharedMemorySizeBitForPersistentBuffer(
+              fusion,
+              runtime_info,
+              reduction_tvs,
+              buffer_info,
+              false,
+              shared_batch,
+              padded_threads);
+      if (shared_capacity >= prop.max_persistent_buffer_size_bit &&
+          padded_threads <= device->maxThreadsPerBlock &&
+          !buffer_info.persistent_buffers.empty() &&
+          buffer_info.persistent_buffers.size() <= 32) {
+        int64_t reduction_dtype_bits = 1;
+        for (auto* tv : reduction_tvs) {
+          reduction_dtype_bits =
+              std::max(reduction_dtype_bits, dataTypeSizeBit(tv->getDataType()));
+        }
+        const bool has_welford = ir_utils::hasOpsOfType<WelfordOp>(fusion);
+        std::string state =
+            "inner_persistent.storage.v1\nreduction_numel=" +
+            std::to_string(prop.total_reduction_numel) +
+            "\niteration_numel=" + std::to_string(prop.total_iteration_numel) +
+            "\nvector_width=" + std::to_string(prop.vectorize_factor) +
+            "\npersistent_buffer_bits=" +
+            std::to_string(prop.max_persistent_buffer_size_bit) +
+            "\nregister_file_bits=" + std::to_string(register_file_bits) +
+            "\nsmem_limit_bits=" +
+            std::to_string((int64_t)device->sharedMemPerBlockOptin * 8) +
+            "\nmax_threads_per_block=" +
+            std::to_string(device->maxThreadsPerBlock) +
+            "\nwarp_size=" + std::to_string(device->warpSize) +
+            "\nreduction_dtype_bits=" +
+            std::to_string(reduction_dtype_bits) +
+            "\nhas_welford=" + std::to_string(has_welford) +
+            "\nmax_vector_bits=" +
+            std::to_string(getMaxVectorizationSizeInBit());
+        for (auto* buffer : buffer_info.persistent_buffers) {
+          state += "\nbuffer=" +
+              std::to_string(scheduler_utils::getPersistentBufferSizeBitOfTensor(
+                  buffer, runtime_info, buffer_info)) +
+              ":" + std::to_string(dataTypeSizeBit(buffer->getDataType()));
+        }
+        if (state.size() <= 16 * 1024) {
+          const std::vector<scheduler::jev::ChoiceOption> options = {
+              {"register", "Keep the proved 2D register persistent plan"},
+              {"shared", "Use the proved 2D shared-memory persistent plan"}};
+          const std::string native_choice =
+              jev_mode == scheduler::jev::Mode::Record ? "register" : "";
+          choose_shared_storage = scheduler::jev::chooseDecision(
+                                      "IP4.storage",
+                                      state,
+                                      options,
+                                      native_choice) == "shared";
+        } else {
+          NVF_ERROR(
+              jev_mode == scheduler::jev::Mode::Record,
+              "Inner persistent storage request exceeds safe size");
+          scheduler::jev::recordCoverageSkip(
+              "IP4.storage", "Storage state exceeds 16 KiB");
+        }
+      }
+    }
+  }
   // specific heuristics for different cases
   if (prop.max_persistent_buffer_size_bit >
           scheduler_utils::register_file_size_bit &&
@@ -2658,7 +2777,8 @@ std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
     innerPersistentHeuristicCluster(prop, rparams.get());
   } else if (
       prop.max_persistent_buffer_size_bit >
-      scheduler_utils::register_file_size_bit) {
+          scheduler_utils::register_file_size_bit ||
+      choose_shared_storage) {
     rparams->tag = "Shared Memory Inner Persistent Heuristic.\n";
     // all persistent buffers are moved to shared memory
     // TODO: allow only part of the buffers to be moved to shared memory
