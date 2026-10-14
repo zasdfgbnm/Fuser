@@ -1351,9 +1351,9 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError(f"unexpected 3D wave dependencies: {issues}")
     elif require_reduction_inner3d_work_split:
         from jev_shim import (analyze_inner3d_cta_target,
-                              analyze_inner3d_work_split,
+                              analyze_reduction_inner3d_work_split,
                               parse_inner3d_cta_target_state,
-                              parse_inner3d_work_split_state)
+                              parse_reduction_inner3d_work_split_state)
 
         if (site != "RD5.work_split" or
                 event["native"] != "unroll_first" or
@@ -1361,8 +1361,8 @@ def check_alternate_report(report: dict[str, Any],
                 set(event["candidates"]) !=
                 {"unroll_first", "iter_first"}):
             raise ValueError("3D reduction fixture lacks its live split menu")
-        state = parse_inner3d_work_split_state(event["state"])
-        plan = analyze_inner3d_work_split(state)
+        state = parse_reduction_inner3d_work_split_state(event["state"])
+        plan = analyze_reduction_inner3d_work_split(state)
         if (state["reduction_numel"] != 1024 or
                 state["iteration_numel"] != 8 or
                 state["inner_numel"] != 128 or
