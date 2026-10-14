@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "debug.h"
@@ -84,6 +85,53 @@ std::vector<InnerUnrollRange> innerUnrollRanges(int64_t low, int64_t high) {
     first = last + 1;
   }
   return ranges;
+}
+
+// Each request has at most 255 options. The same bounded range protocol is
+// used for both a candidate index and an unroll factor below.
+int64_t chooseInnerRemainderRange(
+    std::string_view site,
+    const std::string& state_base,
+    int64_t low,
+    int64_t high,
+    int64_t native_value,
+    scheduler::jev::Mode jev_mode) {
+  NVF_ERROR(jev_mode != scheduler::jev::Mode::Off && low >= 1 && high >= low);
+  for (;;) {
+    const auto ranges = innerUnrollRanges(low, high);
+    std::vector<scheduler::jev::ChoiceOption> options;
+    options.reserve(ranges.size());
+    std::string native_choice;
+    for (const auto& range : ranges) {
+      options.push_back(
+          {range.id,
+           "Choose integer in [" + std::to_string(range.low) + ", " +
+               std::to_string(range.high) + "]"});
+      if (jev_mode == scheduler::jev::Mode::Record &&
+          range.low <= native_value && native_value <= range.high) {
+        native_choice = range.id;
+      }
+    }
+    const std::string state = state_base +
+        "range_low=" + std::to_string(low) + '\n' +
+        "range_high=" + std::to_string(high) + '\n';
+    const auto selected = scheduler::jev::chooseDecision(
+        site, state, options, native_choice);
+    const auto selected_range = std::find_if(
+        ranges.begin(), ranges.end(), [&](const InnerUnrollRange& range) {
+          return range.id == selected;
+        });
+    NVF_ERROR(
+        selected_range != ranges.end(),
+        "RD3 remainder response is outside the candidate range");
+    if (selected_range->low == selected_range->high) {
+      return jev_mode == scheduler::jev::Mode::Record
+          ? native_value
+          : selected_range->low;
+    }
+    low = selected_range->low;
+    high = selected_range->high;
+  }
 }
 
 // Reduce x, y, z until it's product is less than max value, reduce round robin
@@ -405,23 +453,88 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // 5, then iteration = 1.01, the 2nd iteration only has 1% effective threads.
   // Check all possible bdimx and unroll, choose the one with smallest remainder
   if (getInnerRemainder() > 1) {
-    int64_t after_vect_bdimx = ceilDiv(after_vect, bdimx);
-    int64_t current_remainder = after_vect_bdimx % inner_unroll;
-    for (auto tmp_bdimx = four_warps; tmp_bdimx <= target_threads_per_block;
-         tmp_bdimx += min_warp_size) {
-      after_vect_bdimx = ceilDiv(after_vect, tmp_bdimx);
-      for (auto factor = target_inner_unroll; factor > 1; factor--) {
-        int64_t remainder = after_vect_bdimx % factor;
-        if (remainder == 0) {
-          inner_unroll = factor;
-          bdimx = tmp_bdimx;
-          break;
+    const int64_t seed_bdimx = bdimx;
+    if (jev_mode != scheduler::jev::Mode::Remote) {
+      int64_t after_vect_bdimx = ceilDiv(after_vect, bdimx);
+      int64_t current_remainder = after_vect_bdimx % inner_unroll;
+      for (auto tmp_bdimx = four_warps; tmp_bdimx <= target_threads_per_block;
+           tmp_bdimx += min_warp_size) {
+        after_vect_bdimx = ceilDiv(after_vect, tmp_bdimx);
+        for (auto factor = target_inner_unroll; factor > 1; factor--) {
+          int64_t remainder = after_vect_bdimx % factor;
+          if (remainder == 0) {
+            inner_unroll = factor;
+            bdimx = tmp_bdimx;
+            break;
+          }
+          if (remainder < current_remainder) {
+            current_remainder = remainder;
+            inner_unroll = factor;
+            bdimx = tmp_bdimx;
+          }
         }
-        if (remainder < current_remainder) {
-          current_remainder = remainder;
-          inner_unroll = factor;
-          bdimx = tmp_bdimx;
+      }
+    }
+
+    if (jev_mode != scheduler::jev::Mode::Off &&
+        target_inner_unroll >= 2 && target_threads_per_block >= four_warps) {
+      // Enumerate only native CTA widths. The seed may be off the warp-step
+      // search grid, so it is always retained as one legal candidate.
+      std::vector<int64_t> widths{seed_bdimx};
+      for (int64_t x = four_warps; x <= target_threads_per_block;
+           x += min_warp_size) {
+        if (x != seed_bdimx) {
+          widths.push_back(x);
         }
+      }
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote ||
+              (widths.size() <= 32768 && target_inner_unroll <= 65536 &&
+               widths.size() * target_inner_unroll <= 2000000),
+          "RD3.remainder exceeds bounded remote candidate analysis");
+      if (widths.size() > 1) {
+        std::string fields;
+        fields += "after_vect=" + std::to_string(after_vect) + '\n';
+        fields += "target_inner_unroll=" +
+            std::to_string(target_inner_unroll) + '\n';
+        fields += "target_threads_per_block=" +
+            std::to_string(target_threads_per_block) + '\n';
+        fields += "min_warp_size=" + std::to_string(min_warp_size) + '\n';
+        fields += "warp_size=" + std::to_string(threads_per_warp) + '\n';
+        int64_t native_index = 0;
+        if (jev_mode == scheduler::jev::Mode::Record) {
+          const auto found = std::find(widths.begin(), widths.end(), bdimx);
+          NVF_ERROR(found != widths.end());
+          native_index = std::distance(widths.begin(), found) + 1;
+        }
+        const int64_t chosen_index = chooseInnerRemainderRange(
+            "RD3.remainder_x",
+            "reduction.inner_remainder_x.v1\n" + fields,
+            1,
+            static_cast<int64_t>(widths.size()),
+            native_index,
+            jev_mode);
+        const int64_t selected_bdimx = widths.at(chosen_index - 1);
+
+        std::string factor_state =
+            "reduction.inner_remainder_u.v1\n" + fields;
+        factor_state += "chosen_bdimx=" +
+            std::to_string(selected_bdimx) + '\n';
+        const int64_t selected_unroll = chooseInnerRemainderRange(
+            "RD3.remainder_u",
+            factor_state,
+            1,
+            target_inner_unroll,
+            jev_mode == scheduler::jev::Mode::Record ? inner_unroll : 0,
+            jev_mode);
+        if (jev_mode == scheduler::jev::Mode::Remote) {
+          bdimx = selected_bdimx;
+          inner_unroll = selected_unroll;
+        }
+        NVF_ERROR(
+            bdimx >= 1 && bdimx <= target_threads_per_block &&
+                inner_unroll >= 1 && inner_unroll <= target_inner_unroll,
+            "RD3 remainder plan exceeds native CTA or reduction bounds");
       }
     }
   }
