@@ -1254,6 +1254,17 @@ if(BUILD_TEST)
       --require-inner3d-warp)
   set_tests_properties(jev_alternate_numeric_inner3d_persistent_warp PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_occupancy
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.occupancy --alternate occ16
+      --gtest Gpu1Test.JevAlternateInner3dPersistentWarp_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_occupancy
+      --require-inner3d-occupancy)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_occupancy PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_outer_iter_unroll
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

@@ -1200,7 +1200,8 @@ void innerPersistentHeuristic3DPlan(
     int64_t wave_cap,
     ReductionParams* rparams,
     Inner3DPlanResources* resources = nullptr,
-    int64_t warp_target = -1) {
+    int64_t warp_target = -1,
+    int64_t occupancy_target = 28) {
   // Define two free parameters used in this heuristic.
   // register_overhead is all registers except those for the persistent
   // buffers. The register in each thread = register_overhead +
@@ -1210,10 +1211,9 @@ void innerPersistentHeuristic3DPlan(
   // to NVRTC and influences the occupancy.
   const int64_t register_overhead = properties.has_exp_op ? 32l : 16l;
 
-  // Target occupancy required to hide memory latency
-  // Current value is based on tests of sofmax, layer_norm, softmax_dropout,
-  // dropout_layer_norm on A100 & H100.
-  const int64_t target_warps_per_sm = 28l;
+  // The original target is 28 warps. Non-native targets reach this planner
+  // only after a complete-plan Choice; Off mode retains the original target.
+  const int64_t target_warps_per_sm = occupancy_target;
 
   // Set some targets for parallelization
   const int64_t n_elems =
@@ -1728,13 +1728,121 @@ bool isNativeValidInner3DAlternative(
           std::min<int64_t>(scheduler_utils::x_grid_limit, device.maxGridSize[0]);
 }
 
-std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
+struct Inner3DChosenOccupancy {
+  int64_t target;
+  std::unique_ptr<ReductionParams> params;
+  Inner3DPlanResources resources;
+};
+
+Inner3DChosenOccupancy chooseInner3DOccupancyTarget(
     const PersistentKernelProperties& properties,
     const ReductionParams& base,
     int64_t wave_cap,
     std::unique_ptr<ReductionParams> native,
     const Inner3DPlanResources& native_resources,
     const cudaDeviceProp& device) {
+  struct Plan {
+    int64_t target;
+    std::unique_ptr<ReductionParams> params;
+    Inner3DPlanResources resources;
+  };
+  std::vector<Plan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  std::string plan_state;
+  for (const int64_t target : {28, 16, 32}) {
+    auto params = target == 28 ? std::move(native)
+                               : std::make_unique<ReductionParams>(base);
+    Inner3DPlanResources resources = native_resources;
+    if (target != 28) {
+      innerPersistentHeuristic3DPlan(
+          properties, wave_cap, params.get(), &resources, -1, target);
+    }
+    // Send measurements for *all* plans. The service independently applies
+    // the native hard-resource predicate to recover the exact legal menu.
+    // No native winner is present in the Remote request.
+    plan_state += "\nplan" + std::to_string(target) + "=" +
+        std::to_string(params->batches_per_block_inner_reduction) + "," +
+        std::to_string(params->unroll_factor_inner_reduction) + "," +
+        std::to_string(params->batches_per_block_outer_reduction) + "," +
+        std::to_string(params->unroll_factor_outer_reduction) + "," +
+        std::to_string(resources.padded_threads_x) + "," +
+        std::to_string(resources.threads_y) + "," +
+        std::to_string(resources.threads_z) + "," +
+        std::to_string(resources.padded_threads_per_block) + "," +
+        std::to_string(resources.registers_per_thread) + "," +
+        std::to_string(resources.grid_blocks) + "," +
+        std::to_string(params->schedule_3d) + "," +
+        std::to_string(params->persistent_kernel) + "," +
+        std::to_string(params->cross_block_inner_reduction) + "," +
+        std::to_string(params->cross_block_outer_reduction) + "," +
+        std::to_string(params->cross_grid_inner_reduction) + "," +
+        std::to_string(params->cross_grid_outer_reduction) + "," +
+        std::to_string(
+            params->block_dim_inner_reduction == ParallelType::TIDx) + "," +
+        std::to_string(
+            params->block_dim_outer_reduction == ParallelType::TIDz);
+    if (target == 28 || isNativeValidInner3DAlternative(
+                            properties,
+                            *params,
+                            *plans.front().params,
+                            resources,
+                            device)) {
+      options.push_back({
+          "occ" + std::to_string(target),
+          "Target " + std::to_string(target) +
+              " resident warps per SM; completed CTA=" +
+              std::to_string(resources.padded_threads_per_block) +
+              ", register cap=" +
+              std::to_string(resources.registers_per_thread) +
+              ", grid blocks=" + std::to_string(resources.grid_blocks)});
+    }
+    plans.push_back({target, std::move(params), resources});
+  }
+
+  const std::string state =
+      "inner_persistent.3d_occupancy_target.v1\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit) +
+      "\nmax_threads_x=" + std::to_string(device.maxThreadsDim[0]) +
+      "\nmax_threads_y=" + std::to_string(device.maxThreadsDim[1]) +
+      "\nmax_threads_z=" + std::to_string(device.maxThreadsDim[2]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(device.maxThreadsPerBlock) +
+      "\nregisters_per_block=" + std::to_string(device.regsPerBlock) +
+      "\nmax_grid_x=" + std::to_string(device.maxGridSize[0]) + plan_state;
+  const std::string native_choice =
+      scheduler::jev::mode() == scheduler::jev::Mode::Record ? "occ28" : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP6.occupancy", state, options, native_choice);
+  const auto option_it = std::find_if(
+      options.begin(),
+      options.end(),
+      [&](const auto& option) { return option.id == selected; });
+  NVF_ERROR(option_it != options.end(), "Unknown inner 3D occupancy target");
+  const auto plan_it = std::find_if(
+      plans.begin(),
+      plans.end(),
+      [&](const auto& plan) {
+        return "occ" + std::to_string(plan.target) == selected;
+      });
+  NVF_ERROR(plan_it != plans.end(), "Missing inner 3D occupancy plan");
+  return {plan_it->target, std::move(plan_it->params), plan_it->resources};
+}
+
+std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t wave_cap,
+    std::unique_ptr<ReductionParams> native,
+    const Inner3DPlanResources& native_resources,
+    const cudaDeviceProp& device,
+    int64_t occupancy_target) {
   const int64_t native_warp = getInner3DNativeWarpTarget(properties, device);
   struct Plan {
     std::unique_ptr<ReductionParams> params;
@@ -1766,7 +1874,7 @@ std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
     auto params = std::make_unique<ReductionParams>(base);
     Inner3DPlanResources resources;
     innerPersistentHeuristic3DPlan(
-        properties, wave_cap, params.get(), &resources, target);
+        properties, wave_cap, params.get(), &resources, target, occupancy_target);
     if (isNativeValidInner3DAlternative(
             properties, *params, *plans.front().params, resources, device)) {
       add_plan(target, std::move(params), resources);
@@ -1774,13 +1882,18 @@ std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
   }
 
   const std::string state =
-      "inner_persistent.3d_warp_target.v1\nreduction_numel=" +
+      (occupancy_target == 28
+           ? "inner_persistent.3d_warp_target.v1\nreduction_numel="
+           : "inner_persistent.3d_warp_target.v2\nreduction_numel=") +
       std::to_string(properties.total_reduction_numel) +
       "\ninner_numel=" +
       std::to_string(properties.inner_most_dimension_numel) +
       "\niteration_numel=" +
       std::to_string(properties.total_iteration_numel) +
       "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      (occupancy_target == 28
+           ? std::string()
+           : "\nselected_occupancy_target=" + std::to_string(occupancy_target)) +
       "\nmax_dtype_bits=" + std::to_string(properties.max_dtype_size_bit) +
       "\nn_tensor_inputs=" + std::to_string(properties.n_tensor_inputs) +
       "\nl2_cache_bytes=" + std::to_string(device.l2CacheSize) +
@@ -1877,13 +1990,21 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
   NVF_ERROR(option_it != options.end(), "Unknown inner 3D wave target");
   const auto plan_index = std::distance(options.begin(), option_it);
   auto& chosen_plan = plans.at(plan_index);
-  return chooseInner3DWarpTarget(
+  auto chosen_occupancy = chooseInner3DOccupancyTarget(
       properties,
       base,
       chosen_plan.waves,
       std::move(chosen_plan.params),
       chosen_plan.resources,
       *device);
+  return chooseInner3DWarpTarget(
+      properties,
+      base,
+      chosen_plan.waves,
+      std::move(chosen_occupancy.params),
+      chosen_occupancy.resources,
+      *device,
+      chosen_occupancy.target);
 }
 
 } // namespace

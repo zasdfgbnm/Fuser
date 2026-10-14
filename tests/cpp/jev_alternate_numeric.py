@@ -91,7 +91,8 @@ def check_alternate_report(report: dict[str, Any],
                            alternate: str, case_key: str,
                            require_grid: bool = False,
                            require_inner_targets: bool = False,
-                           require_inner3d_warp: bool = False) -> dict[str, Any]:
+                           require_inner3d_warp: bool = False,
+                           require_inner3d_occupancy: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -267,6 +268,38 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError(f"warp plan used an unexpected wave cap: {state}")
         if issues != [intended]:
             raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
+    elif require_inner3d_occupancy:
+        if (site != "IP6.occupancy" or event["native"] != "occ28" or
+                alternate != "occ16" or
+                not {"occ28", "occ16"} <= set(event["candidates"])):
+            raise ValueError("inner 3D fixture lacks a legal occupancy alternate")
+        waves = [row for row in report["multiplicity"]
+                 if row["site"] == "IP6.waves"]
+        if (len(waves) != 1 or waves[0]["record"] != {"waves4": 1} or
+                waves[0]["remote"] != {"waves4": 1}):
+            raise ValueError(f"3D wave target changed before occupancy Choice: {waves}")
+        warps = [row for row in report["multiplicity"]
+                 if row["site"] == "IP6.warp"]
+        record_warp = [row for row in warps
+                       if sum(row["record"].values()) == 1 and not row["remote"]]
+        remote_warp = [row for row in warps
+                       if sum(row["remote"].values()) == 1 and not row["record"]]
+        if len(warps) != 2 or len(record_warp) != 1 or len(remote_warp) != 1:
+            raise ValueError(f"expected exactly one replaced IP6.warp state: {warps}")
+        record_state = record_warp[0]["request"]["state"]
+        remote_state = remote_warp[0]["request"]["state"]
+        if (not record_state.startswith("inner_persistent.3d_warp_target.v1\n") or
+                not remote_state.startswith("inner_persistent.3d_warp_target.v2\n") or
+                "\nselected_occupancy_target=16\n" not in remote_state):
+            raise ValueError("IP6.warp did not receive the selected occupancy")
+        expected = [intended,
+            {"kind": "record_only_state", "site": "IP6.warp",
+             "request_sha256": record_warp[0]["request_sha256"]},
+            {"kind": "remote_only_state", "site": "IP6.warp",
+             "request_sha256": remote_warp[0]["request_sha256"]},
+        ]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected dependent warp comparison issues: {issues}")
     elif issues != [intended]:
         raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
@@ -292,6 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-grid", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
+    parser.add_argument("--require-inner3d-occupancy", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -391,7 +425,8 @@ def main(argv: list[str] | None = None) -> int:
             alternate=args.alternate, case_key=args.case_key,
             require_grid=args.require_grid,
             require_inner_targets=args.require_inner_targets,
-            require_inner3d_warp=args.require_inner3d_warp)
+            require_inner3d_warp=args.require_inner3d_warp,
+            require_inner3d_occupancy=args.require_inner3d_occupancy)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)
