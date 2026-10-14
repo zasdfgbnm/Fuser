@@ -218,14 +218,6 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
   };
   NormOuterParams params;
 
-  // set iter_unroll_factor
-  // This controls vectorized load/store along the iteration dimension.
-  // The kernel calls block reduction [iter_unroll_factor] times.
-  // Test shows performance regression when iter_unroll_factor > 1 due to
-  // the high cost of calling block reduction multiple times per block.
-  params.iter_unroll_factor.set(1l);
-  params.iter_unroll_factor.finalize();
-
   // set redu_unroll_factor
   // This controls unroll along the reduction dimension.
   // For case InstanceNormFP32 of [256, 28, 28, 128], if unroll 2, register
@@ -242,13 +234,16 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     int64_t bdimx;
     int64_t bdimy;
     int64_t batches_per_block;
+    int64_t gdimx;
   };
   const int64_t batches_per_block_min = std::min(8l, total_reduction_numel);
   const int64_t min_threads_in_block = 128l;
   const int64_t max_threads_in_block = 256l;
-  const auto make_block_plan = [&](int64_t seed_bdimx)
+  const auto make_block_plan = [&](int64_t seed_bdimx, int64_t iter_unroll)
       -> std::optional<BlockPlan> {
-    if (seed_bdimx < 1 || device_warp_size % seed_bdimx != 0) {
+    if (seed_bdimx < 1 || iter_unroll < 1 ||
+        seed_bdimx > max_multi_reduction_factor / iter_unroll ||
+        device_warp_size % seed_bdimx != 0) {
       return std::nullopt;
     }
     const int64_t after_unroll = total_reduction_numel;
@@ -284,11 +279,15 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
         ? min_threads_in_block / bdimy
         : seed_bdimx;
     if (ceilDiv(
-            max_persistent_buffer_size_bit * final_bdimx,
+            max_persistent_buffer_size_bit * final_bdimx * iter_unroll,
             scheduler_utils::register_file_size_bit) != 1) {
       return std::nullopt;
     }
-    return BlockPlan{final_bdimx, bdimy, batch};
+    return BlockPlan{
+        final_bdimx,
+        bdimy,
+        batch,
+        ceilDiv(total_iteration_numel, final_bdimx * iter_unroll)};
   };
   const auto plan_id = [](const BlockPlan& plan) {
     return "x" + std::to_string(plan.bdimx) + "_y" +
@@ -296,10 +295,70 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
         std::to_string(plan.batches_per_block);
   };
 
+  // The analyzed vector width is the alignment bound. The additional
+  // divisibility check keeps every offered vectorized iteration tile complete.
+  // A factor is offered only if some complete CTA plan fits one SM's register
+  // budget. The model chooses a factor before the selected factor's OP3.cta
+  // request is formed, so speculative plans never produce nested Choice logs.
+  const auto jev_mode = scheduler::jev::mode();
+  int64_t selected_iter_unroll = 1;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::vector<int64_t> factors;
+    for (int64_t factor = 1;
+         factor <= (int64_t)vectorize_factor &&
+         factor <= total_iteration_numel;
+         factor *= 2) {
+      if (total_iteration_numel % factor != 0) {
+        continue;
+      }
+      bool has_complete_plan = false;
+      for (int64_t seed = 1;
+           seed <= std::min(
+               max_multi_reduction_factor / factor, device_warp_size);
+           seed *= 2) {
+        if (make_block_plan(seed, factor).has_value()) {
+          has_complete_plan = true;
+          break;
+        }
+      }
+      if (has_complete_plan) {
+        options.push_back({
+            "u" + std::to_string(factor),
+            "Vectorize " + std::to_string(factor) +
+                " iteration elements per thread with a valid block plan"});
+        factors.push_back(factor);
+      }
+    }
+    NVF_ERROR(!options.empty(), "No legal outer persistent iteration factor");
+    const std::string state =
+        "outer_persistent.iter_unroll.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) + "\niteration_numel=" +
+        std::to_string(total_iteration_numel) + "\nvector_width=" +
+        std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+        std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
+        std::to_string(device_warp_size) + "\nregister_file_bits=" +
+        std::to_string(scheduler_utils::register_file_size_bit);
+    const std::string choice = scheduler::jev::chooseDecision(
+        "OP3.unroll",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "u1" : "");
+    const auto option_it = std::find_if(
+        options.begin(),
+        options.end(),
+        [&](const auto& option) { return option.id == choice; });
+    NVF_ERROR(
+        option_it != options.end(), "Unknown outer persistent iteration factor");
+    selected_iter_unroll =
+        factors.at(std::distance(options.begin(), option_it));
+  }
+  params.iter_unroll_factor.set(selected_iter_unroll);
+  params.iter_unroll_factor.finalize();
+
   // Start from warp_size, and decrease it until we can make more than 4 waves.
   const int64_t bdimx_max =
       max_multi_reduction_factor / params.iter_unroll_factor.get();
-  const auto jev_mode = scheduler::jev::mode();
   std::optional<BlockPlan> selected_plan;
   if (jev_mode != scheduler::jev::Mode::Remote) {
     // Fit in L2: target 256 bits per warp. Otherwise use 16 lanes. This is a
@@ -317,15 +376,20 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     }
     // InstanceNormFP32 of [32, 32, 32, 128] improved from 618 to 770 GB/s
     // when TIDx was reduced to expose four waves.
-    int64_t num_ctas = ceilDiv(total_iteration_numel, tmp_bdimx);
+    int64_t num_ctas = ceilDiv(
+        total_iteration_numel,
+        tmp_bdimx * params.iter_unroll_factor.get());
     while (
         num_ctas < 4l * device_multiprocessor_count &&
         tmp_bdimx >= 2l *
                 normalization_scheduler_utils::PreferredLaunchConfig::kMinBdimx) {
       tmp_bdimx /= 2l;
-      num_ctas = ceilDiv(total_iteration_numel, tmp_bdimx);
+      num_ctas = ceilDiv(
+          total_iteration_numel,
+          tmp_bdimx * params.iter_unroll_factor.get());
     }
-    selected_plan = make_block_plan(tmp_bdimx);
+    selected_plan = make_block_plan(
+        tmp_bdimx, params.iter_unroll_factor.get());
     NVF_ERROR(selected_plan.has_value(), "Invalid native outer persistent block plan");
   }
 
@@ -335,7 +399,7 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     for (int64_t seed = 1;
          seed <= std::min(bdimx_max, device_warp_size);
          seed *= 2) {
-      auto plan = make_block_plan(seed);
+      auto plan = make_block_plan(seed, params.iter_unroll_factor.get());
       if (!plan.has_value()) {
         continue;
       }
@@ -351,12 +415,18 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
           "Use blockDim=(" + std::to_string(plan->bdimx) + "," +
               std::to_string(plan->bdimy) + ") and " +
               std::to_string(plan->batches_per_block) +
-              " serial reduction batches"});
+              " serial reduction batches over " +
+              std::to_string(plan->gdimx) + " iteration CTAs"});
       plans.push_back(*plan);
     }
     NVF_ERROR(!options.empty(), "No legal outer persistent block plan");
     const std::string state =
-        "outer_persistent.block_cta.v1\nreduction_numel=" +
+        (params.iter_unroll_factor.get() == 1
+             ? "outer_persistent.block_cta.v1\n"
+             : "outer_persistent.block_cta.v2\niter_unroll=" +
+                   std::to_string(params.iter_unroll_factor.get()) +
+                   "\nvector_width=" + std::to_string(vectorize_factor) + "\n") +
+        "reduction_numel=" +
         std::to_string(total_reduction_numel) + "\niteration_numel=" +
         std::to_string(total_iteration_numel) + "\npersistent_buffer_bits=" +
         std::to_string(max_persistent_buffer_size_bit) +
@@ -406,7 +476,7 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
   // copy to ReductionParams
   auto rparams = std::make_unique<ReductionParams>(
       OuterPersistentKernelScheduler::schedulerType());
-  auto gdimx = ceilDiv(total_iteration_numel, params.bdimx.get());
+  auto gdimx = selected_plan->gdimx;
   rparams->batches_per_block_inner_reduction = params.batches_per_block.get();
   rparams->persistent_kernel = true;
   rparams->project_persistent_buffers = project_to_input;
