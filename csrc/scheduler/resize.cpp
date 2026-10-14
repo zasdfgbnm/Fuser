@@ -10,12 +10,15 @@
 
 #include <memory>
 #include <ranges>
+#include <string>
+#include <vector>
 
 #include "debug.h"
 #include "instrumentation.h"
 #include "ir/utils.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/pointwise_utils.h"
 #include "scheduler/registry_utils.h"
@@ -25,6 +28,8 @@
 #include "scheduler/tools/loop_domain_scheduler.h"
 #include "scheduler/tools/resize_utils.h"
 #include "scheduler/tools/static_repeat.h"
+#include "scheduler/utils.h"
+#include "scheduler/vectorize_helper.h"
 #include "val_graph_visitor.h"
 
 namespace nvfuser {
@@ -246,11 +251,84 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
 
   // Only consider the innermost dimension to vectorize for now.
   // TODO: Consider vectorizing merged IDs, not just the innermost
-  params->vectorization_factor = vectorize_helper::getVectorizationFactor(
+  // The helper's layout/resize/alignment bound is a hard legality constraint.
+  // Resize currently has no additional soft width cap, so its native
+  // preference is exactly this bound. The helper may use gcd for Resize
+  // offsets, so a legal alternative must divide the bound, not merely be
+  // smaller than it. Neither the reference nor innermost axis may change.
+  const int64_t layout_max = vectorize_helper::getVectorizationFactor(
       runtime_info,
       ref_tv,
       data_cache,
       (int64_t)ref_tv->getLogicalDomain().size() - 1);
+  params->vectorization_factor = layout_max;
+
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Off) {
+    NVF_ERROR(
+        layout_max >= 1 && layout_max <= 128,
+        "RS1.width layout limit must be in 1..128");
+
+    // Workload measurements are sent as text with the hard width bound. No
+    // separate native winner is transmitted. Preserve original fusion-input
+    // indices, since scalar inputs do not have layouts to vectorize.
+    std::string input_elements;
+    for (size_t input_index = 0; input_index < fusion->inputs().size();
+         ++input_index) {
+      auto* input = fusion->inputs().at(input_index);
+      if (!input->isA<TensorView>()) {
+        continue;
+      }
+      auto* input_tv = input->as<TensorView>();
+      int64_t num_elms = 1;
+      for (auto* logical_id : input_tv->getLogicalDomain()) {
+        auto extent = runtime_info.expressionEvaluator().evaluate(
+            logical_id->extent());
+        NVF_ERROR(extent.hasValue(), "Error inferring extent of: ",
+                  logical_id->toString());
+        num_elms *= extent.as<int64_t>();
+      }
+      if (!input_elements.empty()) {
+        input_elements += ',';
+      }
+      input_elements +=
+          std::to_string(input_index) + ':' + std::to_string(num_elms);
+    }
+    if (input_elements.empty()) {
+      input_elements = "-";
+    }
+
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t width = 1; width <= layout_max; ++width) {
+      if (layout_max % width != 0) {
+        continue;
+      }
+      options.push_back({
+          "w" + std::to_string(width),
+          "Vectorize " + std::to_string(width) + " element(s) per thread"});
+    }
+    const std::string state =
+        "resize.width.v1\nlayout_max=" + std::to_string(layout_max) +
+        "\ninput_elements=" + input_elements +
+        "\nmax_output_elements=" + std::to_string(max_num_elms) + '\n';
+    const std::string native_choice =
+        scheduler::jev::mode() == scheduler::jev::Mode::Record
+        ? "w" + std::to_string(layout_max)
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "RS1.width", state, options, native_choice);
+    bool matched = false;
+    for (int64_t width = 1; width <= layout_max; ++width) {
+      if (layout_max % width != 0) {
+        continue;
+      }
+      if (selected == "w" + std::to_string(width)) {
+        params->vectorization_factor = width;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "RS1.width response is outside native hard bounds");
+  }
 
   return params;
 }
