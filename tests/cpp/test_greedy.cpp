@@ -850,7 +850,11 @@ TEST_F(GreedySchedulerTest, JevAlternateScatterBatch_CUDA) {
   FusionExecutorCache executor_cache(std::move(fusion_ptr));
   auto outputs = executor_cache.runFusionWithInputs({index});
   testValidate(executor_cache.fusion(), outputs, {index}, __LINE__, __FILE__);
-  EXPECT_FALSE(executor_cache.getMostRecentKernelRuntime()->isSegmented());
+  FusionKernelRuntime* runtime = executor_cache.getMostRecentKernelRuntime();
+  EXPECT_FALSE(runtime->isSegmented());
+  EXPECT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
 }
 
 TEST_P(GreedySchedulerTestConstraintSize, ScanLargeConstrainedIDs) {
