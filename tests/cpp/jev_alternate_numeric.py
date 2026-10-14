@@ -1058,16 +1058,81 @@ def check_alternate_report(report: dict[str, Any],
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected inner grid comparison issues: {issues}")
     elif require_grid:
-        if set(event["candidates"]) != {"warp16", "warp32"}:
+        if (site != "RD9.warp" or event["native"] != "warp16" or
+                alternate != "warp32" or
+                set(event["candidates"]) != {"warp16", "warp32"}):
             raise ValueError("outer warp test did not reach both hard-valid plans")
-        allowed = {site, "RD9.stride", "RD8"}
-        if any(issue["site"] not in allowed for issue in issues):
-            raise ValueError(f"unrelated decision comparison issues: {issues}")
-        rd8 = [row for row in report["multiplicity"] if row["site"] == "RD8"]
-        if sum(row["remote"].get("grid", 0) for row in rd8) != 1:
-            raise ValueError(f"alternate warp did not reach the grid plan: {rd8}")
-        if not any(issue["site"] in {"RD9.stride", "RD8"} for issue in issues):
-            raise ValueError("alternate warp did not alter downstream grid analysis")
+        for upstream in ("RD9.reg_budget", "RD9.width", "RD9.waves"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with warp: {rows}")
+        cta_record, cta_remote, cta_issues = paired_state_rows(report, "RD9.cta")
+        cta_before = state_fields(cta_record, "reduction.outer_cta.v1")
+        cta_after = state_fields(cta_remote, "reduction.outer_cta.v1")
+        if (cta_record["record"] != {"q4": 1} or
+                cta_remote["remote"] != {"q4": 1} or
+                cta_before.get("warp") != "16" or
+                cta_after.get("warp") != "32" or
+                {key: value for key, value in cta_before.items()
+                 if key != "warp"} !=
+                {key: value for key, value in cta_after.items()
+                 if key != "warp"}):
+            raise ValueError("CTA target did not receive selected warp")
+        base_record, base_remote, base_issues = paired_state_rows(
+            report, "RD9.grid_base")
+        base_before = state_fields(base_record, "reduction.outer_grid_base.v1")
+        base_after = state_fields(base_remote, "reduction.outer_grid_base.v1")
+        for base, cta, row, side in (
+                (base_before, cta_before, base_record, "record"),
+                (base_after, cta_after, base_remote, "remote")):
+            if (row[side] != {"target": 1} or base.get("cta_share") != "4" or
+                    {key: value for key, value in base.items()
+                     if key != "cta_share"} != cta):
+                raise ValueError("baseline grid did not receive selected warp and CTA")
+        rag_record, rag_remote, rag_issues = paired_state_rows(
+            report, "RD9.ragged")
+        stride_record, stride_remote, stride_issues = paired_state_rows(
+            report, "RD9.stride")
+        plan_record, plan_remote, plan_issues = paired_state_rows(report, "RD8")
+        for rag, stride, plan, side, warp, block, output, raw in (
+                (rag_record, stride_record, plan_record,
+                 "record", "16", (16, 32), 33, 8),
+                (rag_remote, stride_remote, plan_remote,
+                 "remote", "32", (32, 16), 17, 16)):
+            rag_fields = state_fields(rag, "reduction.outer_ragged.v1")
+            stride_fields = outer_stride_fields(stride)
+            plan_fields = state_fields(plan, "reduction.outer_plan.v1")
+            cleaned = clean_outer_grid_waves(raw, output, int(rag_fields["sm_count"]))
+            if (rag[side] != {"clean": 1} or
+                    set(rag["request"]["questions"]["RD9.ragged"]
+                        ["criteria"]) != {"clean", "raw"} or
+                    (rag_fields.get("bdimx"), rag_fields.get("bdimy")) !=
+                    tuple(map(str, block)) or
+                    rag_fields.get("gidim") != str(output) or
+                    rag_fields.get("base_grdim") != str(raw) or
+                    stride_fields.get("min_warp_size") != warp or
+                    any(rag_fields[key] != stride_fields[key]
+                        for key in OUTER_RAGGED_FORWARD_KEYS) or
+                    stride[side] != {f"g{cleaned}": 1} or
+                    plan[side] != {"grid": 1} or
+                    plan_fields.get("grid_gidim") != str(output) or
+                    plan_fields.get("grid_grdim") != str(cleaned) or
+                    plan_fields.get("grid_iter_unroll") !=
+                    stride_fields["iter_unroll"]):
+                raise ValueError("dependent grid plan ignored selected warp")
+        before_plan = state_fields(plan_record, "reduction.outer_plan.v1")
+        after_plan = state_fields(plan_remote, "reduction.outer_plan.v1")
+        if ({key: value for key, value in before_plan.items()
+             if key not in {"grid_gidim", "grid_grdim"}} !=
+                {key: value for key, value in after_plan.items()
+                 if key not in {"grid_gidim", "grid_grdim"}}):
+            raise ValueError("warp changed unrelated RD8 plan measurements")
+        expected = [intended, *cta_issues, *base_issues, *rag_issues,
+                    *stride_issues, *plan_issues]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected outer warp issues: {issues}")
     elif require_inner_width:
         if (site != "IP5.width" or event["native"] != "w4" or
                 alternate != "w1" or
