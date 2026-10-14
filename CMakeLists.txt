@@ -1209,6 +1209,17 @@ if(BUILD_TEST)
       --require-iop3-min-batch)
   set_tests_properties(jev_alternate_numeric_inner_outer_min_batch PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_grid_rows
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.grid_rows --alternate r4
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_grid_rows
+      --require-iop3-grid-rows)
+  set_tests_properties(jev_alternate_numeric_inner_outer_grid_rows PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_outer_tmp_write_width
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

@@ -186,6 +186,36 @@ def iop3_cta_plan_fields(row: dict[str, Any], width: int
     return plans
 
 
+def iop3_rows_expected_cta(state: str, rows: int
+                           ) -> tuple[dict[str, str], list[tuple[int, ...]]]:
+    lines = state.splitlines()
+    if not lines or lines[0] != "inner_outer_multi_wave.grid_rows.v1":
+        raise ValueError("unexpected IOP3.grid_rows state version")
+    scalars: dict[str, str] = {}
+    plans: list[tuple[int, ...]] = []
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        if not sep or not value:
+            raise ValueError(f"malformed IOP3.grid_rows field: {line}")
+        if key == "plan":
+            fields = tuple(int(part) for part in value.split(":"))
+            if len(fields) != 17:
+                raise ValueError("incomplete IOP3.grid_rows CTA plan")
+            if fields[0] == rows:
+                plans.append(fields[3:])
+        elif key in scalars:
+            raise ValueError(f"repeated IOP3.grid_rows field: {key}")
+        else:
+            scalars[key] = value
+    if set(scalars) != IOP3_CTA_FIELDS | {
+            "selected_min_batch", "min_threads", "max_threads", "thread_cap"}:
+        raise ValueError("IOP3.grid_rows omitted upstream or CTA measurements")
+    if not plans or len(plans) != (int(scalars["max_threads"]) //
+                                 int(scalars["min_threads"])).bit_length():
+        raise ValueError("IOP3.grid_rows omitted a complete selected CTA search")
+    return ({key: scalars[key] for key in IOP3_CTA_FIELDS}, plans)
+
+
 OUTER_STRIDE_KEYS = {
     "reduction_numel", "iteration_numel", "dtype_bits", "sm_count",
     "min_warp_size", "bdimx", "bdimy", "iter_unroll", "redu_unroll",
@@ -278,6 +308,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_width: bool = False,
                            require_inner3d_outer_unroll: bool = False,
                            require_iop3_min_batch: bool = False,
+                           require_iop3_grid_rows: bool = False,
                            require_iop3_tmp_write: bool = False,
                            require_iop3_tmp_read: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
@@ -887,6 +918,54 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("batch search did not extend the exact CTA menu")
         if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
             raise ValueError(f"unexpected minimum-batch dependencies: {issues}")
+    elif require_iop3_grid_rows:
+        if (site != "IOP3.grid_rows" or event["native"] != "r8" or
+                alternate != "r4" or
+                not {"r4", "r8"} <= set(event["candidates"])):
+            raise ValueError("inner-outer fixture lacks checked rows alternatives")
+        scalar, native_plans = iop3_rows_expected_cta(event["state"], 8)
+        _, selected_plans = iop3_rows_expected_cta(event["state"], 4)
+        upstream = dict(line.split("=", 1) for line in
+                        event["state"].splitlines()[1:]
+                        if not line.startswith("plan="))
+        if (scalar["inner_dim"] != "2048" or scalar["outer_dim"] != "1024" or
+                scalar["selected_outer_read_width"] != "2" or
+                upstream["selected_min_batch"] != "2" or
+                upstream["min_threads"] != "128" or
+                upstream["max_threads"] != "256"):
+            raise ValueError("rows fixture changed upstream selected values")
+        if (len(native_plans) != 2 or len(selected_plans) != 2 or
+                [p[5] for p in native_plans] != [128, 128] or
+                [p[5] for p in selected_plans] != [256, 256] or
+                [p[0] for p in native_plans] != [256, 128] or
+                [p[0] for p in selected_plans] != [256, 128]):
+            raise ValueError("rows alternate did not change the complete grid plans")
+        for upstream in ("IOP3.min_batch", "IOP3.tmp_read_width"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"rows changed upstream {upstream}: {rows}")
+        record_cta, remote_cta, cta_issues = paired_state_rows(
+            report, "IOP3.cta")
+        for row, expected, side in ((record_cta, native_plans, "record"),
+                                    (remote_cta, selected_plans, "remote")):
+            cta_lines = row["request"]["state"].splitlines()
+            if cta_lines[0] != "inner_outer_multi_wave.cta.v2":
+                raise ValueError("unexpected rows-dependent CTA version")
+            actual_scalar = dict(line.split("=", 1) for line in cta_lines[1:]
+                                 if not line.startswith("plan="))
+            if (actual_scalar != scalar or
+                    iop3_cta_plan_fields(row, 2) != expected or
+                    row[side] != {"t256": 1}):
+                raise ValueError("CTA did not materialize the selected rows plan")
+        writes = [row for row in report["multiplicity"]
+                  if row["site"] == "IOP3.tmp_write_width"]
+        if (len(writes) != 1 or writes[0]["record"] != {"w4": 1} or
+                writes[0]["remote"] != {"w4": 1}):
+            raise ValueError("rows changed the downstream temporary write width")
+        if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
+            raise ValueError(f"unexpected rows-dependent decisions: {issues}")
     elif require_iop3_tmp_write:
         if (site != "IOP3.tmp_write_width" or event["native"] != "w4" or
                 alternate != "w2" or set(event["candidates"]) != {"w2", "w4"}):
@@ -972,6 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-width", action="store_true")
     parser.add_argument("--require-inner3d-outer-unroll", action="store_true")
     parser.add_argument("--require-iop3-min-batch", action="store_true")
+    parser.add_argument("--require-iop3-grid-rows", action="store_true")
     parser.add_argument("--require-iop3-tmp-write", action="store_true")
     parser.add_argument("--require-iop3-tmp-read", action="store_true")
     args = parser.parse_args(argv)
@@ -1084,6 +1164,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_width=args.require_inner3d_width,
             require_inner3d_outer_unroll=args.require_inner3d_outer_unroll,
             require_iop3_min_batch=args.require_iop3_min_batch,
+            require_iop3_grid_rows=args.require_iop3_grid_rows,
             require_iop3_tmp_write=args.require_iop3_tmp_write,
             require_iop3_tmp_read=args.require_iop3_tmp_read)
         manifest["alternate"] = summary

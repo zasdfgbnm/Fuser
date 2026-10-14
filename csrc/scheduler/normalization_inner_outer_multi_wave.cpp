@@ -157,12 +157,10 @@ void getHeuristics(
   // outer dimension. The kernel is a cooperative kernel, so the number of
   // blocks should be as large as possible to achieve a high occupancy unless
   // outer dim is too small which may lead large workload for the final outer
-  // reduction. So, gdimy is drvied from the number of blocks per sm and limited
-  // to ensure at least 8 rows per block.
-  // TODO: re-evaluate this 8 rows per block requirement.
-  auto getGdimy = [&](int64_t inner_vect,
-                      int64_t threads_per_block,
-                      int64_t inner_batch) {
+  // reduction. The empirical minimum rows per block bounds the grid.
+  auto getGridCapacity = [&](int64_t inner_vect,
+                             int64_t threads_per_block,
+                             int64_t inner_batch) {
     int64_t reg_per_thread =
         getEstimatedRegisterUsage(inner_vect * inner_batch);
     // Limit threads per SM by register usage and hardware constraints
@@ -171,8 +169,15 @@ void getHeuristics(
         static_cast<int64_t>(dev_prop->maxThreadsPerMultiProcessor));
     int64_t blocks_per_sm =
         getBlocksPerSM(threads_per_sm, threads_per_block, dev_prop->warpSize);
-    int64_t gdimy = blocks_per_sm * device_multiprocessor_count;
-    const int64_t outer_iter_min = 8;
+    return blocks_per_sm * device_multiprocessor_count;
+  };
+  auto getGdimy = [&](int64_t inner_vect,
+                      int64_t threads_per_block,
+                      int64_t inner_batch,
+                      int64_t outer_iter_min) {
+    int64_t gdimy =
+        getGridCapacity(inner_vect, threads_per_block, inner_batch);
+    int64_t blocks_per_sm = gdimy / device_multiprocessor_count;
     const int64_t gdimy_max = scheduler_utils::roundUpToN(
         ceilDiv(outer_dim_numel, outer_iter_min), device_multiprocessor_count);
     while (gdimy > gdimy_max && blocks_per_sm > 1) {
@@ -231,7 +236,8 @@ void getHeuristics(
   // Get the heuristics given vectorization factor and threads per block
   auto getHeuristicsGivenVectThreads = [&](int64_t vect_factor,
                                            int64_t threads_per_block,
-                                           int64_t outer_read_width) {
+                                           int64_t outer_read_width,
+                                           int64_t outer_iter_min) {
     InnerOuterParams iop;
     // (1) inner reduction
     // Reduction dim: inner_batch, threads_per_block, vect_factor
@@ -240,8 +246,11 @@ void getHeuristics(
     iop.threads_per_block = threads_per_block;
     iop.inner_batch =
         ceilDiv(inner_dim_numel / iop.inner_vect, iop.threads_per_block);
-    iop.gdimy =
-        getGdimy(iop.inner_vect, iop.threads_per_block, iop.inner_batch);
+    iop.gdimy = getGdimy(
+        iop.inner_vect,
+        iop.threads_per_block,
+        iop.inner_batch,
+        outer_iter_min);
     // (2) outer reduction
     // Iteration dim: gdimy, bdimx, vectorization_factor_outer
     // Reduction dim: bdimy
@@ -292,7 +301,8 @@ void getHeuristics(
   };
   const int64_t smem_limit_bit =
       (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
-  const auto make_offered_plan = [&](const InnerOuterParams& candidate)
+  const auto make_offered_plan = [&](const InnerOuterParams& candidate,
+                                     int64_t outer_iter_min)
       -> std::optional<OfferedPlan> {
     if (candidate.inner_vect < 1 || candidate.inner_batch < 1 ||
         candidate.threads_per_block < 1 ||
@@ -328,7 +338,10 @@ void getHeuristics(
           inner_dim_numel, candidate.inner_vect * candidate.inner_batch);
       final_bdimy = 1;
       final_gdimy = getGdimy(
-          candidate.inner_vect, final_bdimx, candidate.inner_batch);
+          candidate.inner_vect,
+          final_bdimx,
+          candidate.inner_batch,
+          outer_iter_min);
     } else {
       const int64_t bdimz = ceilDiv(
           ceilDiv(
@@ -387,8 +400,8 @@ void getHeuristics(
              full_search_safe && threads >= threads_per_block_min;
              threads /= 2) {
           const auto candidate = getHeuristicsGivenVectThreads(
-              vect_factor, threads, native_outer_read_width);
-          if (!make_offered_plan(candidate)) {
+              vect_factor, threads, native_outer_read_width, 8);
+          if (!make_offered_plan(candidate, 8)) {
             full_search_safe = false;
           }
           ++plan_count;
@@ -456,8 +469,8 @@ void getHeuristics(
         for (int64_t threads = threads_per_block_max;
              threads >= threads_per_block_min; threads /= 2) {
           const auto candidate =
-              getHeuristicsGivenVectThreads(vect_factor, threads, width);
-          if (!make_offered_plan(candidate)) {
+              getHeuristicsGivenVectThreads(vect_factor, threads, width, 8);
+          if (!make_offered_plan(candidate, 8)) {
             full_plans_safe = false;
           }
           ++count;
@@ -509,6 +522,123 @@ void getHeuristics(
     }
   }
 
+  // This A100-tuned rows threshold is a performance preference. Offer a small
+  // menu only after the upstream batch and read width are fixed, and only when
+  // every CTA search candidate has a legal complete launch for that threshold.
+  int64_t outer_iter_min = 8;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool valid_rows_bounds =
+        outer_dim_numel > 0 && inner_dim_numel > 0 &&
+        device_multiprocessor_count > 0 &&
+        vect_factor >= 1 && vect_factor <= 128 &&
+        (vect_factor & (vect_factor - 1)) == 0 &&
+        inner_dim_numel % vect_factor == 0 &&
+        threads_per_block_min >= 1 &&
+        threads_per_block_max >= threads_per_block_min &&
+        (threads_per_block_min & (threads_per_block_min - 1)) == 0 &&
+        (threads_per_block_max & (threads_per_block_max - 1)) == 0 &&
+        hp_threads_per_block_max <= dev_prop->maxThreadsPerBlock &&
+        threads_per_block_max <= dev_prop->maxThreadsPerBlock;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::string state =
+        "inner_outer_multi_wave.grid_rows.v1\ninner_dim=" +
+        std::to_string(inner_dim_numel) + "\nouter_dim=" +
+        std::to_string(outer_dim_numel) + "\nvector_width=" +
+        std::to_string(vect_factor) + "\nselected_min_batch=" +
+        std::to_string(batch_min) + "\nselected_outer_read_width=" +
+        std::to_string(outer_read_width) + "\nmin_threads=" +
+        std::to_string(threads_per_block_min) + "\nmax_threads=" +
+        std::to_string(threads_per_block_max) + "\nthread_cap=" +
+        std::to_string(hp_threads_per_block_max) + "\nregs_buffer_bits=" +
+        std::to_string(regs_buffer_size_bit) + "\ntmp_dtype_bits=" +
+        std::to_string(tmp_gmem_dtype_size_bit) + "\nwarp_size=" +
+        std::to_string(dev_prop->warpSize) + "\nsm_count=" +
+        std::to_string(device_multiprocessor_count) +
+        "\nmax_threads_per_block=" +
+        std::to_string(dev_prop->maxThreadsPerBlock) +
+        "\nmax_grid_y=" + std::to_string(dev_prop->maxGridSize[1]) +
+        "\nsmem_total_bits=" +
+        std::to_string(smem_buffer_size_bit + smem_overhead_bit) +
+        "\nsmem_limit_bits=" + std::to_string(smem_limit_bit);
+    if (valid_rows_bounds) {
+      for (int64_t rows : {4l, 8l, 16l}) {
+        bool full_search_safe = true;
+        std::string rows_state;
+        int64_t plan_count = 0;
+        for (int64_t threads = threads_per_block_max;
+             full_search_safe && threads >= threads_per_block_min;
+             threads /= 2) {
+          const auto candidate = getHeuristicsGivenVectThreads(
+              vect_factor, threads, outer_read_width, rows);
+          const auto plan = make_offered_plan(candidate, rows);
+          if (!plan) {
+            full_search_safe = false;
+            break;
+          }
+          const int64_t capacity = getGridCapacity(
+              candidate.inner_vect,
+              candidate.threads_per_block,
+              candidate.inner_batch);
+          const int64_t final_capacity = getGridCapacity(
+              candidate.inner_vect,
+              plan->final_bdimx * plan->final_bdimy,
+              candidate.inner_batch);
+          rows_state += "\nplan=" + std::to_string(rows) + ":" +
+              std::to_string(capacity) + ":" +
+              std::to_string(final_capacity) + ":" +
+              std::to_string(candidate.threads_per_block) + ":" +
+              std::to_string(candidate.inner_vect) + ":" +
+              std::to_string(candidate.inner_batch) + ":" +
+              std::to_string(candidate.bdimx) + ":" +
+              std::to_string(candidate.bdimy) + ":" +
+              std::to_string(candidate.gdimy) + ":" +
+              std::to_string(candidate.tmp_gmem_write_vect) + ":" +
+              std::to_string(candidate.vectorization_factor_outer) + ":" +
+              std::to_string(candidate.warps_per_sm) + ":" +
+              std::to_string(candidate.required_register_per_thread) + ":" +
+              std::to_string(candidate.available_register_per_thread) + ":" +
+              std::to_string(plan->final_bdimx) + ":" +
+              std::to_string(plan->final_bdimy) + ":" +
+              std::to_string(plan->final_gdimy);
+          ++plan_count;
+        }
+        if (full_search_safe && plan_count >= 1 && plan_count <= 7) {
+          options.push_back({
+              "r" + std::to_string(rows),
+              "Require at least " + std::to_string(rows) +
+                  " outer rows per grid-Y block across " +
+                  std::to_string(plan_count) + " complete CTA plans"});
+          state += rows_state;
+        }
+      }
+    }
+    const bool native_offered =
+        std::any_of(options.begin(), options.end(), [](const auto& option) {
+          return option.id == "r8";
+        });
+    if (!native_offered || state.size() >= 48 * 1024) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 rows threshold lacks complete safe CTA plans");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.grid_rows", "native rows lack complete safe CTA plans");
+    } else {
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP3.grid_rows",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "r8" : "");
+      const auto option = std::find_if(
+          options.begin(), options.end(), [&](const auto& candidate) {
+            return candidate.id == selected;
+          });
+      NVF_ERROR(option != options.end(), "IOP3 rows are outside proved plans");
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        outer_iter_min = std::stoll(selected.substr(1));
+      }
+    }
+  }
+
   // Store all the possible heuristics based on different threads per block.
   // Vectorizaton is fixed at the maximum value.
   std::vector<InnerOuterParams> iop_candidates;
@@ -517,7 +647,7 @@ void getHeuristics(
        threads_per_block /= 2) {
     iop_candidates.emplace_back(
         getHeuristicsGivenVectThreads(
-            vect_factor, threads_per_block, outer_read_width));
+            vect_factor, threads_per_block, outer_read_width, outer_iter_min));
   }
 
   // IOP1 previews use Off mode and therefore issue no IOP3 requests.
@@ -575,7 +705,7 @@ void getHeuristics(
         "\nsmem_limit_bits=" + std::to_string(smem_limit_bit) +
         "\nselected_outer_read_width=" + std::to_string(outer_read_width);
     for (const auto& candidate : iop_candidates) {
-      const auto plan = make_offered_plan(candidate);
+      const auto plan = make_offered_plan(candidate, outer_iter_min);
       if (!plan) {
         all_candidates_safe = false;
         continue;
@@ -653,7 +783,8 @@ void getHeuristics(
     iop.bdimx = ceilDiv(inner_dim_numel, iop.inner_vect * iop.inner_batch);
 
     // Step-2, InnerParams, Iteration dim: gdimy, bdimy (in next step)
-    iop.gdimy = getGdimy(iop.inner_vect, iop.bdimx, iop.inner_batch);
+    iop.gdimy = getGdimy(
+        iop.inner_vect, iop.bdimx, iop.inner_batch, outer_iter_min);
 
     // Step-3, OuterParams, Iteration dim: vectorization_factor_outer(reuse),
     // bdimy, gdimy (in previous step).
