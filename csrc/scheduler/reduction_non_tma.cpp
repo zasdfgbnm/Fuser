@@ -1854,29 +1854,47 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
   // registers for other purposes. Test shows it leads to 50% occupancy for
   // outer reduction without fused ops and 50% occupancy for gelu backward which
   // fused 21 ops including the expensive tanh op.
-  int64_t buffer_reg_count = 0L, input_factor = 0L;
-  if (has_mufu_computation) {
-    // when we have expensive ops, computation cost of each thread is already
-    // high, prioritize thread level parallelism, 8 registers are reserved for
-    // unroll and vectorization, the corresponding unroll factor is 2 if fully
-    // vectorized by 16 bytes. when there are more than 4 inputs, reduce to 1.
-    buffer_reg_count = 8L;
-    input_factor = (int64_t)n_tensor_inputs >> 2;
-  } else {
-    // when there is no expensive op, prioritize instruction level parallelism,
-    // 32 registers are reserved for unroll and vectorization, the corresponding
-    // unroll factor is 8 if fully vectorized by 16 bytes. Gradually reduce
-    // unroll factor if we have many inputs, e.g. 2 inputs -> unroll by 4; 3 or
-    // 4 inputs -> unroll by 2; 5, 6, 7 or 8 inputs -> unroll by 1.
-    buffer_reg_count = 32L;
-    input_factor = n_tensor_inputs;
+  // The two original, coupled register-budget policies are performance
+  // targets, not allocated registers. The selected maximum unroll feeds the
+  // unchanged native block/grid planners. Their final CTA and register caps
+  // continue to be calculated from device resources below.
+  const auto budgetMaxUnroll = [&](int64_t buffer_reg_count,
+                                   int64_t input_factor) {
+    return ceilDiv(
+        buffer_reg_count * scheduler_utils::bits_per_register /
+            max_dtype_size_bit_for_vectorization,
+        scheduler_utils::lastPow2(std::max(input_factor, int64_t{1})));
+  };
+  const int64_t unroll8 = budgetMaxUnroll(8, n_tensor_inputs >> 2);
+  const int64_t unroll32 = budgetMaxUnroll(32, n_tensor_inputs);
+  const auto jev_mode = scheduler::jev::mode();
+  int64_t max_unroll = has_mufu_computation ? unroll8 : unroll32;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    NVF_ERROR(
+        unroll8 > 0 && unroll32 > 0,
+        "RD9 register policies require positive unroll budgets");
+    const std::string state =
+        "reduction.outer_reg_budget.v1\nn_tensor_inputs=" +
+        std::to_string(n_tensor_inputs) +
+        "\ndtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\nhas_mufu=" + std::to_string(has_mufu_computation ? 1 : 0) +
+        "\nbits_per_register=" +
+        std::to_string(scheduler_utils::bits_per_register);
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"b8", "Eight data registers; input factor is input count / 4"},
+        {"b32", "32 data registers; input factor is input count"}};
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? (has_mufu_computation ? "b8" : "b32")
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD9.reg_budget", state, options, native_choice);
+    NVF_ERROR(
+        selected == "b8" || selected == "b32",
+        "RD9 register policy is outside native candidate bounds");
+    max_unroll = selected == "b8" ? unroll8 : unroll32;
   }
-  auto const max_unroll = ceilDiv(
-      // Available unrolling based on size of data type
-      buffer_reg_count * scheduler_utils::bits_per_register /
-          (int64_t)max_dtype_size_bit_for_vectorization,
-      // Reduce unrolling if we have many inputs
-      scheduler_utils::lastPow2(std::max(input_factor, (int64_t)1)));
 
   // block or grid reduction heuristic
   auto grid_params = getGridOuterReduction(
@@ -1902,7 +1920,6 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
   // their legality checks in nvFuser; only the performance preference is a
   // Choice. Do not evaluate the native preference on the remote path.
   bool use_block = false;
-  const auto jev_mode = scheduler::jev::mode();
   if (jev_mode == scheduler::jev::Mode::Off) {
     use_block = isBetterThan(block_params, grid_params, sm_count);
   } else {
