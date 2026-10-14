@@ -316,7 +316,7 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // maxrregcount is set, the compiler are more aggressive in register
   // allocation. When has expensive ops, use a smaller CTA size for higher
   // opportunity to reach higher occupancy.
-  int64_t target_threads_per_block = has_mufu_computation ? 128 : 256;
+  int64_t target_threads_per_block = 0;
 
   // When iteration dim is small, the number of blocks is small since each block
   // reduces one row (if iteration dim is extremely small, may do grid reduction
@@ -328,8 +328,12 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
       ceilDiv(target_threads_per_sm * sm_count, max_blocks));
   min_threads_per_block =
       std::min(min_threads_per_block, max_threads_per_block / 2);
-  target_threads_per_block =
-      std::max(target_threads_per_block, min_threads_per_block);
+  // Only off/record need the native empirical starting target. Remote mode
+  // sends the MUFU fact and occupancy inputs so the service can compute it.
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    target_threads_per_block = std::max(
+        has_mufu_computation ? 128 : 256, min_threads_per_block);
+  }
 
   if (jev_mode != scheduler::jev::Mode::Off) {
     // Both empirical starting points are at most half the physical block
