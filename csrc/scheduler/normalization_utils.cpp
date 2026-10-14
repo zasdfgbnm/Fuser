@@ -403,12 +403,11 @@ std::string gridBasePlanId(const GridBasePlan& plan) {
 // the schedule from the persistent batch. The historical search estimates
 // register use using the unadjusted grid, so it may accept a plan that is not
 // suitable for an alternate Choice. That plan remains the native fallback.
-bool isSafeGridBasePlan(
+bool isHardValidGridBasePlan(
     const GridBasePlan& plan,
     int64_t total_reduction_numel,
     int64_t total_iteration_numel,
-    int64_t vectorize_factor,
-    int64_t persistent_buffer_size_bit) {
+    int64_t vectorize_factor) {
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
   const auto& base = plan.launch;
   const auto actual_gdimy = getMinPersistentBufferSize(
@@ -423,14 +422,74 @@ bool isSafeGridBasePlan(
           std::min<int64_t>(
               scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
       base.bdimx() * base.bdimy() <= dev_prop->maxThreadsPerBlock &&
+      ceilDiv(ceilDiv(total_iteration_numel, vectorize_factor), base.bdimx()) >=
+          base.gdimx();
+}
+
+bool isSafeGridBasePlan(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit) {
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel,
+      plan.launch.bdimy(),
+      plan.tail.buffer_size);
+  return isHardValidGridBasePlan(
+             plan,
+             total_reduction_numel,
+             total_iteration_numel,
+             vectorize_factor) &&
       checkIfWithinRegisterSpace(
+             total_reduction_numel,
+             persistent_buffer_size_bit,
+             vectorize_factor,
+             plan.launch.bdimy(),
+             actual_gdimy);
+}
+
+// Offer at most one plan just outside the native no-spill preference. The
+// persistent buffer and fixed overhead must fit the physical per-thread and
+// per-CTA register limits; only the conservative index-cache estimate may
+// spill by another 16 registers. CUDA's generated code handles those spills.
+// This does not alter the native first-good search or runtime eligibility.
+bool isBoundedRegisterGridBasePlan(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit) {
+  if (!isHardValidGridBasePlan(
+          plan,
+          total_reduction_numel,
+          total_iteration_numel,
+          vectorize_factor)) {
+    return false;
+  }
+  const auto& base = plan.launch;
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), plan.tail.buffer_size);
+  if (checkIfWithinRegisterSpace(
           total_reduction_numel,
           persistent_buffer_size_bit,
           vectorize_factor,
           base.bdimy(),
-          actual_gdimy) &&
-      ceilDiv(ceilDiv(total_iteration_numel, vectorize_factor), base.bdimx()) >=
-          base.gdimx();
+          actual_gdimy)) {
+    return false;
+  }
+  const auto pb_factor = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), actual_gdimy);
+  const auto buffer_bits =
+      ceilDiv(ceilDiv(persistent_buffer_size_bit, base.bdimy()), actual_gdimy) *
+      vectorize_factor;
+  const auto buffer_regs = ceilDiv(buffer_bits, sizeof(int) * 8);
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto physical_regs = std::min<int64_t>(
+      scheduler_utils::max_registers_per_thread,
+      dev_prop->regsPerBlock / (base.bdimx() * base.bdimy()));
+  return buffer_regs + scheduler_utils::register_overhead <= physical_regs &&
+      buffer_regs <= getAvailableRegisterCount(pb_factor) + 16;
 }
 
 GridBasePlan chooseGridBasePlan(
@@ -462,7 +521,7 @@ GridBasePlan chooseGridBasePlan(
 
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
   const std::string state =
-      "outer_persistent.grid_base.v1\nreduction_numel=" +
+      "outer_persistent.grid_base.v2\nreduction_numel=" +
       std::to_string(total_reduction_numel) + "\niteration_numel=" +
       std::to_string(total_iteration_numel) + "\nvector_width=" +
       std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
@@ -473,7 +532,8 @@ GridBasePlan chooseGridBasePlan(
       std::to_string(dev_prop->maxGridSize[0]) + "\nmax_grid_y=" +
       std::to_string(dev_prop->maxGridSize[1]) +
       "\nmax_threads_per_block=" +
-      std::to_string(dev_prop->maxThreadsPerBlock);
+      std::to_string(dev_prop->maxThreadsPerBlock) + "\nregs_per_block=" +
+      std::to_string(dev_prop->regsPerBlock);
   const std::string selected = scheduler::jev::chooseDecision(
       "OP2.base",
       state,
@@ -904,6 +964,7 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
     // grid/register checks. The scan's uneven-iteration and first-good-tail
     // filters are performance preferences, so they do not prune this menu.
     std::vector<GridBasePlan> safe_base_plans;
+    std::optional<GridBasePlan> bounded_register_plan;
     PreferredLaunchConfig candidate_cfg;
     const auto native_id = gridBasePlanId(*native_base);
     while (!candidate_cfg.isInvalid()) {
@@ -930,9 +991,21 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
                 vectorize_factor,
                 persistent_buffer_size_bit)) {
           safe_base_plans.push_back(candidate);
+        } else if (!bounded_register_plan.has_value() &&
+                   gridBasePlanId(candidate) != native_id &&
+                   isBoundedRegisterGridBasePlan(
+                       candidate,
+                       total_reduction_numel,
+                       total_iteration_numel,
+                       vectorize_factor,
+                       persistent_buffer_size_bit)) {
+          bounded_register_plan = candidate;
         }
       }
       candidate_cfg.moveToNextConfig();
+    }
+    if (bounded_register_plan.has_value()) {
+      safe_base_plans.push_back(*bounded_register_plan);
     }
     auto chosen_base = chooseGridBasePlan(
         *native_base,

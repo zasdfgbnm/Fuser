@@ -784,6 +784,34 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent CTA comparison issues: {issues}")
+    elif site == "OP2.base" and alternate == "x11_y11_b16":
+        # The bounded register-margin plan bypasses the native no-spill
+        # estimate. It is already a complete grid/batch/unswitch plan, so the
+        # dependent tail and unswitch menus intentionally stay native-only.
+        fields = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "outer_persistent.grid_base.v2")
+        if (event["native"] != "x8_y16_b16" or
+                "x11_y11_b16" not in event["candidates"] or
+                "x12_y10_b16" in event["candidates"] or
+                any(fields.get(key) != value for key, value in {
+                    "reduction_numel": "8192", "iteration_numel": "1024",
+                    "vector_width": "4", "persistent_buffer_bits": "262144",
+                    "regs_per_block": "65536"}.items())):
+            raise ValueError("register-margin fixture changed its bounded plan")
+        expected = [intended]
+        for nested_site, version, winner in (
+                ("OP2.tail", "outer_persistent.grid_tail.v1", "y16_b32"),
+                ("OP2.unswitch", "outer_persistent.unswitch.v1", "u32")):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == nested_site]
+            if (len(rows) != 1 or rows[0]["record"] != {winner: 1} or
+                    rows[0]["remote"] or
+                    not rows[0]["request"]["state"].startswith(version + "\n")):
+                raise ValueError(f"unexpected dependent {nested_site}: {rows}")
+            expected.append({"kind": "record_only_state", "site": nested_site,
+                             "request_sha256": rows[0]["request_sha256"]})
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected register-margin issues: {issues}")
     elif site == "OP2.base":
         # The alternate base must produce one different dependent tail state
         # on each run. The comparator has already checked each remote tail
