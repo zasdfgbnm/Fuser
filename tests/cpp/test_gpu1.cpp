@@ -6071,6 +6071,41 @@ TEST_F(Gpu1Test, JevAlternateInner3dCtaFull_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// The native work split assigns its first factor to reduction unroll (4,2).
+// Assigning it to serial iterations (2,4) rebuilds the complete 3D CTA/grid:
+// physical x grows from 16 to 32 and the outer grid shrinks from 8 to 2.
+TEST_F(Gpu1Test, JevAlternateInner3dWorkSplit_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 8, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  const bool remote = scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  ASSERT_EQ(rparams->lparams.bdimx(), remote ? 32 : 16);
+  ASSERT_EQ(rparams->lparams.gdimz(), remote ? 2 : 8);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // On SM89 this layout makes two raw inner-reduction grid pieces across 65
 // outputs. Native ragged-wave cleanup folds the grid to one piece; the remote
 // alternate keeps both complete grids and must still match the ATen sum.

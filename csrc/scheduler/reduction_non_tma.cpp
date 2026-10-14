@@ -977,7 +977,9 @@ bool inner3dWarpPlanIsSafe(
     int64_t sm_count,
     int64_t max_threads_per_sm,
     int64_t max_threads_per_block,
-    int64_t requested_target_threads = 0) {
+    int64_t requested_target_threads = 0,
+    bool iteration_first = false,
+    int64_t* completed_block_x = nullptr) {
   // Keep every intermediate product bounded, and fix the vector work budget
   // to four. Other shapes retain the native heuristic without a warp request.
   if (reduction_numel <= inner_numel || reduction_numel > 4096 ||
@@ -1000,7 +1002,7 @@ bool inner3dWarpPlanIsSafe(
   int64_t target_iterations = 1;
   if (target_blocks > sm_count) {
     int64_t available = std::max(n_elems / (logical_warp * sm_count), int64_t{1});
-    bool flip = true;
+    bool flip = !iteration_first;
     while (available > 1 &&
            (target_unroll < 4 || target_iterations < 4)) {
       if (target_unroll * 2 <= 4 && flip) {
@@ -1114,6 +1116,9 @@ bool inner3dWarpPlanIsSafe(
         gridim * godim > sm_count) {
       return false;
     }
+  }
+  if (completed_block_x != nullptr) {
+    *completed_block_x = padded_x;
   }
   return true;
 }
@@ -1274,6 +1279,75 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         ceilDiv(n_elems, min_warp_size * target_unroll * target_iterations);
   }
 
+  // The alternating work split favors reduction unroll on its first step.
+  // Starting with serial iterations produces the symmetric alternative. Both
+  // have the same product and therefore the same target-block count, but the
+  // reduction-unroll factor changes the later CTA and grid construction.
+  // Offer it only when both complete bounded 3D plans pass native limits and
+  // produce distinct physical x dimensions. The ordinary native loop above
+  // stays exact in Off and Record modes.
+  bool iteration_first = false;
+  if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
+      target_unroll != target_iterations && min_warp_size >= 1 &&
+      min_warp_size <= 16) {
+    int64_t native_x = 0;
+    int64_t alternate_x = 0;
+    const bool native_safe = inner3dWarpPlanIsSafe(
+        total_reduction_numel,
+        total_iteration_numel,
+        inner_most_dimension_numel,
+        min_warp_size,
+        device_multiprocessor_count,
+        max_threads_per_sm,
+        dev_prop->maxThreadsPerBlock,
+        0,
+        false,
+        &native_x);
+    const bool alternate_safe = inner3dWarpPlanIsSafe(
+        total_reduction_numel,
+        total_iteration_numel,
+        inner_most_dimension_numel,
+        min_warp_size,
+        device_multiprocessor_count,
+        max_threads_per_sm,
+        dev_prop->maxThreadsPerBlock,
+        0,
+        true,
+        &alternate_x);
+    if (native_safe && alternate_safe && native_x != alternate_x) {
+      const std::string state =
+          "reduction.inner3d_work_split.v1\nreduction_numel=" +
+          std::to_string(total_reduction_numel) +
+          "\niteration_numel=" + std::to_string(total_iteration_numel) +
+          "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
+          "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+          "\nmax_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) +
+          "\nvector_width=" + std::to_string(vectorize_factor) +
+          "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+          "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+          "\nmax_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) +
+          "\nlogical_warp=" + std::to_string(min_warp_size);
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"unroll_first",
+           "Assign the first available work factor to reduction unroll"},
+          {"iter_first",
+           "Assign the first available work factor to serial iterations"}};
+      const auto selected = scheduler::jev::chooseDecision(
+          "RD5.work_split", state, options,
+          jev_mode_warp == scheduler::jev::Mode::Record ? "unroll_first"
+                                                         : "");
+      NVF_ERROR(
+          selected == "unroll_first" || selected == "iter_first",
+          "RD5.work_split response exceeds preflighted 3D plans");
+      if (selected == "iter_first") {
+        std::swap(target_unroll, target_iterations);
+        iteration_first = true;
+      }
+    }
+  }
+
   // Cap target blocks to 4 waves
   target_blocks = std::min(target_blocks, device_multiprocessor_count * 4);
 
@@ -1317,7 +1391,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
               device_multiprocessor_count,
               max_threads_per_sm,
               dev_prop->maxThreadsPerBlock,
-              candidate)) {
+              candidate,
+              iteration_first)) {
         continue;
       }
       if (!hard_valid_targets.empty()) {
@@ -1334,7 +1409,9 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           return option.id == "t" + std::to_string(native_target);
         })) {
       const std::string state =
-          "reduction.inner3d_cta_target.v1\nreduction_numel=" +
+          std::string(iteration_first ? "reduction.inner3d_cta_target.v2\n"
+                                      : "reduction.inner3d_cta_target.v1\n") +
+          "reduction_numel=" +
           std::to_string(total_reduction_numel) +
           "\niteration_numel=" + std::to_string(total_iteration_numel) +
           "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
@@ -1347,6 +1424,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           "\nmax_threads_per_block=" +
           std::to_string(dev_prop->maxThreadsPerBlock) +
           "\nlogical_warp=" + std::to_string(min_warp_size) +
+          (iteration_first ? "\nwork_split=iter_first" : "") +
           "\nhard_valid_targets=" + hard_valid_targets;
       const auto selected = scheduler::jev::chooseDecision(
           "RD5.cta", state, options,
