@@ -296,7 +296,7 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
     return *multiwave_buffer_params;
   };
   auto makeMultiWave = [&](const auto& buffers,
-                           size_t inner_vector_width,
+                           int64_t inner_vector_width,
                            bool enable_jev_choice) {
     auto params = makeRParams();
     params->smem_persistent_buffers = buffers.smem_persistent_buffers;
@@ -380,7 +380,7 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
         "\nsmem_limit_bits=" +
         std::to_string((int64_t)dev_prop->sharedMemPerBlockOptin * 8);
     if (valid_bounds) {
-      for (size_t width = 1; width <= vectorize_factor; width *= 2) {
+      for (int64_t width = 1; width <= vectorize_factor; width *= 2) {
         auto buffers = width == vectorize_factor
             ? native_buffers
             : inner_outer_utils::getPersistentBufferStorageParams(
@@ -458,7 +458,8 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
           return option.id == selected;
         });
     NVF_ERROR(choice != options.end(), "Unknown IOP3 inner vector width");
-    const size_t selected_width = std::stoul(selected.substr(1));
+    const int64_t selected_width = std::stoll(selected.substr(1));
+    NVF_ERROR(selected_width > 0, "Invalid IOP3 inner vector width");
     if (selected_width == vectorize_factor) {
       return makeMultiWave(
           native_buffers, vectorize_factor, enable_jev_choice);
