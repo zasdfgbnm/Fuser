@@ -299,6 +299,9 @@ void fillOptimalHopperTileSizes(
   const auto& as = tensor_roles.at(MatmulTensorRole::OPERAND_A);
   const auto& bs = tensor_roles.at(MatmulTensorRole::OPERAND_B);
   const auto& outs = tensor_roles.at(MatmulTensorRole::OUTPUT);
+  NVF_ERROR(
+      !as.empty() && !bs.empty() && !outs.empty(),
+      "MM1 tile search requires nonempty operand and output tensor roles");
   const auto epilogue_input_it =
       tensor_roles.find(MatmulTensorRole::EPILOGUE_INPUT);
   const size_t epilogue_input_count =
