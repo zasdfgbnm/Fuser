@@ -483,7 +483,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
       scheduler::jev::recordCoverageSkip(
           "PW3.cta_1d", "native_1d_cta_preflight");
     } else if (hasBlockQuantizationOps(fusion, data_cache)) {
-      // Block quantization requires the native CTA shape. There is no Choice.
+      // No alternate CTA is proved for block quantization; retain native.
       if (jev_mode == scheduler::jev::Mode::Record) {
         scheduler::jev::recordCoverageSkip(
             "PW3.cta_1d", "block_quantization");
