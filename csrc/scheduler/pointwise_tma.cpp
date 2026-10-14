@@ -670,11 +670,13 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     std::unique_ptr<PointwiseParams> materialized;
     try {
       // Materialize every candidate for the hard guards, but only the final
-      // plan should appear in SchedulerDebug output.
+      // plan should appear in SchedulerDebug output. Do not use the shared
+      // cache: ResizeVectorizationFactors depends on break_point, so a
+      // preflight must not seed another candidate's or final plan's entry.
       materialized = getPointwiseHeuristicsForBreakPoint(
           fusion,
           runtime_info,
-          data_cache,
+          nullptr,
           prop,
           candidate,
           scheduler::jev::Mode::Off,

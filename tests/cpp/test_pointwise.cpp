@@ -12,6 +12,7 @@
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <unistd.h>
 
@@ -23,6 +24,7 @@
 #include "optimization_pass.h"
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/fusion_executor_cache.h"
+#include "scheduler/compile_time_info.h"
 #include "scheduler/pointwise_tma.h"
 #include "scheduler/pointwise_utils.h"
 #include "scheduler/runtime_info.h"
@@ -1565,6 +1567,24 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.width\""));
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp0\""));
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp1\""));
+
+  // In remote mode a deliberately invalid port stops after candidate
+  // preflight. This checks that the preflight did not seed the shared
+  // breakpoint-dependent vectorization cache even on a non-resize fusion.
+  HeuristicDataCache cache;
+  ScopedTestEnv remote_mode("NVFUSER_JEV_MODE", "remote");
+  ScopedTestEnv invalid_port("NVFUSER_JEV_PORT", "0");
+  try {
+    (void)pointwise::tma::getPointwiseHeuristics(
+        &fusion, runtime_info, &cache, *prop);
+    FAIL() << "Remote breakpoint Choice unexpectedly accepted port zero";
+  } catch (const std::runtime_error& error) {
+    EXPECT_THAT(
+        error.what(),
+        ::testing::HasSubstr("NVFUSER_JEV_PORT must be an integer"));
+  }
+  EXPECT_FALSE(cache.hasEntry(
+      HeuristicCompileTime::ResizeVectorizationFactors::EntryType));
 }
 
 // Non-parameterized TMA pointwise test fixture (for TEST_F)
