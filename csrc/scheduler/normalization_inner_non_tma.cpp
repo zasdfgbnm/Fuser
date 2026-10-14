@@ -916,10 +916,21 @@ void innerPersistentHeuristicSharedMemory(
       LaunchParams::UNINITIALIZED_VAL);
 }
 
+struct Inner3DPlanResources {
+  int64_t padded_threads_x = 0;
+  int64_t threads_y = 0;
+  int64_t threads_z = 0;
+  int64_t padded_threads_per_block = 0;
+  int64_t registers_per_thread = 0;
+  int64_t grid_blocks = 0;
+};
+
 // TODO: clean and revise the heuristics
-void innerPersistentHeuristic3D(
+void innerPersistentHeuristic3DPlan(
     const PersistentKernelProperties& properties,
-    ReductionParams* rparams) {
+    int64_t wave_cap,
+    ReductionParams* rparams,
+    Inner3DPlanResources* resources = nullptr) {
   // Define two free parameters used in this heuristic.
   // register_overhead is all registers except those for the persistent
   // buffers. The register in each thread = register_overhead +
@@ -1048,8 +1059,9 @@ void innerPersistentHeuristic3D(
         ceilDiv(n_elems, warp_size * target_unroll * target_iterations);
   }
 
-  // Cap target blocks to 4 waves
-  target_blocks = std::min(target_blocks, device_multiprocessor_count * 4);
+  // The wave cap is an empirical target. All subsequent dimension, register,
+  // and launch calculations are recomputed for each offered complete plan.
+  target_blocks = std::min(target_blocks, device_multiprocessor_count * wave_cap);
 
   if (target_blocks * target_unroll * target_iterations < n_elems) {
     if (outer_reduction_numel == 1) {
@@ -1399,6 +1411,106 @@ void innerPersistentHeuristic3D(
       LaunchParams::UNINITIALIZED_VAL,
       bdimy,
       LaunchParams::UNINITIALIZED_VAL);
+
+  if (resources != nullptr) {
+    *resources = {
+        pad_bdimx ? padded_bdimx : bdimx,
+        bdimy,
+        bdimz,
+        (pad_bdimx ? padded_bdimx : bdimx) * bdimy * bdimz,
+        nvrtc_register_per_thread,
+        godim};
+  }
+}
+
+bool isNativeValidInner3DAlternative(
+    const Inner3DPlanResources& resources,
+    const cudaDeviceProp& device) {
+  // The original four-wave plan remains available. A different wave target is
+  // offered only when its *completed* CTA, register cap and grid all fit native
+  // hardware limits without relying on a later grid split.
+  return resources.threads_x > 0 && resources.threads_y > 0 &&
+      resources.threads_z > 0 &&
+      resources.padded_threads_x <= device.maxThreadsDim[0] &&
+      resources.threads_y <= device.maxThreadsDim[1] &&
+      resources.threads_z <=
+          std::min<int64_t>(scheduler_utils::z_block_limit, device.maxThreadsDim[2]) &&
+      resources.padded_threads_per_block > 0 &&
+      resources.padded_threads_per_block <= device.maxThreadsPerBlock &&
+      resources.registers_per_thread > 0 &&
+      resources.registers_per_thread <= scheduler_utils::max_registers_per_thread &&
+      resources.registers_per_thread <=
+          device.regsPerBlock / resources.padded_threads_per_block &&
+      resources.grid_blocks > 0 &&
+      resources.grid_blocks <=
+          std::min<int64_t>(scheduler_utils::x_grid_limit, device.maxGridSize[0]);
+}
+
+std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base) {
+  const auto jev_mode = scheduler::jev::mode();
+  auto native = std::make_unique<ReductionParams>(base);
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    innerPersistentHeuristic3DPlan(properties, 4, native.get());
+    return native;
+  }
+
+  const auto device = at::cuda::getCurrentDeviceProperties();
+  struct Plan {
+    std::unique_ptr<ReductionParams> params;
+  };
+  std::vector<Plan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  for (const int64_t waves : {2, 4, 8}) {
+    auto params = waves == 4 ? std::move(native)
+                             : std::make_unique<ReductionParams>(base);
+    Inner3DPlanResources resources;
+    innerPersistentHeuristic3DPlan(
+        properties, waves, params.get(), &resources);
+    if (waves != 4 && !isNativeValidInner3DAlternative(resources, *device)) {
+      continue;
+    }
+    const std::string id = "waves" + std::to_string(waves);
+    options.push_back({
+        id,
+        "Target at most " + std::to_string(waves) +
+            " SM waves; completed CTA=" +
+            std::to_string(resources.padded_threads_per_block) +
+            ", register cap=" + std::to_string(resources.registers_per_thread) +
+            ", grid blocks=" + std::to_string(resources.grid_blocks)});
+    plans.push_back({std::move(params)});
+  }
+
+  const std::string state =
+      "inner_persistent.3d_wave_cap.v1\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+      "\nwarp_size=" + std::to_string(device->warpSize) +
+      "\nmax_threads_per_block=" +
+      std::to_string(device->maxThreadsPerBlock) +
+      "\nmax_threads_per_sm=" +
+      std::to_string(device->maxThreadsPerMultiProcessor) +
+      "\nregisters_per_block=" + std::to_string(device->regsPerBlock) +
+      "\nmax_dtype_bits=" + std::to_string(properties.max_dtype_size_bit) +
+      "\nn_tensor_inputs=" + std::to_string(properties.n_tensor_inputs) +
+      "\nvector_width=" + std::to_string(properties.vectorize_factor) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit);
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record ? "waves4" : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP6.waves", state, options, native_choice);
+  const auto option_it = std::find_if(
+      options.begin(),
+      options.end(),
+      [&](const auto& option) { return option.id == selected; });
+  NVF_ERROR(option_it != options.end(), "Unknown inner 3D wave target");
+  return std::move(plans.at(std::distance(options.begin(), option_it)).params);
 }
 
 } // namespace
@@ -1437,7 +1549,7 @@ std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
     innerPersistentHeuristic2D(prop, rparams.get());
   } else {
     rparams->tag = "3D Register Inner Persistent Heuristic.\n";
-    innerPersistentHeuristic3D(prop, rparams.get());
+    rparams = innerPersistentHeuristic3D(prop, *rparams);
   }
 
   // debug print
