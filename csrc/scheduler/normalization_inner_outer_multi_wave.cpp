@@ -274,21 +274,15 @@ void getHeuristics(
   // elements in the inner dimension after vectorization.
   // Start from 128 or a smaller number if inner dim is small.
   const int64_t after_vect = inner_dim_numel / vect_factor;
-  const int64_t batch_min = getMinimumBatch();
   int64_t threads_per_block_min = hp_threads_per_block_min;
   threads_per_block_min = std::min(threads_per_block_min, after_vect);
   threads_per_block_min = scheduler_utils::roundUpPow2(threads_per_block_min);
-
-  // star max threads per block from min threads per block
-  int64_t threads_per_block_max = threads_per_block_min;
-  // increase to cover the whole inner dim
-  threads_per_block_max =
-      std::max(threads_per_block_max, ceilDiv(after_vect, batch_min));
-  // round up to power of 2
-  threads_per_block_max = scheduler_utils::roundUpPow2(threads_per_block_max);
-  // don't go beyond the maximum threads per block
-  threads_per_block_max =
-      std::min(threads_per_block_max, hp_threads_per_block_max);
+  const auto max_threads_for_batch = [&](int64_t batch) {
+    return std::min(
+        scheduler_utils::roundUpPow2(std::max(
+            threads_per_block_min, ceilDiv(after_vect, batch))),
+        hp_threads_per_block_max);
+  };
 
   struct OfferedPlan {
     InnerOuterParams params;
@@ -352,6 +346,94 @@ void getHeuristics(
     }
     return OfferedPlan{candidate, final_bdimx, final_bdimy, final_gdimy};
   };
+
+  // The layer-norm workload thresholds in getMinimumBatch are a performance
+  // preference. Offer a different threshold only when every CTA in its full
+  // search passes the same layout, resource, and final launch checks used by
+  // IOP3.cta. The later read-width Choice repeats these checks for each width.
+  int64_t batch_min =
+      jev_mode == scheduler::jev::Mode::Remote ? 1 : getMinimumBatch();
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool valid_batch_bounds =
+        inner_dim_numel > 0 && outer_dim_numel > 0 &&
+        vect_factor >= 1 && vect_factor <= 128 &&
+        (vect_factor & (vect_factor - 1)) == 0 &&
+        inner_dim_numel % vect_factor == 0 &&
+        tmp_gmem_dtype_size_bit >= 8 && tmp_gmem_dtype_size_bit <= 128 &&
+        (tmp_gmem_dtype_size_bit & (tmp_gmem_dtype_size_bit - 1)) == 0 &&
+        native_outer_read_width >= 1 &&
+        (native_outer_read_width & (native_outer_read_width - 1)) == 0 &&
+        threads_per_block_min >= 1 &&
+        threads_per_block_min <= hp_threads_per_block_max &&
+        (threads_per_block_min & (threads_per_block_min - 1)) == 0;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::string state =
+        "inner_outer_multi_wave.minimum_batch.v1\ninner_dim=" +
+        std::to_string(inner_dim_numel) + "\nouter_dim=" +
+        std::to_string(outer_dim_numel) + "\nvector_width=" +
+        std::to_string(vect_factor) + "\nafter_vector=" +
+        std::to_string(after_vect) + "\nmin_threads=" +
+        std::to_string(threads_per_block_min) + "\nthread_cap=" +
+        std::to_string(hp_threads_per_block_max) + "\ntmp_dtype_bits=" +
+        std::to_string(tmp_gmem_dtype_size_bit) +
+        "\nbaseline_read_width=" +
+        std::to_string(native_outer_read_width);
+    if (valid_batch_bounds) {
+      for (int64_t batch = 1; batch <= 4; ++batch) {
+        const int64_t max_threads = max_threads_for_batch(batch);
+        bool full_search_safe = max_threads >= threads_per_block_min;
+        int64_t plan_count = 0;
+        for (int64_t threads = max_threads;
+             full_search_safe && threads >= threads_per_block_min;
+             threads /= 2) {
+          const auto candidate = getHeuristicsGivenVectThreads(
+              vect_factor, threads, native_outer_read_width);
+          if (!make_offered_plan(candidate)) {
+            full_search_safe = false;
+          }
+          ++plan_count;
+        }
+        if (full_search_safe && plan_count >= 1 && plan_count <= 7) {
+          options.push_back({
+              "b" + std::to_string(batch),
+              "Use minimum batch " + std::to_string(batch) +
+                  " with CTA search " + std::to_string(max_threads) +
+                  " down to " + std::to_string(threads_per_block_min)});
+          state += "\nplan=" + std::to_string(batch) + ":" +
+              std::to_string(max_threads) + ":" +
+              std::to_string(plan_count);
+        }
+      }
+    }
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "b" + std::to_string(batch_min)
+        : "";
+    const bool native_offered =
+        jev_mode != scheduler::jev::Mode::Record ||
+        std::any_of(options.begin(), options.end(), [&](const auto& option) {
+          return option.id == native_choice;
+        });
+    if (options.empty() || !native_offered || state.size() >= 48 * 1024) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 minimum batch lacks a complete safe native CTA search");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.min_batch", "native batch lacks a complete safe CTA search");
+    } else {
+      const auto selected = scheduler::jev::chooseDecision(
+          "IOP3.min_batch", state, options,
+          jev_mode == scheduler::jev::Mode::Record ? native_choice : "");
+      const auto it = std::find_if(
+          options.begin(), options.end(),
+          [&](const auto& option) { return option.id == selected; });
+      NVF_ERROR(it != options.end(), "Unknown IOP3 minimum batch");
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        batch_min = std::stoll(selected.substr(1));
+      }
+    }
+  }
+  const int64_t threads_per_block_max = max_threads_for_batch(batch_min);
 
   // Only offer read widths whose full CTA search space passes the native
   // layout, register, shared-memory, and final launch-geometry checks.
