@@ -276,6 +276,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_occupancy: bool = False,
                            require_inner3d_width: bool = False,
                            require_inner3d_outer_unroll: bool = False,
+                           require_iop3_min_batch: bool = False,
                            require_iop3_tmp_write: bool = False,
                            require_iop3_tmp_read: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
@@ -800,6 +801,43 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent warp comparison issues: {issues}")
+    elif require_iop3_min_batch:
+        if (site != "IOP3.min_batch" or event["native"] != "b2" or
+                alternate != "b1" or
+                not {"b1", "b2"} <= set(event["candidates"])):
+            raise ValueError("inner-outer fixture lacks its alternate batch search")
+        state_lines = event["state"].splitlines()
+        fields = dict(line.split("=", 1) for line in state_lines[1:]
+                      if line.count("=") == 1 and not line.startswith("plan="))
+        plans = [line.removeprefix("plan=") for line in state_lines
+                 if line.startswith("plan=")]
+        if (state_lines[0] != "inner_outer_multi_wave.minimum_batch.v1" or
+                fields.get("inner_dim") != "2048" or
+                fields.get("outer_dim") != "1024" or
+                fields.get("min_threads") != "128" or
+                "1:512:3" not in plans or "2:256:2" not in plans):
+            raise ValueError("batch state omitted the two complete CTA searches")
+        reads = [row for row in report["multiplicity"]
+                 if row["site"] == "IOP3.tmp_read_width"]
+        writes = [row for row in report["multiplicity"]
+                  if row["site"] == "IOP3.tmp_write_width"]
+        if (len(reads) != 1 or reads[0]["record"] != {"w2": 1} or
+                reads[0]["remote"] != {"w2": 1} or
+                len(writes) != 1 or writes[0]["record"] != {"w4": 1} or
+                writes[0]["remote"] != {"w4": 1}):
+            raise ValueError("batch search changed a temporary vector width")
+        record_cta, remote_cta, cta_issues = paired_state_rows(
+            report, "IOP3.cta")
+        record_plans = iop3_cta_plan_fields(record_cta, 2)
+        remote_plans = iop3_cta_plan_fields(remote_cta, 2)
+        if ([plan[0] for plan in record_plans] != [256, 128] or
+                [plan[0] for plan in remote_plans] != [512, 256, 128] or
+                remote_plans[1:] != record_plans or
+                record_cta["record"] != {"t256": 1} or
+                remote_cta["remote"] != {"t512": 1}):
+            raise ValueError("batch search did not extend the exact CTA menu")
+        if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
+            raise ValueError(f"unexpected minimum-batch dependencies: {issues}")
     elif require_iop3_tmp_write:
         if (site != "IOP3.tmp_write_width" or event["native"] != "w4" or
                 alternate != "w2" or set(event["candidates"]) != {"w2", "w4"}):
@@ -883,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
     parser.add_argument("--require-inner3d-outer-unroll", action="store_true")
+    parser.add_argument("--require-iop3-min-batch", action="store_true")
     parser.add_argument("--require-iop3-tmp-write", action="store_true")
     parser.add_argument("--require-iop3-tmp-read", action="store_true")
     args = parser.parse_args(argv)
@@ -993,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,
             require_inner3d_outer_unroll=args.require_inner3d_outer_unroll,
+            require_iop3_min_batch=args.require_iop3_min_batch,
             require_iop3_tmp_write=args.require_iop3_tmp_write,
             require_iop3_tmp_read=args.require_iop3_tmp_read)
         manifest["alternate"] = summary
