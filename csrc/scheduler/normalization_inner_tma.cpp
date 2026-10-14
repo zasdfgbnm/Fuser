@@ -216,6 +216,61 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
         "IP3.stages", stage_state, stage_options, native_stage_choice);
     selected_n_stages = std::stoll(selected_stage_choice.substr(1));
   }
+  int64_t selected_prefetch_distance = selected_n_stages - 1;
+  if (use_warp_specialized && jev_mode != scheduler::jev::Mode::Off) {
+    // The stage choice already fits the native iteration and shared-memory
+    // ceilings. Prefetch changes only the partition of those stages between
+    // load-ahead and reuse; keep the WS topology and its hard gates native.
+    if (!basic_smem_fits || !warp_specialized_legal ||
+        selected_n_stages < 2 || selected_n_stages > native_n_stages) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IP3.prefetch", "warp-specialized TMA plan is outside hard bounds");
+      } else {
+        NVF_ERROR(false, "Cannot prove inner TMA prefetch Choice hard bounds");
+      }
+    } else if (selected_n_stages == 2) {
+      // The only positive distance below two stages is the native one.
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IP3.prefetch", "two stages have one positive prefetch distance");
+      }
+    } else if (selected_n_stages > 256) {
+      // chooseDecision accepts at most 255 options. Keep the native distance
+      // instead of hiding any other positive distance from the model.
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IP3.prefetch", "positive distance menu exceeds Choice limit");
+      } else {
+        NVF_ERROR(false, "IP3.prefetch exceeds the 255-option Choice limit");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> prefetch_options;
+      auto add_prefetch = [&](int64_t distance) {
+        prefetch_options.push_back({
+            "p" + std::to_string(distance),
+            "Prefetch TMA " + std::to_string(distance) +
+                " iteration(s) ahead"});
+      };
+      // A positive prefetch preserves the existing TMA load-ahead pipeline.
+      // The generic circular-buffer API also admits zero, but this scheduler
+      // has no proof that the WS TMA issue order remains safe without it.
+      for (int64_t distance = 1; distance < selected_n_stages; ++distance) {
+        add_prefetch(distance);
+      }
+      const std::string prefetch_state =
+          "inner_persistent.tma_prefetch.v1\nstage_count=" +
+          std::to_string(selected_n_stages);
+      const std::string selected_prefetch = scheduler::jev::chooseDecision(
+          "IP3.prefetch",
+          prefetch_state,
+          prefetch_options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "p" + std::to_string(selected_n_stages - 1)
+              : "");
+      selected_prefetch_distance = std::stoll(selected_prefetch.substr(1));
+    }
+  }
   if (use_warp_specialized) {
     gdimx = sm_count;
     bdimy = n_compute_warp_groups;
@@ -246,7 +301,7 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
     CircularBufferOptions circular_buffer_options{
         .type = ws,
         .stage = selected_n_stages,
-        .prefetch = selected_n_stages - 1};
+        .prefetch = selected_prefetch_distance};
     params->circular_buffer_options = circular_buffer_options;
     params->is_circular_buffer_regs_cached = true;
     // Set launch parameters
