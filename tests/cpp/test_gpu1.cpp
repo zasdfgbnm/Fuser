@@ -7863,9 +7863,11 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   const auto options =
       at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
   at::Tensor aten_input = at::randn({256, feature}, options);
-  auto results =
-      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
-  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  // The generic scheduleAndRun helper omits the selected CompileParams. This
+  // test must compile and launch with the scheduler's magic-zero selection.
+  auto heuristic_params = SchedulerEntry::scheduleWith(
+      &fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = heuristic_params->as<ReductionParams>();
   ASSERT_FALSE(rparams->schedule_3d);
   ASSERT_TRUE(rparams->persistent_kernel);
   ASSERT_FALSE(rparams->project_persistent_buffers);
@@ -7873,7 +7875,18 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   ASSERT_GT(rparams->batches_per_block_inner_reduction, 1);
   const bool expect_zero = scheduler::jev::mode() != scheduler::jev::Mode::Remote;
   EXPECT_EQ(rparams->cparams.enable_magic_zero, expect_zero);
-  const auto code = results.kernel_executor->compiledKernel()->kernelString();
+  KernelExecutor ke;
+  ke.compile(
+      &fusion,
+      {aten_input},
+      heuristic_params->lparams,
+      heuristic_params->cparams);
+  auto outputs = ke.run(
+      {aten_input},
+      {},
+      heuristic_params->lparams,
+      heuristic_params->cparams);
+  const auto code = ke.compiledKernel()->kernelString();
   EXPECT_EQ(
       code.find("NVFUSER_DEFINE_MAGIC_ZERO;") != std::string::npos,
       expect_zero);
@@ -7882,13 +7895,13 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   auto reference = reference_exp / reference_exp.sum(-1, true);
   testValidate(
       &fusion,
-      results.outputs,
+      outputs,
       {aten_input},
       {reference},
       __LINE__,
       __FILE__,
       "",
-      results.heuristic_params->lparams);
+      heuristic_params->lparams);
 }
 
 // Both persistent storage modes fit on SM89 for this RMS normalization. A
