@@ -397,8 +397,8 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
         std::min(tile_elements, kSixteen / max_io_dtype_size);
     std::vector<scheduler::jev::ChoiceOption> options;
     if (hard_cap == 0) {
-      // Preserve the legacy zero cap for an I/O dtype wider than 16 bytes.
-      options.push_back({"u0", "Use the native zero vector cap"});
+      // Preserve the legacy zero input for an I/O dtype wider than 16 bytes.
+      options.push_back({"u0", "Use the legacy zero helper input"});
     } else {
       for (int64_t factor = 1; factor <= hard_cap; factor *= 2) {
         options.push_back(
