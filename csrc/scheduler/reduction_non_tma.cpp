@@ -14,6 +14,7 @@
 #include "instrumentation.h"
 #include "multidevice/utils.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/reduction.h"
 #include "scheduler/reduction_utils.h"
@@ -1292,8 +1293,42 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
       sm_count,
       max_threads_per_block);
 
-  // pick the better heuristic
-  if (isBetterThan(block_params, grid_params, sm_count)) {
+  // RD8 chooses between two complete native plans. Keep both constructions and
+  // their legality checks in nvFuser; only the performance preference is a
+  // Choice. Do not evaluate the native preference on the remote path.
+  bool use_block = false;
+  const auto jev_mode = scheduler::jev::mode();
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    use_block = isBetterThan(block_params, grid_params, sm_count);
+  } else {
+    NVF_ERROR(
+        block_params.grdim == 1,
+        "RD8 requires a completed block-reduction plan");
+    const std::string state =
+        "reduction.outer_plan.v1\nsm_count=" + std::to_string(sm_count) +
+        "\nblock_gidim=" + std::to_string(block_params.gidim) +
+        "\nblock_grdim=" + std::to_string(block_params.grdim) +
+        "\nblock_iter_unroll=" +
+        std::to_string(block_params.iter_unroll_factor) +
+        "\ngrid_gidim=" + std::to_string(grid_params.gidim) +
+        "\ngrid_grdim=" + std::to_string(grid_params.grdim) +
+        "\ngrid_iter_unroll=" +
+        std::to_string(grid_params.iter_unroll_factor);
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"block", "Use the completed block-reduction plan"},
+        {"grid", "Use the completed grid-reduction plan"}};
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? (isBetterThan(block_params, grid_params, sm_count) ? "block" : "grid")
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD8", state, options, native_choice);
+    NVF_ERROR(
+        selected == "block" || selected == "grid",
+        "Remote RD8 choice is not a completed native plan");
+    use_block = selected == "block";
+  }
+  if (use_block) {
     return heuristicParaToSchedulerPara(block_params);
   } else {
     return heuristicParaToSchedulerPara(grid_params);
