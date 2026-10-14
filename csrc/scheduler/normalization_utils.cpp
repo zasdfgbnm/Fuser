@@ -8,6 +8,7 @@
 #include "scheduler/normalization_utils.h"
 
 #include <algorithm>
+#include <limits>
 #include <ranges>
 #include <string>
 
@@ -387,6 +388,105 @@ struct GridTailPlan {
   bool reduce_last_block_work;
 };
 
+struct GridBasePlan {
+  PreferredLaunchConfig launch;
+  GridTailPlan tail;
+};
+
+std::string gridBasePlanId(const GridBasePlan& plan) {
+  return "x" + std::to_string(plan.launch.gdimx()) + "_y" +
+      std::to_string(plan.launch.gdimy()) + "_b" +
+      std::to_string(plan.launch.bdimx());
+}
+
+// Check the fully adjusted plan, including the actual BIDy extent derived by
+// the schedule from the persistent batch. The historical search estimates
+// register use using the unadjusted grid, so it may accept a plan that is not
+// suitable for an alternate Choice. That plan remains the native fallback.
+bool isSafeGridBasePlan(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit) {
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto& base = plan.launch;
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), plan.tail.buffer_size);
+  return base.gdimx() <=
+          std::min<int64_t>(
+              scheduler_utils::x_grid_limit, dev_prop->maxGridSize[0]) &&
+      plan.tail.gdimy <=
+          std::min<int64_t>(
+              scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+      actual_gdimy <=
+          std::min<int64_t>(
+              scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+      base.bdimx() * base.bdimy() <= dev_prop->maxThreadsPerBlock &&
+      checkIfWithinRegisterSpace(
+          total_reduction_numel,
+          persistent_buffer_size_bit,
+          vectorize_factor,
+          base.bdimy(),
+          actual_gdimy) &&
+      ceilDiv(ceilDiv(total_iteration_numel, vectorize_factor), base.bdimx()) >=
+          base.gdimx();
+}
+
+GridBasePlan chooseGridBasePlan(
+    const GridBasePlan& native,
+    const std::vector<GridBasePlan>& safe_plans,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit) {
+  const auto native_id = gridBasePlanId(native);
+  if (safe_plans.size() < 2 ||
+      std::none_of(
+          safe_plans.begin(), safe_plans.end(), [&](const auto& plan) {
+            return gridBasePlanId(plan) == native_id;
+          })) {
+    return native;
+  }
+
+  std::vector<scheduler::jev::ChoiceOption> options;
+  options.reserve(safe_plans.size());
+  for (const auto& plan : safe_plans) {
+    options.push_back({
+        gridBasePlanId(plan),
+        "Use grid=(" + std::to_string(plan.launch.gdimx()) + "," +
+            std::to_string(plan.launch.gdimy()) + ") and block=(" +
+            std::to_string(plan.launch.bdimx()) + "," +
+            std::to_string(plan.launch.bdimy()) + ")"});
+  }
+
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const std::string state =
+      "outer_persistent.grid_base.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) + "\niteration_numel=" +
+      std::to_string(total_iteration_numel) + "\nvector_width=" +
+      std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+      std::to_string(persistent_buffer_size_bit) + "\nsm_count=" +
+      std::to_string(dev_prop->multiProcessorCount) + "\nsm_major=" +
+      std::to_string(dev_prop->major) + "\nsm_minor=" +
+      std::to_string(dev_prop->minor) + "\nmax_grid_x=" +
+      std::to_string(dev_prop->maxGridSize[0]) + "\nmax_grid_y=" +
+      std::to_string(dev_prop->maxGridSize[1]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(dev_prop->maxThreadsPerBlock);
+  const std::string selected = scheduler::jev::chooseDecision(
+      "OP2.base",
+      state,
+      options,
+      scheduler::jev::mode() == scheduler::jev::Mode::Record ? native_id : "");
+  const auto chosen = std::find_if(
+      safe_plans.begin(), safe_plans.end(), [&](const auto& plan) {
+        return gridBasePlanId(plan) == selected;
+      });
+  NVF_ERROR(chosen != safe_plans.end(), "Unknown grid outer base plan");
+  return *chosen;
+}
+
 std::string gridTailPlanId(const GridTailPlan& plan) {
   return "y" + std::to_string(plan.gdimy) + "_b" +
       std::to_string(plan.buffer_size);
@@ -533,6 +633,39 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
     int64_t persistent_buffer_size_bit,
     bool allow_jev_tail_choice) {
   PreferredLaunchConfig launch_cfg;
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto max_int = std::numeric_limits<int64_t>::max();
+  const bool offer_base_choice =
+      allow_jev_tail_choice && scheduler::jev::mode() != scheduler::jev::Mode::Off &&
+      dev_prop->major >= 8 && dev_prop->major <= 20 &&
+      dev_prop->minor <= 9 && dev_prop->multiProcessorCount >= 2 &&
+      dev_prop->multiProcessorCount <= 65536 && vectorize_factor > 0 &&
+      vectorize_factor <= 128 &&
+      (vectorize_factor & (vectorize_factor - 1)) == 0 &&
+      total_iteration_numel % vectorize_factor == 0 &&
+      total_reduction_numel <= max_int / 256 &&
+      total_iteration_numel <= max_int / (128 * 16) &&
+      persistent_buffer_size_bit <= max_int / vectorize_factor;
+  std::optional<GridBasePlan> native_base;
+
+  const auto finalize = [](const GridBasePlan& plan) {
+    const auto& base = plan.launch;
+    const auto& tail = plan.tail;
+    const auto launch_params = LaunchParams(
+        base.gdimx(),
+        tail.gdimy,
+        LaunchParams::UNINITIALIZED_VAL,
+        base.bdimx(),
+        base.bdimy(),
+        LaunchParams::UNINITIALIZED_VAL);
+    const int64_t unswitch_factor = tail.reduce_last_block_work
+        ? tail.buffer_size
+        : std::min(4l, tail.buffer_size);
+    return GridOuterNormalizationParams{
+        .launch_params = launch_params,
+        .persistent_buffer_factor = tail.buffer_size,
+        .unswitch_factor = unswitch_factor};
+  };
 
   // The launch config starts with the largest blockDim.x, which may
   // be larger than the iteration size. Decrease it until it doesn't
@@ -631,48 +764,92 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
       }
       std::tie(adjusted_gdimy, adjusted_buffer_size, last_block_work_reduced) =
           *gdimy_pb_size;
-      if (allow_jev_tail_choice) {
-        auto chosen_tail = chooseGridTailAdjustment(
-            launch_cfg,
-            total_reduction_numel,
-            total_iteration_numel,
-            vectorize_factor,
-            persistent_buffer_size_bit,
-            adjusted_gdimy,
-            adjusted_buffer_size,
-            last_block_work_reduced);
-        if (chosen_tail.has_value()) {
-          adjusted_gdimy = chosen_tail->gdimy;
-          adjusted_buffer_size = chosen_tail->buffer_size;
-          last_block_work_reduced = chosen_tail->reduce_last_block_work;
-        }
-      }
     }
 
-    // Acceptable configuration found
-    auto launch_params = LaunchParams(
-        launch_cfg.gdimx(),
-        adjusted_gdimy,
-        LaunchParams::UNINITIALIZED_VAL,
-        launch_cfg.bdimx(),
-        launch_cfg.bdimy(),
-        LaunchParams::UNINITIALIZED_VAL);
+    GridBasePlan plan{
+        launch_cfg,
+        {adjusted_gdimy, adjusted_buffer_size, last_block_work_reduced}};
+    if (offer_base_choice) {
+      native_base = plan;
+      break;
+    }
 
-    // If the last block is sufficiently reduced, unswitch the whole
-    // persistent buffer. Otherwise, unswitch by a factor of 4.
-    int64_t unswitch_factor = last_block_work_reduced
-        ? adjusted_buffer_size
-        : std::min(4l, adjusted_buffer_size);
-
-    GridOuterNormalizationParams params = {
-        .launch_params = launch_params,
-        .persistent_buffer_factor = adjusted_buffer_size,
-        .unswitch_factor = unswitch_factor};
-    return params;
+    if (allow_jev_tail_choice) {
+      auto chosen_tail = chooseGridTailAdjustment(
+          plan.launch,
+          total_reduction_numel,
+          total_iteration_numel,
+          vectorize_factor,
+          persistent_buffer_size_bit,
+          plan.tail.gdimy,
+          plan.tail.buffer_size,
+          plan.tail.reduce_last_block_work);
+      if (chosen_tail.has_value()) {
+        plan.tail = *chosen_tail;
+      }
+    }
+    return finalize(plan);
   }
 
-  // No valid config found. Return launch_cfg, which should be marked
-  // as invalid
+  if (native_base.has_value()) {
+    // The original scan above determines eligibility and its first preferred
+    // base. Once eligible, offer every base in the existing 16/8-thread ×
+    // SM-grid topology that can cover the iteration domain and pass the final
+    // grid/register checks. The scan's uneven-iteration and first-good-tail
+    // filters are performance preferences, so they do not prune this menu.
+    std::vector<GridBasePlan> safe_base_plans;
+    PreferredLaunchConfig candidate_cfg;
+    const auto native_id = gridBasePlanId(*native_base);
+    while (!candidate_cfg.isInvalid()) {
+      if (candidate_cfg.bdimx() <= max_bdimx) {
+        const auto initial_buffer = getMinPersistentBufferSize(
+            total_reduction_numel,
+            candidate_cfg.bdimy(),
+            candidate_cfg.gdimy());
+        GridBasePlan candidate{
+            candidate_cfg,
+            {candidate_cfg.gdimy(),
+             initial_buffer,
+             getLastBlockWorkRatio(
+                 total_reduction_numel,
+                 candidate_cfg.bdimy(),
+                 initial_buffer) < 0.25}};
+        if (gridBasePlanId(candidate) == native_id) {
+          candidate = *native_base;
+        }
+        if (isSafeGridBasePlan(
+                candidate,
+                total_reduction_numel,
+                total_iteration_numel,
+                vectorize_factor,
+                persistent_buffer_size_bit)) {
+          safe_base_plans.push_back(candidate);
+        }
+      }
+      candidate_cfg.moveToNextConfig();
+    }
+    auto chosen_base = chooseGridBasePlan(
+        *native_base,
+        safe_base_plans,
+        total_reduction_numel,
+        total_iteration_numel,
+        vectorize_factor,
+        persistent_buffer_size_bit);
+    auto chosen_tail = chooseGridTailAdjustment(
+        chosen_base.launch,
+        total_reduction_numel,
+        total_iteration_numel,
+        vectorize_factor,
+        persistent_buffer_size_bit,
+        chosen_base.tail.gdimy,
+        chosen_base.tail.buffer_size,
+        chosen_base.tail.reduce_last_block_work);
+    if (chosen_tail.has_value()) {
+      chosen_base.tail = *chosen_tail;
+    }
+    return finalize(chosen_base);
+  }
+  // No valid config found. Return launch_cfg, which should be marked invalid.
   NVF_ERROR(launch_cfg.isInvalid());
   return std::nullopt;
 }
