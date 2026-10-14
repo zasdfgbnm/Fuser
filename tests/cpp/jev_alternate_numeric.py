@@ -677,6 +677,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_tmp_write: bool = False,
                            require_iop3_tmp_read: bool = False,
                            require_iop3_inner_width: bool = False,
+                           require_iop3_storage: bool = False,
                            require_transpose_tile: bool = False,
                            require_pointwise_1d_cta: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
@@ -1803,6 +1804,43 @@ def check_alternate_report(report: dict[str, Any],
         if site != "IOP3.inner_width" or alternate != "w2":
             raise ValueError("unexpected IOP3 inner-width alternate")
         check_iop3_inner_width_dependency(report, event, intended, issues)
+    elif require_iop3_storage:
+        if (site != "IOP3.storage" or event["native"] != "shared" or
+                alternate != "register" or
+                set(event["candidates"]) != {"shared", "register"}):
+            raise ValueError("inner-outer fixture lacks two proved placements")
+        for upstream in ("IOP3.inner_width", "IOP3.min_batch",
+                         "IOP3.tmp_read_width"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with storage: {rows}")
+        expected = [intended]
+        for dependent in ("IOP3.grid_rows", "IOP3.cta"):
+            before, after, pair = paired_state_rows(report, dependent)
+            old = before["request"]["state"].splitlines()
+            new = after["request"]["state"].splitlines()
+            if old[0] != new[0]:
+                raise ValueError(f"{dependent} changed state version")
+            old_fields = dict(line.split("=", 1) for line in old[1:]
+                              if line.count("=") == 1 and
+                              not line.startswith("plan="))
+            new_fields = dict(line.split("=", 1) for line in new[1:]
+                              if line.count("=") == 1 and
+                              not line.startswith("plan="))
+            if (int(old_fields["regs_buffer_bits"]) >=
+                    int(new_fields["regs_buffer_bits"]) or
+                    int(old_fields["smem_total_bits"]) <=
+                    int(new_fields["smem_total_bits"]) or
+                    {key: value for key, value in old_fields.items()
+                     if key not in {"regs_buffer_bits", "smem_total_bits"}} !=
+                    {key: value for key, value in new_fields.items()
+                     if key not in {"regs_buffer_bits", "smem_total_bits"}}):
+                raise ValueError(f"{dependent} did not receive selected storage")
+            expected.extend(pair)
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected storage-dependent decisions: {issues}")
     elif require_iop3_min_batch:
         if (site != "IOP3.min_batch" or event["native"] != "b2" or
                 alternate != "b1" or
@@ -1999,6 +2037,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-iop3-tmp-write", action="store_true")
     parser.add_argument("--require-iop3-tmp-read", action="store_true")
     parser.add_argument("--require-iop3-inner-width", action="store_true")
+    parser.add_argument("--require-iop3-storage", action="store_true")
     parser.add_argument("--require-transpose-tile", action="store_true")
     parser.add_argument("--require-pointwise-1d-cta", action="store_true")
     args = parser.parse_args(argv)
@@ -2125,6 +2164,7 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_tmp_write=args.require_iop3_tmp_write,
             require_iop3_tmp_read=args.require_iop3_tmp_read,
             require_iop3_inner_width=args.require_iop3_inner_width,
+            require_iop3_storage=args.require_iop3_storage,
             require_transpose_tile=args.require_transpose_tile,
             require_pointwise_1d_cta=args.require_pointwise_1d_cta)
         manifest["alternate"] = summary

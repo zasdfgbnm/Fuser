@@ -1283,6 +1283,17 @@ if(BUILD_TEST)
       --require-iop3-inner-width)
   set_tests_properties(jev_alternate_numeric_inner_outer_inner_width PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_storage
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.storage --alternate register
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_storage
+      --require-iop3-storage)
+  set_tests_properties(jev_alternate_numeric_inner_outer_storage PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_outer_tmp_write_width
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
