@@ -571,6 +571,7 @@ bool fillDefaultHopperHeuristic(
       !matmul_heuristic_plugin::hasPlugin() &&
       mparams->tiling_strategy ==
           MatmulParams::TilingStrategy::DistributeTilesAcrossSMs;
+  const bool jev_cluster_enabled = jev_raster_enabled;
   const bool compute_native_raster =
       jev_mode != scheduler::jev::Mode::Remote || !jev_raster_enabled;
 
@@ -598,6 +599,9 @@ bool fillDefaultHopperHeuristic(
     // large CGAs because they will leave some SMs idle.
     int64_t largest_cga = -1L;
     MatmulParams::ClusterDims largest_cga_cfg{1, 1};
+    std::vector<MatmulParams::ClusterDims> legal_cgas;
+    const bool compute_native_cluster =
+        jev_mode != scheduler::jev::Mode::Remote || !jev_cluster_enabled;
     // Allow CGAs larger than 2 only for small problems
     const int64_t max_cga_size =
         Mtiles * Ntiles > ((double)num_sms * .75) ? 2L : 4L;
@@ -607,14 +611,55 @@ bool fillDefaultHopperHeuristic(
         if (Mtiles % cm != 0 || Ntiles % cn != 0 || cga_size > max_cga_size) {
           continue;
         }
-        if (largest_cga == -1L || cga_size > largest_cga) {
+        if (jev_cluster_enabled) {
+          legal_cgas.push_back({cm, cn});
+        }
+        if (compute_native_cluster &&
+            (largest_cga == -1L || cga_size > largest_cga)) {
           largest_cga = cga_size;
           largest_cga_cfg = {cm, cn};
         }
       }
     }
 
-    mparams->cluster_dims = largest_cga_cfg;
+    if (jev_cluster_enabled) {
+      const auto choice_id = [](const MatmulParams::ClusterDims& dims) {
+        return "m" + std::to_string(dims.m) + "n" + std::to_string(dims.n);
+      };
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(legal_cgas.size());
+      for (const auto& dims : legal_cgas) {
+        options.push_back({
+            choice_id(dims),
+            "CGA " + std::to_string(dims.m) + "x" +
+                std::to_string(dims.n) + " CTA cluster"});
+      }
+      const std::string state =
+          "matmul.hopper_cluster.v1\nm_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::M]) +
+          "\nn_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::N]) +
+          "\ncta_m=" + std::to_string(cta_tile.m) +
+          "\ncta_n=" + std::to_string(cta_tile.n) +
+          "\nsm_count=" + std::to_string(num_sms);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "MM3.cluster",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? choice_id(largest_cga_cfg)
+              : "");
+      const auto selected_it = std::find_if(
+          legal_cgas.begin(), legal_cgas.end(), [&](const auto& dims) {
+            return choice_id(dims) == selected;
+          });
+      NVF_ERROR(
+          selected_it != legal_cgas.end(),
+          "MM3.cluster response is outside divisible native CGA bounds");
+      mparams->cluster_dims = *selected_it;
+    } else {
+      mparams->cluster_dims = largest_cga_cfg;
+    }
   }
 
   if (compute_native_raster) {
