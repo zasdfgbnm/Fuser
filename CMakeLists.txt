@@ -1826,6 +1826,7 @@ if(BUILD_NVFUSER_BENCHMARK)
     ${NVFUSER_ROOT}/benchmarks/cpp/broadcast.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/gelu_backward.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/gelu_backward_reduction.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/greedy.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/heuristic_cache.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/heuristic_lookup.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/indexselect.cpp

@@ -138,6 +138,11 @@ std::string toString(const std::unique_ptr<HeuristicParams>& params) {
        << " / split grid x: " << resize_params->split_grid_x_dim;
     return ss.str();
   }
+  // Greedy schedules per tensor. The per-site decision log captures those
+  // batches; keep the benchmark label stable across cache instances.
+  if (params->scheduler_type == SchedulerType::Greedy) {
+    return "Greedy";
+  }
   NVF_THROW(
       "Unknown heuristic parameter type. Did you just added a new heuristic "
       "parameter type but forget to update here?");
