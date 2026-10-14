@@ -9,6 +9,7 @@
 #include "scheduler/pointwise_non_tma.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 
 #include "debug.h"
 #include "exceptions.h"
@@ -30,18 +31,30 @@ namespace {
 // Unused at the moment, commenting for clang tidy
 constexpr int64_t kThreadX = 128;
 
-// Get number of vectorizable non-outer broadcast inputs
+std::vector<TensorView*> getUniqueVectorizableInputs(
+    const std::vector<TensorView*>& vectorizable_io_tvs) {
+  std::vector<TensorView*> inputs;
+  for (auto* tv : vectorizable_io_tvs) {
+    if (tv->isFusionInput() &&
+        std::find(inputs.begin(), inputs.end(), tv) == inputs.end()) {
+      inputs.push_back(tv);
+    }
+  }
+  return inputs;
+}
+
+// Classify each unique vectorizable input for the non-outer broadcast cost.
 // vectorizable_inputs: all vectorizable inputs
 // break_point: the break point of the broadcast flags.
 // Used to determine the influence of inputs on unroll factor.
 // outer broadcast inputs are not counted since outer unroll is used
 // and they are only loaded once regardless of the unroll factor due to
 // the re-use across different unrolled iterations.
-int64_t getNumOfNonOuterBcastInputs(
-    std::vector<TensorView*> vectorizable_inputs,
+std::vector<bool> getOuterBcastInputFlags(
+    const std::vector<TensorView*>& vectorizable_inputs,
     int64_t break_point) {
   if (break_point == 0) {
-    return std::max((int64_t)vectorizable_inputs.size(), 1L);
+    return std::vector<bool>(vectorizable_inputs.size(), false);
   }
 
   // Returns true if tv is outer broadcast tv or is used by outer broadcast
@@ -73,12 +86,20 @@ int64_t getNumOfNonOuterBcastInputs(
     }
     return false;
   };
-  int64_t n_non_bcast_inputs = 0;
+  std::vector<bool> flags;
+  flags.reserve(vectorizable_inputs.size());
   for (auto tv : vectorizable_inputs) {
-    if (!isUsedByOuterBcast(tv)) {
-      n_non_bcast_inputs++;
-    }
+    flags.push_back(isUsedByOuterBcast(tv));
   }
+  return flags;
+}
+
+int64_t getNumOfNonOuterBcastInputs(
+    const std::vector<TensorView*>& vectorizable_inputs,
+    int64_t break_point) {
+  const auto flags = getOuterBcastInputFlags(vectorizable_inputs, break_point);
+  const int64_t n_non_bcast_inputs =
+      static_cast<int64_t>(std::count(flags.begin(), flags.end(), false));
   // return 1 if no non-outer broadcast inputs to avoid division by 0
   return std::max(n_non_bcast_inputs, 1L);
 }
@@ -128,23 +149,10 @@ int64_t getElementBasedUnrollFactor(int64_t total_blocks) {
   return n_elems_limited_unroll;
 }
 
-// returns unroll factor.
-// The unroll factor is calculated based on the following:
-// (1) ensure enough bytes in flight to cover gmem access latency
-// (2) ensure enough threads for thread level parallelism (TLP)
-// (3) when kernel doesn't have enough TLP and split is not divisible, don't
-// unroll.
-int64_t getUnrollFactor(
+// Block quantization requires a hard unroll factor of one.
+bool hasBlockQuantizationOps(
     Fusion* fusion,
-    int64_t break_point,
-    int64_t total_blocks,
-    int64_t vectorization_bits,
-    bool divisible_split,
-    std::vector<TensorView*> vectorizable_io_tvs,
     HeuristicDataCache* data_cache) {
-  // Check if fusion has BlockQuantizationOp(s)
-  // Limit unroll factor for fusions with BlockQuantizationOp(s). The runtime
-  // function which implements quantization assumes no unrolling
   auto block_quantization_ops =
       HeuristicDataCacheEntry<HeuristicCompileTime::BlockQuantizationOps>(
           data_cache,
@@ -163,23 +171,27 @@ int64_t getUnrollFactor(
           })
           .get();
 
-  if (!block_quantization_ops.empty()) {
+  return !block_quantization_ops.empty();
+}
+
+// Balance memory latency, TLP and non-divisible tails.
+int64_t getUnrollFactor(
+    Fusion* fusion,
+    int64_t break_point,
+    int64_t total_blocks,
+    int64_t vectorization_bits,
+    bool divisible_split,
+    std::vector<TensorView*> vectorizable_io_tvs,
+    HeuristicDataCache* data_cache) {
+  // The runtime block-quantization function assumes no unrolling.
+  if (hasBlockQuantizationOps(fusion, data_cache)) {
     // Runtime function implementing Block Quantization Op requires unroll
     // factor to be 1
     return 1;
   }
 
-  // only consider vectorizable inputs,
-  // needs to check if it's already in the list to avoid duplication since a tv
-  // may be both input and output, e.g. NVFuserTest.FusionIssue2372_CUDA
-  std::vector<TensorView*> vectorizable_inputs;
-  for (auto* tv : vectorizable_io_tvs) {
-    if (tv->isFusionInput() &&
-        std::find(vectorizable_inputs.begin(), vectorizable_inputs.end(), tv) ==
-            vectorizable_inputs.end()) {
-      vectorizable_inputs.push_back(tv);
-    }
-  }
+  auto vectorizable_inputs =
+      getUniqueVectorizableInputs(vectorizable_io_tvs);
 
   int64_t empirical_unroll = getEmpiricalUnrollFactor(
       fusion, break_point, vectorization_bits, vectorizable_inputs);
@@ -199,6 +211,60 @@ int64_t getUnrollFactor(
   } else {
     return std::min(n_elems_limited_unroll, empirical_unroll);
   }
+}
+
+struct ExpensiveOpCounts {
+  int64_t tanh = 0;
+  int64_t exp = 0;
+  int64_t reciprocal = 0;
+};
+
+ExpensiveOpCounts countExpensiveOps(Fusion* fusion) {
+  ExpensiveOpCounts counts;
+  for (auto* expr : fusion->exprs()) {
+    if (auto* unary = dynamic_cast<UnaryOp*>(expr)) {
+      switch (unary->getUnaryOpType()) {
+        case UnaryOpType::Tanh:
+          ++counts.tanh;
+          break;
+        case UnaryOpType::Exp:
+          ++counts.exp;
+          break;
+        case UnaryOpType::Reciprocal:
+          ++counts.reciprocal;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return counts;
+}
+
+struct FactorRange {
+  int64_t low;
+  int64_t high;
+  std::string id;
+};
+
+std::vector<FactorRange> getUnrollRanges(int64_t low, int64_t high) {
+  NVF_ERROR(low >= 1 && high >= low);
+  constexpr int64_t kMaxChoices = 255;
+  const int64_t span = high - low + 1;
+  const int64_t stride = span / kMaxChoices + (span % kMaxChoices != 0);
+  std::vector<FactorRange> ranges;
+  for (int64_t first = low;;) {
+    const int64_t last = first + std::min(stride - 1, high - first);
+    const std::string id = first == last
+        ? "u" + std::to_string(first)
+        : "r" + std::to_string(first) + "_" + std::to_string(last);
+    ranges.push_back({first, last, id});
+    if (last == high) {
+      break;
+    }
+    first = last + 1;
+  }
+  return ranges;
 }
 
 } // namespace
@@ -374,14 +440,117 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   bool divisible_split = break_point > 0
       ? (right_elem_count % (params->vectorization_factor * bdimx) == 0)
       : (n_elems % (params->vectorization_factor * kThreadX) == 0);
-  int64_t unroll_factor = getUnrollFactor(
-      fusion,
-      break_point,
-      total_blocks,
-      params->vectorization_factor * max_dtype_size_bit_for_vectorization,
-      divisible_split,
-      vectorizable_inputs_outputs,
-      data_cache);
+  int64_t unroll_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    unroll_factor = getUnrollFactor(
+        fusion,
+        break_point,
+        total_blocks,
+        params->vectorization_factor * max_dtype_size_bit_for_vectorization,
+        divisible_split,
+        vectorizable_inputs_outputs,
+        data_cache);
+  }
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Any positive integer up to max(1, total_blocks) can be represented by
+    // the pointwise split, including non-power-of-two factors and tails. The
+    // source's element-based cap also guarantees its native choice is in this
+    // range. Partition large ranges to respect Jev's 255-choice limit.
+    const bool block_quantization =
+        hasBlockQuantizationOps(fusion, data_cache);
+    const int64_t hard_max =
+        block_quantization ? 1 : std::max<int64_t>(1, total_blocks);
+    NVF_ERROR(
+        jev_mode != scheduler::jev::Mode::Record ||
+            (unroll_factor >= 1 && unroll_factor <= hard_max),
+        "PW3.unroll native factor exceeds the schedule's hard range");
+
+    const auto inputs = getUniqueVectorizableInputs(vectorizable_inputs_outputs);
+    const auto outer_flags = getOuterBcastInputFlags(inputs, break_point);
+    const auto op_counts = countExpensiveOps(fusion);
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    int memory_clock_khz = 0;
+    NVF_ERROR(
+        cudaDeviceGetAttribute(
+            &memory_clock_khz,
+            cudaDevAttrMemoryClockRate,
+            at::cuda::current_device()) == cudaSuccess,
+        "PW3.unroll could not read CUDA memory clock");
+    std::string flags = outer_flags.empty() ? "-" : std::string();
+    for (size_t i = 0; i < outer_flags.size(); ++i) {
+      if (i != 0) {
+        flags += ',';
+      }
+      flags += (outer_flags[i] ? '1' : '0');
+    }
+    std::string state_base = "pointwise.unroll.v1\n";
+    state_base += "axis=" +
+        std::string(is_outer_broadcast_dominated ? "outer" : "inner") + '\n';
+    state_base += "break_point=" + std::to_string(break_point) + '\n';
+    state_base += "n_elems=" + std::to_string(n_elems) + '\n';
+    state_base += "right_elems=" + std::to_string(right_elem_count) + '\n';
+    state_base += "bdimx=" + std::to_string(bdimx) + '\n';
+    state_base += "gdim_left=" + std::to_string(gdim_left) + '\n';
+    state_base += "gdim_right=" + std::to_string(gdim_right) + '\n';
+    state_base +=
+        "vector_width=" + std::to_string(vectorization_factor) + '\n';
+    state_base += "max_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+    state_base += "input_outer_bcast_flags=" + flags + '\n';
+    state_base += "tanh_ops=" + std::to_string(op_counts.tanh) + '\n';
+    state_base += "exp_ops=" + std::to_string(op_counts.exp) + '\n';
+    state_base += "reciprocal_ops=" + std::to_string(op_counts.reciprocal) + '\n';
+    state_base += "sm_count=" +
+        std::to_string(dev_prop->multiProcessorCount) + '\n';
+    state_base += "max_threads_per_sm=" +
+        std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
+    state_base += "memory_bus_bits=" +
+        std::to_string(dev_prop->memoryBusWidth) + '\n';
+    state_base += "memory_clock_khz=" +
+        std::to_string(memory_clock_khz) + '\n';
+    state_base += "block_quantization=" +
+        std::to_string(static_cast<int>(block_quantization)) + '\n';
+
+    int64_t range_low = 1;
+    int64_t range_high = hard_max;
+    for (;;) {
+      const auto ranges = getUnrollRanges(range_low, range_high);
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(ranges.size());
+      std::string native_choice;
+      for (const auto& range : ranges) {
+        options.push_back(
+            {range.id,
+             "Unroll factor in [" + std::to_string(range.low) + ", " +
+                 std::to_string(range.high) + "]"});
+        if (jev_mode == scheduler::jev::Mode::Record &&
+            range.low <= unroll_factor && unroll_factor <= range.high) {
+          native_choice = range.id;
+        }
+      }
+      const std::string state = state_base +
+          "range_low=" + std::to_string(range_low) + '\n' +
+          "range_high=" + std::to_string(range_high) + '\n';
+      const auto selected = scheduler::jev::chooseDecision(
+          "PW3.unroll", state, options, native_choice);
+      const auto selected_range = std::find_if(
+          ranges.begin(), ranges.end(), [&](const FactorRange& range) {
+            return range.id == selected;
+          });
+      NVF_ERROR(
+          selected_range != ranges.end(),
+          "PW3.unroll response is outside native hard bounds");
+      if (selected_range->low == selected_range->high) {
+        unroll_factor = selected_range->low;
+        break;
+      }
+      range_low = selected_range->low;
+      range_high = selected_range->high;
+    }
+    NVF_ERROR(
+        !block_quantization || unroll_factor == 1,
+        "PW3.unroll violated the block-quantization guard");
+  }
 
   if (is_outer_broadcast_dominated) {
     params->unroll_factor_outer = unroll_factor;
