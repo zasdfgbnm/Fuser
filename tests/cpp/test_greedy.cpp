@@ -857,6 +857,40 @@ TEST_F(GreedySchedulerTest, JevAlternateScatterBatch_CUDA) {
       testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
 }
 
+// The local API forces one shared b4 choice for two equal Scan operations.
+// Check the second scan against an independent ATen prefix-sum reference.
+TEST_F(GreedySchedulerTest, JevAlternateMultiScanBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto first = scan(input_tv, -1, BinaryOpType::Add);
+  auto second = scan(first, -1, BinaryOpType::Add);
+  fusion.addOutput(second);
+
+  auto input = at::randint(
+                   0,
+                   2,
+                   shape,
+                   at::TensorOptions().dtype(at::kLong).device(at::kCUDA, 0))
+                   .to(at::kFloat);
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  ASSERT_EQ(outputs.size(), 1);
+  // Every prefix result is an integer below 2^24, hence exactly
+  // representable as Float for an order-independent comparison.
+  EXPECT_TRUE(at::equal(outputs.at(0), input.cumsum(-1).cumsum(-1)));
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+}
+
 TEST_P(GreedySchedulerTestConstraintSize, ScanLargeConstrainedIDs) {
   auto fusion_ptr = std::make_unique<Fusion>();
   Fusion& fusion = *fusion_ptr.get();

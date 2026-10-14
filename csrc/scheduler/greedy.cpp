@@ -865,6 +865,7 @@ class HeuristicsBuilder : private IterVisitor {
         constrained_ops.front()->isA<ArgsortOp>();
     single_scatter_ = constrained_ops.size() == 1 &&
         constrained_ops.front()->isA<ScatterOp>();
+    multi_scan_batch_ = chooseMultiScanBatch(constrained_ops);
 
     traverse(fusion);
   }
@@ -890,7 +891,9 @@ class HeuristicsBuilder : private IterVisitor {
         ir_utils::getTvOutput(scan)->getLogicalDomain(),
         {scan->dim()},
         /*consumer=*/nullptr,
-        /*allow_scan_choice=*/single_scan_);
+        /*allow_scan_choice=*/single_scan_,
+        /*argsort_input=*/nullptr,
+        multi_scan_batch_);
   }
 
   void handle(ScatterOp* scatter) override {
@@ -932,6 +935,127 @@ class HeuristicsBuilder : private IterVisitor {
         TensorDomain::noReductions(inp_tv->getLogicalDomain()),
         {topk->dim()},
         out_tv);
+  }
+
+  // Both Scan calls use the same TIDx extent. Offer only one shared batch for
+  // an exact two-Scan fusion, after checking the combined CUB storage and a
+  // conservative register budget for each input and output. Other mixes
+  // keep the native independent batches until their full plans are proven.
+  std::optional<int64_t> chooseMultiScanBatch(
+      const std::vector<Expr*>& constrained_ops) {
+    const auto jev_mode = scheduler::jev::mode();
+    if (jev_mode == scheduler::jev::Mode::Off || constrained_ops.size() != 2 ||
+        !std::ranges::all_of(constrained_ops, [](Expr* op) {
+          return op->isA<ScanOp>();
+        })) {
+      return std::nullopt;
+    }
+
+    auto* first = constrained_ops.front()->as<ScanOp>();
+    auto* second = constrained_ops.back()->as<ScanOp>();
+    auto* first_tv = ir_utils::getTvOutput(first);
+    auto* second_tv = ir_utils::getTvOutput(second);
+    if (first->dim() != second->dim() ||
+        first_tv->dtype() != second_tv->dtype() ||
+        first_tv->getLogicalDomain().size() !=
+            second_tv->getLogicalDomain().size()) {
+      return std::nullopt;
+    }
+    auto extent_of = [&](TensorView* tv, int64_t dim)
+        -> std::optional<int64_t> {
+      auto value = runtime_info_.expressionEvaluator().evaluate(
+          tv->getLogicalDomain().at(dim)->extent());
+      return value.hasValue() ? std::optional<int64_t>(value.as<int64_t>())
+                              : std::nullopt;
+    };
+    const auto extent = extent_of(first_tv, first->dim());
+    if (!extent.has_value() || *extent <= 0 ||
+        extent_of(second_tv, second->dim()) != extent) {
+      return std::nullopt;
+    }
+
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+    const int64_t max_threads_x = dev_prop->maxThreadsDim[0];
+    const int64_t warp_size = dev_prop->warpSize;
+    const int64_t item_bytes = dataTypeSizeByte(first_tv->dtype());
+    const int64_t registers = dev_prop->regsPerBlock;
+    const int64_t shmem = dev_prop->sharedMemPerBlock;
+    if (max_threads <= 0 || max_threads_x <= 0 || item_bytes <= 0 ||
+        item_bytes > std::numeric_limits<int64_t>::max() / 4) {
+      return std::nullopt;
+    }
+    const int64_t native_batch = ceilDiv(*extent, max_threads);
+    const int64_t native_threads = ceilDiv(*extent, native_batch);
+    auto storage_fits = [&](int64_t threads, int64_t batch) {
+      scheduler_tools::CubSharedMemoryBuffer storage;
+      storage.registerScan(threads, batch, first_tv->dtype());
+      storage.registerScan(threads, batch, second_tv->dtype());
+      const int64_t required = storage.getTotalSizeInBytes();
+      return required <= shmem && (required + 127) / 128 * 128 <= shmem;
+    };
+    if (native_threads > max_threads_x || !storage_fits(native_threads, native_batch)) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "Unable to prove native two-Scan CUB capacity");
+      return std::nullopt;
+    }
+
+    std::vector<scheduler::jev::ChoiceOption> options;
+    auto add_option = [&](int64_t batch, int64_t threads) {
+      options.push_back({
+          "b" + std::to_string(batch),
+          "Use " + std::to_string(batch) +
+              " items per thread for both Scan ops with " +
+              std::to_string(threads) + " TIDx threads"});
+    };
+    add_option(native_batch, native_threads);
+    const int64_t bytes_per_item = 4 * item_bytes;
+    for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+      if (native_batch > std::numeric_limits<int64_t>::max() / factor) {
+        continue;
+      }
+      const int64_t batch = native_batch * factor;
+      if (*extent % batch != 0) {
+        continue;
+      }
+      const int64_t threads = *extent / batch;
+      if (warp_size != 32 || threads < warp_size ||
+          threads > max_threads || threads > max_threads_x ||
+          threads % warp_size != 0 ||
+          batch > (255 - 20) * 4 / bytes_per_item) {
+        continue;
+      }
+      const int64_t estimated_registers =
+          ceilDiv(batch * bytes_per_item, int64_t{4}) + 20;
+      if (estimated_registers > 255 ||
+          estimated_registers > registers / threads ||
+          !storage_fits(threads, batch)) {
+        continue;
+      }
+      add_option(batch, threads);
+    }
+
+    const std::string state =
+        "greedy.multi_scan_batch.v1\nscan_count=2\nextent=" +
+        std::to_string(*extent) +
+        "\nmax_threads_per_block=" + std::to_string(max_threads) +
+        "\nmax_threads_x=" + std::to_string(max_threads_x) +
+        "\nwarp_size=" + std::to_string(warp_size) +
+        "\nitem_bytes=" + std::to_string(item_bytes) +
+        "\nregs_per_block=" + std::to_string(registers) +
+        "\nsmem_per_block_bytes=" + std::to_string(shmem);
+    const auto selected = scheduler::jev::chooseDecision(
+        "GR1.multi_scan_batch",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? options.front().id : "");
+    const auto option_it = std::find_if(
+        options.begin(),
+        options.end(),
+        [&](const auto& option) { return option.id == selected; });
+    NVF_ERROR(option_it != options.end(), "Unknown two-Scan batch");
+    return std::stoll(selected.substr(1));
   }
 
   // Scatter has two coupled parameter tuples: the output/index/src loop and
@@ -1326,6 +1450,7 @@ class HeuristicsBuilder : private IterVisitor {
   bool single_scan_ = false;
   bool single_argsort_ = false;
   bool single_scatter_ = false;
+  std::optional<int64_t> multi_scan_batch_;
 };
 
 // Propagate all reshape transformations throughout the fusion.
