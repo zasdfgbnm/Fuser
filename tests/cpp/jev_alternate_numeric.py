@@ -385,6 +385,107 @@ def check_iop3_grid_rows_dependency(
     return [*rows_issues, *cta_issues], record_cta, remote_cta
 
 
+def check_iop3_inner_width_dependency(
+        report: dict[str, Any], event: dict[str, Any],
+        intended: dict[str, str], issues: list[dict[str, str]]) -> None:
+    """Pair and replay every IOP3 request after a narrower inner vector."""
+    from jev_shim import (evaluate, parse_inner_outer_inner_width_state)
+
+    target = parse_inner_outer_inner_width_state(event["state"])
+    if (event["native"] != "w4" or event["requested_alternate"] != "w2" or
+            target.inner_dim != 2048 or target.outer_dim != 1024 or
+            not {"w2", "w4"} <= set(event["candidates"])):
+        raise ValueError("inner-outer fixture lacks a complete vector-width alternate")
+    target_plans = {plan[0]: plan for plan in target.plans}
+    paired = {}
+    expected = [intended]
+    for site in ("IOP3.min_batch", "IOP3.tmp_read_width",
+                 "IOP3.grid_rows", "IOP3.cta", "IOP3.tmp_write_width"):
+        before, after, pair_issues = paired_state_rows(report, site)
+        paired[site] = (before, after)
+        expected.extend(pair_issues)
+        for row, side in ((before, "record"), (after, "remote")):
+            try:
+                response, _ = evaluate(row["request"])
+                native = response["answers"][site]["choice"]
+            except Exception as exc:
+                raise ValueError(f"invalid dependent {site} request") from exc
+            if row[side] != {native: 1}:
+                raise ValueError(f"dependent {site} changed its native winner")
+
+    batch_rows = paired["IOP3.min_batch"]
+    read_rows = paired["IOP3.tmp_read_width"]
+    rows_rows = paired["IOP3.grid_rows"]
+    cta_rows = paired["IOP3.cta"]
+    write_rows = paired["IOP3.tmp_write_width"]
+    for index, width in enumerate((4, 2)):
+        batch = batch_rows[index]
+        read = read_rows[index]
+        rows = rows_rows[index]
+        cta = cta_rows[index]
+        write = write_rows[index]
+        batch_state = batch["request"]["state"].splitlines()
+        batch_fields = dict(line.split("=", 1) for line in batch_state[1:]
+                            if not line.startswith("plan="))
+        read_fields = state_fields(read, "inner_outer_multi_wave.tmp_read_width.v1")
+        rows_fields, _ = checked_iop3_rows_request(rows)
+        write_fields = state_fields(write, "inner_outer_multi_wave.tmp_write_width.v2")
+        cta_fields, cta_plans = iop3_rows_expected_cta(
+            rows["request"]["state"], 8)
+        cta_lines = cta["request"]["state"].splitlines()
+        actual_cta_fields = dict(line.split("=", 1) for line in cta_lines[1:]
+                                 if not line.startswith("plan="))
+        if (batch_state[0] != "inner_outer_multi_wave.minimum_batch.v1" or
+                batch_fields.get("vector_width") != str(width) or
+                batch_fields.get("after_vector") != str(2048 // width) or
+                read_fields["inner_vector_width"] != str(width) or
+                rows_fields["vector_width"] != str(width) or
+                rows_fields["selected_min_batch"] != "2" or
+                rows_fields["selected_outer_read_width"] != "2" or
+                rows_fields["max_threads"] != str(512 if width == 2 else 256) or
+                rows_fields["smem_total_bits"] != str(
+                    target_plans[width][2] + target_plans[width][3]) or
+                rows_fields["regs_buffer_bits"] != str(target_plans[width][1]) or
+                actual_cta_fields != cta_fields or
+                iop3_cta_plan_fields(cta, 2) != cta_plans or
+                write_fields["inner_vector_width"] != str(width) or
+                write_fields["outer_read_width"] != "2" or
+                write_fields["tmp_dtype_bits"] != "32"):
+            raise ValueError("inner width did not produce the exact dependent plan")
+    for site, version, changing in (
+            ("IOP3.tmp_read_width", "inner_outer_multi_wave.tmp_read_width.v1",
+             {"inner_vector_width", "legal_widths"}),
+            ("IOP3.tmp_write_width", "inner_outer_multi_wave.tmp_write_width.v2",
+             {"inner_vector_width"})):
+        before, after = paired[site]
+        left, right = (state_fields(row, version) for row in (before, after))
+        if ({key: value for key, value in left.items() if key not in changing} !=
+                {key: value for key, value in right.items() if key not in changing}):
+            raise ValueError(f"inner width changed unrelated {site} fields")
+    batch_before, batch_after = (
+        {key: value for key, value in
+         (line.split("=", 1) for line in row["request"]["state"].splitlines()[1:]
+          if not line.startswith("plan="))}
+        for row in batch_rows)
+    if ({key: value for key, value in batch_before.items()
+         if key not in {"vector_width", "after_vector"}} !=
+            {key: value for key, value in batch_after.items()
+             if key not in {"vector_width", "after_vector"}}):
+        raise ValueError("inner width changed unrelated batch measurements")
+    left, right = (checked_iop3_rows_request(row)[0] for row in rows_rows)
+    changed = {"vector_width", "max_threads", "smem_total_bits"}
+    if ({key: value for key, value in left.items() if key not in changed} !=
+            {key: value for key, value in right.items() if key not in changed}):
+        raise ValueError("inner width changed unrelated rows measurements")
+    left_cta, right_cta = (iop3_rows_expected_cta(
+        row["request"]["state"], 8)[0] for row in rows_rows)
+    if ({key: value for key, value in left_cta.items() if key not in changed} !=
+            {key: value for key, value in right_cta.items() if key not in changed}):
+        raise ValueError("inner width changed unrelated CTA measurements")
+    if sorted(issues, key=str) != sorted(expected, key=str):
+        raise ValueError(f"unexpected inner-width decision differences: {issues}")
+
+
 OUTER_STRIDE_KEYS = {
     "reduction_numel", "iteration_numel", "dtype_bits", "sm_count",
     "min_warp_size", "bdimx", "bdimy", "iter_unroll", "redu_unroll",
@@ -480,7 +581,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_min_batch: bool = False,
                            require_iop3_grid_rows: bool = False,
                            require_iop3_tmp_write: bool = False,
-                           require_iop3_tmp_read: bool = False) -> dict[str, Any]:
+                           require_iop3_tmp_read: bool = False,
+                           require_iop3_inner_width: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -1073,6 +1175,10 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent warp comparison issues: {issues}")
+    elif require_iop3_inner_width:
+        if site != "IOP3.inner_width" or alternate != "w2":
+            raise ValueError("unexpected IOP3 inner-width alternate")
+        check_iop3_inner_width_dependency(report, event, intended, issues)
     elif require_iop3_min_batch:
         if (site != "IOP3.min_batch" or event["native"] != "b2" or
                 alternate != "b1" or
@@ -1259,6 +1365,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-iop3-grid-rows", action="store_true")
     parser.add_argument("--require-iop3-tmp-write", action="store_true")
     parser.add_argument("--require-iop3-tmp-read", action="store_true")
+    parser.add_argument("--require-iop3-inner-width", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -1372,7 +1479,8 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_min_batch=args.require_iop3_min_batch,
             require_iop3_grid_rows=args.require_iop3_grid_rows,
             require_iop3_tmp_write=args.require_iop3_tmp_write,
-            require_iop3_tmp_read=args.require_iop3_tmp_read)
+            require_iop3_tmp_read=args.require_iop3_tmp_read,
+            require_iop3_inner_width=args.require_iop3_inner_width)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)

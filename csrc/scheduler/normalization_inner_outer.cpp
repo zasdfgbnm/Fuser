@@ -295,7 +295,9 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
     }
     return *multiwave_buffer_params;
   };
-  auto makeMultiWave = [&](const auto& buffers, bool enable_jev_choice) {
+  auto makeMultiWave = [&](const auto& buffers,
+                           size_t inner_vector_width,
+                           bool enable_jev_choice) {
     auto params = makeRParams();
     params->smem_persistent_buffers = buffers.smem_persistent_buffers;
     inner_outer_multi_wave::getHeuristics(
@@ -306,7 +308,7 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
         buffers.smem_buffer_size_bit,
         buffers.smem_overhead_bit,
         max_outer_reduction_dtype_size_bit,
-        vectorize_factor,
+        inner_vector_width,
         threads_per_block_min,
         threads_per_block_max,
         buffers.project_to_input,
@@ -339,6 +341,147 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
   };
 
   const auto jev_mode = scheduler::jev::mode();
+  auto chooseMultiWave = [&](const auto& native_buffers,
+                             bool enable_jev_choice) {
+    // The layout helper supplies the alignment maximum. Recompute storage for
+    // every narrower width: rounding a persistent buffer into shared memory
+    // depends on the width, even when its placement does not change.
+    if (!enable_jev_choice || jev_mode == scheduler::jev::Mode::Off ||
+        hp != nullptr) {
+      return makeMultiWave(
+          native_buffers, vectorize_factor, enable_jev_choice);
+    }
+
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const bool valid_bounds =
+        vectorize_factor >= 2 && vectorize_factor <= 128 &&
+        (vectorize_factor & (vectorize_factor - 1)) == 0 &&
+        properties.total_reduction_numel > 0 &&
+        properties.total_reduction_numel % vectorize_factor == 0 &&
+        properties.total_iteration_numel > 0 &&
+        max_outer_reduction_dtype_size_bit >= 8 &&
+        max_outer_reduction_dtype_size_bit <= 128 &&
+        (max_outer_reduction_dtype_size_bit &
+         (max_outer_reduction_dtype_size_bit - 1)) == 0 &&
+        native_buffers.has_enough_regs_and_smem;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::string state =
+        "inner_outer_multi_wave.inner_width.v1\ninner_dim=" +
+        std::to_string(properties.total_reduction_numel) + "\nouter_dim=" +
+        std::to_string(properties.total_iteration_numel) +
+        "\nmax_layout_width=" + std::to_string(vectorize_factor) +
+        "\ntmp_dtype_bits=" +
+        std::to_string(max_outer_reduction_dtype_size_bit) +
+        "\nmax_threads_per_block=" +
+        std::to_string(dev_prop->maxThreadsPerBlock) +
+        "\nmax_thread_x=" + std::to_string(dev_prop->maxThreadsDim[0]) +
+        "\nmax_thread_y=" + std::to_string(dev_prop->maxThreadsDim[1]) +
+        "\nmax_grid_y=" + std::to_string(dev_prop->maxGridSize[1]) +
+        "\nsmem_limit_bits=" +
+        std::to_string((int64_t)dev_prop->sharedMemPerBlockOptin * 8);
+    if (valid_bounds) {
+      for (size_t width = 1; width <= vectorize_factor; width *= 2) {
+        auto buffers = width == vectorize_factor
+            ? native_buffers
+            : inner_outer_utils::getPersistentBufferStorageParams(
+                  fusion,
+                  runtime_info,
+                  data_cache,
+                  reduction_tvs,
+                  width,
+                  threads_per_block_min,
+                  threads_per_block_max,
+                  /*is_warp_specialized=*/false);
+        // Hold the storage strategy fixed for this first width experiment.
+        // The candidate still uses its own recomputed resource sizes.
+        if (!buffers.has_enough_regs_and_smem ||
+            buffers.project_to_input != native_buffers.project_to_input ||
+            buffers.smem_persistent_buffers !=
+                native_buffers.smem_persistent_buffers ||
+            buffers.regs_buffer_size_bit !=
+                native_buffers.regs_buffer_size_bit ||
+            buffers.smem_overhead_bit !=
+                native_buffers.smem_overhead_bit) {
+          continue;
+        }
+        try {
+          auto preview = makeMultiWave(
+              buffers, width, /*enable_jev_choice=*/false);
+          if (!hardValidMultiWavePlan(*preview, buffers) ||
+              preview->unroll_factor_inner_reduction != width ||
+              preview->vectorization_factor_outer < 1 ||
+              preview->vectorization_factor_tmp_gmem_write <
+                  preview->vectorization_factor_outer ||
+              preview->vectorization_factor_tmp_gmem_write > width) {
+            continue;
+          }
+          const auto& launch = preview->lparams;
+          options.push_back(
+              {"w" + std::to_string(width),
+               "Use inner reduction vector width " + std::to_string(width)});
+          state += "\nplan=" + std::to_string(width) + ":" +
+              std::to_string(buffers.regs_buffer_size_bit) + ":" +
+              std::to_string(buffers.smem_buffer_size_bit) + ":" +
+              std::to_string(buffers.smem_overhead_bit) + ":" +
+              std::to_string(launch.bdimx()) + ":" +
+              std::to_string(launch.bdimy()) + ":" +
+              std::to_string(launch.gdimy()) + ":" +
+              std::to_string(preview->batches_per_block_inner_reduction) +
+              ":" +
+              std::to_string(preview->vectorization_factor_outer) + ":" +
+              std::to_string(preview->vectorization_factor_tmp_gmem_write) +
+              ":" + std::to_string(preview->cparams.maxrregcount);
+        } catch (const std::exception&) {
+          // An unconstructible native preview cannot be offered.
+        }
+      }
+    }
+    const std::string native_id = "w" + std::to_string(vectorize_factor);
+    const bool native_offered = std::any_of(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == native_id;
+        });
+    if (!native_offered || options.size() < 2 ||
+        state.size() >= 48 * 1024) {
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.inner_width", "no stable-storage width alternative");
+      return makeMultiWave(
+          native_buffers, vectorize_factor, enable_jev_choice);
+    }
+    const std::string selected = scheduler::jev::chooseDecision(
+        "IOP3.inner_width",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? native_id : "");
+    const auto choice = std::find_if(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == selected;
+        });
+    NVF_ERROR(choice != options.end(), "Unknown IOP3 inner vector width");
+    const size_t selected_width = std::stoul(selected.substr(1));
+    if (selected_width == vectorize_factor) {
+      return makeMultiWave(
+          native_buffers, vectorize_factor, enable_jev_choice);
+    }
+    auto buffers = inner_outer_utils::getPersistentBufferStorageParams(
+        fusion,
+        runtime_info,
+        data_cache,
+        reduction_tvs,
+        selected_width,
+        threads_per_block_min,
+        threads_per_block_max,
+        /*is_warp_specialized=*/false);
+    NVF_ERROR(
+        buffers.has_enough_regs_and_smem &&
+            buffers.project_to_input == native_buffers.project_to_input &&
+            buffers.smem_persistent_buffers ==
+                native_buffers.smem_persistent_buffers &&
+            buffers.regs_buffer_size_bit == native_buffers.regs_buffer_size_bit &&
+            buffers.smem_overhead_bit == native_buffers.smem_overhead_bit,
+        "Selected IOP3 width changed persistent buffer placement");
+    return makeMultiWave(buffers, selected_width, enable_jev_choice);
+  };
   const bool attempt_ws = user_enforced_warp_specialization ||
       (jev_mode == scheduler::jev::Mode::Off
            ? preferWarpSpecialized(
@@ -420,7 +563,9 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
             if (multiwave_buffers.has_enough_regs_and_smem) {
               try {
                 auto preview = makeMultiWave(
-                    multiwave_buffers, /*enable_jev_choice=*/false);
+                    multiwave_buffers,
+                    vectorize_factor,
+                    /*enable_jev_choice=*/false);
                 multiwave_valid =
                     hardValidMultiWavePlan(*preview, multiwave_buffers);
               } catch (const std::exception&) {
@@ -485,7 +630,8 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
               }
               return selected_ws;
             }
-            return makeMultiWave(multiwave_buffers, /*enable_jev_choice=*/true);
+            return chooseMultiWave(
+                multiwave_buffers, /*enable_jev_choice=*/true);
           }
         }
       }
@@ -493,7 +639,7 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
   }
 
   // Fallback to multi-wave
-  return makeMultiWave(multiwaveBuffers(), /*enable_jev_choice=*/true);
+  return chooseMultiWave(multiwaveBuffers(), /*enable_jev_choice=*/true);
 }
 
 } // namespace
