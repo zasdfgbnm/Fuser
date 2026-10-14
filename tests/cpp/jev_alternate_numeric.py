@@ -569,6 +569,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_width: bool = False,
                            require_outer_cta: bool = False,
                            require_outer_ragged: bool = False,
+                           require_outer_grid_base: bool = False,
                            require_inner_iter_unroll: bool = False,
                            require_inner_warp_target: bool = False,
                            require_inner3d_warp_target: bool = False,
@@ -741,7 +742,7 @@ def check_alternate_report(report: dict[str, Any],
                 set(event["candidates"]) != {"clean", "raw"}):
             raise ValueError("outer ragged fixture lacks both complete grid plans")
         for upstream in ("RD9.reg_budget", "RD9.width", "RD9.waves",
-                         "RD9.warp", "RD9.cta"):
+                         "RD9.warp", "RD9.cta", "RD9.grid_base"):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == upstream]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
@@ -769,6 +770,67 @@ def check_alternate_report(report: dict[str, Any],
             if {"kind": kind, "site": "RD9.stride",
                 "request_sha256": row["request_sha256"]} not in issues:
                 raise ValueError(f"missing dependent stride state: {issues}")
+    elif require_outer_grid_base:
+        if (site != "RD9.grid_base" or event["native"] != "target" or
+                alternate != "wave" or
+                set(event["candidates"]) != {"target", "wave"}):
+            raise ValueError("outer grid baseline fixture lacks both complete plans")
+        for upstream in ("RD9.reg_budget", "RD9.width", "RD9.waves",
+                         "RD9.warp", "RD9.cta"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with grid baseline: {rows}")
+        base_state = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "reduction.outer_grid_base.v1")
+        if any(base_state.get(key) != value for key, value in {
+                "reduction_numel": "16384", "iteration_numel": "513",
+                "vector_width": "1", "cta_share": "4"}.items()):
+            raise ValueError(f"grid baseline fixture changed shape: {base_state}")
+        record_ragged, remote_ragged, ragged_issues = paired_state_rows(
+            report, "RD9.ragged")
+        for row, side, base in ((record_ragged, "record", "8"),
+                                (remote_ragged, "remote", "4")):
+            state = state_fields(row, "reduction.outer_ragged.v1")
+            if (state.get("base_grdim") != base or
+                    row[side] != {"clean": 1}):
+                raise ValueError(f"ragged plan ignored selected baseline: {row}")
+        ragged_before = state_fields(record_ragged, "reduction.outer_ragged.v1")
+        ragged_after = state_fields(remote_ragged, "reduction.outer_ragged.v1")
+        if ({key: value for key, value in ragged_before.items()
+             if key != "base_grdim"} !=
+                {key: value for key, value in ragged_after.items()
+                 if key != "base_grdim"}):
+            raise ValueError("grid baseline changed unrelated ragged measurements")
+        record_stride, remote_stride, stride_issues = paired_state_rows(
+            report, "RD9.stride")
+        stride_before = outer_stride_fields(record_stride)
+        stride_after = outer_stride_fields(remote_stride)
+        if (stride_before.get("base_grdim") != "8" or
+                stride_after.get("base_grdim") != "4" or
+                record_stride["record"] != {"g7": 1} or
+                remote_stride["remote"] != {"g4": 1} or
+                {key: value for key, value in stride_before.items()
+                 if key != "base_grdim"} !=
+                {key: value for key, value in stride_after.items()
+                 if key != "base_grdim"}):
+            raise ValueError("stride grid did not follow selected baseline")
+        record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
+        plan_before = state_fields(record_plan, "reduction.outer_plan.v1")
+        plan_after = state_fields(remote_plan, "reduction.outer_plan.v1")
+        if (record_plan["record"] != {"grid": 1} or
+                remote_plan["remote"] != {"grid": 1} or
+                plan_before.get("grid_grdim") != "7" or
+                plan_after.get("grid_grdim") != "4" or
+                {key: value for key, value in plan_before.items()
+                 if key != "grid_grdim"} !=
+                {key: value for key, value in plan_after.items()
+                 if key != "grid_grdim"}):
+            raise ValueError("RD8 did not receive selected baseline grid")
+        expected = [intended, *ragged_issues, *stride_issues, *plan_issues]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected dependent baseline issues: {issues}")
     elif require_outer_cta:
         if (site != "RD9.cta" or event["native"] != "q4" or
                 alternate != "q8" or
@@ -780,6 +842,19 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed with CTA target: {rows}")
+        base_record, base_remote, base_issues = paired_state_rows(
+            report, "RD9.grid_base")
+        base_before = state_fields(base_record, "reduction.outer_grid_base.v1")
+        base_after = state_fields(base_remote, "reduction.outer_grid_base.v1")
+        if (base_record["record"] != {"target": 1} or
+                base_remote["remote"] != {"target": 1} or
+                base_before.get("cta_share") != "4" or
+                base_after.get("cta_share") != "8" or
+                {key: value for key, value in base_before.items()
+                 if key != "cta_share"} !=
+                {key: value for key, value in base_after.items()
+                 if key != "cta_share"}):
+            raise ValueError("CTA target did not reach dependent grid baseline")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
         before, after = (outer_stride_fields(row) for row in
@@ -804,7 +879,8 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in plan_after.items()
                  if key != "grid_grdim"}):
             raise ValueError("CTA target changed more than the RD8 grid size")
-        expected = [intended, *ragged_issues, *stride_issues, *plan_issues]
+        expected = [intended, *base_issues, *ragged_issues,
+                    *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer CTA comparison issues: {issues}")
     elif require_outer_width:
@@ -830,6 +906,19 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in cta_after.items()
                  if key != "vector_width"}):
             raise ValueError("width changed the CTA winner or upstream CTA state")
+        base_record, base_remote, base_issues = paired_state_rows(
+            report, "RD9.grid_base")
+        base_before = state_fields(base_record, "reduction.outer_grid_base.v1")
+        base_after = state_fields(base_remote, "reduction.outer_grid_base.v1")
+        if (base_record["record"] != {"target": 1} or
+                base_remote["remote"] != {"target": 1} or
+                base_before.get("vector_width") != "4" or
+                base_after.get("vector_width") != "1" or
+                {key: value for key, value in base_before.items()
+                 if key != "vector_width"} !=
+                {key: value for key, value in base_after.items()
+                 if key != "vector_width"}):
+            raise ValueError("width did not reach dependent grid baseline")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
         before, after = (outer_stride_fields(row) for row in
@@ -846,7 +935,7 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("width changed the stride winner unexpectedly")
         record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
         check_outer_grid_plan(record_plan, remote_plan, record_stride, remote_stride)
-        expected = [intended, *cta_issues, *ragged_issues, *stride_issues,
+        expected = [intended, *cta_issues, *base_issues, *ragged_issues, *stride_issues,
                     *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
@@ -1352,6 +1441,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-width", action="store_true")
     parser.add_argument("--require-outer-cta", action="store_true")
     parser.add_argument("--require-outer-ragged", action="store_true")
+    parser.add_argument("--require-outer-grid-base", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner-iter-unroll", action="store_true")
     parser.add_argument("--require-inner-warp-target", action="store_true")
@@ -1467,6 +1557,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_width=args.require_outer_width,
             require_outer_cta=args.require_outer_cta,
             require_outer_ragged=args.require_outer_ragged,
+            require_outer_grid_base=args.require_outer_grid_base,
             require_inner_targets=args.require_inner_targets,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
             require_inner_warp_target=args.require_inner_warp_target,

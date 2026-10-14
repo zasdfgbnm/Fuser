@@ -1371,6 +1371,17 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_outer_ragged --require-outer-ragged)
   set_tests_properties(jev_alternate_numeric_outer_ragged PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_reduction_outer_grid_base
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.grid_base --alternate wave
+      --gtest Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_alternate_numeric_reduction_outer_grid_base
+      --require-outer-grid-base)
+  set_tests_properties(jev_alternate_numeric_reduction_outer_grid_base PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_outer_grid_base
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

@@ -1936,7 +1936,8 @@ OuterGridWarpPlans buildOuterGridWarpPlans(
     int64_t max_threads_per_sm,
     int64_t n_waves,
     int64_t min_warp_size,
-    int64_t sm_cta_thread_divisor = 4) {
+    int64_t sm_cta_thread_divisor = 4,
+    bool extend_reduction_grid = true) {
   const int64_t n_elems = total_reduction_numel * total_iteration_numel;
   // Set some targets for parallelization
   int64_t target_threads_in_block = min_warp_size;
@@ -2083,7 +2084,7 @@ OuterGridWarpPlans buildOuterGridWarpPlans(
   // Try to hit a wave by going cross reduction
   grdim = std::min(rDimAvail(), ceilDiv(sm_count, gidim));
   // Extend to go to target blocks
-  if (gidim * grdim < target_blocks) {
+  if (extend_reduction_grid && gidim * grdim < target_blocks) {
     // What should we use out of the reduction factor to hit target blocks? Make
     // sure we have 2 reductions per thread beyond what's already set as we
     // consider expanding to target block
@@ -2459,6 +2460,62 @@ OuterReductionParams getGridOuterReduction(
           max_unroll,
           max_threads_per_block),
       "Selected RD9 warp plan violates hard bounds");
+  // One SM wave and the native target-block formula are two complete grid
+  // plans. The latter is an occupancy preference, not a reduction-coverage
+  // requirement. Keep both downstream ragged and stride calculations coupled
+  // to whichever hard-valid complete plan the Choice selects.
+  auto wave_plans = buildOuterGridWarpPlans(
+      total_reduction_numel,
+      total_iteration_numel,
+      max_dtype_size_bit_for_vectorization,
+      vectorize_factor,
+      max_unroll,
+      sm_count,
+      max_threads_per_sm,
+      n_waves,
+      min_warp_size,
+      cta_share,
+      false);
+  std::vector<scheduler::jev::ChoiceOption> grid_base_options = {
+      {"target", "Apply target-block reduction-grid formula"}};
+  if (wave_plans.base_grdim != plans.base_grdim &&
+      outerGridWarpPlansHardValid(
+          wave_plans,
+          total_reduction_numel,
+          total_iteration_numel,
+          vectorize_factor,
+          max_unroll,
+          max_threads_per_block)) {
+    grid_base_options.push_back(
+        {"wave", "Keep one-SM-wave reduction grid"});
+  }
+  const std::string grid_base_state =
+      "reduction.outer_grid_base.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) +
+      "\niteration_numel=" + std::to_string(total_iteration_numel) +
+      "\ndtype_bits=" +
+      std::to_string(max_dtype_size_bit_for_vectorization) +
+      "\nsm_count=" + std::to_string(sm_count) +
+      "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+      "\nmax_threads_per_block=" +
+      std::to_string(max_threads_per_block) +
+      "\nmax_unroll=" + std::to_string(max_unroll) +
+      "\nvector_width=" + std::to_string(vectorize_factor) +
+      "\nwaves=" + std::to_string(n_waves) +
+      "\nwarp=" + std::to_string(min_warp_size) +
+      "\ncta_share=" + std::to_string(cta_share);
+  const auto grid_base_choice = scheduler::jev::chooseDecision(
+      "RD9.grid_base",
+      grid_base_state,
+      grid_base_options,
+      jev_mode == scheduler::jev::Mode::Record ? "target" : "");
+  NVF_ERROR(
+      grid_base_choice == "target" ||
+          (grid_base_choice == "wave" && grid_base_options.size() == 2),
+      "RD9 baseline grid choice is outside hard-valid complete plans");
+  if (grid_base_choice == "wave") {
+    plans = wave_plans;
+  }
   // The ragged-wave cleanup is an empirical occupancy preference. Offer the
   // raw grid only after both complete grid variants pass the same native
   // launch, CTA, vectorization, and reduction-coverage bounds.

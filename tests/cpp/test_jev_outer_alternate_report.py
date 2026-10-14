@@ -48,7 +48,8 @@ class OuterAlternateReportTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 report, events, options = load_case(kind)
                 result = check_alternate_report(report, events, **options)
-                expected_events = 7 + bool(rows(report, "RD9.ragged"))
+                expected_events = (7 + bool(rows(report, "RD9.ragged")) +
+                                   bool(rows(report, "RD9.grid_base")))
                 self.assertEqual(result["record_events"], expected_events)
                 self.assertEqual(result["remote_events"], expected_events)
                 self.assertEqual(result["server_successes"], expected_events)
@@ -57,7 +58,9 @@ class OuterAlternateReportTest(unittest.TestCase):
         for kind, site in (("width", "RD9.cta"), ("width", "RD9.stride"),
                            ("width", "RD8"), ("cta", "RD9.stride"),
                            ("cta", "RD8"), ("width", "RD9.ragged"),
-                           ("cta", "RD9.ragged")):
+                           ("cta", "RD9.ragged"),
+                           ("width", "RD9.grid_base"),
+                           ("cta", "RD9.grid_base")):
             report, events, options = load_case(kind)
             if not rows(report, site):
                 continue  # Prior v1 fixtures have no ragged Choice.
