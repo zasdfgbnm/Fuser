@@ -1169,12 +1169,38 @@ struct Inner3DPlanResources {
   int64_t grid_blocks = 0;
 };
 
+// Retain the exact L1/L2 estimate used by the native 3D planner.
+int64_t getInner3DNativeWarpTarget(
+    const PersistentKernelProperties& properties,
+    const cudaDeviceProp& device) {
+  const int64_t n_elems =
+      properties.total_reduction_numel * properties.total_iteration_numel;
+  constexpr int64_t l1_cache_bit = 32l * 1024l * 8;
+  constexpr int64_t active_threads = 1024;
+  const bool fits_in_l2 =
+      n_elems * properties.max_dtype_size_bit * properties.n_tensor_inputs <
+      device.l2CacheSize * 8;
+  const int64_t warp_size_based_on_l2 =
+      fits_in_l2 ? 256l / properties.max_dtype_size_bit : 16l;
+  const int64_t warp_size_based_on_l1 = std::min(
+      ceilDiv(
+          properties.total_reduction_numel,
+          scheduler_utils::safeDiv(
+              l1_cache_bit,
+              properties.n_tensor_inputs * properties.max_dtype_size_bit *
+                  active_threads)),
+      16l);
+  // This empirical target can be odd; preserve that exact native result.
+  return std::min(warp_size_based_on_l1, warp_size_based_on_l2);
+}
+
 // TODO: clean and revise the heuristics
 void innerPersistentHeuristic3DPlan(
     const PersistentKernelProperties& properties,
     int64_t wave_cap,
     ReductionParams* rparams,
-    Inner3DPlanResources* resources = nullptr) {
+    Inner3DPlanResources* resources = nullptr,
+    int64_t warp_target = -1) {
   // Define two free parameters used in this heuristic.
   // register_overhead is all registers except those for the persistent
   // buffers. The register in each thread = register_overhead +
@@ -1211,40 +1237,11 @@ void innerPersistentHeuristic3DPlan(
       // Reduce unrolling if we have many inputs, start reduction at 4 inputs
       scheduler_utils::lastPow2(std::max(properties.n_tensor_inputs >> 2, 1l)));
 
-  // Conservative value, could be set to larger based on arch if necessary.
-  constexpr int64_t l1_cache_bit = 32l * 1024l * 8;
-  // Could change per generation, but for l1 we want to consider active threads,
-  // not resident
-  constexpr int64_t active_threads = 1024;
-
-  // if data fits in l2 and we need more parallelization in the reduction dim,
-  // we can use a smaller warp size. While thread local data fits in l1, and
-  // reduction dim is really small, we can use <32 threads per warp.
-  const bool fits_in_l2 =
-      n_elems * properties.max_dtype_size_bit * properties.n_tensor_inputs <
-      dev_prop->l2CacheSize * 8;
-
-  // If it fits in l2, we just want to make sure each warp uses 256Bits. Set
-  // minimum warp as 16 threads instead of 32 as if we have a small reduction
-  // dim going a bit smaller than 32 usually helps.
-  const int64_t warp_size_based_on_l2 =
-      fits_in_l2 ? 256l / properties.max_dtype_size_bit : 16l;
-
-  // Check how many elements it would take per thread to start thrashing l1
-  // set that to minimum number we want to reduce per thread.
-  const int64_t warp_size_based_on_l1 = std::min(
-      ceilDiv(
-          properties.total_reduction_numel,
-          scheduler_utils::safeDiv(
-              l1_cache_bit,
-              properties.n_tensor_inputs * properties.max_dtype_size_bit *
-                  active_threads)),
-      16l);
-
-  // Take the smaller, warp_size may be a odd number, e.g. 15
-  // Tracked at https://github.com/NVIDIA/Fuser/issues/107
-  const int64_t warp_size =
-      std::min(warp_size_based_on_l1, warp_size_based_on_l2);
+  // A caller may substitute a legal target after materializing and checking
+  // the complete plan. Off mode uses the unchanged L1/L2 estimate.
+  const int64_t warp_size = warp_target > 0
+      ? warp_target
+      : getInner3DNativeWarpTarget(properties, *dev_prop);
 
   // Initialization
   int64_t target_blocks = 1;
@@ -1731,6 +1728,79 @@ bool isNativeValidInner3DAlternative(
           std::min<int64_t>(scheduler_utils::x_grid_limit, device.maxGridSize[0]);
 }
 
+std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t wave_cap,
+    std::unique_ptr<ReductionParams> native,
+    const Inner3DPlanResources& native_resources,
+    const cudaDeviceProp& device) {
+  const int64_t native_warp = getInner3DNativeWarpTarget(properties, device);
+  struct Plan {
+    std::unique_ptr<ReductionParams> params;
+  };
+  std::vector<Plan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  auto add_plan = [&](int64_t target,
+                      std::unique_ptr<ReductionParams> params,
+                      const Inner3DPlanResources& resources) {
+    const std::string id = "warp" + std::to_string(target);
+    options.push_back({
+        id,
+        "Target " + std::to_string(target) +
+            " threads; completed CTA=" +
+            std::to_string(resources.padded_threads_per_block) +
+            ", register cap=" + std::to_string(resources.registers_per_thread) +
+            ", grid blocks=" + std::to_string(resources.grid_blocks)});
+    plans.push_back({std::move(params)});
+  };
+  add_plan(native_warp, std::move(native), native_resources);
+
+  // The L1/L2 estimate is empirical. Each alternate target recomputes the
+  // complete selected-wave plan and must retain native capacity and launch
+  // limits. The native plan remains available even if no alternate survives.
+  for (const int64_t target : {4, 8, 16, 32}) {
+    if (target == native_warp || target > device.warpSize) {
+      continue;
+    }
+    auto params = std::make_unique<ReductionParams>(base);
+    Inner3DPlanResources resources;
+    innerPersistentHeuristic3DPlan(
+        properties, wave_cap, params.get(), &resources, target);
+    if (isNativeValidInner3DAlternative(
+            properties, *params, *plans.front().params, resources, device)) {
+      add_plan(target, std::move(params), resources);
+    }
+  }
+
+  const std::string state =
+      "inner_persistent.3d_warp_target.v1\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      "\nmax_dtype_bits=" + std::to_string(properties.max_dtype_size_bit) +
+      "\nn_tensor_inputs=" + std::to_string(properties.n_tensor_inputs) +
+      "\nl2_cache_bytes=" + std::to_string(device.l2CacheSize) +
+      "\ndevice_warp_size=" + std::to_string(device.warpSize) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit);
+  const std::string native_choice =
+      scheduler::jev::mode() == scheduler::jev::Mode::Record
+      ? "warp" + std::to_string(native_warp)
+      : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP6.warp", state, options, native_choice);
+  const auto option_it = std::find_if(
+      options.begin(),
+      options.end(),
+      [&](const auto& option) { return option.id == selected; });
+  NVF_ERROR(option_it != options.end(), "Unknown inner 3D warp target");
+  return std::move(plans.at(std::distance(options.begin(), option_it)).params);
+}
+
 std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
     const PersistentKernelProperties& properties,
     const ReductionParams& base) {
@@ -1743,7 +1813,9 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
 
   const auto device = at::cuda::getCurrentDeviceProperties();
   struct Plan {
+    int64_t waves;
     std::unique_ptr<ReductionParams> params;
+    Inner3DPlanResources resources;
   };
   std::vector<Plan> plans;
   std::vector<scheduler::jev::ChoiceOption> options;
@@ -1772,7 +1844,7 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
             std::to_string(resources.padded_threads_per_block) +
             ", register cap=" + std::to_string(resources.registers_per_thread) +
             ", grid blocks=" + std::to_string(resources.grid_blocks)});
-    plans.push_back({std::move(params)});
+    plans.push_back({waves, std::move(params), resources});
   }
 
   const std::string state =
@@ -1803,7 +1875,15 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
       options.end(),
       [&](const auto& option) { return option.id == selected; });
   NVF_ERROR(option_it != options.end(), "Unknown inner 3D wave target");
-  return std::move(plans.at(std::distance(options.begin(), option_it)).params);
+  const auto plan_index = std::distance(options.begin(), option_it);
+  auto& chosen_plan = plans.at(plan_index);
+  return chooseInner3DWarpTarget(
+      properties,
+      base,
+      chosen_plan.waves,
+      std::move(chosen_plan.params),
+      chosen_plan.resources,
+      *device);
 }
 
 } // namespace

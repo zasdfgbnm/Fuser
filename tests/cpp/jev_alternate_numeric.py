@@ -90,7 +90,8 @@ def check_alternate_report(report: dict[str, Any],
                            events: list[dict[str, Any]], *, site: str,
                            alternate: str, case_key: str,
                            require_grid: bool = False,
-                           require_inner_targets: bool = False) -> dict[str, Any]:
+                           require_inner_targets: bool = False,
+                           require_inner3d_warp: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -250,6 +251,22 @@ def check_alternate_report(report: dict[str, Any],
                     f"\npolicy_register_overhead={expected_overhead}\n" not in state or
                     f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
                 raise ValueError(f"nested batch did not use selected target policy: {row}")
+    elif require_inner3d_warp:
+        if (site != "IP6.warp" or event["native"] != "warp8" or
+                alternate != "warp16" or
+                not {"warp8", "warp16"} <= set(event["candidates"])):
+            raise ValueError("inner 3D fixture lacks a legal nonnative warp plan")
+        waves = [row for row in report["multiplicity"]
+                 if row["site"] == "IP6.waves"]
+        if (len(waves) != 1 or waves[0]["record"] != {"waves4": 1} or
+                waves[0]["remote"] != {"waves4": 1}):
+            raise ValueError(f"3D wave target changed before warp Choice: {waves}")
+        state = dict(line.split("=", 1) for line in
+                     event["state"].splitlines()[1:])
+        if state.get("selected_wave_cap") != "4":
+            raise ValueError(f"warp plan used an unexpected wave cap: {state}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
     elif issues != [intended]:
         raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
@@ -274,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--case-key", default=CASE_KEY)
     parser.add_argument("--require-grid", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
+    parser.add_argument("--require-inner3d-warp", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -372,7 +390,8 @@ def main(argv: list[str] | None = None) -> int:
             report, override.events, site=args.site,
             alternate=args.alternate, case_key=args.case_key,
             require_grid=args.require_grid,
-            require_inner_targets=args.require_inner_targets)
+            require_inner_targets=args.require_inner_targets,
+            require_inner3d_warp=args.require_inner3d_warp)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)
