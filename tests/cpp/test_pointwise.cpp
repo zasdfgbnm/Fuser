@@ -1633,6 +1633,28 @@ TEST_F(PointwiseTest, TmaDomainTargetCompletePlanAnalysis) {
   EXPECT_THAT(records, ::testing::HasSubstr("\"t1024\""));
 }
 
+// The external harness runs this same analysis once in record and once with
+// the loopback API. No TMA kernel is compiled or launched on pre-Hopper GPUs.
+TEST_F(PointwiseTest, TmaDomainTargetExternalModeAnalysis) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {131072}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  const auto params = pointwise::tma::getPointwiseHeuristics(
+      &fusion, runtime_info, nullptr, *prop);
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->break_point, 0);
+  EXPECT_EQ(params->tma_domain_inner, 512);
+}
+
 // Non-parameterized TMA pointwise test fixture (for TEST_F)
 class TmaPointwiseTestF : public PointwiseTest {
  protected:

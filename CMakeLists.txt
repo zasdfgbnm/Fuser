@@ -1179,6 +1179,19 @@ if(BUILD_TEST)
   add_jev_remote_numeric_test(inner_outer_persistent
     "CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv" "IOP")
 
+  # This exercises the TMA parameter decisions through the real API on SM89.
+  # The GTest constructs scheduler parameters but never launches a TMA kernel.
+  add_test(NAME jev_remote_analysis_pointwise_tma
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter "PointwiseTest.TmaDomainTargetExternalModeAnalysis"
+      --case-key jev_remote_numeric_pointwise_tma_analysis
+      --site-prefix PW --required-site PW4.domain_inner --analysis-only
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_analysis")
+  set_tests_properties(jev_remote_analysis_pointwise_tma PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+
   # A focused, test-only API override chooses a legal non-native inner-grid
   # candidate and checks the exact GTest's numerical reference and wire logs.
   add_test(NAME jev_alternate_numeric_inner_grid

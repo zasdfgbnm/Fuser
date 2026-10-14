@@ -27,6 +27,7 @@ from typing import Any
 GTEST_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\Z")
 CASE_KEY = re.compile(r"jev_remote_numeric_[a-z_]+\Z")
 SITE_PREFIX = re.compile(r"(?:PW|RD|TR|IP|OP|IOP)\Z")
+REQUIRED_SITE = re.compile(r"[A-Z]{2,3}[0-9]+(?:\.[a-z][a-z0-9_]*)?\Z")
 PASSED = re.compile(r"^\[\s+PASSED\s+\]\s+(\d+) tests?\.$", re.M)
 RUNNING = re.compile(r"^\[==========\] Running (\d+) tests? from", re.M)
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -71,7 +72,7 @@ def check_numeric_output(output: str, expected: int) -> dict[str, int]:
     if running != [expected] or passed != [expected] or "[  SKIPPED ]" in output:
         raise ValueError(
             f"GTest ran/passed {running}/{passed}; expected exactly {expected} "
-            "non-skipped numerical tests"
+            "non-skipped tests"
         )
     return {"running": running[0], "passed": passed[0]}
 
@@ -79,6 +80,7 @@ def check_numeric_output(output: str, expected: int) -> dict[str, int]:
 def run_numeric(
     *, mode: str, binary: Path, names: list[str], case_key: str,
     loader: Path, libraries: list[str], directory: Path, port: int | None,
+    analysis_only: bool = False,
 ) -> dict[str, Any]:
     decision_log = directory / f"{mode}.jsonl"
     output = directory / f"{mode}.stdout.txt"
@@ -105,7 +107,8 @@ def run_numeric(
     for path in (output, errors, decision_log):
         if path.stat().st_size > MAX_ARTIFACT_BYTES:
             raise ValueError(f"{path} exceeds the {MAX_ARTIFACT_BYTES}-byte artifact bound")
-    summary["numeric"] = check_numeric_output(output.read_text(errors="replace"), len(names))
+    summary["analysis" if analysis_only else "numeric"] = check_numeric_output(
+        output.read_text(errors="replace"), len(names))
     summary["artifact_sha256"] = {path.name: file_hash(path) for path in
                                   (output, errors, decision_log)}
     if completed.returncode != 0:
@@ -113,7 +116,8 @@ def run_numeric(
     return summary
 
 
-def check_parity(report: dict[str, Any], case_key: str, prefix: str) -> None:
+def check_parity(report: dict[str, Any], case_key: str, prefix: str,
+                 required_site: str | None = None) -> None:
     if not report["ok"]:
         kinds = sorted({issue["kind"] for issue in report["issues"]})
         raise ValueError(f"record/remote/server decision parity failed: {kinds}")
@@ -141,6 +145,11 @@ def check_parity(report: dict[str, Any], case_key: str, prefix: str) -> None:
     if not any(site.startswith(prefix) and value["status"] == "covered"
                and value["server_events"] > 0 for site, value in sites.items()):
         raise ValueError(f"no matched {prefix} Choice was exercised")
+    if required_site is not None and (
+            required_site not in sites or
+            sites[required_site]["status"] != "covered" or
+            sites[required_site]["server_events"] == 0):
+        raise ValueError(f"required Choice {required_site} was not covered")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -149,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gtest-filter", required=True)
     parser.add_argument("--case-key", required=True)
     parser.add_argument("--site-prefix", required=True)
+    parser.add_argument("--required-site")
+    parser.add_argument("--analysis-only", action="store_true")
     parser.add_argument("--artifacts-root", required=True, type=Path)
     args = parser.parse_args(argv)
     names = args.gtest_filter.split(":")
@@ -158,6 +169,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--gtest-filter must contain 1..4 distinct exact GTest names")
     if CASE_KEY.fullmatch(args.case_key) is None or SITE_PREFIX.fullmatch(args.site_prefix) is None:
         parser.error("invalid test case key or scheduler site prefix")
+    if args.required_site is not None and (
+            REQUIRED_SITE.fullmatch(args.required_site) is None or
+            not args.required_site.startswith(args.site_prefix)):
+        parser.error("invalid required Choice site")
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
     if not args.artifacts_root.is_absolute():
@@ -167,8 +182,11 @@ def main(argv: list[str] | None = None) -> int:
     directory = Path(tempfile.mkdtemp(prefix=args.case_key + "-", dir=args.artifacts_root))
     manifest_path = directory / "manifest.json"
     manifest: dict[str, Any] = {
-        "schema": "nvfuser-jev-remote-numeric-v1",
-        "case_key": args.case_key, "gtests": names, "required_site_prefix": args.site_prefix,
+        "schema": ("nvfuser-jev-remote-analysis-v1" if args.analysis_only else
+                   "nvfuser-jev-remote-numeric-v1"),
+        "case_key": args.case_key, "gtests": names,
+        "required_site_prefix": args.site_prefix,
+        "required_site": args.required_site,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "binary": str(args.binary), "binary_sha256": file_hash(args.binary),
         "loader": str(loader), "loader_sha256": file_hash(loader),
@@ -189,7 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         write_manifest(manifest_path, manifest)
         record = run_numeric(mode="record", binary=args.binary, names=names,
                              case_key=args.case_key, loader=loader, libraries=libraries,
-                             directory=directory, port=None)
+                             directory=directory, port=None,
+                             analysis_only=args.analysis_only)
         manifest["runs"].append(record)
         manifest.pop("active_mode")
         write_manifest(manifest_path, manifest)
@@ -205,7 +224,8 @@ def main(argv: list[str] | None = None) -> int:
             write_manifest(manifest_path, manifest)
             remote = run_numeric(mode="remote", binary=args.binary, names=names,
                                  case_key=args.case_key, loader=loader, libraries=libraries,
-                                 directory=directory, port=server.server_port)
+                                 directory=directory, port=server.server_port,
+                                 analysis_only=args.analysis_only)
         finally:
             server.shutdown()
             thread.join()
@@ -225,10 +245,12 @@ def main(argv: list[str] | None = None) -> int:
         report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         manifest["decision_parity"] = str(report_path)
         manifest["decision_parity_sha256"] = file_hash(report_path)
-        check_parity(report, args.case_key, args.site_prefix)
-        manifest["status"] = "numeric_and_decision_parity_pass"
+        check_parity(report, args.case_key, args.site_prefix, args.required_site)
+        manifest["status"] = ("analysis_and_decision_parity_pass" if args.analysis_only
+                              else "numeric_and_decision_parity_pass")
         write_manifest(manifest_path, manifest)
-        print(json.dumps({"numeric_tests_per_mode": len(names),
+        print(json.dumps({("analysis_tests_per_mode" if args.analysis_only else
+                           "numeric_tests_per_mode"): len(names),
                           "record_decisions": report["summary"]["record_events"],
                           "remote_decisions": report["summary"]["remote_events"],
                           "server_successes": report["summary"]["server_successes"],
