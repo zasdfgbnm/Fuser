@@ -18,6 +18,7 @@
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/executor.h"
 #include "runtime/executor_utils.h"
+#include "scheduler/jev_client.h"
 #include "tests/cpp/utils.h"
 #include "tests/cpp/validator.h"
 
@@ -973,6 +974,10 @@ TEST_F(GreedySchedulerTest, JevAlternateFourScanBatch_CUDA) {
                         ->as<KernelExecutor>()
                         ->compiledKernel()
                         ->kernel();
+  const bool forced_batch =
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  const int64_t expected_threads = forced_batch ? 512 : 1024;
+  const int64_t expected_batch = forced_batch ? 4 : 2;
   int64_t scan_count = 0;
   for (auto* tv : scheduled->allTvs()) {
     if (!tv->isDefinitionType<ScanOp>()) {
@@ -982,9 +987,10 @@ TEST_F(GreedySchedulerTest, JevAlternateFourScanBatch_CUDA) {
     ASSERT_EQ(tv->getLoopDomain().size(), 3);
     EXPECT_EQ(tv->axis(0)->getParallelType(), ParallelType::BIDx);
     EXPECT_EQ(tv->axis(1)->getParallelType(), ParallelType::TIDx);
-    EXPECT_EQ(tv->axis(1)->extent()->evaluate().as<int64_t>(), 512);
+    EXPECT_EQ(
+        tv->axis(1)->extent()->evaluate().as<int64_t>(), expected_threads);
     EXPECT_EQ(tv->axis(2)->getParallelType(), ParallelType::Group);
-    EXPECT_EQ(tv->axis(2)->extent()->evaluate().as<int64_t>(), 4);
+    EXPECT_EQ(tv->axis(2)->extent()->evaluate().as<int64_t>(), expected_batch);
   }
   EXPECT_EQ(scan_count, 4);
 }
