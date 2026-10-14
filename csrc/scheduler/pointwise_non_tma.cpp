@@ -317,9 +317,35 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // break point.
   int64_t gdim_right = 1;
 
-  // Only calculate break point if there's enough parallelism for 2D scheduling
+  // PW2.entry is the performance choice to search for a 2D break point at all.
+  // Both choices are legal: the default 1D plan requires no view split, while
+  // getBreakPoint keeps the view-disjointness checks for every 2D candidate.
+  const auto jev_mode = scheduler::jev::mode();
+  bool analyze_2d_break_point = false;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    analyze_2d_break_point =
+        n_elems * 2 > device_multiprocessor_count * kThreadX;
+  }
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const std::string state =
+        "pointwise.entry.v1\nn_elems=" + std::to_string(n_elems) +
+        "\nsm_count=" + std::to_string(device_multiprocessor_count);
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"analyze", "Analyze hard-legal two-dimensional break points"},
+        {"default_1d",
+         "Use the one-dimensional default without split analysis"}};
+    std::string native_choice;
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      native_choice = analyze_2d_break_point ? "analyze" : "default_1d";
+    }
+    const auto selected = scheduler::jev::chooseDecision(
+        "PW2.entry", state, options, native_choice);
+    analyze_2d_break_point = selected == "analyze";
+  }
+
+  // Only calculate break point if its performance choice requests analysis.
   pointwise_utils::BreakPointInfo bp_info;
-  if (n_elems * 2 > device_multiprocessor_count * kThreadX) {
+  if (analyze_2d_break_point) {
     bp_info = pointwise_utils::getBreakPoint(
         fusion,
         prop,
