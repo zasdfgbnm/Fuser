@@ -309,9 +309,10 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
     const bool can_use_smem_persistent,
     const bool project_to_inputs,
-    // Zero preserves the native max-thread padding estimate. A positive batch
-    // bounds a candidate's actual persistent-buffer padding.
-    int64_t candidate_batch = 0);
+    // Zero preserves the native max-thread padding estimate. A candidate
+    // supplies its batch and warp-padded TIDx for per-buffer capacity bounds.
+    int64_t candidate_batch = 0,
+    int64_t candidate_padded_threads = 0);
 
 enum class BufferProjectionStrategy {
   // Recompute persistent buffers from inputs, only need to cache inputs in

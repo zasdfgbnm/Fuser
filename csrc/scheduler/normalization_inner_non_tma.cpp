@@ -697,7 +697,8 @@ void innerPersistentHeuristicSharedMemory(
                 persistent_buffer_info,
                 /*can_use_smem_persistent=*/true,
                 properties.project_persistent_buffers,
-                batch);
+                batch,
+                padded_threads);
         if (properties.max_persistent_buffer_size_bit > available_bits) {
           continue;
         }
