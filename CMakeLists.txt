@@ -1171,6 +1171,16 @@ if(BUILD_TEST)
   add_jev_remote_numeric_test(inner_outer_persistent
     "CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv" "IOP")
 
+  # A focused, test-only API override chooses a legal non-native inner-grid
+  # candidate and checks the exact GTest's numerical reference and wire logs.
+  add_test(NAME jev_alternate_numeric_inner_grid
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric")
+  set_tests_properties(jev_alternate_numeric_inner_grid PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()
 

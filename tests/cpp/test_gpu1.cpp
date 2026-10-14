@@ -5659,6 +5659,38 @@ TEST_F(Gpu1Test, FusionReductionScheduler_CUDA) {
       cg_results.heuristic_params->lparams);
 }
 
+// Keep the output dimension small enough that the inner reduction grid has
+// both one- and two-block plans on SM89. The alternate Choice test exercises
+// the non-native plan and checks its result against the ATen reference.
+TEST_F(Gpu1Test, JevAlternateInnerGrid_CUDA) {
+  constexpr int output_size = 32;
+  constexpr int reduction_size = 4096;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // This test checks if our system could correctly handles the case where both
 // reduction and trivial reduction exist in the fusion. Trivial reduction
 // deserve testing because trivial reduction is handled by doing a squeeze
