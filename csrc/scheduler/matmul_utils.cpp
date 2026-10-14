@@ -12,6 +12,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -269,8 +270,18 @@ void fillOptimalHopperTileSizes(
     GemmTile instr;
   };
 
+  const auto jev_mode = scheduler::jev::mode();
+  // A plugin may replace the default Hopper plan after this function returns.
+  const bool jev_tile_enabled =
+      jev_mode != scheduler::jev::Mode::Off &&
+      !matmul_heuristic_plugin::hasPlugin();
+  const bool score_native =
+      jev_mode != scheduler::jev::Mode::Remote || !jev_tile_enabled;
+
   const int64_t num_sms =
       at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int64_t smem_bytes =
+      at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
 
   // Compute how many total bytes need to be computed, summed over all tiles in
   // the output
@@ -299,6 +310,7 @@ void fillOptimalHopperTileSizes(
       /*cta=*/{64, 64, 64}, /*warp=*/{64, 64, 64}, /*instr=*/{64, 64, 16}};
   int64_t best_bytes_tx = std::numeric_limits<int64_t>::max();
   int64_t best_stages = std::numeric_limits<int64_t>::max();
+  std::vector<TileConfig> legal_configs;
 
   // If two sizes result in the same number of total byte, prefer the larger CTA
   // K. To do this we iterate backwards here.
@@ -320,8 +332,6 @@ void fillOptimalHopperTileSizes(
         const int64_t bytes_per_stage = (cta_m + cta_n) * cta_k * 2 + 8 * 2;
         // Don't consider cases where we would need fewer than 3 load stages due
         // to smem constraint
-        const int64_t smem_bytes =
-            at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
         int64_t min_stages = 3L;
 
         // There might be fewer than min_stages stages needed to compute the
@@ -346,6 +356,12 @@ void fillOptimalHopperTileSizes(
             .warp = {64L, instr_n, cta_k},
             .instr = {64L, instr_n, 16L},
         };
+        if (jev_tile_enabled) {
+          legal_configs.push_back(cfg);
+        }
+        if (!score_native) {
+          continue;
+        }
         const int64_t bytes_tx = bytes_transferred(cfg.cta);
         bool new_best = bytes_tx < best_bytes_tx;
         if (bytes_tx == best_bytes_tx) {
@@ -369,6 +385,71 @@ void fillOptimalHopperTileSizes(
           best_config = cfg;
           best_stages = stages_per_sm;
         }
+      }
+    }
+  }
+
+  if (jev_tile_enabled) {
+    if (legal_configs.empty()) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "MM1.tile", "no native-valid Hopper tile; preserved legacy fallback");
+      } else {
+        NVF_ERROR(false, "MM1.tile has no native-valid Hopper tile");
+      }
+    } else {
+      const auto choice_id = [](const TileConfig& cfg) {
+        return "m" + std::to_string(cfg.cta.m) + "n" +
+            std::to_string(cfg.cta.n) + "k" + std::to_string(cfg.cta.k) +
+            "w" + std::to_string(cfg.warp.n);
+      };
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(legal_configs.size());
+      for (const TileConfig& cfg : legal_configs) {
+        options.push_back({
+            choice_id(cfg),
+            "CTA " + std::to_string(cfg.cta.m) + "x" +
+                std::to_string(cfg.cta.n) + "x" +
+                std::to_string(cfg.cta.k) + "; warp " +
+                std::to_string(cfg.warp.m) + "x" +
+                std::to_string(cfg.warp.n) + "x" +
+                std::to_string(cfg.warp.k) + "; instruction " +
+                std::to_string(cfg.instr.m) + "x" +
+                std::to_string(cfg.instr.n) + "x" +
+                std::to_string(cfg.instr.k)});
+      }
+      const std::string state =
+          "matmul.hopper_tile.v1\nm_extent=" + std::to_string(m) +
+          "\nn_extent=" + std::to_string(n) +
+          "\nk_extent=" + std::to_string(k) +
+          "\nsm_count=" + std::to_string(num_sms) +
+          "\nsmem_per_block_bytes=" + std::to_string(smem_bytes);
+      const auto native_it = std::find_if(
+          legal_configs.begin(), legal_configs.end(), [&](const TileConfig& cfg) {
+            return cfg.cta.m == best_config.cta.m &&
+                cfg.cta.n == best_config.cta.n &&
+                cfg.cta.k == best_config.cta.k &&
+                cfg.warp.n == best_config.warp.n;
+          });
+      if (jev_mode == scheduler::jev::Mode::Record &&
+          native_it == legal_configs.end()) {
+        scheduler::jev::recordCoverageSkip(
+            "MM1.tile", "legacy winner is outside the native-valid tile menu");
+      } else {
+        const std::string selected = scheduler::jev::chooseDecision(
+            "MM1.tile",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? choice_id(*native_it)
+                                                      : "");
+        const auto selected_it = std::find_if(
+            legal_configs.begin(), legal_configs.end(), [&](const TileConfig& cfg) {
+              return choice_id(cfg) == selected;
+            });
+        NVF_ERROR(
+            selected_it != legal_configs.end(),
+            "MM1.tile response is outside the native-valid tile menu");
+        best_config = *selected_it;
       }
     }
   }
