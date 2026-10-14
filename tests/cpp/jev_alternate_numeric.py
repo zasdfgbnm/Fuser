@@ -97,7 +97,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False,
                            require_inner3d_width: bool = False,
-                           require_inner3d_outer_unroll: bool = False) -> dict[str, Any]:
+                           require_inner3d_outer_unroll: bool = False,
+                           require_iop3_tmp_write: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -502,6 +503,17 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent warp comparison issues: {issues}")
+    elif require_iop3_tmp_write:
+        if (site != "IOP3.tmp_write_width" or event["native"] != "w4" or
+                alternate != "w2" or set(event["candidates"]) != {"w2", "w4"}):
+            raise ValueError("inner-outer fixture lacks its checked write-width menu")
+        ctas = [row for row in report["multiplicity"]
+                if row["site"] == "IOP3.cta"]
+        if (len(ctas) != 1 or ctas[0]["record"] != ctas[0]["remote"] or
+                sum(ctas[0]["record"].values()) != 1):
+            raise ValueError(f"write width changed the preceding CTA plan: {ctas}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected inner-outer width issues: {issues}")
     elif issues != [intended]:
         raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
@@ -533,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
     parser.add_argument("--require-inner3d-outer-unroll", action="store_true")
+    parser.add_argument("--require-iop3-tmp-write", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -638,7 +651,8 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,
-            require_inner3d_outer_unroll=args.require_inner3d_outer_unroll)
+            require_inner3d_outer_unroll=args.require_inner3d_outer_unroll,
+            require_iop3_tmp_write=args.require_iop3_tmp_write)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)

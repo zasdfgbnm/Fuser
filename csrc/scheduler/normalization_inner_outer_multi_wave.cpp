@@ -533,6 +533,72 @@ void getHeuristics(
   // check all the parameters in InnerOuterParams are set.
   iop.verify();
 
+  // The CTA choice has fixed the inner vector, batch, grid, and outer read
+  // width. A narrower vector store to the partial-result buffer keeps those
+  // dimensions unchanged. Preserve the read-width <= write-width invariant
+  // checked for each IOP3 CTA plan above; smaller power-of-two stores divide
+  // the same aligned inner vector and cannot increase the access size.
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool valid_width_bounds =
+        tmp_gmem_dtype_size_bit >= 8 && tmp_gmem_dtype_size_bit <= 128 &&
+        (tmp_gmem_dtype_size_bit & (tmp_gmem_dtype_size_bit - 1)) == 0 &&
+        iop.inner_vect >= 1 && iop.inner_vect <= 128 &&
+        (iop.inner_vect & (iop.inner_vect - 1)) == 0 &&
+        inner_dim_numel > 0 && inner_dim_numel % iop.inner_vect == 0 &&
+        iop.vectorization_factor_outer >= 1 &&
+        (iop.vectorization_factor_outer &
+         (iop.vectorization_factor_outer - 1)) == 0;
+    const int64_t hard_max = valid_width_bounds
+        ? std::min<int64_t>(
+              128 / (int64_t)tmp_gmem_dtype_size_bit, iop.inner_vect)
+        : 0;
+    const bool native_in_bounds =
+        valid_width_bounds && hard_max >= iop.vectorization_factor_outer &&
+        hard_max == iop.tmp_gmem_write_vect &&
+        hard_max % iop.vectorization_factor_outer == 0;
+    if (!native_in_bounds) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 temporary write width lacks proved vector bounds");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.tmp_write_width",
+          "native temporary write width lacks proved vector bounds");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t width = iop.vectorization_factor_outer; width <= hard_max;
+           width *= 2) {
+        options.push_back(
+            {"w" + std::to_string(width),
+             "Write partial outer reduction to global memory with vector "
+             "width " + std::to_string(width)});
+      }
+      const std::string state =
+          "inner_outer_multi_wave.tmp_write_width.v1\ninner_dim=" +
+          std::to_string(inner_dim_numel) +
+          "\ninner_vector_width=" + std::to_string(iop.inner_vect) +
+          "\nouter_read_width=" +
+          std::to_string(iop.vectorization_factor_outer) +
+          "\ntmp_dtype_bits=" + std::to_string(tmp_gmem_dtype_size_bit);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP3.tmp_write_width",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "w" + std::to_string(iop.tmp_gmem_write_vect)
+              : "");
+      const auto option = std::find_if(
+          options.begin(), options.end(), [&](const auto& candidate) {
+            return candidate.id == selected;
+          });
+      NVF_ERROR(
+          option != options.end(),
+          "IOP3 temporary write width is outside proved bounds");
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        iop.tmp_gmem_write_vect = std::stoll(selected.substr(1));
+      }
+    }
+  }
+
   rparams->persistent_kernel = true;
   rparams->fastest_dim = true;
   rparams->combined_inner_outer = true;
