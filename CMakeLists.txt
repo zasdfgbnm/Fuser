@@ -1142,6 +1142,35 @@ if(BUILD_TEST)
       # A misspelled GTest filter exits successfully after running zero tests.
       FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
 
+  # Each remote test runs the same numerical GTests twice (native record and
+  # local API), then checks the complete decision exchange. The harness needs
+  # an explicit parity-module directory and CUDA loader from its environment;
+  # no machine-specific workspace path is embedded in this source tree.
+  function(add_jev_remote_numeric_test FAMILY GTEST_FILTER SITE_PREFIX)
+    set(TEST_NAME "jev_remote_numeric_${FAMILY}")
+    add_test(NAME ${TEST_NAME}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+        --binary "$<TARGET_FILE:test_nvfuser>"
+        --gtest-filter "${GTEST_FILTER}"
+        --case-key "${TEST_NAME}"
+        --site-prefix "${SITE_PREFIX}"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+    set_tests_properties(${TEST_NAME} PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  endfunction()
+  add_jev_remote_numeric_test(pointwise
+    "Gpu2Test.FusionPointwiseBroadcast_CUDA" "PW")
+  add_jev_remote_numeric_test(reduction
+    "Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA" "RD")
+  add_jev_remote_numeric_test(transpose
+    "TransposeTest.FusionScheduleTransposeSmall" "TR")
+  add_jev_remote_numeric_test(inner_persistent
+    "Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA" "IP")
+  add_jev_remote_numeric_test(outer_persistent
+    "Gpu3Test.TemplateFunctionTypeMismatch" "OP")
+  add_jev_remote_numeric_test(inner_outer_persistent
+    "CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv" "IOP")
+
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()
 
