@@ -11,6 +11,7 @@
 
 #include <fusion_profiler.h>
 #include <scheduler/all_schedulers.h>
+#include <scheduler/resize_heuristic.h>
 #include <tests/cpp/utils.h>
 
 #include <sstream>
@@ -127,6 +128,15 @@ std::string toString(const std::unique_ptr<HeuristicParams>& params) {
   auto tparams = dynamic_cast<const TransposeParams*>(params.get());
   if (tparams) {
     return toString(tparams);
+  }
+  auto resize_params = dynamic_cast<const ResizeParams*>(params.get());
+  if (resize_params) {
+    std::stringstream ss;
+    ss << "Resize / vectorization factor: "
+       << resize_params->vectorization_factor
+       << " / largest input: " << resize_params->largest_input
+       << " / split grid x: " << resize_params->split_grid_x_dim;
+    return ss.str();
   }
   NVF_THROW(
       "Unknown heuristic parameter type. Did you just added a new heuristic "
