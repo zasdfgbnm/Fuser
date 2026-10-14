@@ -6004,6 +6004,41 @@ TEST_F(Gpu1Test, JevAlternateInner3dCtaTarget_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// On SM89 this layout makes two raw inner-reduction grid pieces across 65
+// outputs. Native ragged-wave cleanup folds the grid to one piece; the remote
+// alternate keeps both complete grids and must still match the ATen sum.
+TEST_F(Gpu1Test, JevAlternateInner3dGridWave_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({2, 65, 8192}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(
+      rparams->cross_grid_inner_reduction,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Hold the native 3D reduction block/grid plan fixed while the local API
 // chooses a smaller, still aligned vector width for its innermost axis.
 TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {

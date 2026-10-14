@@ -1576,6 +1576,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         (int64_t)1);
   }
 
+  const int64_t raw_inner_grid = gridim;
   // Try to do some cleanup of ragged waves on device, don't do this if we're
   // trying to do a 3D schedule. godim is a remainder of a split, so can only
   // control gridim
@@ -1597,6 +1598,42 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         // and difference is less than 25% of the original number of blocks
         ((new_gridim * godim) - (gridim * godim)) * 4 < gridim * godim) {
       gridim = new_gridim;
+    }
+  }
+
+  // RD5.grid offers the raw grid alongside the native ragged-wave cleanup.
+  // Both plans use the same completed CTA and reduction unroll. Restrict the
+  // offer to one output per CTA and no output unroll, so neither plan can hit
+  // the unsupported 3D fallback or change the grid-unroll rollback below.
+  // The native grid construction above remains exact in Off and Record modes.
+  if (jev_mode_3d != scheduler::jev::Mode::Off &&
+      raw_inner_grid > gridim && gridim >= 1 &&
+      raw_inner_grid <= 1024 && bdimy == 1 && grodim == 1 &&
+      iter_unroll_factor == 1 && total_iteration_numel == godim &&
+      godim >= 1 && godim <= scheduler_utils::y_grid_limit &&
+      device_multiprocessor_count >= 1 &&
+      device_multiprocessor_count <= 256) {
+    const std::string state =
+        "reduction.inner3d_grid_wave.v1\nraw_inner_grid=" +
+        std::to_string(raw_inner_grid) +
+        "\noutput_grid=" + std::to_string(godim) +
+        "\nouter_grid=" + std::to_string(grodim) +
+        "\noutput_threads=" + std::to_string(bdimy) +
+        "\noutput_unroll=" + std::to_string(iter_unroll_factor) +
+        "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+        "\nmax_grid_x=" + std::to_string(scheduler_utils::x_grid_limit) +
+        "\nmax_grid_y=" + std::to_string(scheduler_utils::y_grid_limit);
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"raw", "Keep the complete raw inner-reduction grid"},
+        {"clean", "Use the native ragged-wave inner-reduction grid"}};
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD5.grid", state, options,
+        jev_mode_3d == scheduler::jev::Mode::Record ? "clean" : "");
+    NVF_ERROR(
+        selected == "raw" || selected == "clean",
+        "RD5.grid response exceeds native bounds");
+    if (selected == "raw") {
+      gridim = raw_inner_grid;
     }
   }
 

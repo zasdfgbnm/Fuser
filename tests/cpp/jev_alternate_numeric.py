@@ -638,6 +638,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner_cta_envelope: bool = False,
                            require_inner3d_warp_target: bool = False,
                            require_inner3d_cta_target: bool = False,
+                           require_inner3d_grid_wave: bool = False,
                            require_inner_width: bool = False,
                            require_inner_batch_cap: bool = False,
                            require_inner_targets: bool = False,
@@ -1092,6 +1093,25 @@ def check_alternate_report(report: dict[str, Any],
                     *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
+    elif require_inner3d_grid_wave:
+        if (site != "RD5.grid" or event["native"] != "clean" or
+                alternate != "raw" or
+                set(event["candidates"]) != {"raw", "clean"}):
+            raise ValueError("3D grid fixture lacks both complete grid plans")
+        fields = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "reduction.inner3d_grid_wave.v1")
+        if any(fields.get(key) != value for key, value in {
+                "raw_inner_grid": "2", "output_grid": "65",
+                "outer_grid": "1", "output_threads": "1",
+                "output_unroll": "1", "sm_count": "128"}.items()):
+            raise ValueError(f"3D grid fixture escaped the proved shape: {fields}")
+        for row in report["multiplicity"]:
+            if row["site"] != site and (
+                    row["record"] != row["remote"] or
+                    sum(row["record"].values()) != 1):
+                raise ValueError(f"3D grid changed unrelated decision: {row}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected 3D grid comparison issues: {issues}")
     elif require_inner3d_cta_target:
         if (site != "RD5.cta" or event["native"] != "t32" or
                 alternate != "t64" or
@@ -1781,6 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-cta-envelope", action="store_true")
     parser.add_argument("--require-inner3d-warp-target", action="store_true")
     parser.add_argument("--require-inner3d-cta-target", action="store_true")
+    parser.add_argument("--require-inner3d-grid-wave", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner-batch-cap", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
@@ -1902,6 +1923,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner_cta_envelope=args.require_inner_cta_envelope,
             require_inner3d_warp_target=args.require_inner3d_warp_target,
             require_inner3d_cta_target=args.require_inner3d_cta_target,
+            require_inner3d_grid_wave=args.require_inner3d_grid_wave,
             require_inner_width=args.require_inner_width,
             require_inner_batch_cap=args.require_inner_batch_cap,
             require_inner3d_warp=args.require_inner3d_warp,
