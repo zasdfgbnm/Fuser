@@ -849,7 +849,8 @@ bool inner3dWarpPlanIsSafe(
     int64_t logical_warp,
     int64_t sm_count,
     int64_t max_threads_per_sm,
-    int64_t max_threads_per_block) {
+    int64_t max_threads_per_block,
+    int64_t requested_target_threads = 0) {
   // Keep every intermediate product bounded, and fix the vector work budget
   // to four. Other shapes retain the native heuristic without a warp request.
   if (reduction_numel <= inner_numel || reduction_numel > 4096 ||
@@ -897,6 +898,14 @@ bool inner3dWarpPlanIsSafe(
         div(max_threads_per_sm, 4));
   }
   target_threads = div(target_threads, logical_warp) * logical_warp;
+  if (requested_target_threads != 0) {
+    if (requested_target_threads < logical_warp ||
+        requested_target_threads % logical_warp != 0 ||
+        requested_target_threads > max_threads_per_block) {
+      return false;
+    }
+    target_threads = requested_target_threads;
+  }
   if (target_threads < 1 || target_threads > max_threads_per_block) {
     return false;
   }
@@ -1152,6 +1161,81 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   if (target_threads_in_block % min_warp_size != 0) {
     target_threads_in_block +=
         min_warp_size - target_threads_in_block % min_warp_size;
+  }
+
+  // The four-wave/quarter-SM CTA target is a performance preference. Keep
+  // native arithmetic above for Record mode, then let Remote choose among
+  // nearby targets whose *complete* downstream 3D plans pass native checks.
+  // In particular, the preflight covers physical CTA size, all later output
+  // unroll choices, grid extents, and the unsupported 3D-to-2D fallback.
+  if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
+      min_warp_size >= 1 && min_warp_size <= 16 &&
+      target_threads_in_block >= min_warp_size &&
+      target_threads_in_block <= dev_prop->maxThreadsPerBlock) {
+    const int64_t native_target = target_threads_in_block;
+    std::vector<int64_t> nearby_targets = {native_target};
+    if (native_target / 2 >= min_warp_size &&
+        (native_target / 2) % min_warp_size == 0) {
+      nearby_targets.push_back(native_target / 2);
+    }
+    if (native_target <= dev_prop->maxThreadsPerBlock / 2) {
+      nearby_targets.push_back(native_target * 2);
+    }
+    std::sort(nearby_targets.begin(), nearby_targets.end());
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::string hard_valid_targets;
+    for (const int64_t candidate : nearby_targets) {
+      if (!inner3dWarpPlanIsSafe(
+              total_reduction_numel,
+              total_iteration_numel,
+              inner_most_dimension_numel,
+              min_warp_size,
+              device_multiprocessor_count,
+              max_threads_per_sm,
+              dev_prop->maxThreadsPerBlock,
+              candidate)) {
+        continue;
+      }
+      if (!hard_valid_targets.empty()) {
+        hard_valid_targets += ",";
+      }
+      hard_valid_targets += std::to_string(candidate);
+      options.push_back(
+          {"t" + std::to_string(candidate),
+           "Target " + std::to_string(candidate) +
+               " threads in the completed 3D CTA plan"});
+    }
+    if (options.size() > 1 &&
+        std::any_of(options.begin(), options.end(), [&](const auto& option) {
+          return option.id == "t" + std::to_string(native_target);
+        })) {
+      const std::string state =
+          "reduction.inner3d_cta_target.v1\nreduction_numel=" +
+          std::to_string(total_reduction_numel) +
+          "\niteration_numel=" + std::to_string(total_iteration_numel) +
+          "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
+          "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+          "\nmax_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) +
+          "\nvector_width=" + std::to_string(vectorize_factor) +
+          "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+          "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+          "\nmax_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) +
+          "\nlogical_warp=" + std::to_string(min_warp_size) +
+          "\nhard_valid_targets=" + hard_valid_targets;
+      const auto selected = scheduler::jev::chooseDecision(
+          "RD5.cta", state, options,
+          jev_mode_warp == scheduler::jev::Mode::Record
+              ? "t" + std::to_string(native_target)
+              : "");
+      const auto found = std::find_if(
+          options.begin(), options.end(), [&](const auto& option) {
+            return option.id == selected;
+          });
+      NVF_ERROR(found != options.end(), "RD5.cta exceeds preflighted 3D plans");
+      target_threads_in_block = std::stoll(selected.substr(1));
+    }
   }
 
   // To get to target threads:
