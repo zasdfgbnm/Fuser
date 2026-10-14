@@ -11,6 +11,7 @@
 #include <ir/utils.h>
 #include <ops/all_ops.h>
 #include <runtime/fusion_kernel_runtime.h>
+#include <tests/cpp/utils.h>
 
 #include <ATen/ATen.h>
 #include <benchmark/benchmark.h>
