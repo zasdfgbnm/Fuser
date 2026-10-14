@@ -489,27 +489,118 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
     inner_most_pos1_in_ref1 = to_update[0];
     inner_most_pos2_in_ref1 = to_update[1];
 
-    tparams->vectorize_factor1 =
-        vectorize_helper::getVectorizationFactorTransposeGroup(
+    auto choose_group_width = [&](int64_t group,
+                                  int64_t inner_dim,
+                                  const std::vector<int64_t>& merged_dims,
+                                  const std::vector<TensorView*>& group_tvs)
+        -> int64_t {
+      if (jev_mode == scheduler::jev::Mode::Off) {
+        return vectorize_helper::getVectorizationFactorTransposeGroup(
             runtime_info,
             reference1,
-            inner_most_pos1_in_ref1,
-            tparams->dims_merged_with_1,
-            grouped_inputs_outputs[0],
+            inner_dim,
+            merged_dims,
+            group_tvs,
             max_unroll_factor);
+      }
+
+      // The mapper, not the API, determines which contiguous inner regions
+      // each tensor can vectorize. All smaller powers of two remain legal.
+      const auto mapped_sizes =
+          vectorize_helper::getTransposeGroupContiguousInnerSizes(
+              runtime_info, reference1, inner_dim, merged_dims, group_tvs);
+      NVF_ERROR(!mapped_sizes.empty(), "Transpose group has no I/O tensors");
+      int64_t max_legal =
+          scheduler_utils::maxVectorizationWidth(max_unroll_factor);
+      for (auto size : mapped_sizes) {
+        NVF_ERROR(size > 0, "Transpose contiguous inner size must be positive");
+        max_legal = std::min(
+            max_legal, scheduler_utils::maxVectorizationWidth(size));
+      }
+      NVF_ERROR(max_legal > 0, "Transpose vector width must be positive");
+
+      // With a normal cap, TR2.unroll has already limited each width to the
+      // tile work and 16 bytes per widest I/O type. The legacy zero helper
+      // input is different: it means an effectively unbounded cap, not width 0.
+      const bool legacy_zero_cap = max_unroll_factor == 0;
+      if (!legacy_zero_cap) {
+        NVF_ERROR(
+            max_legal <=
+                    (int64_t)tparams->tile_size1 * tparams->tile_size2 &&
+                max_legal <= kSixteen / max_io_dtype_size,
+            "Transpose group width exceeds native tile or byte bound");
+      }
+
+      std::vector<scheduler::jev::ChoiceOption> options;
+      if (legacy_zero_cap) {
+        // Retain the original helper's exact sentinel behavior; no new
+        // width above the original result or zero-width option is exposed.
+        options.push_back(
+            {"w" + std::to_string(max_legal),
+             "Use the only legacy-zero-cap group width"});
+      } else {
+        for (int64_t factor = 1; factor <= max_legal; factor *= 2) {
+          options.push_back(
+              {"w" + std::to_string(factor),
+               "Vectorize this transpose group by " + std::to_string(factor)});
+        }
+      }
+
+      std::string state =
+          "transpose.group_width.v1\ngroup=" + std::to_string(group) +
+          "\nmax_unroll_input=" + std::to_string(max_unroll_factor) +
+          "\nmax_io_dtype_bytes=" + std::to_string(max_io_dtype_size) +
+          "\ntile1=" + std::to_string(tparams->tile_size1) +
+          "\ntile2=" + std::to_string(tparams->tile_size2) +
+          "\nmapped_sizes=";
+      for (size_t i = 0; i < mapped_sizes.size(); ++i) {
+        if (i != 0) {
+          state += ',';
+        }
+        state += std::to_string(mapped_sizes[i]);
+      }
+
+      std::string native_choice;
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        const int64_t native_width =
+            vectorize_helper::getVectorizationFactorTransposeGroup(
+                runtime_info,
+                reference1,
+                inner_dim,
+                merged_dims,
+                group_tvs,
+                max_unroll_factor);
+        NVF_ERROR_EQ(native_width, max_legal);
+        native_choice = "w" + std::to_string(native_width);
+      }
+      const auto selected = scheduler::jev::chooseDecision(
+          "TR2.width" + std::to_string(group),
+          state,
+          options,
+          native_choice);
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          return std::stoll(selected.substr(1));
+        }
+      }
+      NVF_THROW("TR2 group width response is outside native hard bounds");
+    };
+
+    tparams->vectorize_factor1 = choose_group_width(
+        1,
+        inner_most_pos1_in_ref1,
+        tparams->dims_merged_with_1,
+        grouped_inputs_outputs[0]);
 
     // TODO: Since group2 only has global->shared and shared->global set op, we
     // can have fine-grained control of unroll/vectorization at per tensor
     // level. We should not be using a single global vectorize factor for the
     // entire group 2
-    tparams->vectorize_factor2 =
-        vectorize_helper::getVectorizationFactorTransposeGroup(
-            runtime_info,
-            reference1,
-            inner_most_pos2_in_ref1,
-            tparams->dims_merged_with_2,
-            grouped_inputs_outputs[1],
-            max_unroll_factor);
+    tparams->vectorize_factor2 = choose_group_width(
+        2,
+        inner_most_pos2_in_ref1,
+        tparams->dims_merged_with_2,
+        grouped_inputs_outputs[1]);
   }
 
   tparams->lparams.bind(tparams->getThreadsPerBlock(), ParallelType::TIDx);
