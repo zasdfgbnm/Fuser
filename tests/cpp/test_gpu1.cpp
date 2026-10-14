@@ -5951,7 +5951,7 @@ TEST_F(Gpu1Test, JevAlternateInner3dCtaTarget_CUDA) {
       rparams->lparams.bdimz(),
       scheduler::jev::mode() == scheduler::jev::Mode::Remote
           ? 2
-          : LaunchParams::UNINITIALIZED_VAL);
+          : 1);
   auto reference =
       aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
   testValidate(
