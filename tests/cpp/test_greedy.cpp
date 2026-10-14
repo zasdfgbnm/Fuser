@@ -826,6 +826,33 @@ TEST_F(GreedySchedulerTest, JevAlternateArgsortBatch_CUDA) {
       testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
 }
 
+// Force an exact-divisible alternate batch for a single Scatter. The
+// reference checks that values follow the permutation, not just that the
+// output has the expected shape.
+TEST_F(GreedySchedulerTest, JevAlternateScatterBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  constexpr int64_t size = 2048;
+  auto index_tv = makeContigConcreteTensor({size}, DataType::Int);
+  fusion.addInput(index_tv);
+  auto base_tv = zeros({IrBuilder::create<Val>(size)}, DataType::Int);
+  auto source_tv = arange(
+      fusion.zeroVal(DataType::Int),
+      IrBuilder::create<Val>(size, DataType::Int),
+      DataType::Int);
+  auto out_tv = scatter(base_tv, 0, index_tv, source_tv);
+  fusion.addOutput(out_tv);
+
+  auto index = at::randperm(
+      size, at::TensorOptions().dtype(at::kLong).device(at::kCUDA, 0));
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({index});
+  testValidate(executor_cache.fusion(), outputs, {index}, __LINE__, __FILE__);
+  EXPECT_FALSE(executor_cache.getMostRecentKernelRuntime()->isSegmented());
+}
+
 TEST_P(GreedySchedulerTestConstraintSize, ScanLargeConstrainedIDs) {
   auto fusion_ptr = std::make_unique<Fusion>();
   Fusion& fusion = *fusion_ptr.get();

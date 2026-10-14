@@ -863,6 +863,8 @@ class HeuristicsBuilder : private IterVisitor {
         constrained_ops.front()->isA<ScanOp>();
     single_argsort_ = constrained_ops.size() == 1 &&
         constrained_ops.front()->isA<ArgsortOp>();
+    single_scatter_ = constrained_ops.size() == 1 &&
+        constrained_ops.front()->isA<ScatterOp>();
 
     traverse(fusion);
   }
@@ -900,12 +902,23 @@ class HeuristicsBuilder : private IterVisitor {
     // ConstrainedOpScheduler::handle(ScatterOp*).
     auto out_tv = ir_utils::getTvOutput(scatter);
     auto inp_tv = ir_utils::getTvInput(scatter);
-    addHeuristicsFor(out_tv, out_tv->domain()->initialLoop(), {scatter->dim()});
+    const auto shared_batch = chooseSingleScatterBatch(scatter);
+    addHeuristicsFor(
+        out_tv,
+        out_tv->domain()->initialLoop(),
+        {scatter->dim()},
+        /*consumer=*/nullptr,
+        /*allow_scan_choice=*/false,
+        /*argsort_input=*/nullptr,
+        shared_batch);
     addHeuristicsFor(
         inp_tv,
         TensorDomain::noReductions(inp_tv->getLogicalDomain()),
         {scatter->dim()},
-        out_tv);
+        out_tv,
+        /*allow_scan_choice=*/false,
+        /*argsort_input=*/nullptr,
+        shared_batch);
   }
 
   void handle(TopKOp* topk) override {
@@ -919,6 +932,139 @@ class HeuristicsBuilder : private IterVisitor {
         TensorDomain::noReductions(inp_tv->getLogicalDomain()),
         {topk->dim()},
         out_tv);
+  }
+
+  // Scatter has two coupled parameter tuples: the output/index/src loop and
+  // the input/output-copy loop. A single exact Scatter with equally sized
+  // constrained domains can use one batch for both without changing the
+  // launch topology or introducing a partial serial tail.
+  std::optional<int64_t> chooseSingleScatterBatch(ScatterOp* scatter) {
+    const auto jev_mode = scheduler::jev::mode();
+    if (!single_scatter_ || jev_mode == scheduler::jev::Mode::Off ||
+        !scatter->exactSizes()) {
+      return std::nullopt;
+    }
+
+    auto out_tv = ir_utils::getTvOutput(scatter);
+    auto inp_tv = ir_utils::getTvInput(scatter);
+    auto index_tv = scatter->index()->as<TensorView>();
+    // The native scheduler keeps fusion outputs and their inputs in global
+    // memory. A non-global Scatter may need shared storage not priced here.
+    if (!out_tv->isFusionOutput()) {
+      return std::nullopt;
+    }
+
+    const auto dim = scatter->dim();
+    auto extent_of = [&](const std::vector<IterDomain*>& ids)
+        -> std::optional<int64_t> {
+      auto value = runtime_info_.expressionEvaluator().evaluate(
+          ids.at(dim)->extent());
+      if (!value.hasValue()) {
+        return std::nullopt;
+      }
+      return value.as<int64_t>();
+    };
+    const auto output_extent = extent_of(out_tv->domain()->initialLoop());
+    const auto input_extent =
+        extent_of(TensorDomain::noReductions(inp_tv->getLogicalDomain()));
+    const auto index_extent =
+        extent_of(TensorDomain::noReductions(index_tv->getLogicalDomain()));
+    if (!output_extent.has_value() || !input_extent.has_value() ||
+        !index_extent.has_value() || *output_extent <= 0 ||
+        *output_extent != *input_extent || *output_extent != *index_extent) {
+      return std::nullopt;
+    }
+    if (scatter->src()->isA<TensorView>()) {
+      const auto source_extent = extent_of(TensorDomain::noReductions(
+          scatter->src()->as<TensorView>()->getLogicalDomain()));
+      if (source_extent != output_extent) {
+        return std::nullopt;
+      }
+    }
+
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+    const int64_t max_threads_x = dev_prop->maxThreadsDim[0];
+    const int64_t warp_size = dev_prop->warpSize;
+    const int64_t input_bytes = dataTypeSizeByte(inp_tv->dtype());
+    const int64_t output_bytes = dataTypeSizeByte(out_tv->dtype());
+    const int64_t index_bytes = dataTypeSizeByte(index_tv->dtype());
+    const int64_t source_bytes = dataTypeSizeByte(scatter->src()->dtype());
+    const int64_t registers = dev_prop->regsPerBlock;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::vector<int64_t> batches;
+    if (*output_extent > 0 && max_threads > 0 && max_threads_x > 0 &&
+        input_bytes > 0 && output_bytes > 0 && index_bytes == 8 &&
+        source_bytes > 0) {
+      const int64_t native_batch = ceilDiv(*output_extent, max_threads);
+      const int64_t native_threads = ceilDiv(*output_extent, native_batch);
+      auto add_option = [&](int64_t batch, int64_t threads) {
+        options.push_back({
+            "b" + std::to_string(batch),
+            "Use " + std::to_string(batch) +
+                " Scatter items per thread with " +
+                std::to_string(threads) + " TIDx threads"});
+        batches.push_back(batch);
+      };
+      if (native_threads <= max_threads_x) {
+        add_option(native_batch, native_threads);
+        for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+          if (native_batch > std::numeric_limits<int64_t>::max() / factor) {
+            continue;
+          }
+          const int64_t batch = native_batch * factor;
+          if (*output_extent % batch != 0) {
+            continue;
+          }
+          const int64_t threads = *output_extent / batch;
+          // All four per-item values may be live near the Scatter. Count
+          // their bytes as registers and reserve twenty more per thread.
+          const int64_t bytes_per_item =
+              input_bytes + output_bytes + index_bytes + source_bytes;
+          if (warp_size != 32 || threads < warp_size ||
+              threads > max_threads || threads > max_threads_x ||
+              threads % warp_size != 0 ||
+              batch > (255 - 20) * 4 / bytes_per_item) {
+            continue;
+          }
+          const int64_t estimated_registers =
+              ceilDiv(batch * bytes_per_item, int64_t{4}) + 20;
+          if (estimated_registers > 255 ||
+              estimated_registers > registers / threads) {
+            continue;
+          }
+          add_option(batch, threads);
+        }
+      }
+    }
+
+    if (options.empty()) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "Unable to prove native Greedy Scatter CTA capacity");
+      return std::nullopt;
+    }
+    const std::string state =
+        "greedy.scatter_batch.v1\nextent=" + std::to_string(*output_extent) +
+        "\nmax_threads_per_block=" + std::to_string(max_threads) +
+        "\nmax_threads_x=" + std::to_string(max_threads_x) +
+        "\nwarp_size=" + std::to_string(warp_size) +
+        "\ninput_bytes=" + std::to_string(input_bytes) +
+        "\noutput_bytes=" + std::to_string(output_bytes) +
+        "\nindex_bytes=" + std::to_string(index_bytes) +
+        "\nsource_bytes=" + std::to_string(source_bytes) +
+        "\nregs_per_block=" + std::to_string(registers);
+    const auto selected = scheduler::jev::chooseDecision(
+        "GR1.scatter_batch",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? options.front().id : "");
+    const auto option_it = std::find_if(
+        options.begin(),
+        options.end(),
+        [&](const auto& option) { return option.id == selected; });
+    NVF_ERROR(option_it != options.end(), "Unknown Greedy Scatter batch");
+    return batches.at(std::distance(options.begin(), option_it));
   }
 
   // Make sure a given tensor has some heuristics parameters
@@ -939,7 +1085,8 @@ class HeuristicsBuilder : private IterVisitor {
       const std::vector<int64_t>& constrained_id_offsets,
       TensorView* consumer = nullptr,
       bool allow_scan_choice = false,
-      TensorView* argsort_input = nullptr) {
+      TensorView* argsort_input = nullptr,
+      std::optional<int64_t> batch_override = std::nullopt) {
     const bool as_consumer = consumer == nullptr;
 
     int64_t size_of_constrained_ids = 1;
@@ -960,7 +1107,7 @@ class HeuristicsBuilder : private IterVisitor {
     const int64_t bdim =
         at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock;
 
-    auto batch_size = ceilDiv(size_of_constrained_ids, bdim);
+    auto batch_size = batch_override.value_or(ceilDiv(size_of_constrained_ids, bdim));
 
     // With exactly one constrained Scan, its batch alone sets TIDx and its
     // Group extent. Other constrained ops may have coupled TIDx or CUB
@@ -1178,6 +1325,7 @@ class HeuristicsBuilder : private IterVisitor {
   std::unique_ptr<GreedyParams> params_;
   bool single_scan_ = false;
   bool single_argsort_ = false;
+  bool single_scatter_ = false;
 };
 
 // Propagate all reshape transformations throughout the fusion.
