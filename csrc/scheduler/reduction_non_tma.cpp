@@ -1279,6 +1279,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       rparams->vectorize_inner_reduction && fixed_inner_factor > 1 &&
       (fixed_inner_factor & (fixed_inner_factor - 1)) == 0 &&
       fixed_inner_factor <= static_cast<int64_t>(vectorize_factor) &&
+      vectorize_factor % static_cast<size_t>(fixed_inner_factor) == 0 &&
       inner_work_per_thread >= fixed_inner_factor) {
     std::vector<scheduler::jev::ChoiceOption> options;
     for (int64_t width = 1; width <= fixed_inner_factor; width *= 2) {
