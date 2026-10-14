@@ -7384,6 +7384,48 @@ TEST_F(Gpu1Test, FusionMagicSchedulerRMSNormalization_CUDA) {
       "");
 }
 
+// On SM89 the original 2D register policy stops at batch 10, while batch 12
+// has a complete CTA/register/grid plan. Exercise both choices numerically.
+TEST_F(Gpu1Test, JevAlternateInnerRegisterBatchCap_CUDA) {
+  constexpr int64_t norm_size = 8192;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  auto result =
+      rms_norm(input, {norm_size}, nullptr, IrBuilder::create<Val>(eps));
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.invstd);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, norm_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    ASSERT_EQ(rparams->batches_per_block_inner_reduction, 12);
+  } else {
+    ASSERT_LE(rparams->batches_per_block_inner_reduction, 10);
+  }
+
+  auto squared = at::pow(aten_input.to(at::kDouble), 2);
+  auto invstd = at::pow(squared.mean(-1, true) + eps, -0.5);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {aten_input.to(at::kDouble) * invstd, invstd},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 TEST_F(Gpu1Test, FusionMagicSchedulerBatchNormalization_CUDA) {
   if (!deviceMajorMinorCheck(7)) {
     GTEST_SKIP() << "skipping tests on pre-Volta GPUs";

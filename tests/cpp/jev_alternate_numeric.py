@@ -587,6 +587,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_warp_target: bool = False,
                            require_inner3d_cta_target: bool = False,
                            require_inner_width: bool = False,
+                           require_inner_batch_cap: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False,
@@ -1174,6 +1175,25 @@ def check_alternate_report(report: dict[str, Any],
                     *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer warp issues: {issues}")
+    elif require_inner_batch_cap:
+        if (site != "IP5.batch" or alternate != "b12" or
+                event["native"] == alternate):
+            raise ValueError("register batch cap fixture lacks a non-native choice")
+        lines = event["state"].splitlines()
+        if not lines or lines[0] != "inner_persistent.reg_batch.v3":
+            raise ValueError("expected the extended register batch state")
+        fields = dict(line.split("=", 1) for line in lines[1:]
+                      if not line.startswith("plan="))
+        lower = int(fields["batch_min"])
+        original = int(fields["native_batch_max"])
+        upper = int(fields["batch_max"])
+        if (fields["parallel_after_vectorize"] != "2048" or
+                original != 10 or upper < 12 or
+                set(event["candidates"]) != {
+                    f"b{batch}" for batch in range(lower, upper + 1)} or
+                int(event["native"][1:]) > original or
+                issues != [intended]):
+            raise ValueError("register batch cap did not preserve its baseline")
     elif require_inner_width:
         if (site != "IP5.width" or event["native"] != "w4" or
                 alternate != "w1" or
@@ -1576,6 +1596,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-warp-target", action="store_true")
     parser.add_argument("--require-inner3d-cta-target", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
+    parser.add_argument("--require-inner-batch-cap", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -1693,6 +1714,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_warp_target=args.require_inner3d_warp_target,
             require_inner3d_cta_target=args.require_inner3d_cta_target,
             require_inner_width=args.require_inner_width,
+            require_inner_batch_cap=args.require_inner_batch_cap,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,

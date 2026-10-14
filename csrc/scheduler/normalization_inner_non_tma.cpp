@@ -491,7 +491,7 @@ void innerPersistentHeuristic2DPlan(
   // Keep the original, ascending-batch candidate order for the Choice
   // request. The native stable sort below would otherwise put its winner
   // first and reveal the preference to the service.
-  const std::vector<NormInnerParams> candidate_heuristics =
+  std::vector<NormInnerParams> candidate_heuristics =
       jev_mode == scheduler::jev::Mode::Off && policy_resources == nullptr
       ? std::vector<NormInnerParams>{}
       : all_heuristics;
@@ -520,60 +520,106 @@ void innerPersistentHeuristic2DPlan(
   }
 
   if (jev_mode != scheduler::jev::Mode::Off || policy_resources != nullptr) {
-    // getMaxPersistentBatch caps the upper batch bound at 10 or 12. If the
-    // physical-block lower bound exceeds that cap, max becomes min, yielding
-    // a singleton. Thus at most 12 plans enter the 255-option/64-KiB client.
-    // Recheck every plan before offering it, not only the returned selection.
-    const bool supported_menu = !candidate_heuristics.empty() &&
+    // Validate a complete 2D schedule, including its physical CTA, register
+    // allocation and grid, before it can appear in a Choice request.
+    const auto supported_plan = [&](const NormInnerParams& candidate) {
+      if (candidate.persistent_batch_size <= 0 || candidate.bdimx <= 0 ||
+          candidate.bdimx > max_threads_in_block || candidate.bdimy <= 0 ||
+          candidate.bdimy > max_threads_in_block ||
+          candidate.padded_bdimx < candidate.bdimx ||
+          candidate.padded_bdimx > max_threads_in_block + threads_per_warp) {
+        return false;
+      }
+      const int64_t padded_threads = candidate.padded_bdimx * candidate.bdimy;
+      const bool should_pad =
+          candidate.bdimx > 16 && padded_threads <= max_threads_in_block;
+      const int64_t threads =
+          should_pad ? padded_threads : candidate.bdimx * candidate.bdimy;
+      const int64_t buffer_registers = buffer_bits_per_batch *
+          candidate.persistent_batch_size / scheduler_utils::bits_per_register;
+      const int64_t godim =
+          ceilDiv(properties.total_iteration_numel, candidate.bdimy);
+      const int64_t grid_x_limit = scheduler_utils::x_grid_limit;
+      const int64_t grid_y_limit = std::min<int64_t>(
+          scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]);
+      return candidate.is_pad_bdimx == should_pad && threads > 0 &&
+          threads <= max_threads_in_block &&
+          candidate.bdimx <= dev_prop->maxThreadsDim[0] &&
+          candidate.bdimy <= dev_prop->maxThreadsDim[1] &&
+          candidate.register_per_thread > 0 &&
+          candidate.register_per_thread <= 255 &&
+          candidate.register_per_thread <= dev_prop->regsPerBlock / threads &&
+          candidate.register_per_thread >=
+          buffer_registers + register_overhead &&
+          godim > 0 && grid_x_limit > 0 && grid_y_limit > 0 &&
+          (godim <= dev_prop->maxGridSize[0] ||
+           (godim > grid_x_limit &&
+            grid_x_limit <= dev_prop->maxGridSize[0])) &&
+          ceilDiv(godim, grid_x_limit) <= grid_y_limit;
+    };
+    // Keep the original capped range as the native decision domain. The
+    // empirical 10/12 limit is not a resource bound: in Jev modes, extend the
+    // offered menu through the target-occupancy register budget when complete
+    // plans pass the same hard checks. Off and Record still pick the original
+    // native winner; the API may choose a proved larger batch.
+    const int64_t native_batch_max = batches_per_block_inner_reduction_max;
+    const bool supported_native_menu = !candidate_heuristics.empty() &&
         candidate_heuristics.size() <= 12 &&
         std::all_of(
             candidate_heuristics.begin(),
             candidate_heuristics.end(),
-            [&](const NormInnerParams& candidate) {
-              if (candidate.persistent_batch_size <= 0 ||
-                  candidate.bdimx <= 0 ||
-                  candidate.bdimx > max_threads_in_block ||
-                  candidate.bdimy <= 0 ||
-                  candidate.bdimy > max_threads_in_block ||
-                  candidate.padded_bdimx < candidate.bdimx ||
-                  candidate.padded_bdimx >
-                      max_threads_in_block + threads_per_warp) {
-                return false;
-              }
-              const int64_t padded_threads =
-                  candidate.padded_bdimx * candidate.bdimy;
-              const bool should_pad = candidate.bdimx > 16 &&
-                  padded_threads <= max_threads_in_block;
-              const int64_t threads = should_pad
-                  ? padded_threads
-                  : candidate.bdimx * candidate.bdimy;
-              const int64_t buffer_registers = buffer_bits_per_batch *
-                  candidate.persistent_batch_size /
-                  scheduler_utils::bits_per_register;
-              const int64_t godim =
-                  ceilDiv(properties.total_iteration_numel, candidate.bdimy);
-              const int64_t grid_x_limit = scheduler_utils::x_grid_limit;
-              const int64_t grid_y_limit = std::min<int64_t>(
-                  scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]);
-              return candidate.is_pad_bdimx == should_pad && threads > 0 &&
-                  threads <= max_threads_in_block &&
-                  candidate.bdimx <= dev_prop->maxThreadsDim[0] &&
-                  candidate.bdimy <= dev_prop->maxThreadsDim[1] &&
-                  candidate.register_per_thread > 0 &&
-                  candidate.register_per_thread <= 255 &&
-                  candidate.register_per_thread <=
-                  dev_prop->regsPerBlock / threads &&
-                  candidate.register_per_thread >=
-                  buffer_registers + register_overhead &&
-                  godim > 0 && grid_x_limit > 0 && grid_y_limit > 0 &&
-                  (godim <= dev_prop->maxGridSize[0] ||
-                   (godim > grid_x_limit &&
-                    grid_x_limit <= dev_prop->maxGridSize[0])) &&
-                  ceilDiv(godim, grid_x_limit) <= grid_y_limit;
-            });
+            supported_plan);
+    if (jev_mode != scheduler::jev::Mode::Off && supported_native_menu &&
+        buffer_bits_per_batch > 0) {
+      const int64_t register_budget =
+          getRegPerThreadGivenThreadsPerSM(target_threads_per_sm) -
+          register_overhead;
+      if (register_budget > 0) {
+        const int64_t uncapped_max = std::min(
+            pbs_max_1,
+            register_budget * scheduler_utils::bits_per_register /
+                buffer_bits_per_batch);
+        for (int64_t pbs = native_batch_max + 1;
+             pbs <= uncapped_max && candidate_heuristics.size() < 255;
+             ++pbs) {
+          auto plan = getNormInnerParamsGivenPerisisentBatchSize(
+              parallel_after_vectorize,
+              properties.total_iteration_numel,
+              max_multi_reduction_factor,
+              min_threads_per_block,
+              buffer_bits_per_batch,
+              target_warps_per_sm,
+              register_overhead,
+              pbs);
+          // The later persistent split uses ceil(reduction / batch) as its
+          // physical TIDx extent. The legacy score estimates floor instead;
+          // require both to produce the same physical CTA for a new plan.
+          const int64_t actual_bdimx = ceilDiv(parallel_after_vectorize, pbs);
+          const int64_t actual_padded_bdimx =
+              ceilDiv(actual_bdimx, threads_per_warp) * threads_per_warp;
+          const bool same_physical_cta = plan.is_pad_bdimx
+              ? actual_padded_bdimx == plan.padded_bdimx
+              : actual_bdimx == plan.bdimx;
+          // A contiguous menu lets the service verify that no cheaper batch
+          // was silently omitted. Stop at the first unsupported plan.
+          if (!same_physical_cta || actual_bdimx > dev_prop->maxThreadsDim[0] ||
+              !supported_plan(plan)) {
+            break;
+          }
+          candidate_heuristics.push_back(plan);
+        }
+      }
+    }
+    const bool supported_menu = supported_native_menu &&
+        candidate_heuristics.size() <= 255 &&
+        std::all_of(candidate_heuristics.begin(),
+                    candidate_heuristics.end(),
+                    supported_plan);
     if (policy_resources != nullptr) {
       policy_resources->batch_min = batches_per_block_inner_reduction_min;
-      policy_resources->batch_max = batches_per_block_inner_reduction_max;
+      policy_resources->batch_max = candidate_heuristics.empty()
+          ? native_batch_max
+          : candidate_heuristics.back().persistent_batch_size;
       policy_resources->supported_menu = supported_menu;
     }
     // Candidate preflight has no nested Choice or log side effect.
@@ -589,8 +635,13 @@ void innerPersistentHeuristic2DPlan(
         // limits. The service gets unranked measurements and independently
         // applies the empirical comparison; it never receives the native
         // winner.
-        std::string state =
-            "inner_persistent.reg_batch.v2\nparallel_after_vectorize=" +
+        const bool expanded =
+            candidate_heuristics.back().persistent_batch_size >
+            native_batch_max;
+        std::string state = std::string(
+                                expanded ? "inner_persistent.reg_batch.v3\n"
+                                         : "inner_persistent.reg_batch.v2\n") +
+            "parallel_after_vectorize=" +
             std::to_string(parallel_after_vectorize) +
             "\ntotal_iteration_numel=" +
             std::to_string(properties.total_iteration_numel) +
@@ -614,7 +665,10 @@ void innerPersistentHeuristic2DPlan(
             "\nbatch_min=" +
             std::to_string(batches_per_block_inner_reduction_min) +
             "\nbatch_max=" +
-            std::to_string(batches_per_block_inner_reduction_max);
+            std::to_string(candidate_heuristics.back().persistent_batch_size);
+        if (expanded) {
+          state += "\nnative_batch_max=" + std::to_string(native_batch_max);
+        }
         std::vector<scheduler::jev::ChoiceOption> options;
         options.reserve(candidate_heuristics.size());
         for (const auto& candidate : candidate_heuristics) {
