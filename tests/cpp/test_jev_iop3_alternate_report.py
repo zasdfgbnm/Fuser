@@ -1,7 +1,6 @@
 """Regression checks for IOP3 read-width-dependent decision logs."""
 from __future__ import annotations
 
-from copy import deepcopy
 import unittest
 
 from jev_alternate_numeric import check_alternate_report, state_fields
@@ -10,7 +9,7 @@ CASE = "jev_alternate_numeric_inner_outer_tmp_read_width"
 
 
 def cta_state(read: int) -> str:
-    x = 8 if read == 2 else 16
+    x = {1: 16, 2: 8, 4: 4}[read]
     return "\n".join((
         "inner_outer_multi_wave.cta.v2",
         "inner_dim=2048", "outer_dim=1024", "vector_width=4",
@@ -38,15 +37,17 @@ def row(site: str, hash_: str, state: str,
             "record": record, "remote": remote}
 
 
-def fixture() -> tuple[dict, list[dict]]:
+def fixture(alternate: str = "w1") -> tuple[dict, list[dict]]:
+    remote_width = int(alternate[1:])
     entries = [
         row("IOP3.tmp_read_width", "read", "read-state",
-            {"w2": 1}, {"w1": 1}),
+            {"w2": 1}, {alternate: 1}),
         row("IOP3.cta", "cta-record", cta_state(2), {"t256": 1}, {}),
-        row("IOP3.cta", "cta-remote", cta_state(1), {}, {"t256": 1}),
+        row("IOP3.cta", "cta-remote", cta_state(remote_width),
+            {}, {"t256": 1}),
         row("IOP3.tmp_write_width", "write-record", write_state(2),
             {"w4": 1}, {}),
-        row("IOP3.tmp_write_width", "write-remote", write_state(1),
+        row("IOP3.tmp_write_width", "write-remote", write_state(remote_width),
             {}, {"w4": 1}),
     ]
     issues = [{"kind": "winner_mismatch", "site": "IOP3.tmp_read_width",
@@ -67,9 +68,10 @@ def fixture() -> tuple[dict, list[dict]]:
 
 
 class Iop3ReadReportTests(unittest.TestCase):
-    def check(self, report: dict, events: list[dict]) -> dict:
+    def check(self, report: dict, events: list[dict],
+              alternate: str = "w1") -> dict:
         return check_alternate_report(
-            report, events, site="IOP3.tmp_read_width", alternate="w1",
+            report, events, site="IOP3.tmp_read_width", alternate=alternate,
             case_key=CASE, require_iop3_tmp_read=True)
 
     def test_accepts_two_complete_cta_plans_and_exact_downstream_pair(self):
@@ -78,6 +80,14 @@ class Iop3ReadReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "malformed IOP3.cta"):
             state_fields(report["multiplicity"][1],
                          "inner_outer_multi_wave.cta.v2")
+
+    def test_accepts_wider_read_and_rejects_wrong_cta_geometry(self):
+        report, events = fixture("w4")
+        self.assertEqual(self.check(report, events, "w4")["remote_events"], 3)
+        report["multiplicity"][2]["request"]["state"] = (
+            cta_state(4).replace("plan=256:4:2:4:64", "plan=256:4:2:8:32"))
+        with self.assertRaisesRegex(ValueError, "plan disagrees"):
+            self.check(report, events, "w4")
 
     def test_rejects_duplicate_scalar_and_missing_plan(self):
         for corrupt in (

@@ -1220,6 +1220,17 @@ if(BUILD_TEST)
       --require-iop3-tmp-read)
   set_tests_properties(jev_alternate_numeric_inner_outer_tmp_read_width PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_tmp_read_width_4
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.tmp_read_width --alternate w4
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_tmp_read_width_4
+      --require-iop3-tmp-read)
+  set_tests_properties(jev_alternate_numeric_inner_outer_tmp_read_width_4 PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
 
   # This exercises the TMA parameter decisions through the real API on SM89.
   # The GTest constructs scheduler parameters but never launches a TMA kernel.

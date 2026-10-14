@@ -780,9 +780,10 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError(f"unexpected inner-outer width issues: {issues}")
     elif require_iop3_tmp_read:
         if (site != "IOP3.tmp_read_width" or event["native"] != "w2" or
-                alternate != "w1" or
+                alternate not in {"w1", "w4"} or
                 set(event["candidates"]) != {"w1", "w2", "w4"}):
             raise ValueError("inner-outer fixture lacks its proved read-width menu")
+        alternate_width = alternate[1:]
         expected = [intended]
         for nested_site, version, field in (
                 ("IOP3.cta", "inner_outer_multi_wave.cta.v2",
@@ -797,14 +798,15 @@ def check_alternate_report(report: dict[str, Any],
                 raise ValueError(f"{nested_site} changed its winner: "
                                  f"{record_row}, {remote_row}")
             cta_plans: dict[str, list[tuple[int, ...]]] = {}
-            for row, width in ((record_row, "2"), (remote_row, "1")):
+            for row, width in ((record_row, "2"),
+                               (remote_row, alternate_width)):
                 if nested_site == "IOP3.cta":
                     cta_plans[width] = iop3_cta_plan_fields(row, int(width))
                 elif state_fields(row, version).get(field) != width:
                     raise ValueError(f"{nested_site} omitted selected read width")
             if nested_site == "IOP3.cta":
                 record_plans = cta_plans["2"]
-                remote_plans = cta_plans["1"]
+                remote_plans = cta_plans[alternate_width]
                 invariant_columns = (0, 1, 2, 5, 6, 8, 9, 10, 13)
                 if (len(record_plans) != len(remote_plans) or
                         any(tuple(record_plan[index] for index in invariant_columns)
