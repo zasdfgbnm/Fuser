@@ -17,6 +17,7 @@
 #include "ir/all_nodes.h"
 #include "ops/all_ops.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/nvmmh.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/utils.h"
@@ -117,6 +118,13 @@ std::unique_ptr<HeuristicParams> CutlassScheduler::computeHeuristicsImpl(
   // If nvMatmulHeuristics is not available, this call will leave params
   // default-initialized
   fillNvMatmulHeuristicsParams(params.get(), fusion, runtime_info);
+
+  // NVMMH supplies only its top-ranked configuration here. Keep that result
+  // until alternative configurations have been validated for SM100.
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+    scheduler::jev::recordCoverageSkip(
+        "CU1", "NVMMH top-K alternatives have no SM100 validation");
+  }
 
   if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << params->toString() << std::endl;
