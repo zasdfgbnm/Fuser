@@ -669,6 +669,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_occupancy: bool = False,
                            require_inner3d_width: bool = False,
                            require_inner3d_outer_unroll: bool = False,
+                           require_inner3d_register_overhead: bool = False,
                            require_iop3_min_batch: bool = False,
                            require_iop3_grid_rows: bool = False,
                            require_iop3_tmp_write: bool = False,
@@ -1574,6 +1575,30 @@ def check_alternate_report(report: dict[str, Any],
                     f"\npolicy_register_overhead={expected_overhead}\n" not in state or
                     f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
                 raise ValueError(f"nested batch did not use selected target policy: {row}")
+    elif require_inner3d_register_overhead:
+        from jev_shim import parse_inner3d_register_overhead_state
+
+        if (site != "IP6.reg_overhead" or event["native"] != "r32" or
+                alternate != "r40" or
+                set(event["candidates"]) != {"r32", "r40"}):
+            raise ValueError("inner 3D fixture lacks a live register alternate")
+        state = parse_inner3d_register_overhead_state(event["state"])
+        native, selected = state.plans[32], state.plans[40]
+        if (state.has_exp_op != 1 or state.inner_numel != 5120 or
+                state.iteration_numel != 256 or
+                state.selected_vector_width != 4 or
+                native.inner_batch <= 1 or
+                selected.register_cap <= native.register_cap):
+            raise ValueError("register choice did not change the complete plan")
+        for upstream in ("IP6.width", "IP6.waves", "IP6.occupancy",
+                         "IP6.warp", "IP6.outer_unroll"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed: {rows}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected register-overhead comparison issues: {issues}")
     elif require_inner3d_outer_unroll:
         if (site != "IP6.outer_unroll" or event["native"] != "u4" or
                 alternate != "u2" or
@@ -1592,7 +1617,18 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed with outer unroll: {rows}")
-        if issues != [intended]:
+        before, after, dependent = paired_state_rows(
+            report, "IP6.reg_overhead")
+        left = state_fields(
+            before, "inner_persistent.3d_register_overhead.v1")
+        right = state_fields(
+            after, "inner_persistent.3d_register_overhead.v1")
+        if (left.get("selected_outer_unroll") != "4" or
+                right.get("selected_outer_unroll") != "2" or
+                before["record"] != {"r32": 1} or
+                after["remote"] != {"r32": 1}):
+            raise ValueError("register plan ignored selected outer unroll")
+        if sorted(issues, key=str) != sorted([intended, *dependent], key=str):
             raise ValueError(f"unexpected outer unroll comparison issues: {issues}")
     elif require_inner3d_width:
         if (site != "IP6.width" or event["native"] != "w4" or
@@ -1612,7 +1648,9 @@ def check_alternate_report(report: dict[str, Any],
                 ("IP6.warp", "inner_persistent.3d_warp_target.v1\n",
                  "inner_persistent.3d_warp_target.v3\n"),
                 ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1\n",
-                 "inner_persistent.3d_outer_unroll.v1\n")):
+                 "inner_persistent.3d_outer_unroll.v1\n"),
+                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1\n",
+                 "inner_persistent.3d_register_overhead.v1\n")):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == nested_site]
             record_only = [row for row in rows
@@ -1668,7 +1706,18 @@ def check_alternate_report(report: dict[str, Any],
                      event["state"].splitlines()[1:])
         if state.get("selected_wave_cap") != "4":
             raise ValueError(f"warp plan used an unexpected wave cap: {state}")
-        if issues != [intended]:
+        expected = [intended]
+        for dependent_site, version in (
+                ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1"),
+                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1")):
+            before, after, replaced = paired_state_rows(report, dependent_site)
+            left = state_fields(before, version)
+            right = state_fields(after, version)
+            if (left.get("selected_warp_target") != "8" or
+                    right.get("selected_warp_target") != "16"):
+                raise ValueError(f"{dependent_site} ignored selected warp")
+            expected.extend(replaced)
+        if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
     elif require_inner3d_occupancy:
         if (site != "IP6.occupancy" or event["native"] != "occ28" or
@@ -1700,6 +1749,16 @@ def check_alternate_report(report: dict[str, Any],
             {"kind": "remote_only_state", "site": "IP6.warp",
              "request_sha256": remote_warp[0]["request_sha256"]},
         ]
+        for dependent_site, version in (
+                ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1"),
+                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1")):
+            before, after, replaced = paired_state_rows(report, dependent_site)
+            left = state_fields(before, version)
+            right = state_fields(after, version)
+            if (left.get("selected_occupancy_target") != "28" or
+                    right.get("selected_occupancy_target") != "16"):
+                raise ValueError(f"{dependent_site} ignored selected occupancy")
+            expected.extend(replaced)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent warp comparison issues: {issues}")
     elif require_iop3_inner_width:
@@ -1894,6 +1953,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
     parser.add_argument("--require-inner3d-outer-unroll", action="store_true")
+    parser.add_argument("--require-inner3d-register-overhead", action="store_true")
     parser.add_argument("--require-iop3-min-batch", action="store_true")
     parser.add_argument("--require-iop3-grid-rows", action="store_true")
     parser.add_argument("--require-iop3-tmp-write", action="store_true")
@@ -2017,6 +2077,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,
             require_inner3d_outer_unroll=args.require_inner3d_outer_unroll,
+            require_inner3d_register_overhead=args.require_inner3d_register_overhead,
             require_iop3_min_batch=args.require_iop3_min_batch,
             require_iop3_grid_rows=args.require_iop3_grid_rows,
             require_iop3_tmp_write=args.require_iop3_tmp_write,

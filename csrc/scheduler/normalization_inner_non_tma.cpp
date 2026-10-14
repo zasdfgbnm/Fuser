@@ -1394,7 +1394,8 @@ void innerPersistentHeuristic3DPlan(
     Inner3DPlanResources* resources = nullptr,
     int64_t warp_target = -1,
     int64_t occupancy_target = 28,
-    int64_t outer_unroll_cap = std::numeric_limits<int64_t>::max()) {
+    int64_t outer_unroll_cap = std::numeric_limits<int64_t>::max(),
+    int64_t register_overhead_override = -1) {
   // Define two free parameters used in this heuristic.
   // register_overhead is all registers except those for the persistent
   // buffers. The register in each thread = register_overhead +
@@ -1402,7 +1403,9 @@ void innerPersistentHeuristic3DPlan(
   // Current values are based on tests of sofmax, layer_norm, softmax_dropout,
   // dropout_layer_norm on A100 & H100. It directly affects maxregcount passed
   // to NVRTC and influences the occupancy.
-  const int64_t register_overhead = properties.has_exp_op ? 32l : 16l;
+  const int64_t register_overhead = register_overhead_override > 0
+      ? register_overhead_override
+      : (properties.has_exp_op ? 32l : 16l);
 
   // The original target is 28 warps. Non-native targets reach this planner
   // only after a complete-plan Choice; Off mode retains the original target.
@@ -2146,6 +2149,152 @@ Inner3DChosenOccupancy chooseInner3DOccupancyTarget(
   return {plan_it->target, std::move(plan_it->params), plan_it->resources};
 }
 
+std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t wave_cap,
+    int64_t warp_target,
+    int64_t occupancy_target,
+    int64_t outer_unroll_cap,
+    std::unique_ptr<ReductionParams> native,
+    const Inner3DPlanResources& native_resources,
+    const cudaDeviceProp& device) {
+  const int64_t native_overhead = properties.has_exp_op ? 32 : 16;
+  const int64_t alternate_overhead = native_overhead + 8;
+  struct Plan {
+    int64_t overhead;
+    std::unique_ptr<ReductionParams> params;
+  };
+  std::vector<Plan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  std::string plan_state;
+  auto add_plan = [&](int64_t overhead,
+                      std::unique_ptr<ReductionParams> params,
+                      const Inner3DPlanResources& resources,
+                      bool eligible) {
+    plan_state += "\nplan" + std::to_string(overhead) + "=" +
+        std::to_string(params->batches_per_block_inner_reduction) + "," +
+        std::to_string(params->unroll_factor_inner_reduction) + "," +
+        std::to_string(params->batches_per_block_outer_reduction) + "," +
+        std::to_string(params->unroll_factor_outer_reduction) + "," +
+        std::to_string(resources.padded_threads_x) + "," +
+        std::to_string(resources.threads_y) + "," +
+        std::to_string(resources.threads_z) + "," +
+        std::to_string(resources.padded_threads_per_block) + "," +
+        std::to_string(resources.registers_per_thread) + "," +
+        std::to_string(resources.grid_blocks) + "," +
+        std::to_string(params->schedule_3d) + "," +
+        std::to_string(params->persistent_kernel) + "," +
+        std::to_string(params->cross_block_inner_reduction) + "," +
+        std::to_string(params->cross_block_outer_reduction) + "," +
+        std::to_string(params->cross_grid_inner_reduction) + "," +
+        std::to_string(params->cross_grid_outer_reduction) + "," +
+        std::to_string(params->block_dim_inner_reduction == ParallelType::TIDx) +
+        "," +
+        std::to_string(params->block_dim_outer_reduction == ParallelType::TIDz);
+    if (eligible) {
+      options.push_back({
+          "r" + std::to_string(overhead),
+          "Reserve " + std::to_string(overhead) +
+              " nonbuffer registers per thread; completed CTA=" +
+              std::to_string(resources.padded_threads_per_block) +
+              ", register cap=" +
+              std::to_string(resources.registers_per_thread) +
+              ", grid blocks=" + std::to_string(resources.grid_blocks)});
+    }
+    plans.push_back({overhead, std::move(params)});
+  };
+  add_plan(native_overhead, std::move(native), native_resources, true);
+
+  // The 16/32-register allowance is empirical. Only offer a larger allowance
+  // when the native vectorized multi-block plan actually uses the register
+  // estimate and its buffer plus allowance fits the per-thread hardware cap.
+  const int64_t inner_batch =
+      plans.front().params->batches_per_block_inner_reduction;
+  const int64_t inner_unroll =
+      plans.front().params->unroll_factor_inner_reduction;
+  const int64_t buffer_bits_per_element =
+      properties.max_persistent_buffer_size_bit /
+      properties.inner_most_dimension_numel;
+  const int64_t max_buffer_bits =
+      (scheduler_utils::max_registers_per_thread - alternate_overhead) *
+      scheduler_utils::bits_per_register;
+  if (properties.vectorize_factor > 1 &&
+      native_resources.grid_blocks > device.multiProcessorCount &&
+      inner_batch > 1 &&
+      inner_unroll > 0 &&
+      inner_batch <= std::numeric_limits<int64_t>::max() / inner_unroll &&
+      buffer_bits_per_element <=
+          max_buffer_bits / (inner_batch * inner_unroll)) {
+    auto params = std::make_unique<ReductionParams>(base);
+    Inner3DPlanResources resources;
+    innerPersistentHeuristic3DPlan(
+        properties,
+        wave_cap,
+        params.get(),
+        &resources,
+        warp_target,
+        occupancy_target,
+        outer_unroll_cap,
+        alternate_overhead);
+    const bool eligible =
+        resources.registers_per_thread >
+            native_resources.registers_per_thread &&
+        isNativeValidInner3DAlternative(
+            properties,
+            *params,
+            *plans.front().params,
+            resources,
+            device);
+    add_plan(alternate_overhead, std::move(params), resources, eligible);
+  }
+
+  const std::string state =
+      "inner_persistent.3d_register_overhead.v1\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nselected_vector_width=" +
+      std::to_string(properties.vectorize_factor) +
+      "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      "\nselected_occupancy_target=" +
+      std::to_string(occupancy_target) +
+      "\nselected_warp_target=" + std::to_string(warp_target) +
+      "\nselected_outer_unroll=" + std::to_string(outer_unroll_cap) +
+      "\nhas_exp_op=" + std::to_string(properties.has_exp_op) +
+      "\nsm_count=" + std::to_string(device.multiProcessorCount) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit) +
+      "\nmax_threads_x=" + std::to_string(device.maxThreadsDim[0]) +
+      "\nmax_threads_y=" + std::to_string(device.maxThreadsDim[1]) +
+      "\nmax_threads_z=" + std::to_string(device.maxThreadsDim[2]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(device.maxThreadsPerBlock) +
+      "\nregisters_per_block=" + std::to_string(device.regsPerBlock) +
+      "\nmax_grid_x=" + std::to_string(device.maxGridSize[0]) + plan_state;
+  const std::string native_choice =
+      scheduler::jev::mode() == scheduler::jev::Mode::Record
+      ? "r" + std::to_string(native_overhead)
+      : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP6.reg_overhead", state, options, native_choice);
+  const auto option_it = std::find_if(
+      options.begin(),
+      options.end(),
+      [&](const auto& option) { return option.id == selected; });
+  NVF_ERROR(option_it != options.end(), "Unknown inner 3D register allowance");
+  const auto plan_it = std::find_if(
+      plans.begin(),
+      plans.end(),
+      [&](const auto& plan) {
+        return "r" + std::to_string(plan.overhead) == selected;
+      });
+  NVF_ERROR(plan_it != plans.end(), "Missing inner 3D register plan");
+  return std::move(plan_it->params);
+}
+
 std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
     const PersistentKernelProperties& properties,
     const ReductionParams& base,
@@ -2158,6 +2307,7 @@ std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
   struct Plan {
     int64_t target;
     std::unique_ptr<ReductionParams> params;
+    Inner3DPlanResources resources;
   };
   const int64_t native_target = native->unroll_factor_outer_reduction;
   std::vector<Plan> plans;
@@ -2197,7 +2347,7 @@ std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
               std::to_string(resources.registers_per_thread) +
               ", grid blocks=" + std::to_string(resources.grid_blocks)});
     }
-    plans.push_back({target, std::move(params)});
+    plans.push_back({target, std::move(params), resources});
   };
   add_plan(native_target, std::move(native), native_resources, true);
 
@@ -2276,7 +2426,16 @@ std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
         return "u" + std::to_string(plan.target) == selected;
       });
   NVF_ERROR(plan_it != plans.end(), "Missing inner 3D outer unroll plan");
-  return std::move(plan_it->params);
+  return chooseInner3DRegisterOverhead(
+      properties,
+      base,
+      wave_cap,
+      warp_target,
+      occupancy_target,
+      plan_it->target,
+      std::move(plan_it->params),
+      plan_it->resources,
+      device);
 }
 
 std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(

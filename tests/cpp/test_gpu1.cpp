@@ -6227,6 +6227,42 @@ TEST_F(Gpu1Test, JevAlternateInner3dPersistentOuterUnroll_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// A larger estimated nonbuffer allowance may select a different NVRTC
+// register cap only after the completed register-backed 3D plan is checked.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentRegisterOverhead_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 256, 5120}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_GT(rparams->batches_per_block_inner_reduction, 1);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // This test checks if our system could correctly handles the case where both
 // reduction and trivial reduction exist in the fusion. Trivial reduction
 // deserve testing because trivial reduction is handled by doing a squeeze
