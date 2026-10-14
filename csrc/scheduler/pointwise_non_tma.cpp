@@ -15,6 +15,7 @@
 #include "ir/printer.h"
 #include "multidevice/utils.h"
 #include "scheduler/cache_policy_refiner.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -269,24 +270,86 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     bp_info.is_outer_broadcast_dominated = false;
   }
 
-  // Use unified function that handles all constraints internally
-  const int64_t vectorization_factor = vectorize_helper::getVectorizationFactor(
-      runtime_info,
-      prop.largest_out,
-      data_cache,
-      bp_info.break_point,
-      max_vectorization_size_in_bit,
-      prop.min_dtype_size_bit_for_vectorization,
-      prop.max_dtype_size_bit_for_vectorization,
-      /*n_vectorizable_tensors=*/(int64_t)vectorizable_inputs_outputs.size(),
-      // should use the actual wave count, here just to keep consistency with
-      // the old code.
-      // TODO: check how should we limit the vectorization factor based on the
-      // wave count.
-      /*n_waves=*/n_elems > device_multiprocessor_count * kThreadX ? -1 : 1,
-      /*logical_reorder_map=*/
-      pointwise_utils::getLogicalReorderMap(
-          prop.largest_out, prop.has_reshapes, data_cache));
+  const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
+      prop.largest_out, prop.has_reshapes, data_cache);
+  const auto jev_mode = scheduler::jev::mode();
+  int64_t vectorization_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Retain the original calculation in off and record modes. Remote mode
+    // must never compute the soft width before asking the local model.
+    vectorization_factor = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        max_vectorization_size_in_bit,
+        prop.min_dtype_size_bit_for_vectorization,
+        prop.max_dtype_size_bit_for_vectorization,
+        /*n_vectorizable_tensors=*/(int64_t)vectorizable_inputs_outputs.size(),
+        // Keep the source's existing one-wave or disabled-wave approximation.
+        /*n_waves=*/n_elems > device_multiprocessor_count * kThreadX ? -1 : 1,
+        logical_reorder_map);
+  }
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Calling the same layout analysis with optional soft constraints disabled
+    // gives a correctness-derived upper bound, not the native preferred width.
+    const int64_t layout_max = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        max_vectorization_size_in_bit,
+        /*min_dtype_size_bit=*/-1,
+        /*max_dtype_size_bit=*/-1,
+        /*n_vectorizable_tensors=*/-1,
+        /*n_waves=*/-1,
+        logical_reorder_map);
+    const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+    const int64_t byte_min = min_dtype_bits < 8
+        ? scheduler_utils::safeDiv(8L, min_dtype_bits)
+        : 1;
+    NVF_ERROR(
+        layout_max >= 1 && layout_max <= max_vectorization_size_in_bit &&
+            scheduler_utils::lastPow2(layout_max) == layout_max,
+        "PW3.width layout limit must be a power of two in 1..128");
+    NVF_ERROR(
+        scheduler_utils::lastPow2(byte_min) == byte_min,
+        "PW3.width byte minimum must be a power of two");
+
+    std::vector<scheduler::jev::ChoiceOption> options;
+    const int64_t first_width = std::min(byte_min, layout_max);
+    for (int64_t width = first_width; width <= layout_max; width *= 2) {
+      options.push_back(
+          {"w" + std::to_string(width),
+           "Vectorize " + std::to_string(width) + " element(s) per thread"});
+    }
+    // Current nvFuser returns layout_max if the byte floor exceeds it; the
+    // singleton preserves that existing behavior until the source TODO is
+    // resolved. In the normal case all options satisfy both hard constraints.
+    std::string state = "pointwise.width.v1\n";
+    state += "layout_max=" + std::to_string(layout_max) + '\n';
+    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+    state += "max_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+    state += "n_vectorizable_tensors=" +
+        std::to_string(vectorizable_inputs_outputs.size()) + '\n';
+    state += "n_elems=" + std::to_string(n_elems) + '\n';
+    state += "sm_count=" + std::to_string(device_multiprocessor_count) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "w" + std::to_string(vectorization_factor)
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "PW3.width", state, options, native_choice);
+    bool matched = false;
+    for (int64_t width = first_width; width <= layout_max; width *= 2) {
+      if (selected == "w" + std::to_string(width)) {
+        vectorization_factor = width;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW3.width response is outside native hard bounds");
+  }
   params->vectorization_factor = vectorization_factor;
 
   // Calculate block and grid configuration based on break point
