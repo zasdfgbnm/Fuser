@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -17,6 +19,7 @@
 
 #include "instrumentation.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
@@ -613,7 +616,10 @@ void innerPersistentHeuristicCluster(
 }
 
 void innerPersistentHeuristicSharedMemory(
+    Fusion* fusion,
     const PersistentKernelProperties& properties,
+    HeuristicDataCache* data_cache,
+    SchedulerRuntimeInfo& runtime_info,
     ReductionParams* rparams) {
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
   // Inner reduction domain
@@ -632,8 +638,122 @@ void innerPersistentHeuristicSharedMemory(
       vectorize_factor,
       ", bdimx= ",
       bdimx);
-  int64_t persistent_batch =
-      ceilDiv(properties.total_reduction_numel, vectorize_factor * bdimx);
+  const auto jev_mode = scheduler::jev::mode();
+  int64_t persistent_batch = jev_mode == scheduler::jev::Mode::Remote
+      ? -1
+      : ceilDiv(properties.total_reduction_numel, vectorize_factor * bdimx);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // The batch sets the residual TIDx extent in scheduleReductionTV. Its
+    // launch parameter is inferred there, then padded to a whole warp. The
+    // maximum-thread seed is an empirical preference, not a fixed launch dim.
+    const int64_t warp_size = dev_prop->warpSize;
+    const bool supported_topology =
+        dev_prop->major < 9 &&
+        properties.total_reduction_numel ==
+            properties.inner_most_dimension_numel &&
+        scheduler_utils::getMaxClusterSize() == 1;
+    const bool supported_width =
+        vectorize_factor > 0 &&
+        properties.total_reduction_numel % vectorize_factor == 0;
+    const bool supported_threads = warp_size > 0 && bdimx >= warp_size &&
+        (bdimx & (bdimx - 1)) == 0 && (warp_size & (warp_size - 1)) == 0;
+    if (supported_topology && supported_width && supported_threads) {
+      auto persistent_buffer_info_entry =
+          HeuristicDataCacheEntry<HeuristicCompileTime::PersistentBufferInfo>(
+              data_cache, [&fusion]() {
+                return std::make_unique<scheduler_utils::PersistentBufferInfo>(
+                    scheduler_utils::persistentBuffers(fusion));
+              });
+      const auto& persistent_buffer_info = persistent_buffer_info_entry.get();
+      auto reduction_tvs = scheduler_utils::getReductionTvs(fusion);
+      struct BatchPlan {
+        int64_t seed;
+        int64_t batch;
+        int64_t padded_threads;
+      };
+      std::vector<BatchPlan> plans;
+      std::vector<scheduler::jev::ChoiceOption> options;
+      const int64_t after_vectorize =
+          properties.total_reduction_numel / vectorize_factor;
+      for (int64_t seed = bdimx; seed >= warp_size; seed /= 2) {
+        const int64_t batch = ceilDiv(after_vectorize, seed);
+        const int64_t actual_threads = ceilDiv(after_vectorize, batch);
+        const int64_t padded_threads = ceilDiv(actual_threads, warp_size) *
+            warp_size;
+        if (actual_threads < 1 || padded_threads > bdimx ||
+            padded_threads > seed) {
+          continue;
+        }
+        // This repeats the native per-buffer roundup calculation with the
+        // candidate batch and keeps its max-thread reduction workspace and
+        // static shared-memory reserve. The original topology gate and buffer
+        // projection remain native.
+        const int64_t available_bits = normalization_scheduler_utils::
+            getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+                fusion,
+                runtime_info,
+                reduction_tvs,
+                persistent_buffer_info,
+                /*can_use_smem_persistent=*/true,
+                properties.project_persistent_buffers,
+                batch);
+        if (properties.max_persistent_buffer_size_bit > available_bits) {
+          continue;
+        }
+        const std::string id = "b" + std::to_string(batch);
+        if (std::any_of(
+                options.begin(),
+                options.end(),
+                [&](const auto& option) { return option.id == id; })) {
+          continue;
+        }
+        plans.push_back({seed, batch, padded_threads});
+        options.push_back({
+            id,
+            "Use persistent batch " + std::to_string(batch) +
+                " from CTA target " + std::to_string(seed) +
+                "; derived warp-padded TIDx=" +
+                std::to_string(padded_threads)});
+      }
+      // If the conservative candidate estimate cannot prove even the native
+      // plan, off/record retain the original calculation; remote fails closed.
+      const bool native_is_legal =
+          !plans.empty() && plans.front().seed == bdimx;
+      if (native_is_legal) {
+        const std::string state =
+            "inner_persistent.smem_cta.v1\nreduction_numel=" +
+            std::to_string(properties.total_reduction_numel) +
+            "\nvector_width=" + std::to_string(vectorize_factor) +
+            "\nmax_threads_per_block=" + std::to_string(bdimx) +
+            "\nwarp_size=" + std::to_string(warp_size) +
+            "\npersistent_buffer_bits=" +
+            std::to_string(properties.max_persistent_buffer_size_bit) +
+            "\nsmem_per_block_bytes=" +
+            std::to_string(dev_prop->sharedMemPerBlockOptin);
+        const std::string native_choice =
+            jev_mode == scheduler::jev::Mode::Record ? options.front().id : "";
+        const std::string selected = scheduler::jev::chooseDecision(
+            "IP8.cta", state, options, native_choice);
+        const auto option_it = std::find_if(
+            options.begin(),
+            options.end(),
+            [&](const auto& option) { return option.id == selected; });
+        NVF_ERROR(
+            option_it != options.end(), "Unknown inner persistent CTA plan");
+        persistent_batch =
+            plans.at(std::distance(options.begin(), option_it)).batch;
+      } else {
+        NVF_ERROR(
+            jev_mode != scheduler::jev::Mode::Remote,
+            "Unable to prove native shared-memory persistent CTA capacity");
+      }
+    } else {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "Unsupported shared-memory persistent CTA topology");
+    }
+  }
   rparams->cross_block_inner_reduction = true;
   rparams->block_dim_inner_reduction = ParallelType::TIDx;
   rparams->pad_inner_reduction_to_warp = true;
@@ -1144,7 +1264,8 @@ void innerPersistentHeuristic3D(
 std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
     Fusion* fusion,
     const PersistentKernelProperties& prop,
-    HeuristicDataCache* data_cache) {
+    HeuristicDataCache* data_cache,
+    SchedulerRuntimeInfo& runtime_info) {
   FusionGuard fg(fusion);
 
   std::unique_ptr<ReductionParams> rparams = std::make_unique<ReductionParams>(
@@ -1167,7 +1288,8 @@ std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
     // all persistent buffers are moved to shared memory
     // TODO: allow only part of the buffers to be moved to shared memory
     rparams->smem_persistent_buffers = prop.persistent_buffers;
-    innerPersistentHeuristicSharedMemory(prop, rparams.get());
+    innerPersistentHeuristicSharedMemory(
+        fusion, prop, data_cache, runtime_info, rparams.get());
   } else if (prop.total_reduction_numel == prop.inner_most_dimension_numel) {
     rparams->tag = "2D Register Inner Persistent Heuristic.\n";
     innerPersistentHeuristic2D(prop, rparams.get());

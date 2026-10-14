@@ -765,7 +765,8 @@ namespace {
 // shared memory size due to this round up.
 int64_t roundUpSharedMemory(
     int64_t tv_buffer_size_bit,
-    int64_t data_type_size_bit) {
+    int64_t data_type_size_bit,
+    int64_t candidate_batch) {
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
   int64_t max_threads_per_block = (int64_t)dev_prop->maxThreadsPerBlock;
   int64_t max_smem_bit = 0;
@@ -781,10 +782,14 @@ int64_t roundUpSharedMemory(
       continue;
     }
     int64_t after_vect = dim_size / vectorize_factor;
-    // For shared memory persistence, heuristic always uses maximum threads
-    // per block
-    int64_t threads_per_block = max_threads_per_block;
-    int64_t persistent_batch = ceilDiv(after_vect, threads_per_block);
+    // The ordinary eligibility estimate uses the maximum thread count. A
+    // candidate batch changes the TIDx extent to ceil(after_vect / batch).
+    int64_t persistent_batch = candidate_batch > 0
+        ? candidate_batch
+        : ceilDiv(after_vect, max_threads_per_block);
+    int64_t threads_per_block =
+        candidate_batch > 0 ? ceilDiv(after_vect, persistent_batch)
+                            : max_threads_per_block;
     max_smem_bit = std::max(
         max_smem_bit,
         persistent_batch * vectorize_factor * threads_per_block *
@@ -795,7 +800,8 @@ int64_t roundUpSharedMemory(
 int64_t sharedMemoryRoundUpOverheadBit(
     SchedulerRuntimeInfo& runtime_info,
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
-    const bool project_to_inputs) {
+    const bool project_to_inputs,
+    int64_t candidate_batch) {
   auto buffers = project_to_inputs
       ? persistent_buffer_info.projectable_buffer_inputs
       : persistent_buffer_info.persistent_buffers;
@@ -807,7 +813,9 @@ int64_t sharedMemoryRoundUpOverheadBit(
             buffer, runtime_info, persistent_buffer_info);
     // Required shared memory size if store that tensor in shared memory
     int64_t buffer_size_smem = roundUpSharedMemory(
-        logical_buffer_size_bit, dataTypeSizeBit(buffer->getDataType()));
+        logical_buffer_size_bit,
+        dataTypeSizeBit(buffer->getDataType()),
+        candidate_batch);
     // The difference is counted as roundup overhead
     total_smem_overhead_bit += (buffer_size_smem - logical_buffer_size_bit);
   }
@@ -821,7 +829,8 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
     const std::vector<TensorView*>& reduction_tvs,
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
     const bool can_use_smem_persistent,
-    const bool project_to_inputs) {
+    const bool project_to_inputs,
+    int64_t candidate_batch) {
   // Init to register file size, which is half of the full register file size
   int64_t available_persistent_buffer_size_bit =
       scheduler_utils::register_file_size_bit;
@@ -834,7 +843,7 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
       scheduler_utils::getReductionSmemWorkspaceBit(fusion, reduction_tvs);
 
   smem_overhead_bit += sharedMemoryRoundUpOverheadBit(
-      runtime_info, persistent_buffer_info, project_to_inputs);
+      runtime_info, persistent_buffer_info, project_to_inputs, candidate_batch);
 
   smem_overhead_bit += scheduler_utils::static_smem_usage_in_bits;
 

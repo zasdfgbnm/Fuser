@@ -230,7 +230,7 @@ std::unique_ptr<HeuristicParams> InnerPersistentKernelScheduler::
   // Fallback to non-TMA scheduler if TMA is not applicable
   if (rparams == nullptr) {
     rparams = normalization_inner::non_tma::getInnerPersistentHeuristics(
-        fusion, prop, data_cache);
+        fusion, prop, data_cache, runtime_info);
   }
 
   NVF_ERROR(rparams != nullptr);
