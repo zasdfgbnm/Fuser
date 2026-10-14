@@ -1328,7 +1328,7 @@ if(BUILD_TEST)
   add_test(NAME jev_alternate_numeric_greedy_argsort_batch
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
-      --binary "$<TARGET_FILE:test_nvfuser>"
+      --binary "$<TARGET_FILE:test_greedy>"
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
       --site GR1.argsort_batch --alternate b4
       --gtest GreedySchedulerTest.JevAlternateArgsortBatch_CUDA
