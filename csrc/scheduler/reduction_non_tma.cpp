@@ -130,7 +130,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
 
   // RD3.width asks the local model for the performance width within the
   // layout-derived native maximum. RD3.unroll separately chooses the inner
-  // unroll target; CTA and grid preferences remain native.
+  // unroll target, and RD3.cta chooses the CTA target before native
+  // remainder and grid planning.
   const auto jev_mode = scheduler::jev::mode();
   int64_t target_vect_unroll = 0;
   if (jev_mode != scheduler::jev::Mode::Remote) {
@@ -329,6 +330,58 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
       std::min(min_threads_per_block, max_threads_per_block / 2);
   target_threads_per_block =
       std::max(target_threads_per_block, min_threads_per_block);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Both empirical starting points are at most half the physical block
+    // limit on supported devices. The occupancy floor has the same bound.
+    // This leaves room for native warp padding below (< 2x the unpadded
+    // thread count). Native bdimx, bdimy, remainder and grid calculations
+    // still run for the chosen target. A cross-grid plan has godim <= SM/2,
+    // below the BIDy limit on the supported SM-count range.
+    NVF_ERROR(
+        max_threads_per_block >= 512 && total_iteration_numel >= 1 &&
+            target_threads_per_sm >= 1 && sm_count >= 1,
+        "RD3.cta requires a positive iteration extent and a block limit of at "
+        "least 512 threads");
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t starting_target : {int64_t{128}, int64_t{256}}) {
+      const int64_t candidate =
+          std::max(starting_target, min_threads_per_block);
+      const std::string id = "t" + std::to_string(candidate);
+      if (options.empty() || options.back().id != id) {
+        options.push_back(
+            {id, "Target " + std::to_string(candidate) +
+                     " threads per CTA before native remainder and grid planning"});
+      }
+    }
+
+    std::string state = "reduction.inner_cta.v1\n";
+    state += "iteration_numel=" +
+        std::to_string(total_iteration_numel) + '\n';
+    state += "has_mufu=" + std::to_string(has_mufu_computation ? 1 : 0) + '\n';
+    state += "sm_count=" + std::to_string(sm_count) + '\n';
+    state += "max_threads_per_sm=" +
+        std::to_string(max_threads_per_sm) + '\n';
+    state += "max_threads_per_block=" +
+        std::to_string(max_threads_per_block) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "t" + std::to_string(target_threads_per_block)
+        : std::string();
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD3.cta", state, options, native_choice);
+    bool matched = false;
+    for (const auto& option : options) {
+      if (selected == option.id) {
+        target_threads_per_block = std::stoll(selected.substr(1));
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "RD3.cta response exceeds the native CTA target set");
+    NVF_ERROR(
+        target_threads_per_block <= max_threads_per_block / 2,
+        "RD3.cta target exceeds half the physical block limit");
+  }
 
   // Put inner remainder to bdimx, but don't go over 4 warps
   // to leave some room for unrolling.
