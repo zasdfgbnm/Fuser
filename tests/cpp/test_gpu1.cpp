@@ -7840,8 +7840,9 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterCTASeed_CUDA) {
       results.heuristic_params->lparams);
 }
 
-// On an unprojected register-backed softmax, magic zero changes generated
-// index/predicate code while preserving the numerical result.
+// Keep a projectable exp buffer instead of recomputing it from the Half input.
+// This exposes the native 2D register magic-zero preference, while its two
+// code forms must produce the same normalized exponential.
 TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   const auto* device = at::cuda::getCurrentDeviceProperties();
   if (device->major != 8 || device->minor != 9) {
@@ -7850,18 +7851,22 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   constexpr int64_t feature = 1028;
   Fusion fusion;
   FusionGuard fg(&fusion);
-  TensorView* input = makeContigTensor(2);
+  TensorView* input = makeContigTensor(2, DataType::Half);
   fusion.addInput(input);
-  fusion.addOutput(softmax(input, 1));
+  auto exp_value = exp(castOp(DataType::Float, input));
+  auto exp_sum = sum(exp_value, {1});
+  auto broadcast_sum = broadcast(exp_sum, {false, true});
+  fusion.addOutput(castOp(DataType::Half, div(exp_value, broadcast_sum)));
 
   const auto options =
-      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
   at::Tensor aten_input = at::randn({256, feature}, options);
   auto results =
       scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
   const auto* rparams = results.heuristic_params->as<ReductionParams>();
   ASSERT_FALSE(rparams->schedule_3d);
   ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_FALSE(rparams->project_persistent_buffers);
   ASSERT_TRUE(rparams->smem_persistent_buffers.empty());
   const bool expect_zero = scheduler::jev::mode() != scheduler::jev::Mode::Remote;
   EXPECT_EQ(rparams->cparams.enable_magic_zero, expect_zero);
@@ -7870,7 +7875,8 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
       code.find("NVFUSER_DEFINE_MAGIC_ZERO;") != std::string::npos,
       expect_zero);
 
-  auto reference = at::_softmax(aten_input.to(at::kDouble), -1, false);
+  auto reference_exp = at::exp(aten_input.to(at::kDouble));
+  auto reference = reference_exp / reference_exp.sum(-1, true);
   testValidate(
       &fusion,
       results.outputs,
