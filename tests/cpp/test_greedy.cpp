@@ -883,7 +883,8 @@ TEST_F(GreedySchedulerTest, JevAlternateMultiScanBatch_CUDA) {
   ASSERT_EQ(outputs.size(), 1);
   // Every prefix result is an integer below 2^24, hence exactly
   // representable as Float for an order-independent comparison.
-  EXPECT_TRUE(at::equal(outputs.at(0), input.cumsum(-1).cumsum(-1)));
+  EXPECT_TRUE(at::equal(
+      outputs[0].as<at::Tensor>(), input.cumsum(-1).cumsum(-1)));
   auto* runtime = executor_cache.getMostRecentKernelRuntime();
   ASSERT_FALSE(runtime->isSegmented());
   ASSERT_THAT(
