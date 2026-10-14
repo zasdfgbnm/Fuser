@@ -811,14 +811,19 @@ TEST_F(GreedySchedulerTest, JevAlternateArgsortBatch_CUDA) {
   auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
   fusion.addInput(input_tv);
   auto sorted_indices = argsort(input_tv, -1);
-  fusion.addOutput(sorted_indices);
+  // A lone Argsort is evaluated by ExprEval without entering Greedy.
+  fusion.addOutput(add(sorted_indices, fusion.oneVal(DataType::Int)));
 
   auto input = at::randn(
       shape, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
   FusionExecutorCache executor_cache(std::move(fusion_ptr));
   auto outputs = executor_cache.runFusionWithInputs({input});
   testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
-  EXPECT_FALSE(executor_cache.getMostRecentKernelRuntime()->isSegmented());
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
 }
 
 TEST_P(GreedySchedulerTestConstraintSize, ScanLargeConstrainedIDs) {
