@@ -45,13 +45,14 @@ std::unique_ptr<TmaOuterReductionParams> getReductionHeuristics(
   // Each input tensor gets a tma_tile_r * tma_tile_i tile in smem.
   // Reserve space for block reduction workspace and static smem.
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const int64_t shared_mem_per_block =
+      static_cast<int64_t>(dev_prop->sharedMemPerBlockOptin);
   const int64_t dtype_bytes = props.max_dtype_size_bit_for_vectorization / 8;
   const int64_t threads_per_block = bdimx * bdimy;
   const int64_t smem_overhead =
       alignSharedMemoryBytes(threads_per_block * dtype_bytes) +
       kSharedMemoryAlignmentBytes;
-  const int64_t smem_bytes =
-      (int64_t)dev_prop->sharedMemPerBlockOptin - smem_overhead;
+  const int64_t smem_bytes = shared_mem_per_block - smem_overhead;
   const int64_t n_inputs = std::max(props.n_tensor_inputs, (int64_t)1);
   const int64_t smem_per_input = smem_bytes / n_inputs;
 
@@ -105,8 +106,7 @@ std::unique_ptr<TmaOuterReductionParams> getReductionHeuristics(
           kSharedMemoryAlignmentBytes;
       const int64_t bytes_per_input =
           alignSharedMemoryBytes(plan.i * plan.r * dtype_bytes);
-      return bytes_per_input * n_inputs + overhead <=
-          dev_prop->sharedMemPerBlockOptin;
+      return bytes_per_input * n_inputs + overhead <= shared_mem_per_block;
     };
     std::vector<Plan> plans;
     std::vector<scheduler::jev::ChoiceOption> options;
@@ -142,7 +142,7 @@ std::unique_ptr<TmaOuterReductionParams> getReductionHeuristics(
       state += "dtype_bytes=" + std::to_string(dtype_bytes) + '\n';
       state += "n_inputs=" + std::to_string(n_inputs) + '\n';
       state += "smem_per_block_bytes=" +
-          std::to_string(dev_prop->sharedMemPerBlockOptin) + '\n';
+          std::to_string(shared_mem_per_block) + '\n';
       state += "max_threads_per_block=" +
           std::to_string(dev_prop->maxThreadsPerBlock) + '\n';
       state += "max_grid_y=" + std::to_string(dev_prop->maxGridSize[1]) + '\n';
