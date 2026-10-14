@@ -5757,6 +5757,38 @@ TEST_F(Gpu1Test, JevAlternateOuterWidth_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// The native grid plan puts four aligned output elements in each thread.
+// Force one output element so that the remaining unroll budget moves to the
+// reduction axis, then validate the complete reduction against ATen.
+TEST_F(Gpu1Test, JevAlternateOuterUnroll_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 512;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // The quarter-SM CTA target produces a 512-thread grid block here. Force the
 // eighth-SM target, whose complete grid plan uses 256 threads per block, and
 // compare both schedules against the same high-precision ATen reduction.

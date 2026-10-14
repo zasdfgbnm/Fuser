@@ -41,9 +41,9 @@ class OuterWarpReportTest(unittest.TestCase):
         result = check_alternate_report(report, events, **options)
         self.assertEqual(result["native"], "warp16")
         self.assertEqual(result["alternate"], "warp32")
-        self.assertEqual(result["record_events"], 9)
-        self.assertEqual(result["remote_events"], 9)
-        self.assertEqual(result["server_successes"], 9)
+        self.assertEqual(result["record_events"], 10)
+        self.assertEqual(result["remote_events"], 10)
+        self.assertEqual(result["server_successes"], 10)
 
     def test_dependent_baseline_state_and_issue_are_required(self) -> None:
         report, events, options = load_report()
@@ -62,6 +62,7 @@ class OuterWarpReportTest(unittest.TestCase):
     def test_dependent_ragged_and_final_grid_are_required(self) -> None:
         report, events, options = load_report()
         for site, old, new in (
+                ("RD9.unroll", "warp=32", "warp=16"),
                 ("RD9.ragged", "base_grdim=16", "base_grdim=8"),
                 ("RD9.stride", "min_warp_size=32", "min_warp_size=16"),
                 ("RD8", "grid_grdim=15", "grid_grdim=16")):

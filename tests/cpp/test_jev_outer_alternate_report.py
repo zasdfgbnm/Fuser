@@ -48,7 +48,7 @@ class OuterAlternateReportTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 report, events, options = load_case(kind)
                 result = check_alternate_report(report, events, **options)
-                expected_events = (7 + bool(rows(report, "RD9.ragged")) +
+                expected_events = (8 + bool(rows(report, "RD9.ragged")) +
                                    bool(rows(report, "RD9.grid_base")))
                 self.assertEqual(result["record_events"], expected_events)
                 self.assertEqual(result["remote_events"], expected_events)
@@ -56,6 +56,7 @@ class OuterAlternateReportTest(unittest.TestCase):
 
     def test_missing_or_duplicate_dependent_state_is_rejected(self) -> None:
         for kind, site in (("width", "RD9.cta"), ("width", "RD9.stride"),
+                           ("width", "RD9.unroll"), ("cta", "RD9.unroll"),
                            ("width", "RD8"), ("cta", "RD9.stride"),
                            ("cta", "RD8"), ("width", "RD9.ragged"),
                            ("cta", "RD9.ragged"),
@@ -97,6 +98,8 @@ class OuterAlternateReportTest(unittest.TestCase):
                     check_alternate_report(broken, events, **options)
         for kind, site, old, new in (
                 ("width", "RD9.cta", "vector_width=1", "vector_width=2"),
+                ("width", "RD9.unroll", "vector_width=1", "vector_width=2"),
+                ("cta", "RD9.unroll", "cta_share=8", "cta_share=4"),
                 ("cta", "RD9.stride", "bdimy=16", "bdimy=32")):
             report, events, options = load_case(kind)
             broken = deepcopy(report)

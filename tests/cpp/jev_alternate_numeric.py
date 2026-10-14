@@ -625,6 +625,28 @@ def check_outer_grid_plan(record: dict[str, Any], remote: dict[str, Any],
                 raise ValueError(f"RD8 omitted selected stride plan: {plan}, {selected}")
 
 
+def check_outer_unroll_dependency(
+        report: dict[str, Any], changed_field: str,
+        before_value: str, after_value: str) -> list[dict[str, str]]:
+    """Require an upstream choice to reach RD9's complete unroll menu."""
+    before, after, issues = paired_state_rows(report, "RD9.unroll")
+    left = state_fields(before, "reduction.outer_unroll_distribution.v1")
+    right = state_fields(after, "reduction.outer_unroll_distribution.v1")
+    if (left.get(changed_field) != before_value or
+            right.get(changed_field) != after_value or
+            {key: value for key, value in left.items()
+             if key != changed_field} !=
+            {key: value for key, value in right.items()
+             if key != changed_field}):
+        raise ValueError(f"RD9.unroll missed selected {changed_field}: {left}, {right}")
+    for row, side in ((before, "record"), (after, "remote")):
+        if (len(row[side]) != 1 or
+                next(iter(row[side])) not in
+                row["request"]["questions"]["RD9.unroll"]["criteria"]):
+            raise ValueError("dependent unroll winner is outside its complete menu")
+    return issues
+
+
 def check_alternate_report(report: dict[str, Any],
                            events: list[dict[str, Any]], *, site: str,
                            alternate: str, case_key: str,
@@ -633,6 +655,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_cta: bool = False,
                            require_outer_ragged: bool = False,
                            require_outer_grid_base: bool = False,
+                           require_outer_unroll: bool = False,
                            require_inner_iter_unroll: bool = False,
                            require_inner_warp_target: bool = False,
                            require_inner_cta_envelope: bool = False,
@@ -886,7 +909,8 @@ def check_alternate_report(report: dict[str, Any],
                 set(event["candidates"]) != {"clean", "raw"}):
             raise ValueError("outer ragged fixture lacks both complete grid plans")
         for upstream in ("RD9.reg_budget", "RD9.width", "RD9.waves",
-                         "RD9.warp", "RD9.cta", "RD9.grid_base"):
+                         "RD9.warp", "RD9.cta", "RD9.grid_base",
+                         "RD9.unroll"):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == upstream]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
@@ -914,6 +938,56 @@ def check_alternate_report(report: dict[str, Any],
             if {"kind": kind, "site": "RD9.stride",
                 "request_sha256": row["request_sha256"]} not in issues:
                 raise ValueError(f"missing dependent stride state: {issues}")
+    elif require_outer_unroll:
+        if (site != "RD9.unroll" or event["native"] != "u4" or
+                alternate != "u1" or
+                set(event["candidates"]) != {"u1", "u2", "u4"}):
+            raise ValueError("outer unroll fixture lacks its complete plan menu")
+        state = state_fields({"site": site, "request": {
+            "state": event["state"]}},
+            "reduction.outer_unroll_distribution.v1")
+        if any(state.get(key) != value for key, value in {
+                "reduction_numel": "16384", "iteration_numel": "512",
+                "vector_width": "4", "max_unroll": "32",
+                "cta_share": "4", "grid_base": "target"}.items()):
+            raise ValueError(f"outer unroll fixture changed shape: {state}")
+        for upstream in ("RD9.reg_budget", "RD9.width", "RD9.waves",
+                         "RD9.warp", "RD9.cta", "RD9.grid_base"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with unroll: {rows}")
+        record_ragged, remote_ragged, ragged_issues = paired_state_rows(
+            report, "RD9.ragged")
+        record_stride, remote_stride, stride_issues = paired_state_rows(
+            report, "RD9.stride")
+        record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
+        expected_factors = (("4", "8", "8", "32"),
+                            ("1", "32", "32", "8"))
+        for row, factors in zip((record_ragged, remote_ragged), expected_factors):
+            fields = state_fields(row, "reduction.outer_ragged.v1")
+            if tuple(fields.get(key) for key in (
+                    "iter_unroll", "redu_unroll", "gidim", "base_grdim")) != factors:
+                raise ValueError(f"ragged plan ignored selected unroll: {fields}")
+        for row, factors in zip((record_stride, remote_stride), expected_factors):
+            fields = outer_stride_fields(row)
+            if tuple(fields.get(key) for key in (
+                    "iter_unroll", "redu_unroll", "gidim", "base_grdim")) != factors:
+                raise ValueError(f"stride plan ignored selected unroll: {fields}")
+        if (record_stride["record"] != {"g32": 1} or
+                remote_stride["remote"] != {"g8": 1}):
+            raise ValueError("outer unroll did not select its complete grid")
+        check_outer_grid_plan(
+            record_plan, remote_plan, record_stride, remote_stride)
+        before = state_fields(record_plan, "reduction.outer_plan.v1")
+        after = state_fields(remote_plan, "reduction.outer_plan.v1")
+        for field in ("block_gidim", "block_grdim", "block_iter_unroll"):
+            if before[field] != after[field]:
+                raise ValueError("outer unroll changed the block plan")
+        expected = [intended, *ragged_issues, *stride_issues, *plan_issues]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected outer unroll dependencies: {issues}")
     elif require_outer_grid_base:
         if (site != "RD9.grid_base" or event["native"] != "target" or
                 alternate != "wave" or
@@ -932,6 +1006,8 @@ def check_alternate_report(report: dict[str, Any],
                 "reduction_numel": "16384", "iteration_numel": "513",
                 "vector_width": "1", "cta_share": "4"}.items()):
             raise ValueError(f"grid baseline fixture changed shape: {base_state}")
+        unroll_issues = check_outer_unroll_dependency(
+            report, "grid_base", "target", "wave")
         record_ragged, remote_ragged, ragged_issues = paired_state_rows(
             report, "RD9.ragged")
         for row, side, base in ((record_ragged, "record", "8"),
@@ -982,7 +1058,8 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in plan_after.items()
                  if key != "grid_grdim"}):
             raise ValueError("RD8 did not receive selected baseline grid")
-        expected = [intended, *ragged_issues, *stride_issues, *plan_issues]
+        expected = [intended, *unroll_issues, *ragged_issues,
+                    *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent baseline issues: {issues}")
     elif require_outer_cta:
@@ -1009,6 +1086,8 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in base_after.items()
                  if key != "cta_share"}):
             raise ValueError("CTA target did not reach dependent grid baseline")
+        unroll_issues = check_outer_unroll_dependency(
+            report, "cta_share", "4", "8")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
         before, after = (outer_stride_fields(row) for row in
@@ -1033,7 +1112,7 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in plan_after.items()
                  if key != "grid_grdim"}):
             raise ValueError("CTA target changed more than the RD8 grid size")
-        expected = [intended, *base_issues, *ragged_issues,
+        expected = [intended, *base_issues, *unroll_issues, *ragged_issues,
                     *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer CTA comparison issues: {issues}")
@@ -1073,6 +1152,8 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in base_after.items()
                  if key != "vector_width"}):
             raise ValueError("width did not reach dependent grid baseline")
+        unroll_issues = check_outer_unroll_dependency(
+            report, "vector_width", "4", "1")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
         before, after = (outer_stride_fields(row) for row in
@@ -1089,7 +1170,8 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("width changed the stride winner unexpectedly")
         record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
         check_outer_grid_plan(record_plan, remote_plan, record_stride, remote_stride)
-        expected = [intended, *cta_issues, *base_issues, *ragged_issues, *stride_issues,
+        expected = [intended, *cta_issues, *base_issues, *unroll_issues,
+                    *ragged_issues, *stride_issues,
                     *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
@@ -1338,6 +1420,8 @@ def check_alternate_report(report: dict[str, Any],
                     {key: value for key, value in base.items()
                      if key != "cta_share"} != cta):
                 raise ValueError("baseline grid did not receive selected warp and CTA")
+        unroll_issues = check_outer_unroll_dependency(
+            report, "warp", "16", "32")
         rag_record, rag_remote, rag_issues = paired_state_rows(
             report, "RD9.ragged")
         stride_record, stride_remote, stride_issues = paired_state_rows(
@@ -1376,7 +1460,8 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in after_plan.items()
                  if key not in {"grid_gidim", "grid_grdim"}}):
             raise ValueError("warp changed unrelated RD8 plan measurements")
-        expected = [intended, *cta_issues, *base_issues, *rag_issues,
+        expected = [intended, *cta_issues, *base_issues, *unroll_issues,
+                    *rag_issues,
                     *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer warp issues: {issues}")
@@ -1795,6 +1880,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-cta", action="store_true")
     parser.add_argument("--require-outer-ragged", action="store_true")
     parser.add_argument("--require-outer-grid-base", action="store_true")
+    parser.add_argument("--require-outer-unroll", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner-iter-unroll", action="store_true")
     parser.add_argument("--require-inner-warp-target", action="store_true")
@@ -1917,6 +2003,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_cta=args.require_outer_cta,
             require_outer_ragged=args.require_outer_ragged,
             require_outer_grid_base=args.require_outer_grid_base,
+            require_outer_unroll=args.require_outer_unroll,
             require_inner_targets=args.require_inner_targets,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
             require_inner_warp_target=args.require_inner_warp_target,

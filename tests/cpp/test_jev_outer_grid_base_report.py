@@ -41,13 +41,14 @@ class OuterGridBaseReportTest(unittest.TestCase):
         result = check_alternate_report(report, events, **options)
         self.assertEqual(result["native"], "target")
         self.assertEqual(result["alternate"], "wave")
-        self.assertEqual(result["record_events"], 9)
-        self.assertEqual(result["remote_events"], 9)
-        self.assertEqual(result["server_successes"], 9)
+        self.assertEqual(result["record_events"], 10)
+        self.assertEqual(result["remote_events"], 10)
+        self.assertEqual(result["server_successes"], 10)
 
     def test_rejects_changed_dependent_grid_state(self) -> None:
         report, events, options = load_report()
         for site, old, new in (
+                ("RD9.unroll", "grid_base=wave", "grid_base=target"),
                 ("RD9.ragged", "base_grdim=4", "base_grdim=5"),
                 ("RD9.stride", "base_grdim=4", "base_grdim=5"),
                 ("RD8", "grid_grdim=3", "grid_grdim=4")):

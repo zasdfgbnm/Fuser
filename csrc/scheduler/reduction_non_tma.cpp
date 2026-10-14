@@ -2185,7 +2185,8 @@ OuterGridWarpPlans buildOuterGridWarpPlans(
     int64_t n_waves,
     int64_t min_warp_size,
     int64_t sm_cta_thread_divisor = 4,
-    bool extend_reduction_grid = true) {
+    bool extend_reduction_grid = true,
+    int64_t iteration_unroll_cap = std::numeric_limits<int64_t>::max()) {
   const int64_t n_elems = total_reduction_numel * total_iteration_numel;
   // Set some targets for parallelization
   int64_t target_threads_in_block = min_warp_size;
@@ -2290,7 +2291,9 @@ OuterGridWarpPlans buildOuterGridWarpPlans(
   // split is divisible. This improves performance when iteration dim is not
   // power of 2, e.g. 1600 and 4800.
   int64_t max_iter_unroll_factor =
-      std::min(vectorize_factor, std::min(iDimAvail(), target_unroll));
+      std::min(
+          iteration_unroll_cap,
+          std::min(vectorize_factor, std::min(iDimAvail(), target_unroll)));
   while (total_iteration_numel % (bdimx * iter_unroll_factor * 2) == 0 &&
          iter_unroll_factor * 2 <= max_iter_unroll_factor) {
     iter_unroll_factor *= 2;
@@ -2764,6 +2767,86 @@ OuterReductionParams getGridOuterReduction(
   if (grid_base_choice == "wave") {
     plans = wave_plans;
   }
+  // The native grid planner favors the largest aligned iteration unroll and
+  // spends the remaining register budget on reduction unroll. Offer smaller
+  // iteration factors only as complete, independently checked grid plans.
+  const int64_t native_iter_unroll = plans.baseline.iter_unroll_factor;
+  NVF_ERROR(
+      native_iter_unroll > 0 &&
+          scheduler_utils::lastPow2(native_iter_unroll) == native_iter_unroll,
+      "RD9 native iteration unroll is not a positive power of two");
+  std::vector<scheduler::jev::ChoiceOption> unroll_options;
+  std::vector<OuterGridWarpPlans> unroll_plans;
+  for (int64_t factor = 1; factor <= native_iter_unroll; factor *= 2) {
+    auto candidate = factor == native_iter_unroll
+        ? plans
+        : buildOuterGridWarpPlans(
+              total_reduction_numel,
+              total_iteration_numel,
+              max_dtype_size_bit_for_vectorization,
+              vectorize_factor,
+              max_unroll,
+              sm_count,
+              max_threads_per_sm,
+              n_waves,
+              min_warp_size,
+              cta_share,
+              grid_base_choice != "wave",
+              factor);
+    if (candidate.baseline.iter_unroll_factor == factor &&
+        outerGridWarpPlansHardValid(
+            candidate,
+            total_reduction_numel,
+            total_iteration_numel,
+            vectorize_factor,
+            max_unroll,
+            max_threads_per_block)) {
+      unroll_options.push_back(
+          {"u" + std::to_string(factor),
+           "Unroll " + std::to_string(factor) +
+               " iteration element(s); recompute reduction unroll"});
+      unroll_plans.push_back(std::move(candidate));
+    }
+    if (factor == native_iter_unroll) {
+      break;
+    }
+  }
+  NVF_ERROR(
+      !unroll_options.empty() &&
+          unroll_options.back().id == "u" + std::to_string(native_iter_unroll),
+      "RD9 native iteration unroll violates hard bounds");
+  const std::string unroll_state =
+      "reduction.outer_unroll_distribution.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) +
+      "\niteration_numel=" + std::to_string(total_iteration_numel) +
+      "\ndtype_bits=" +
+      std::to_string(max_dtype_size_bit_for_vectorization) +
+      "\nsm_count=" + std::to_string(sm_count) +
+      "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+      "\nmax_threads_per_block=" + std::to_string(max_threads_per_block) +
+      "\nmax_unroll=" + std::to_string(max_unroll) +
+      "\nvector_width=" + std::to_string(vectorize_factor) +
+      "\nwaves=" + std::to_string(n_waves) +
+      "\nwarp=" + std::to_string(min_warp_size) +
+      "\ncta_share=" + std::to_string(cta_share) +
+      "\ngrid_base=" + grid_base_choice;
+  const auto unroll_choice = scheduler::jev::chooseDecision(
+      "RD9.unroll",
+      unroll_state,
+      unroll_options,
+      jev_mode == scheduler::jev::Mode::Record
+          ? "u" + std::to_string(native_iter_unroll)
+          : "");
+  const auto unroll_option = std::find_if(
+      unroll_options.begin(),
+      unroll_options.end(),
+      [&](const scheduler::jev::ChoiceOption& option) {
+        return option.id == unroll_choice;
+      });
+  NVF_ERROR(
+      unroll_option != unroll_options.end(),
+      "RD9 unroll distribution is outside hard-valid complete plans");
+  plans = unroll_plans.at(unroll_option - unroll_options.begin());
   // The ragged-wave cleanup is an empirical occupancy preference. Offer the
   // raw grid only after both complete grid variants pass the same native
   // launch, CTA, vectorization, and reduction-coverage bounds.
