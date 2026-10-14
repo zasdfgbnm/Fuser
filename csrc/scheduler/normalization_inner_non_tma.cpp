@@ -714,20 +714,104 @@ void innerPersistentHeuristic2D(
 void innerPersistentHeuristicCluster(
     const PersistentKernelProperties& properties,
     ReductionParams* rparams) {
+  const auto jev_mode = scheduler::jev::mode();
   int64_t vectorize_factor = properties.vectorize_factor;
   int64_t after_vect = properties.total_reduction_numel / vectorize_factor;
   int64_t bdimx = 256; // empirical value
   int64_t after_vect_bdimx = ceilDiv(after_vect, bdimx);
 
-  // Targeting 2 blocks per SM
-  const int64_t register_per_block =
-      scheduler_utils::register_file_size_bit / 2;
-  int64_t blocks_per_cluster =
-      ceilDiv(properties.max_persistent_buffer_size_bit, register_per_block);
-  blocks_per_cluster = scheduler_utils::roundUpPow2(blocks_per_cluster);
-  blocks_per_cluster =
-      std::min(blocks_per_cluster, scheduler_utils::getMaxClusterSize());
-  int64_t persistent_batch = ceilDiv(after_vect_bdimx, blocks_per_cluster);
+  int64_t persistent_batch = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Legacy preference: two resident blocks per SM.
+    const int64_t register_per_block =
+        scheduler_utils::register_file_size_bit / 2;
+    int64_t blocks_per_cluster =
+        ceilDiv(properties.max_persistent_buffer_size_bit, register_per_block);
+    blocks_per_cluster = scheduler_utils::roundUpPow2(blocks_per_cluster);
+    blocks_per_cluster =
+        std::min(blocks_per_cluster, scheduler_utils::getMaxClusterSize());
+    persistent_batch = ceilDiv(after_vect_bdimx, blocks_per_cluster);
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const auto device = at::cuda::getCurrentDeviceProperties();
+    const int64_t max_cluster = scheduler_utils::getMaxClusterSize();
+    const int64_t max_grid_y =
+        std::min<int64_t>(scheduler_utils::y_grid_limit, device->maxGridSize[1]);
+    struct ClusterBatchPlan {
+      int64_t batch;
+      int64_t cluster;
+    };
+    std::vector<ClusterBatchPlan> plans;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    // The BIDx cluster extent is derived by the reduction split, not by the
+    // target cluster count. Validate that actual extent and the worst block's
+    // persistent-buffer share for every complete batch/cluster plan.
+    if (after_vect_bdimx > 0 && max_cluster >= 2 && max_cluster <= 16 &&
+        bdimx <= device->maxThreadsPerBlock &&
+        properties.total_iteration_numel <= max_grid_y &&
+        properties.max_persistent_buffer_size_bit > 0) {
+      const int64_t bits_per_batch = ceilDiv(
+          properties.max_persistent_buffer_size_bit, after_vect_bdimx);
+      for (int64_t target_cluster = 2; target_cluster <= max_cluster;
+           ++target_cluster) {
+        const int64_t batch = ceilDiv(after_vect_bdimx, target_cluster);
+        const int64_t actual_cluster = ceilDiv(after_vect_bdimx, batch);
+        if (actual_cluster < 2 || actual_cluster > max_cluster ||
+            bits_per_batch > scheduler_utils::register_file_size_bit / batch ||
+            std::any_of(plans.begin(), plans.end(), [&](const auto& plan) {
+              return plan.batch == batch;
+            })) {
+          continue;
+        }
+        plans.push_back({batch, actual_cluster});
+        options.push_back({
+            "b" + std::to_string(batch),
+            "Persistent batch " + std::to_string(batch) + ", cluster " +
+                std::to_string(actual_cluster) + ", CTA 256"});
+      }
+    }
+
+    const auto native_it = std::find_if(
+        plans.begin(), plans.end(), [&](const auto& plan) {
+          return plan.batch == persistent_batch;
+        });
+    if (jev_mode == scheduler::jev::Mode::Record &&
+        native_it == plans.end()) {
+      scheduler::jev::recordCoverageSkip(
+          "IP7.cluster", "Native cluster batch falls outside proved menu");
+    } else {
+      NVF_ERROR(!options.empty(), "No legal inner persistent cluster plan");
+      const std::string state =
+          "inner_persistent.cluster.v1\nreduction_numel=" +
+          std::to_string(properties.total_reduction_numel) +
+          "\niteration_numel=" +
+          std::to_string(properties.total_iteration_numel) +
+          "\nvector_width=" + std::to_string(vectorize_factor) +
+          "\npersistent_buffer_bits=" +
+          std::to_string(properties.max_persistent_buffer_size_bit) +
+          "\nregister_file_bits=" +
+          std::to_string(scheduler_utils::register_file_size_bit) +
+          "\nmax_cluster_size=" + std::to_string(max_cluster) +
+          "\nmax_threads_per_block=" +
+          std::to_string(device->maxThreadsPerBlock) +
+          "\nmax_grid_y=" + std::to_string(max_grid_y);
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? "b" + std::to_string(persistent_batch)
+          : "";
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IP7.cluster", state, options, native_choice);
+      const auto selected_it = std::find_if(
+          plans.begin(), plans.end(), [&](const auto& plan) {
+            return selected == "b" + std::to_string(plan.batch);
+          });
+      NVF_ERROR(
+          selected_it != plans.end(),
+          "Unknown inner persistent cluster batch plan");
+      persistent_batch = selected_it->batch;
+    }
+  }
 
   rparams->cross_block_inner_reduction = true;
   rparams->cross_grid_inner_reduction = true;
