@@ -283,6 +283,61 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
         batch,
         ceilDiv(total_iteration_numel, final_bdimx * iter_unroll)};
   };
+  // The native TIDy search stops at the largest useful reduction split. Its
+  // earlier splits are also valid complete block plans: they trade parallel
+  // reduction lanes for more serial batches. Keep the native last plan as the
+  // default, and expose the preceding plans through the same OP3.cta Choice.
+  const auto make_block_candidates = [&](int64_t seed_bdimx,
+                                         int64_t iter_unroll,
+                                         int64_t redu_unroll) {
+    std::vector<BlockPlan> candidates;
+    const auto native =
+        make_block_plan(seed_bdimx, iter_unroll, redu_unroll);
+    if (!native.has_value()) {
+      return candidates;
+    }
+    const int64_t after_unroll = total_reduction_numel / redu_unroll;
+    const int64_t min_batch = std::min(8l, after_unroll);
+    const int64_t y_max = std::min(
+        ceilDiv(after_unroll, min_batch),
+        max_threads_in_block / seed_bdimx);
+    const int64_t y_min =
+        std::min(y_max, min_threads_in_block / seed_bdimx);
+    const int64_t y_step =
+        std::max(1l, device_warp_size / seed_bdimx);
+    const auto append = [&](int64_t y) {
+      const int64_t x = seed_bdimx * y < min_threads_in_block
+          ? min_threads_in_block / y
+          : seed_bdimx;
+      const int64_t batch = ceilDiv(after_unroll, y);
+      if (x > max_multi_reduction_factor / iter_unroll ||
+          x * y > max_threads_in_block || batch < min_batch) {
+        return;
+      }
+      candidates.push_back(BlockPlan{
+          x,
+          y,
+          batch,
+          ceilDiv(total_iteration_numel, x * iter_unroll)});
+    };
+    for (int64_t y = y_min; y <= native->bdimy; y += y_step) {
+      // The native search visits the initial split, then only exact divisors
+      // on this stride. Its last candidate may be the nondivisible y_max.
+      if (y == y_min || after_unroll % y == 0) {
+        append(y);
+      }
+    }
+    if (candidates.empty() ||
+        candidates.back().bdimy != native->bdimy) {
+      append(native->bdimy);
+    }
+    NVF_ERROR(
+        !candidates.empty() && candidates.back().bdimx == native->bdimx &&
+            candidates.back().bdimy == native->bdimy &&
+            candidates.back().batches_per_block == native->batches_per_block,
+        "Outer persistent CTA candidates lost the native block plan");
+    return candidates;
+  };
   const auto plan_id = [](const BlockPlan& plan) {
     return "x" + std::to_string(plan.bdimx) + "_y" +
         std::to_string(plan.bdimy) + "_b" +
@@ -453,43 +508,34 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     for (int64_t seed = 1;
          seed <= std::min(bdimx_max, device_warp_size);
          seed *= 2) {
-      auto plan = make_block_plan(
-          seed,
-          params.iter_unroll_factor.get(),
-          params.redu_unroll_factor.get());
-      if (!plan.has_value()) {
-        continue;
+      for (const auto& plan : make_block_candidates(
+               seed,
+               params.iter_unroll_factor.get(),
+               params.redu_unroll_factor.get())) {
+        const std::string id = plan_id(plan);
+        if (std::any_of(
+                options.begin(),
+                options.end(),
+                [&](const auto& option) { return option.id == id; })) {
+          continue;
+        }
+        options.push_back({
+            id,
+            "Use blockDim=(" + std::to_string(plan.bdimx) + "," +
+                std::to_string(plan.bdimy) + ") and " +
+                std::to_string(plan.batches_per_block) +
+                " serial reduction batches over " +
+                std::to_string(plan.gdimx) + " iteration CTAs"});
+        plans.push_back(plan);
       }
-      const std::string id = plan_id(*plan);
-      if (std::any_of(
-              options.begin(),
-              options.end(),
-              [&](const auto& option) { return option.id == id; })) {
-        continue;
-      }
-      options.push_back({
-          id,
-          "Use blockDim=(" + std::to_string(plan->bdimx) + "," +
-              std::to_string(plan->bdimy) + ") and " +
-              std::to_string(plan->batches_per_block) +
-              " serial reduction batches over " +
-              std::to_string(plan->gdimx) + " iteration CTAs"});
-      plans.push_back(*plan);
     }
     NVF_ERROR(!options.empty(), "No legal outer persistent block plan");
     const std::string state =
-        (params.redu_unroll_factor.get() > 1
-             ? "outer_persistent.block_cta.v3\nredu_unroll=" +
-                   std::to_string(params.redu_unroll_factor.get()) +
-                   "\niter_unroll=" +
-                   std::to_string(params.iter_unroll_factor.get()) +
-                   "\nvector_width=" + std::to_string(vectorize_factor) + "\n"
-             : params.iter_unroll_factor.get() == 1
-                 ? "outer_persistent.block_cta.v1\n"
-                 : "outer_persistent.block_cta.v2\niter_unroll=" +
-                       std::to_string(params.iter_unroll_factor.get()) +
-                       "\nvector_width=" + std::to_string(vectorize_factor) +
-                       "\n") +
+        "outer_persistent.block_cta.v4\nredu_unroll=" +
+        std::to_string(params.redu_unroll_factor.get()) +
+        "\niter_unroll=" +
+        std::to_string(params.iter_unroll_factor.get()) +
+        "\nvector_width=" + std::to_string(vectorize_factor) + "\n" +
         "reduction_numel=" +
         std::to_string(total_reduction_numel) + "\niteration_numel=" +
         std::to_string(total_iteration_numel) + "\npersistent_buffer_bits=" +

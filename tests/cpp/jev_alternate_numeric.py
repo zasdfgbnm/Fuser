@@ -716,6 +716,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_grid: bool = False,
                            require_outer_width: bool = False,
                            require_outer_cta: bool = False,
+                           require_outer_batch_menu: bool = False,
                            require_outer_ragged: bool = False,
                            require_outer_grid_base: bool = False,
                            require_outer_unroll: bool = False,
@@ -837,8 +838,8 @@ def check_alternate_report(report: dict[str, Any],
         for nested_site, record_tag, remote_tag in (
                 ("OP3.unroll", "outer_persistent.iter_unroll.v1\n",
                  "outer_persistent.iter_unroll.v2\n"),
-                ("OP3.cta", "outer_persistent.block_cta.v1\n",
-                 "outer_persistent.block_cta.v3\n")):
+                ("OP3.cta", "outer_persistent.block_cta.v4\n",
+                 "outer_persistent.block_cta.v4\n")):
             rows = [entry for entry in report["multiplicity"]
                     if entry["site"] == nested_site]
             record_only = [entry for entry in rows
@@ -857,6 +858,13 @@ def check_alternate_report(report: dict[str, Any],
             if (fields.get("redu_unroll") != alternate[1:] or
                     (nested_site == "OP3.cta" and fields.get("iter_unroll") != "1")):
                 raise ValueError(f"{nested_site} did not receive {alternate}: {fields}")
+            if nested_site == "OP3.cta":
+                native_fields = dict(line.split("=", 1) for line in
+                                     record_only[0]["request"]["state"].splitlines()[1:])
+                if (native_fields.get("redu_unroll") != "1" or
+                        any(native_fields[key] != fields[key] for key in
+                            native_fields if key != "redu_unroll")):
+                    raise ValueError("OP3.cta changed unrelated reduction measurements")
             dependent.extend((
                 {"kind": "record_only_state", "site": nested_site,
                  "request_sha256": record_only[0]["request_sha256"]},
@@ -878,14 +886,19 @@ def check_alternate_report(report: dict[str, Any],
         if len(ctas) != 2 or len(record_cta) != 1 or len(remote_cta) != 1:
             raise ValueError(f"expected exactly one replaced OP3.cta request: {ctas}")
         if (not record_cta[0]["request"]["state"].startswith(
-                "outer_persistent.block_cta.v1\n") or
+                "outer_persistent.block_cta.v4\n") or
                 not remote_cta[0]["request"]["state"].startswith(
-                    "outer_persistent.block_cta.v2\n")):
+                    "outer_persistent.block_cta.v4\n")):
             raise ValueError("OP3.cta state versions did not follow factor choice")
+        original = dict(line.split("=", 1) for line in
+                        record_cta[0]["request"]["state"].splitlines()[1:])
         selected = dict(line.split("=", 1) for line in
                         remote_cta[0]["request"]["state"].splitlines()[1:])
-        if (selected.get("iter_unroll") != alternate[1:] or
-                int(selected.get("vector_width", "0")) < int(alternate[1:])):
+        if (original.get("iter_unroll") != "1" or
+                selected.get("iter_unroll") != alternate[1:] or
+                int(selected.get("vector_width", "0")) < int(alternate[1:]) or
+                any(original[key] != selected[key] for key in original
+                    if key != "iter_unroll")):
             raise ValueError(f"OP3.cta did not receive selected {alternate}: {selected}")
         expected = [intended,
             {"kind": "record_only_state", "site": "OP3.cta",
@@ -895,6 +908,14 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent CTA comparison issues: {issues}")
+    elif require_outer_batch_menu:
+        if (site != "OP3.cta" or alternate != "x16_y8_b16" or
+                event["native"] != "x8_y16_b8" or
+                not entry["request"]["state"].startswith(
+                    "outer_persistent.block_cta.v4\n") or
+                "x16_y8_b16" not in event["candidates"] or
+                issues != [intended]):
+            raise ValueError("outer batch fixture lacks the new complete block plan")
     elif site == "OP2.base" and alternate == "x11_y11_b16":
         # The bounded register-margin plan bypasses the native no-spill
         # estimate. It is already a complete grid/batch/unswitch plan, so the
@@ -2318,6 +2339,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-grid", action="store_true")
     parser.add_argument("--require-outer-width", action="store_true")
     parser.add_argument("--require-outer-cta", action="store_true")
+    parser.add_argument("--require-outer-batch-menu", action="store_true")
     parser.add_argument("--require-outer-ragged", action="store_true")
     parser.add_argument("--require-outer-grid-base", action="store_true")
     parser.add_argument("--require-outer-unroll", action="store_true")
@@ -2454,6 +2476,7 @@ def main(argv: list[str] | None = None) -> int:
             require_grid=args.require_grid,
             require_outer_width=args.require_outer_width,
             require_outer_cta=args.require_outer_cta,
+            require_outer_batch_menu=args.require_outer_batch_menu,
             require_outer_ragged=args.require_outer_ragged,
             require_outer_grid_base=args.require_outer_grid_base,
             require_outer_unroll=args.require_outer_unroll,
