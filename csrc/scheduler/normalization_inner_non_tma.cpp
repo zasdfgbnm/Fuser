@@ -1055,39 +1055,23 @@ int64_t chooseInner2DCTASeed(
         "IP5.cta_seed", "Native CTA seed lacks a complete physical plan");
     return native_seed;
   }
-  const auto same_schedule = [](const SeedPlan& a, const SeedPlan& b) {
-    return a.batch == b.batch && a.physical_x == b.physical_x &&
-        a.physical_y == b.physical_y &&
-        a.pad_to_warp == b.pad_to_warp &&
-        a.register_cap == b.register_cap && a.grid_x == b.grid_x;
-  };
-  std::vector<const SeedPlan*> offered;
-  const auto native_plan = std::find_if(
-      plans.begin(), plans.end(), [&](const SeedPlan& plan) {
-        return plan.seed == native_seed;
-      });
-  offered.push_back(&*native_plan);
-  for (const auto& plan : plans) {
-    if (!plan.valid || plan.seed == native_seed ||
-        std::any_of(offered.begin(), offered.end(), [&](const SeedPlan* prior) {
-          return same_schedule(plan, *prior);
-        })) {
-      continue;
-    }
-    offered.push_back(&plan);
-  }
-  if (offered.size() == 1) {
+  const auto valid_count = std::count_if(
+      plans.begin(), plans.end(),
+      [](const SeedPlan& plan) { return plan.valid; });
+  // Two seeds can have the same preview winner but expose different later
+  // IP5.batch menus and per-batch CTA/register plans. Only a single hard-valid
+  // seed is proved to lack a model decision.
+  if (valid_count == 1) {
     if (mode == scheduler::jev::Mode::Record) {
       scheduler::jev::recordCoverageSkip(
-          "IP5.cta_seed", "All proved CTA seeds have the same schedule");
+          "IP5.cta_seed", "Only one hard-valid CTA seed");
     }
     return native_seed;
   }
   std::vector<scheduler::jev::ChoiceOption> options;
-  // Retain ascending seed order on the wire. Representative selection above
-  // preserves the native schedule without exposing its identity in ordering.
+  // Keep ascending seed order on the wire; never send a native-winner hint.
   for (const auto& plan : plans) {
-    if (std::find(offered.begin(), offered.end(), &plan) == offered.end()) {
+    if (!plan.valid) {
       continue;
     }
     options.push_back({
