@@ -12,6 +12,8 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <string>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -20,6 +22,7 @@
 #include "ops/arith.h"
 #include "runtime/executor_params.h"
 #include "scheduler/cache_policy_refiner.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -103,7 +106,56 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
   const int64_t smem_limited_stages =
       (int64_t)dev_prop->sharedMemPerBlockOptin * 8 / smem_size_bit;
   const int64_t n_stages = std::min(smem_limited_stages, iter_limited_stages);
-  if (n_stages >= 2 && bdimx == 128) {
+  const bool native_warp_specialized = n_stages >= 2 && bdimx == 128;
+  bool use_warp_specialized = native_warp_specialized;
+  const auto jev_mode = scheduler::jev::mode();
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // The basic TMA schedule works with the same width and persistent batch.
+    // Only the warp-specialized plan needs the extra producer warp group,
+    // static CTA, circular-buffer stages, and one-CTA-per-SM grid. These
+    // resource and topology checks are native hard gates, not model choices.
+    const bool warp_specialized_legal =
+        native_warp_specialized && dev_prop->major >= 9 &&
+        bdimx * (n_compute_warp_groups + 1) <= max_threads_per_cta &&
+        sm_count <= dev_prop->maxGridSize[0];
+    if (jev_mode == scheduler::jev::Mode::Record &&
+        native_warp_specialized && !warp_specialized_legal) {
+      scheduler::jev::recordCoverageSkip(
+          "IP2.tma_mode", "native warp-specialized plan is outside hard bounds");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options = {{
+          "basic", "Use multiwave TMA without circular buffering"}};
+      if (warp_specialized_legal) {
+        options.push_back({
+            "ws", "Use warp-specialized TMA with circular buffering"});
+      }
+      const std::string state =
+          "inner_persistent.tma_mode.v1\nreduction_numel=" +
+          std::to_string(total_redu_count) + "\niteration_numel=" +
+          std::to_string(total_iter_count) + "\nvector_width=" +
+          std::to_string(params->vectorization_factor) +
+          "\npersistent_batch_size=" +
+          std::to_string(params->persistent_batch_size) +
+          "\ncompute_bdimx=" + std::to_string(bdimx) +
+          "\npersistent_buffer_bits=" +
+          std::to_string(prop.max_persistent_buffer_size_bit) +
+          "\nwarp_size=" + std::to_string(warp_size) + "\nsm_count=" +
+          std::to_string(sm_count) + "\nsm_major=" +
+          std::to_string(dev_prop->major) + "\nmax_threads_per_block=" +
+          std::to_string(max_threads_per_cta) + "\nmax_grid_x=" +
+          std::to_string(dev_prop->maxGridSize[0]) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(dev_prop->sharedMemPerBlockOptin);
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? (native_warp_specialized ? "ws" : "basic")
+          : "";
+      use_warp_specialized = scheduler::jev::chooseDecision(
+                                 "IP2.tma_mode", state, options, native_choice) ==
+          "ws";
+    }
+  }
+  if (use_warp_specialized) {
     gdimx = sm_count;
     bdimy = n_compute_warp_groups;
     bdimz = 1; // warp specialized kernel requires static CTA shape
