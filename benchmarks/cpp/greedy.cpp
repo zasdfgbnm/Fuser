@@ -61,6 +61,7 @@ void runGreedyFourScan(
   }
   auto* runtime = executor_cache->getMostRecentKernelRuntime();
   NVF_ERROR(runtime != nullptr);
+  NVF_ERROR(!runtime->isSegmented(), "Expected an unsegmented Greedy schedule");
   const auto& groups = runtime->fusionSegments()->groups();
   NVF_ERROR(
       groups.size() == 1 &&
