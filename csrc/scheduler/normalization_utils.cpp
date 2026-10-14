@@ -7,7 +7,9 @@
 // clang-format on
 #include "scheduler/normalization_utils.h"
 
+#include <algorithm>
 #include <ranges>
+#include <string>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -379,6 +381,145 @@ std::optional<std::tuple<int64_t, int64_t, bool>> reduceWorkOfLastBlock(
   return std::nullopt;
 }
 
+struct GridTailPlan {
+  int64_t gdimy;
+  int64_t buffer_size;
+  bool reduce_last_block_work;
+};
+
+std::string gridTailPlanId(const GridTailPlan& plan) {
+  return "y" + std::to_string(plan.gdimy) + "_b" +
+      std::to_string(plan.buffer_size);
+}
+
+// Only the last-block batch adjustment is a Choice here. The native search
+// still chooses the base grid/CTA configuration, which is also used by
+// canScheduleRunTime. Every offered adjustment is a complete schedulable
+// (gridDim.y, persistent batch, unswitch policy) plan for that base.
+std::optional<GridTailPlan> chooseGridTailAdjustment(
+    const PreferredLaunchConfig& base,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit,
+    int64_t native_gdimy,
+    int64_t native_buffer_size,
+    bool native_reduced) {
+  const auto jev_mode = scheduler::jev::mode();
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  // SM7.5 has a separate native rule; all SM7 runtime eligibility also checks
+  // iteration divisibility. Keep those architectures entirely native.
+  if (jev_mode == scheduler::jev::Mode::Off || dev_prop->major < 8) {
+    return std::nullopt;
+  }
+
+  const int64_t num_sms = dev_prop->multiProcessorCount;
+  if (base.gdimx() >
+          std::min<int64_t>(scheduler_utils::x_grid_limit, dev_prop->maxGridSize[0]) ||
+      base.bdimx() * base.bdimy() > dev_prop->maxThreadsPerBlock) {
+    return std::nullopt;
+  }
+
+  std::vector<GridTailPlan> plans;
+  int64_t gdimy = base.gdimy();
+  int64_t buffer_size =
+      getMinPersistentBufferSize(total_reduction_numel, base.bdimy(), gdimy);
+  const int64_t min_gdimy = static_cast<int64_t>((double)gdimy * 0.9);
+  const int64_t iteration_blocks = ceilDiv(
+      ceilDiv(total_iteration_numel, vectorize_factor), base.bdimx());
+  // The native preference stops at the first sufficiently small tail. A
+  // bounded menu also prevents a gridDim.y=1 tail from generating an
+  // unbounded sequence of oversized batches. If it misses the native winner,
+  // this site stays native for that shape.
+  int64_t inspected = 0;
+  while (inspected++ < 128 && gdimy >= min_gdimy &&
+         checkIfWithinRegisterSpace(
+             total_reduction_numel,
+             persistent_buffer_size_bit,
+             vectorize_factor,
+             base.bdimy(),
+             gdimy)) {
+    // The schedule derives its actual BIDy extent from the batch factor.
+    // The base launch estimate may overstate that extent by one block.
+    const int64_t actual_gdimy = getMinPersistentBufferSize(
+        total_reduction_numel, base.bdimy(), buffer_size);
+    if (gdimy <=
+            std::min<int64_t>(
+                scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+        actual_gdimy <=
+            std::min<int64_t>(
+                scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+        // The native estimate uses the grid extent. Bound the actual batch as
+        // well before offering a larger buffer to the model.
+        ceilDiv(
+            ceilDiv(
+                ceilDiv(persistent_buffer_size_bit, base.bdimy()),
+                actual_gdimy) * vectorize_factor,
+            32l) <= 220l - buffer_size &&
+        iteration_blocks >= ceilDiv(ceilDiv(num_sms, 2l), actual_gdimy)) {
+      const bool reduced = getLastBlockWorkRatio(
+                               total_reduction_numel,
+                               base.bdimy(),
+                               buffer_size) < 0.25;
+      plans.push_back({gdimy, buffer_size, reduced});
+    }
+    ++buffer_size;
+    gdimy = getMinPersistentBufferSize(
+        total_reduction_numel, base.bdimy(), buffer_size);
+  }
+
+  // The native plan is already known to have passed runtime eligibility. If
+  // the stronger actual-grid check above excludes it, preserve native output.
+  const auto native_it = std::find_if(
+      plans.begin(), plans.end(), [&](const GridTailPlan& plan) {
+        return plan.gdimy == native_gdimy &&
+            plan.buffer_size == native_buffer_size;
+      });
+  if (plans.size() < 2 || native_it == plans.end()) {
+    return std::nullopt;
+  }
+  NVF_ERROR(
+      native_it->reduce_last_block_work == native_reduced,
+      "Grid tail native unswitch policy does not match the offered plan");
+
+  std::vector<scheduler::jev::ChoiceOption> options;
+  options.reserve(plans.size());
+  for (const auto& plan : plans) {
+    options.push_back({
+        gridTailPlanId(plan),
+        "Use gridDim.y=" + std::to_string(plan.gdimy) +
+            ", persistent batch=" + std::to_string(plan.buffer_size) +
+            (plan.reduce_last_block_work ? ", fully unswitch batch"
+                                         : ", unswitch up to 4")});
+  }
+  const std::string state =
+      "outer_persistent.grid_tail.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) + "\niteration_numel=" +
+      std::to_string(total_iteration_numel) + "\nvector_width=" +
+      std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+      std::to_string(persistent_buffer_size_bit) + "\nbase_gdimx=" +
+      std::to_string(base.gdimx()) + "\nbase_gdimy=" +
+      std::to_string(base.gdimy()) + "\nbase_bdimx=" +
+      std::to_string(base.bdimx()) + "\nbase_bdimy=" +
+      std::to_string(base.bdimy()) + "\nsm_count=" +
+      std::to_string(num_sms) + "\nmax_grid_x=" +
+      std::to_string(dev_prop->maxGridSize[0]) + "\nmax_grid_y=" +
+      std::to_string(dev_prop->maxGridSize[1]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(dev_prop->maxThreadsPerBlock);
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record ? gridTailPlanId(*native_it)
+                                               : "";
+  const auto selected = scheduler::jev::chooseDecision(
+      "OP2.tail", state, options, native_choice);
+  const auto choice_it = std::find_if(
+      plans.begin(), plans.end(), [&](const GridTailPlan& plan) {
+        return gridTailPlanId(plan) == selected;
+      });
+  NVF_ERROR(choice_it != plans.end(), "Unknown grid outer tail plan");
+  return *choice_it;
+}
+
 } // namespace
 
 // Iterate configurations from largest blockDim.x and smallest
@@ -389,7 +530,8 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
     int64_t total_reduction_numel,
     int64_t total_iteration_numel,
     int64_t vectorize_factor,
-    int64_t persistent_buffer_size_bit) {
+    int64_t persistent_buffer_size_bit,
+    bool allow_jev_tail_choice) {
   PreferredLaunchConfig launch_cfg;
 
   // The launch config starts with the largest blockDim.x, which may
@@ -489,6 +631,22 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
       }
       std::tie(adjusted_gdimy, adjusted_buffer_size, last_block_work_reduced) =
           *gdimy_pb_size;
+      if (allow_jev_tail_choice) {
+        auto chosen_tail = chooseGridTailAdjustment(
+            launch_cfg,
+            total_reduction_numel,
+            total_iteration_numel,
+            vectorize_factor,
+            persistent_buffer_size_bit,
+            adjusted_gdimy,
+            adjusted_buffer_size,
+            last_block_work_reduced);
+        if (chosen_tail.has_value()) {
+          adjusted_gdimy = chosen_tail->gdimy;
+          adjusted_buffer_size = chosen_tail->buffer_size;
+          last_block_work_reduced = chosen_tail->reduce_last_block_work;
+        }
+      }
     }
 
     // Acceptable configuration found

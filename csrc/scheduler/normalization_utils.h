@@ -160,7 +160,8 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
     int64_t total_reduction_numel,
     int64_t total_iteration_numel,
     int64_t vectorize_factor,
-    int64_t persistent_buffer_size_bit);
+    int64_t persistent_buffer_size_bit,
+    bool allow_jev_tail_choice = false);
 
 //! check iter type of each domain in inner and outer reduction tvs
 //! inner reduction must be [I,I,...R,R]

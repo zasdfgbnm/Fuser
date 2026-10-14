@@ -81,7 +81,8 @@ std::unique_ptr<ReductionParams> gridOuterPersistentHeuristic(
           total_reduction_numel,
           total_iteration_numel,
           (int64_t)vectorize_factor,
-          max_persistent_buffer_size_bit);
+          max_persistent_buffer_size_bit,
+          true);
 
   NVF_ERROR(outer_params.has_value(), "No valid config found");
 
