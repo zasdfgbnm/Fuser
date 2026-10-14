@@ -241,12 +241,102 @@ void getHeuristics(
         /*target_stages=*/2, /*target_bdimy=*/1, /*target_iter_unroll=*/1);
   }
 
+  // The native joint search above fixes topology, unroll and register-cache
+  // placement. At that fixed plan, either non-circular input path is a
+  // performance choice if both pass the same hard resource checks. In
+  // particular, do not offer a one-stage plan: the native search uses that
+  // outcome to trigger a different topology and load-mode fallback.
+  const auto jev_mode = scheduler::jev::mode();
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool native_direct = is_non_circular_buffer_gmem_to_regs;
+    const bool valid_shape = inner_dim_numel > 0 && vect_factor > 0 &&
+        inner_dim_numel % vect_factor == 0 && outer_dim_numel > 0 &&
+        outer_dim_numel % iter_unroll == 0 && min_bdimx >= 128 &&
+        min_bdimx % 128 == 0 && max_bdimx >= min_bdimx &&
+        max_bdimx <= 1024 && bdimx >= min_bdimx && bdimx <= max_bdimx &&
+        bdimx % 128 == 0 && (bdimy == 1 || bdimy == 2) &&
+        n_stages >= 2 && n_stages % bdimy == 0 &&
+        non_circular_buffered_smem_size_bit > 0 &&
+        circular_buffered_smem_size_bit >= 0 && regs_buffer_size_bit >= 0 &&
+        computation_dtype_size_bit > 0 &&
+        bdimx * bdimy + kWarpSpecializationPaddedThreads <=
+            dev_prop->maxThreadsPerBlock &&
+        (bdimx > 128 ? bdimx + kWarpSpecializationPaddedThreads : bdimx) <=
+            dev_prop->maxThreadsDim[0] &&
+        (bdimx > 128 ? bdimy : bdimy + 1) <=
+            dev_prop->maxThreadsDim[1] &&
+        gdimy <= dev_prop->maxGridSize[1];
+    is_non_circular_buffer_gmem_to_regs = true;
+    const bool direct_valid = valid_shape &&
+        is_enough_regs(iter_unroll, bdimx, bdimy) &&
+        is_enough_smem(iter_unroll, n_stages, bdimx, bdimy);
+    is_non_circular_buffer_gmem_to_regs = false;
+    const bool smem_valid = valid_shape &&
+        is_enough_regs(iter_unroll, bdimx, bdimy) &&
+        is_enough_smem(iter_unroll, n_stages, bdimx, bdimy);
+    is_non_circular_buffer_gmem_to_regs = native_direct;
+    if (direct_valid && smem_valid) {
+      std::string register_budgets;
+      for (int64_t x = min_bdimx; x <= max_bdimx; x += 128) {
+        if (!register_budgets.empty()) {
+          register_budgets += ",";
+        }
+        register_budgets += std::to_string(x + kWarpSpecializationPaddedThreads) +
+            ":" + std::to_string(getRegPerThreadGivenThreadsPerSM(
+                      x + kWarpSpecializationPaddedThreads));
+      }
+      // The two-computation-group probe also needs the 384-thread budget
+      // when the configured maximum leaves only x=128 in the sweep.
+      if (max_bdimx == 128) {
+        register_budgets += ",384:" +
+            std::to_string(getRegPerThreadGivenThreadsPerSM(384));
+      }
+      const std::string state =
+          "inner_outer.tma_ws_load_mode.v1\nouter_dim_numel=" +
+          std::to_string(outer_dim_numel) + "\ninner_dim_numel=" +
+          std::to_string(inner_dim_numel) + "\nvector_width=" +
+          std::to_string(vect_factor) + "\nmin_threads=" +
+          std::to_string(hp_threads_per_block_min) + "\nmax_threads=" +
+          std::to_string(hp_threads_per_block_max) + "\nregister_budgets=" +
+          register_budgets + "\nregister_buffer_bits=" +
+          std::to_string(regs_buffer_size_bit) + "\ncircular_buffer_bits=" +
+          std::to_string(circular_buffered_smem_size_bit) +
+          "\nnon_circular_buffer_bits=" +
+          std::to_string(non_circular_buffered_smem_size_bit) +
+          "\ncomputation_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(dev_prop->sharedMemPerBlockOptin) +
+          "\nmax_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) +
+          "\nmax_threads_dim_x=" +
+          std::to_string(dev_prop->maxThreadsDim[0]) +
+          "\nmax_threads_dim_y=" +
+          std::to_string(dev_prop->maxThreadsDim[1]) + "\nmax_grid_y=" +
+          std::to_string(dev_prop->maxGridSize[1]) + "\nsm_count=" +
+          std::to_string(sm_count);
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"direct", "Load non-circular inputs directly into registers"},
+          {"smem", "Load non-circular inputs through shared memory"}};
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.load_mode",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? (native_direct ? "direct" : "smem")
+              : "");
+      is_non_circular_buffer_gmem_to_regs = selected == "direct";
+    } else if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IOP2.load_mode", "fixed topology lacks two hard-valid load paths");
+    }
+  }
+
   // The topology, register-cache mode, and load mode above are fixed before
   // choosing the final circular-buffer depth. The initial stage count is also
   // the lower bound: selecting a smaller count could bypass the load-mode
   // fallback that update_heuristics uses for a single-stage plan.
   const int64_t initial_stages = n_stages;
-  const auto jev_mode = scheduler::jev::mode();
   if (!enable_jev_choice || jev_mode != scheduler::jev::Mode::Remote) {
     // The IOP1 preflight also needs the native full-depth plan. On the
     // executed branch, preserve the native preference in off/record modes.
