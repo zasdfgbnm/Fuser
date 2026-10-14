@@ -727,6 +727,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_cta_full: bool = False,
                            require_reduction_inner3d_work_split: bool = False,
                            require_reduction_inner3d_waves: bool = False,
+                           require_reduction_inner3d_outer_unroll: bool = False,
                            require_inner3d_grid_wave: bool = False,
                            require_inner_width: bool = False,
                            require_inner_batch_cap: bool = False,
@@ -2268,6 +2269,30 @@ def check_alternate_report(report: dict[str, Any],
             expected.extend(pair_issues)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected read-width dependencies: {issues}")
+    elif require_reduction_inner3d_outer_unroll:
+        from jev_shim import (analyze_rd5_outer_unroll,
+                              parse_rd5_outer_unroll_state)
+
+        if (site != "RD5.outer_unroll" or event["native"] != "u4" or
+                alternate != "u1" or
+                event["candidates"] != ["u1", "u2", "u3", "u4"]):
+            raise ValueError("3D reduction fixture lacks a complete outer-unroll menu")
+        state = parse_rd5_outer_unroll_state(event["state"])
+        if (state["reduction_numel"] != 24 or state["inner_numel"] != 3 or
+                state["iteration_numel"] != 32 or
+                analyze_rd5_outer_unroll(state).native_factor != 4):
+            raise ValueError("3D reduction outer-unroll fixture changed")
+        before, after, dependent = paired_state_rows(report, "RD5.iter_unroll")
+        left = state_fields(before, "reduction.inner3d_iter_unroll.v1")
+        right = state_fields(after, "reduction.inner3d_iter_unroll.v1")
+        if (left.get("outer_unroll") != "4" or
+                right.get("outer_unroll") != "1" or
+                before["record"] != {"u1": 1} or
+                after["remote"] != {"u1": 1} or
+                any(left[key] != right[key] for key in left if key != "outer_unroll") or
+                sorted(issues, key=str) !=
+                sorted([intended, *dependent], key=str)):
+            raise ValueError("outer unroll did not rebuild dependent output plan")
     elif issues != [intended]:
         raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
@@ -2307,6 +2332,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-reduction-inner3d-work-split",
                         action="store_true")
     parser.add_argument("--require-reduction-inner3d-waves",
+                        action="store_true")
+    parser.add_argument("--require-reduction-inner3d-outer-unroll",
                         action="store_true")
     parser.add_argument("--require-inner3d-grid-wave", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
@@ -2442,6 +2469,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.require_reduction_inner3d_work_split),
             require_reduction_inner3d_waves=(
                 args.require_reduction_inner3d_waves),
+            require_reduction_inner3d_outer_unroll=(
+                args.require_reduction_inner3d_outer_unroll),
             require_inner3d_grid_wave=args.require_inner3d_grid_wave,
             require_inner_width=args.require_inner_width,
             require_inner_batch_cap=args.require_inner_batch_cap,

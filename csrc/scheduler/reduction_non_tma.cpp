@@ -1125,6 +1125,92 @@ bool inner3dWarpPlanIsSafe(
   return true;
 }
 
+// Check one outer-reduction unroll against the fixed upstream CTA plan. In
+// this bounded domain the output CTA dimension is one, so no later grid plan
+// can enter the unsupported 3D-to-2D fallback. Probe every later output
+// unroll, including the native grid-reduction rollback, before offering it.
+bool inner3dOuterUnrollPlanIsSafe(
+    int64_t reduction_numel,
+    int64_t iteration_numel,
+    int64_t inner_numel,
+    int64_t inner_unroll,
+    int64_t max_unroll,
+    int64_t block_x,
+    int64_t block_y,
+    int64_t block_z,
+    int64_t target_iterations,
+    int64_t target_blocks,
+    int64_t sm_count,
+    int64_t max_threads_per_block,
+    int64_t outer_unroll) {
+  if (reduction_numel <= inner_numel || reduction_numel > 4096 ||
+      inner_numel < 1 || inner_numel > 128 ||
+      reduction_numel % inner_numel != 0 || iteration_numel < 1 ||
+      iteration_numel > 128 || inner_unroll < 1 || inner_unroll > 16 ||
+      max_unroll < 1 || max_unroll > 16 || block_x < 1 ||
+      block_x > 2048 || block_y != 1 || block_z < 1 ||
+      block_z > scheduler_utils::z_block_limit || target_iterations < 1 ||
+      target_iterations > 16 || target_blocks < 1 ||
+      target_blocks > 2048 || sm_count < 1 || sm_count > 256 ||
+      max_threads_per_block < 256 || max_threads_per_block > 2048) {
+    return false;
+  }
+  const int64_t native_limit = inner_unroll < max_unroll
+      ? std::min(
+            ceilDiv(max_unroll, inner_unroll),
+            ceilDiv(ceilDiv(reduction_numel, inner_numel), block_z))
+      : 1;
+  if (outer_unroll < 1 || outer_unroll > native_limit) {
+    return false;
+  }
+  const int64_t physical_x =
+      block_x > 16 && block_x * block_y < max_threads_per_block
+      ? ceilDiv(block_x, int64_t{32}) * 32
+      : block_x;
+  if (physical_x * block_y * block_z > max_threads_per_block) {
+    return false;
+  }
+  const int64_t reduction_remainder = ceilDiv(
+      reduction_numel,
+      block_x * inner_unroll * block_z * outer_unroll * target_iterations);
+  const int64_t inner_remainder = ceilDiv(
+      inner_numel, block_x * inner_unroll * target_iterations);
+  const int64_t reduction_unroll = inner_unroll * outer_unroll;
+  const int64_t output_budget = reduction_unroll < max_unroll
+      ? ceilDiv(max_unroll, reduction_unroll)
+      : 1;
+  const int64_t output_limit =
+      std::min(output_budget, ceilDiv(iteration_numel, block_y));
+  for (int64_t output_unroll = 1; output_unroll <= output_limit;
+       ++output_unroll) {
+    int64_t output_grid =
+        ceilDiv(iteration_numel, block_y * output_unroll);
+    int64_t inner_grid = 1;
+    int64_t outer_grid = 1;
+    if (output_grid < target_blocks || reduction_remainder >= 8) {
+      const int64_t reduction_grid =
+          std::min(reduction_remainder, block_x * block_y * 8);
+      inner_grid = inner_remainder;
+      outer_grid = std::max(reduction_grid / inner_grid, int64_t{1});
+      outer_grid = std::max(
+          std::min(reduction_remainder / inner_remainder, outer_grid),
+          int64_t{1});
+    }
+    if (inner_grid > 1 || outer_grid > 1) {
+      output_grid = ceilDiv(iteration_numel, block_y);
+    }
+    // This also excludes the ragged-wave rewrite; the complete grid is
+    // therefore identical to the native arithmetic for every offered factor.
+    if (inner_grid < 1 || inner_grid > scheduler_utils::x_grid_limit ||
+        outer_grid < 1 || outer_grid > scheduler_utils::z_grid_limit ||
+        output_grid < 1 || output_grid > scheduler_utils::y_grid_limit ||
+        inner_grid * output_grid > sm_count) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     const int64_t total_reduction_numel,
     const int64_t total_iteration_numel,
@@ -1650,6 +1736,107 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         ceilDiv(max_unroll, inner_reduction_unroll_factor),
         ceilDiv(
             ceilDiv(total_reduction_numel, inner_most_dimension_numel), bdimz));
+  }
+
+  // The native rule spends the remaining per-thread work budget on outer
+  // reduction unroll. A smaller factor may expose more reduction blocks or
+  // leave work for output unroll. Offer only complete preflighted 3D plans.
+  if (jev_mode_warp != scheduler::jev::Mode::Off &&
+      outer_reduction_unroll_factor > 1) {
+    const int64_t native_factor = outer_reduction_unroll_factor;
+    const bool bounded_input =
+        total_reduction_numel > inner_most_dimension_numel &&
+        total_reduction_numel <= 4096 &&
+        inner_most_dimension_numel >= 1 &&
+        inner_most_dimension_numel <= 128 &&
+        total_reduction_numel % inner_most_dimension_numel == 0 &&
+        total_iteration_numel >= 1 && total_iteration_numel <= 128 &&
+        inner_reduction_unroll_factor >= 1 &&
+        inner_reduction_unroll_factor <= 16 && max_unroll >= 1 &&
+        max_unroll <= 16 && bdimx >= 1 && bdimx <= 2048 && bdimy == 1 &&
+        bdimz >= 1 && bdimz <= scheduler_utils::z_block_limit &&
+        target_iterations >= 1 && target_iterations <= 16 &&
+        target_blocks >= 1 && target_blocks <= 2048 &&
+        device_multiprocessor_count >= 1 &&
+        device_multiprocessor_count <= 256 &&
+        dev_prop->maxThreadsPerBlock >= 256 &&
+        dev_prop->maxThreadsPerBlock <= 2048;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t candidate = 1;
+         bounded_input && candidate <= native_factor;
+         ++candidate) {
+      if (inner3dOuterUnrollPlanIsSafe(
+              total_reduction_numel,
+              total_iteration_numel,
+              inner_most_dimension_numel,
+              inner_reduction_unroll_factor,
+              max_unroll,
+              bdimx,
+              bdimy,
+              bdimz,
+              target_iterations,
+              target_blocks,
+              device_multiprocessor_count,
+              dev_prop->maxThreadsPerBlock,
+              candidate)) {
+        options.push_back(
+            {"u" + std::to_string(candidate),
+             "Unroll " + std::to_string(candidate) +
+                 " outer reduction element(s) per thread"});
+      }
+    }
+    const bool native_preflighted =
+        std::any_of(options.begin(), options.end(), [&](const auto& option) {
+          return option.id == "u" + std::to_string(native_factor);
+        });
+    if (!native_preflighted) {
+      NVF_ERROR(
+          jev_mode_warp != scheduler::jev::Mode::Remote || !bounded_input,
+          "RD5.outer_unroll native plan lacks bounded 3D proof");
+      if (jev_mode_warp == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "RD5.outer_unroll", "native outer unroll lacks bounded 3D proof");
+      }
+    } else if (options.size() == 1) {
+      if (jev_mode_warp == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "RD5.outer_unroll", "only native outer unroll has a 3D proof");
+      }
+    } else if (options.size() > 1) {
+      const std::string state =
+          "reduction.inner3d_outer_unroll.v1\nreduction_numel=" +
+          std::to_string(total_reduction_numel) +
+          "\niteration_numel=" + std::to_string(total_iteration_numel) +
+          "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
+          "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+          "\nmax_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) +
+          "\ninner_unroll=" +
+          std::to_string(inner_reduction_unroll_factor) +
+          "\nblock_x=" + std::to_string(bdimx) +
+          "\nblock_y=" + std::to_string(bdimy) +
+          "\nblock_z=" + std::to_string(bdimz) +
+          "\ntarget_iterations=" + std::to_string(target_iterations) +
+          "\ntarget_blocks=" + std::to_string(target_blocks) +
+          "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+          "\nmax_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock);
+      const auto selected = scheduler::jev::chooseDecision(
+          "RD5.outer_unroll",
+          state,
+          options,
+          jev_mode_warp == scheduler::jev::Mode::Record
+              ? "u" + std::to_string(native_factor)
+              : "");
+      const auto found = std::find_if(
+          options.begin(), options.end(), [&](const auto& option) {
+            return option.id == selected;
+          });
+      NVF_ERROR(
+          found != options.end(),
+          "RD5.outer_unroll exceeds preflighted 3D plans");
+      outer_reduction_unroll_factor = std::stoll(selected.substr(1));
+    }
   }
 
   int64_t remainder_in_reduction = ceilDiv(

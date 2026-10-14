@@ -6178,6 +6178,42 @@ TEST_F(Gpu1Test, JevAlternateInner3dGridWave_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// With a scalar innermost reduction, the native register policy unrolls four
+// outer reduction elements per thread. The bounded alternate leaves that
+// work to the outer grid while keeping the same CTA and numerical result.
+TEST_F(Gpu1Test, JevAlternateInner3dOuterUnroll_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 32, 3}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  const bool remote = scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  ASSERT_EQ(rparams->unroll_factor_inner_reduction, 1);
+  ASSERT_EQ(rparams->unroll_factor_outer_reduction, remote ? 1 : 4);
+  ASSERT_EQ(rparams->lparams.gdimz(), remote ? 8 : 2);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Hold the native 3D reduction block/grid plan fixed while the local API
 // chooses a smaller, still aligned vector width for its innermost axis.
 TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
