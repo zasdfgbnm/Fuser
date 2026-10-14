@@ -980,8 +980,7 @@ bool inner3dWarpPlanIsSafe(
     int64_t requested_target_threads = 0,
     bool iteration_first = false,
     int64_t* completed_block_x = nullptr,
-    int64_t target_waves = 4,
-    int64_t* completed_block_z = nullptr) {
+    int64_t target_waves = 4) {
   // Keep every intermediate product bounded, and fix the vector work budget
   // to four. Other shapes retain the native heuristic without a warp request.
   if (reduction_numel <= inner_numel || reduction_numel > 4096 ||
@@ -1122,9 +1121,6 @@ bool inner3dWarpPlanIsSafe(
   }
   if (completed_block_x != nullptr) {
     *completed_block_x = padded_x;
-  }
-  if (completed_block_z != nullptr) {
-    *completed_block_z = z;
   }
   return true;
 }
@@ -1355,31 +1351,30 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   }
 
   // The wave cap couples the block count and the per-CTA SM thread budget.
-  // Offer a bounded subset only when each complete 3D plan passes the same
-  // CTA, grid, and unsupported-fallback checks as the later RD5.cta menu.
+  // Preserve every hard-valid cap: equal CTAs can still have different target
+  // block counts and dependent grid or CTA-target menus.
   int64_t target_waves = 4;
-  if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
-      min_warp_size >= 1 && min_warp_size <= 16) {
-    int64_t native_x = 0;
-    int64_t native_z = 0;
-    if (inner3dWarpPlanIsSafe(
-            total_reduction_numel,
-            total_iteration_numel,
-            inner_most_dimension_numel,
-            min_warp_size,
-            device_multiprocessor_count,
-            max_threads_per_sm,
-            dev_prop->maxThreadsPerBlock,
-            0,
-            iteration_first,
-            &native_x,
-            4,
-            &native_z)) {
+  const bool bounded_wave_domain =
+      bounded_warp_input && total_reduction_numel > inner_most_dimension_numel &&
+      total_reduction_numel <= 4096 && inner_most_dimension_numel >= 4 &&
+      inner_most_dimension_numel <= 128 &&
+      total_reduction_numel % inner_most_dimension_numel == 0 &&
+      inner_most_dimension_numel % 4 == 0 && total_iteration_numel >= 1 &&
+      total_iteration_numel <= 128 && min_warp_size >= 1 &&
+      min_warp_size <= 16 && device_multiprocessor_count >= 1 &&
+      device_multiprocessor_count <= 256 && max_threads_per_sm >= 256 &&
+      max_threads_per_sm <= 4096 && dev_prop->maxThreadsPerBlock >= 256 &&
+      dev_prop->maxThreadsPerBlock <= 2048;
+  if (jev_mode_warp != scheduler::jev::Mode::Off) {
+    if (!bounded_wave_domain) {
+      if (jev_mode_warp == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "RD5.waves", "outside bounded 3D wave domain");
+      }
+    } else {
       std::vector<scheduler::jev::ChoiceOption> options;
       for (int64_t waves : {2, 4, 8}) {
-        int64_t candidate_x = 0;
-        int64_t candidate_z = 0;
-        if (!inner3dWarpPlanIsSafe(
+        if (inner3dWarpPlanIsSafe(
                 total_reduction_numel,
                 total_iteration_numel,
                 inner_most_dimension_numel,
@@ -1389,13 +1384,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
                 dev_prop->maxThreadsPerBlock,
                 0,
                 iteration_first,
-                &candidate_x,
-                waves,
-                &candidate_z)) {
-          continue;
-        }
-        if (waves == 4 || candidate_x != native_x ||
-            candidate_z != native_z) {
+                nullptr,
+                waves)) {
           options.push_back(
               {"waves" + std::to_string(waves),
                "Cap target blocks at " + std::to_string(waves) +
@@ -1403,7 +1393,23 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
                    std::to_string(waves) + " per CTA"});
         }
       }
-      if (options.size() > 1) {
+      const bool native_preflighted = std::any_of(
+          options.begin(), options.end(), [](const auto& option) {
+            return option.id == "waves4";
+          });
+      if (!native_preflighted) {
+        if (jev_mode_warp == scheduler::jev::Mode::Record) {
+          scheduler::jev::recordCoverageSkip(
+              "RD5.waves", "complete-plan preflight excludes native cap");
+        } else {
+          NVF_ERROR(false, "RD5.waves lacks a complete native plan");
+        }
+      } else if (options.size() == 1) {
+        if (jev_mode_warp == scheduler::jev::Mode::Record) {
+          scheduler::jev::recordCoverageSkip(
+              "RD5.waves", "only one hard-valid wave cap");
+        }
+      } else {
         const std::string state =
             std::string(iteration_first ? "reduction.inner3d_waves.v2\n"
                                         : "reduction.inner3d_waves.v1\n") +
