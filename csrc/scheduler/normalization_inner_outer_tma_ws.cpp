@@ -413,6 +413,68 @@ void getHeuristics(
   int64_t vectorization_factor_outer =
       std::min(workload_per_thread, max_tmp_gmem_vect_factor);
 
+  // The final outer reduction reads the temporary global buffer in a
+  // different thread layout from the producer. Keep its physical write width
+  // and the already checked WS topology fixed. A narrower read vector divides
+  // the producer width and never increases the per-thread vector footprint.
+  // The native 2/4 rule is a performance preference within this envelope.
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool legal_width_envelope =
+        inner_dim_numel > 0 && vect_factor > 0 && vect_factor <= 128 &&
+        (vect_factor & (vect_factor - 1)) == 0 &&
+        inner_dim_numel % vect_factor == 0 &&
+        computation_dtype_size_bit >= 8 &&
+        computation_dtype_size_bit <= 128 &&
+        (computation_dtype_size_bit & (computation_dtype_size_bit - 1)) == 0 &&
+        max_tmp_gmem_vect_factor > 0 &&
+        (max_tmp_gmem_vect_factor & (max_tmp_gmem_vect_factor - 1)) == 0 &&
+        vectorization_factor_outer > 0 &&
+        max_tmp_gmem_vect_factor % vectorization_factor_outer == 0 &&
+        outer_dim_numel > 0 && iter_unroll > 0 &&
+        outer_dim_numel % iter_unroll == 0 &&
+        bdimx > 0 && bdimy > 0 && gdimy > 0 && n_stages >= 2 &&
+        n_stages % bdimy == 0 &&
+        bdimx * bdimy + kWarpSpecializationPaddedThreads <=
+            dev_prop->maxThreadsPerBlock &&
+        (bdimx > 128 ? bdimx + kWarpSpecializationPaddedThreads : bdimx) <=
+            dev_prop->maxThreadsDim[0] &&
+        (bdimx > 128 ? bdimy : bdimy + 1) <=
+            dev_prop->maxThreadsDim[1] &&
+        gdimy <= dev_prop->maxGridSize[1] &&
+        is_enough_regs(iter_unroll, bdimx, bdimy) &&
+        is_enough_smem(iter_unroll, n_stages, bdimx, bdimy);
+    if (!legal_width_envelope) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP2.tmp_read_width", "WS temporary read width lacks hard bounds");
+      } else {
+        NVF_ERROR(false, "No hard-valid IOP2 temporary read width");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> read_options;
+      for (int64_t width = 1; width <= vectorization_factor_outer;
+           width *= 2) {
+        read_options.push_back({
+            "w" + std::to_string(width),
+            "Read partial outer reduction from global memory with vector "
+            "width " + std::to_string(width)});
+      }
+      const std::string state =
+          "inner_outer.tma_ws_tmp_read_width.v1\ninner_dim_numel=" +
+          std::to_string(inner_dim_numel) + "\ninner_vector_width=" +
+          std::to_string(vect_factor) + "\ntmp_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.tmp_read_width",
+          state,
+          read_options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "w" + std::to_string(vectorization_factor_outer)
+              : "");
+      vectorization_factor_outer = std::stoll(selected.substr(1));
+    }
+  }
+
   rparams->combined_split_grid_inner_dim =
       vectorization_factor_outer * bdimx * gdimy < inner_dim_numel;
   rparams->persistent_kernel = true;
