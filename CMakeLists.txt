@@ -1306,6 +1306,17 @@ if(BUILD_TEST)
       --require-inner3d-width)
   set_tests_properties(jev_alternate_numeric_inner3d_persistent_width PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_outer_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.outer_unroll --alternate u2
+      --gtest Gpu1Test.JevAlternateInner3dPersistentOuterUnroll_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_outer_unroll
+      --require-inner3d-outer-unroll)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_outer_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_outer_iter_unroll
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

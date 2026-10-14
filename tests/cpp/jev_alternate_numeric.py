@@ -94,7 +94,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False,
-                           require_inner3d_width: bool = False) -> dict[str, Any]:
+                           require_inner3d_width: bool = False,
+                           require_inner3d_outer_unroll: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -296,6 +297,26 @@ def check_alternate_report(report: dict[str, Any],
                     f"\npolicy_register_overhead={expected_overhead}\n" not in state or
                     f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
                 raise ValueError(f"nested batch did not use selected target policy: {row}")
+    elif require_inner3d_outer_unroll:
+        if (site != "IP6.outer_unroll" or event["native"] != "u4" or
+                alternate != "u2" or
+                not {"u4", "u2"} <= set(event["candidates"])):
+            raise ValueError("inner 3D fixture lacks a legal outer unroll alternate")
+        fields = dict(line.split("=", 1) for line in event["state"].splitlines()[1:]
+                      if not line.startswith("plan"))
+        if any(fields.get(key) != value for key, value in {
+                "selected_vector_width": "4", "selected_wave_cap": "4",
+                "selected_occupancy_target": "28", "selected_warp_target": "8",
+                "pre_outer_threads_z": "1"}.items()):
+            raise ValueError(f"outer unroll did not use selected 3D plan: {fields}")
+        for upstream in ("IP6.width", "IP6.waves", "IP6.occupancy", "IP6.warp"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with outer unroll: {rows}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected outer unroll comparison issues: {issues}")
     elif require_inner3d_width:
         if (site != "IP6.width" or event["native"] != "w4" or
                 alternate != "w2" or
@@ -420,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
+    parser.add_argument("--require-inner3d-outer-unroll", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -522,7 +544,8 @@ def main(argv: list[str] | None = None) -> int:
             require_inner_targets=args.require_inner_targets,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
-            require_inner3d_width=args.require_inner3d_width)
+            require_inner3d_width=args.require_inner3d_width,
+            require_inner3d_outer_unroll=args.require_inner3d_outer_unroll)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)
