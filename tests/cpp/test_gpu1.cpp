@@ -5691,6 +5691,40 @@ TEST_F(Gpu1Test, JevAlternateInnerGrid_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// Hold the native 3D reduction block/grid plan fixed while the local API
+// chooses a smaller, still aligned vector width for its innermost axis.
+TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
+  constexpr int outer_reduction = 32;
+  constexpr int outputs = 32;
+  constexpr int inner_reduction = 128;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input =
+      at::randn({outer_reduction, outputs, inner_reduction}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  ASSERT_TRUE(results.heuristic_params->as<ReductionParams>()->schedule_3d);
+  auto reference = aten_input.to(at::kDouble).sum({0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // This test checks if our system could correctly handles the case where both
 // reduction and trivial reduction exist in the fusion. Trivial reduction
 // deserve testing because trivial reduction is handled by doing a squeeze

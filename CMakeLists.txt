@@ -1180,6 +1180,17 @@ if(BUILD_TEST)
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric")
   set_tests_properties(jev_alternate_numeric_inner_grid PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.width
+      --alternate w1
+      --gtest Gpu1Test.JevAlternateInner3dWidth_CUDA
+      --case-key jev_alternate_numeric_inner3d_width)
+  set_tests_properties(jev_alternate_numeric_inner3d_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()

@@ -914,6 +914,9 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   godim = ceilDiv(total_iteration_numel, bdimy);
 
   bool vectorize = false;
+  // Preserve the unrounded work factor so the remote RD5.width service can
+  // reproduce the native vector width from the layout cap and this fixed plan.
+  const int64_t inner_work_per_thread = inner_reduction_unroll_factor;
 
   // Move unrolling factor into vectorization upto vectorization limit.
   if (vectorize_factor > 1 && inner_reduction_unroll_factor > 1) {
@@ -1262,6 +1265,58 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           max_dtype_size_bit_for_vectorization,
           static_cast<int64_t>(vectorize_factor),
           has_mufu_computation);
+    }
+  }
+
+  // RD5.width changes only the split of the fixed inner work between a
+  // contiguous vector load and ordinary unrolling. CTA dimensions, grid
+  // dimensions, total work per thread, and the unsupported-3D fallback above
+  // were already established by native analysis. Any smaller power-of-two
+  // vector width divides the original vector factor, so the source layout
+  // and alignment proof still applies.
+  const int64_t fixed_inner_factor = rparams->unroll_factor_inner_reduction;
+  if (jev_mode != scheduler::jev::Mode::Off &&
+      rparams->vectorize_inner_reduction && fixed_inner_factor > 1 &&
+      (fixed_inner_factor & (fixed_inner_factor - 1)) == 0 &&
+      fixed_inner_factor <= static_cast<int64_t>(vectorize_factor) &&
+      inner_work_per_thread >= fixed_inner_factor) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t width = 1; width <= fixed_inner_factor; width *= 2) {
+      options.push_back(
+          {"w" + std::to_string(width),
+           "Vectorize " + std::to_string(width) +
+               " innermost reduction element(s) per thread"});
+    }
+    const std::string state =
+        "reduction.inner3d_width.v1\nlayout_max=" +
+        std::to_string(vectorize_factor) +
+        "\ninner_work_per_thread=" +
+        std::to_string(inner_work_per_thread) +
+        "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
+        "\nreduction_numel=" + std::to_string(total_reduction_numel) +
+        "\nmax_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization);
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "w" + std::to_string(fixed_inner_factor)
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD5.width", state, options, native_choice);
+    int64_t selected_width = 0;
+    for (int64_t width = 1; width <= fixed_inner_factor; width *= 2) {
+      if (selected == "w" + std::to_string(width)) {
+        selected_width = width;
+        break;
+      }
+    }
+    NVF_ERROR(selected_width > 0, "RD5.width response exceeds native bounds");
+    if (selected_width == 1) {
+      // Keep the original factor as an ordinary unroll so isUnrolled() and
+      // cache placement remain unchanged even when vectorization is disabled.
+      rparams->vectorize_inner_reduction = false;
+    } else if (selected_width != fixed_inner_factor) {
+      rparams->unroll_factor_inner_reduction = selected_width;
+      rparams->unroll_factor_top_of_vectorization =
+          fixed_inner_factor / selected_width;
     }
   }
 
