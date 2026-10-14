@@ -1693,45 +1693,87 @@ OuterReductionParams getGridOuterReduction(
         ceilDiv(target_blocks, gidim));
   }
 
-  // If there isn't a lot of available parallelism from the iteration dimension,
-  // expand across the reduction dimension. This has to be done carefully.
-  // expand further
-  if (rDimAvail() > 16 &&
-      ceilDiv(total_iteration_numel, min_warp_size) < sm_count * 2) {
-    // Find minimum we want to parallelize by, we don't want blocks striding
-    // across too many elements: In the parallel scheme [rBIDy, remainder,
-    // iBIDx, rTIDy, i_unroll, r_unroll] figure out how many bytes iterations
-    // across remainder stride
-    int64_t bits_stride_remainder = max_dtype_size_bit_for_vectorization *
-        bdimx * bdimy * iter_unroll_factor * inner_reduction_unroll_factor;
-    // Empiercally found stride shouldn't exceed 256kiB boundaries in a block
-    int64_t kMaxStrideBit = 128l * 1024l * 8;
-
-    int64_t max_remainder_size =
-        scheduler_utils::safeDiv(kMaxStrideBit, bits_stride_remainder);
-
-    int64_t grdim_for_stride = ceilDiv(
-        total_reduction_numel,
-        max_remainder_size * bdimy * inner_reduction_unroll_factor);
-
-    grdim = grdim_for_stride;
+  // Two complete reduction-grid plans share the same hard-valid block,
+  // unroll, and output-grid dimensions. The empirical stride cap is 128 KiB
+  // in the original executable formula, despite its old 256 KiB comment.
+  const int64_t base_grdim = grdim;
+  constexpr int64_t kMaxStrideBit = 128L * 1024L * 8L;
+  int64_t max_remainder_size = kMaxStrideBit;
+  for (const int64_t factor : {
+           max_dtype_size_bit_for_vectorization,
+           bdimx,
+           bdimy,
+           iter_unroll_factor,
+           inner_reduction_unroll_factor}) {
+    max_remainder_size =
+        scheduler_utils::safeDiv(max_remainder_size, factor);
   }
+  const int64_t stride_grdim = ceilDiv(
+      ceilDiv(
+          ceilDiv(total_reduction_numel, max_remainder_size), bdimy),
+      inner_reduction_unroll_factor);
 
-  // Try to do some cleanup of ragged waves on device
-  if (
-      // If we have less than 8 waves of blocks
-      grdim * gidim < sm_count * 16 &&
-      // And we don't have an even divisible number of blocks
-      (grdim * gidim) % sm_count != 0 &&
-      // And we have more than one wave
-      grdim * gidim > sm_count) {
-    // round waves down
-    auto waves = std::max((gidim * grdim) / sm_count, (int64_t)1);
-    auto new_grdim = std::max((waves * sm_count) / gidim, (int64_t)1);
-    if ((grdim - new_grdim) * 4 <= grdim &&
-        new_grdim * gidim % sm_count > grdim * gidim % sm_count) {
-      grdim = new_grdim;
+  // Complete each plan with the original ragged-wave preference. Both plans
+  // retain the same native launch/grid splitting bounds downstream.
+  auto cleanRaggedWaves = [&](int64_t candidate) {
+    if (candidate * gidim < sm_count * 16 &&
+        (candidate * gidim) % sm_count != 0 &&
+        candidate * gidim > sm_count) {
+      auto waves = std::max((gidim * candidate) / sm_count, (int64_t)1);
+      auto new_grdim = std::max((waves * sm_count) / gidim, (int64_t)1);
+      if ((candidate - new_grdim) * 4 <= candidate &&
+          new_grdim * gidim % sm_count > candidate * gidim % sm_count) {
+        candidate = new_grdim;
+      }
     }
+    return candidate;
+  };
+  const int64_t base_plan = cleanRaggedWaves(base_grdim);
+  const int64_t stride_plan = cleanRaggedWaves(stride_grdim);
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    grdim =
+        rDimAvail() > 16 &&
+            ceilDiv(total_iteration_numel, min_warp_size) < sm_count * 2
+        ? stride_plan
+        : base_plan;
+  } else {
+    const std::string state =
+        "reduction.outer_grid_stride.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) +
+        "\niteration_numel=" + std::to_string(total_iteration_numel) +
+        "\ndtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\nsm_count=" + std::to_string(sm_count) +
+        "\nmin_warp_size=" + std::to_string(min_warp_size) +
+        "\nbdimx=" + std::to_string(bdimx) +
+        "\nbdimy=" + std::to_string(bdimy) +
+        "\niter_unroll=" + std::to_string(iter_unroll_factor) +
+        "\nredu_unroll=" + std::to_string(inner_reduction_unroll_factor) +
+        "\ngidim=" + std::to_string(gidim) +
+        "\nbase_grdim=" + std::to_string(base_grdim);
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"g" + std::to_string(base_plan), "Use the baseline reduction grid"}};
+    if (stride_plan != base_plan) {
+      options.push_back(
+          {"g" + std::to_string(stride_plan),
+           "Use the stride-capped reduction grid"});
+    }
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "g" + std::to_string(
+              rDimAvail() > 16 &&
+                      ceilDiv(total_iteration_numel, min_warp_size) <
+                          sm_count * 2
+                  ? stride_plan
+                  : base_plan)
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD9.stride", state, options, native_choice);
+    NVF_ERROR(
+        selected == options.front().id ||
+            (options.size() == 2 && selected == options.back().id),
+        "RD9 stride plan is outside native candidates");
+    grdim = selected == options.front().id ? base_plan : stride_plan;
   }
 
   OuterReductionParams params(total_iteration_numel, total_reduction_numel);
