@@ -5693,6 +5693,38 @@ TEST_F(Gpu1Test, JevAlternateOuterWarp_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// Native ragged-wave cleanup contracts this complete g8 outer reduction grid
+// to g7 on SM89. Keep g8 through RD9.stride and verify the reduction against
+// the same high-precision ATen reference.
+TEST_F(Gpu1Test, JevAlternateOuterRagged_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 513;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // The aligned output axis admits four float32 values per vector. Force a
 // smaller legal RD9.width through the local Choice server and compare the
 // completed reduction against an ATen double-precision reference.

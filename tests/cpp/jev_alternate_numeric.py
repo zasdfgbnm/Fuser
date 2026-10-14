@@ -143,6 +143,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_grid: bool = False,
                            require_outer_width: bool = False,
                            require_outer_cta: bool = False,
+                           require_outer_ragged: bool = False,
                            require_inner_width: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
@@ -269,6 +270,40 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected decision comparison issues: {issues}")
+    elif require_outer_ragged:
+        if (site != "RD9.ragged" or event["native"] != "clean" or
+                alternate != "raw" or
+                set(event["candidates"]) != {"clean", "raw"}):
+            raise ValueError("outer ragged fixture lacks both complete grid plans")
+        for upstream in ("RD9.reg_budget", "RD9.width", "RD9.waves",
+                         "RD9.warp", "RD9.cta"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with ragged choice: {rows}")
+        strides = [row for row in report["multiplicity"]
+                   if row["site"] == "RD9.stride"]
+        clean = [row for row in strides if row["record"] == {"g7": 1} and
+                 not row["remote"]]
+        raw = [row for row in strides if row["remote"] == {"g8": 1} and
+               not row["record"]]
+        if len(strides) != 2 or len(clean) != 1 or len(raw) != 1:
+            raise ValueError(f"ragged choice did not reach both stride grids: {strides}")
+        if ("base_grdim=8\nragged_policy=clean" not in
+                clean[0]["request"]["state"] or
+                "base_grdim=8\nragged_policy=raw" not in
+                raw[0]["request"]["state"]):
+            raise ValueError("stride grid did not receive the selected ragged policy")
+        allowed = {site, "RD9.stride", "RD8"}
+        if any(issue["site"] not in allowed for issue in issues):
+            raise ValueError(f"unrelated ragged decision issue: {issues}")
+        for row in (clean[0], raw[0]):
+            kind = ("record_only_state" if row is clean[0]
+                    else "remote_only_state")
+            if {"kind": kind, "site": "RD9.stride",
+                "request_sha256": row["request_sha256"]} not in issues:
+                raise ValueError(f"missing dependent stride state: {issues}")
     elif require_outer_cta:
         if (site != "RD9.cta" or event["native"] != "q4" or
                 alternate != "q8" or
@@ -588,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-grid", action="store_true")
     parser.add_argument("--require-outer-width", action="store_true")
     parser.add_argument("--require-outer-cta", action="store_true")
+    parser.add_argument("--require-outer-ragged", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
@@ -695,6 +731,7 @@ def main(argv: list[str] | None = None) -> int:
             require_grid=args.require_grid,
             require_outer_width=args.require_outer_width,
             require_outer_cta=args.require_outer_cta,
+            require_outer_ragged=args.require_outer_ragged,
             require_inner_targets=args.require_inner_targets,
             require_inner_width=args.require_inner_width,
             require_inner3d_warp=args.require_inner3d_warp,

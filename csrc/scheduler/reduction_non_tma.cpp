@@ -1592,6 +1592,7 @@ struct OuterGridWarpPlans {
   OuterReductionParams baseline;
   OuterReductionParams stride_capped;
   int64_t base_grdim;
+  int64_t stride_grdim;
   bool native_use_stride;
 };
 
@@ -1817,6 +1818,7 @@ OuterGridWarpPlans buildOuterGridWarpPlans(
       makePlan(base_plan),
       makePlan(stride_plan),
       base_grdim,
+      stride_grdim,
       rDimAvail() > 16 &&
           ceilDiv(total_iteration_numel, min_warp_size) < sm_count * 2};
 }
@@ -2107,7 +2109,7 @@ OuterReductionParams getGridOuterReduction(
     NVF_ERROR(found != options.end(), "RD9 CTA target is outside hard bounds");
     cta_share = std::stoll(selected.substr(1));
   }
-  const auto plans = buildOuterGridWarpPlans(
+  auto plans = buildOuterGridWarpPlans(
       total_reduction_numel,
       total_iteration_numel,
       max_dtype_size_bit_for_vectorization,
@@ -2130,10 +2132,60 @@ OuterReductionParams getGridOuterReduction(
           max_unroll,
           max_threads_per_block),
       "Selected RD9 warp plan violates hard bounds");
+  // The ragged-wave cleanup is an empirical occupancy preference. Offer the
+  // raw grid only after both complete grid variants pass the same native
+  // launch, CTA, vectorization, and reduction-coverage bounds.
+  auto raw_plans = plans;
+  raw_plans.baseline.grdim = plans.base_grdim;
+  raw_plans.stride_capped.grdim = plans.stride_grdim;
+  const bool raw_valid = outerGridWarpPlansHardValid(
+      raw_plans,
+      total_reduction_numel,
+      total_iteration_numel,
+      vectorize_factor,
+      max_unroll,
+      max_threads_per_block);
+  std::vector<scheduler::jev::ChoiceOption> ragged_options = {
+      {"clean", "Apply the native ragged-wave grid adjustment"}};
+  if (raw_valid &&
+      (plans.base_grdim != plans.baseline.grdim ||
+       plans.stride_grdim != plans.stride_capped.grdim)) {
+    ragged_options.push_back({"raw", "Keep the complete raw reduction grids"});
+  }
+  const std::string ragged_state =
+      "reduction.outer_ragged.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) +
+      "\niteration_numel=" + std::to_string(total_iteration_numel) +
+      "\ndtype_bits=" +
+      std::to_string(max_dtype_size_bit_for_vectorization) +
+      "\nsm_count=" + std::to_string(sm_count) +
+      "\nmax_threads_per_block=" + std::to_string(max_threads_per_block) +
+      "\nvector_width=" + std::to_string(vectorize_factor) +
+      "\nmax_unroll=" + std::to_string(max_unroll) +
+      "\nbdimx=" + std::to_string(plans.baseline.bdimx) +
+      "\nbdimy=" + std::to_string(plans.baseline.bdimy) +
+      "\niter_unroll=" +
+      std::to_string(plans.baseline.iter_unroll_factor) +
+      "\nredu_unroll=" +
+      std::to_string(plans.baseline.redu_unroll_factor) +
+      "\ngidim=" + std::to_string(plans.baseline.gidim) +
+      "\nbase_grdim=" + std::to_string(plans.base_grdim);
+  const auto ragged_choice = scheduler::jev::chooseDecision(
+      "RD9.ragged",
+      ragged_state,
+      ragged_options,
+      jev_mode == scheduler::jev::Mode::Record ? "clean" : "");
+  NVF_ERROR(
+      ragged_choice == "clean" ||
+          (ragged_choice == "raw" && ragged_options.size() == 2),
+      "RD9 ragged choice is outside hard-valid complete plans");
+  if (ragged_choice == "raw") {
+    plans = raw_plans;
+  }
   const auto& baseline = plans.baseline;
   const auto& stride = plans.stride_capped;
   const std::string state =
-      "reduction.outer_grid_stride.v1\nreduction_numel=" +
+      "reduction.outer_grid_stride.v2\nreduction_numel=" +
       std::to_string(total_reduction_numel) +
       "\niteration_numel=" + std::to_string(total_iteration_numel) +
       "\ndtype_bits=" +
@@ -2145,7 +2197,8 @@ OuterReductionParams getGridOuterReduction(
       "\niter_unroll=" + std::to_string(baseline.iter_unroll_factor) +
       "\nredu_unroll=" + std::to_string(baseline.redu_unroll_factor) +
       "\ngidim=" + std::to_string(baseline.gidim) +
-      "\nbase_grdim=" + std::to_string(plans.base_grdim);
+      "\nbase_grdim=" + std::to_string(plans.base_grdim) +
+      "\nragged_policy=" + ragged_choice;
   std::vector<scheduler::jev::ChoiceOption> options = {
       {"g" + std::to_string(baseline.grdim),
        "Use the baseline reduction grid"}};
