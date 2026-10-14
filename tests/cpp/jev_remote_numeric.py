@@ -123,6 +123,13 @@ def check_parity(report: dict[str, Any], case_key: str, prefix: str) -> None:
         raise ValueError("the numeric test made no Jev Choice request")
     if summary["remote_events"] != summary["server_successes"]:
         raise ValueError("remote client and API request counts differ")
+    # These exact GTests run once per mode in fresh processes. Unlike the
+    # timed benchmark, their scheduler-call multiplicity must match too.
+    unequal = [entry for entry in report["multiplicity"]
+               if entry["record"] != entry["remote"]]
+    if unequal:
+        sites = sorted({entry["site"] for entry in unequal})
+        raise ValueError(f"record/remote decision multiplicity differs at {sites}")
     cases = report["case_coverage"]
     if set(cases) != {case_key}:
         raise ValueError(f"decision logs contain unexpected case keys: {sorted(cases)}")
