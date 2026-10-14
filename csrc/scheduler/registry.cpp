@@ -16,6 +16,7 @@
 #include "scheduler/heuristic.h"
 #include "scheduler/matmul_utils.h"
 #include "scheduler/native_outcome.h"
+#include "scheduler/native_plan_fields.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/resize.h"
 #include "scheduler/runtime_info.h"
@@ -145,6 +146,10 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
       outcome.scheduler_type = nvfuser::toString(params->scheduler_type);
       outcome.tag = params->tag;
       outcome.heuristic_text = params->toString();
+      auto description =
+          scheduler::native_diagnostic::describeSchedulerFields(*params);
+      outcome.params_kind = std::move(description.params_kind);
+      outcome.scheduler_fields_json = std::move(description.fields_json);
       const auto& launch = params->lparams;
       outcome.launch = {
           launch.getRawVal(ParallelType::BIDx),

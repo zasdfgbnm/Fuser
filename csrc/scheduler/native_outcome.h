@@ -17,6 +17,8 @@ struct Outcome {
   std::string scheduler_type;
   std::string tag;
   std::string heuristic_text;
+  std::string params_kind = "Unknown";
+  std::string scheduler_fields_json = "{}";
   struct Launch {
     int64_t grid_x_raw = -1;
     int64_t grid_y_raw = -1;
@@ -96,7 +98,7 @@ inline void recordOutcome(const Outcome& outcome) noexcept {
     const auto sequence =
         next_outcome_invocation.fetch_add(1, std::memory_order_relaxed) + 1;
     Object row;
-    row.add("schema", "nvfuser.native_outcome.v1");
+    row.add("schema", "nvfuser.native_outcome.v2");
     row.add("kind", "final");
     row.add("mode", logMode());
     row.add("case_key", case_key_env == nullptr ? "" : case_key_env);
@@ -107,6 +109,8 @@ inline void recordOutcome(const Outcome& outcome) noexcept {
     row.add("scheduler_type", outcome.scheduler_type);
     row.add("tag", outcome.tag);
     row.add("heuristic_text", outcome.heuristic_text);
+    row.add("params_kind", outcome.params_kind);
+    row.addRaw("scheduler_fields", outcome.scheduler_fields_json);
     row.addRaw("launch", launch.str());
     row.addRaw("compile", compile.str());
     appendLine(row.str());

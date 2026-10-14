@@ -29,6 +29,8 @@ int main() {
   outcome.scheduler_type = "Reduction";
   outcome.tag = "modified\nplan";
   outcome.heuristic_text = "complete \"reduction\" plan";
+  outcome.params_kind = "HeuristicParams";
+  outcome.scheduler_fields_json = "{}";
   outcome.launch.block_x_raw = 128;
   outcome.launch.dynamic_smem_bytes = 4096;
   outcome.compile.index_type = 6;
@@ -56,7 +58,7 @@ int main() {
       (std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
   assert(!data.empty() && data.back() == '\n');
   assert(std::count(data.begin(), data.end(), '\n') == 2);
-  assert(data.find("\"schema\":\"nvfuser.native_outcome.v1\"") != std::string::npos);
+  assert(data.find("\"schema\":\"nvfuser.native_outcome.v2\"") != std::string::npos);
   assert(data.find("\"kind\":\"final\"") != std::string::npos);
   assert(data.find("\"mode\":\"record\"") != std::string::npos);
   assert(data.find("\"mode\":\"remote\"") != std::string::npos);
@@ -64,6 +66,8 @@ int main() {
   assert(data.find("\"scheduler_type\":\"Reduction\"") != std::string::npos);
   assert(data.find("\"tag\":\"modified\\nplan\"") != std::string::npos);
   assert(data.find("\"heuristic_text\":\"complete \\\"reduction\\\" plan\"") != std::string::npos);
+  assert(data.find("\"params_kind\":\"HeuristicParams\"") != std::string::npos);
+  assert(data.find("\"scheduler_fields\":{}") != std::string::npos);
   assert(data.find("\"block_x_raw\":128") != std::string::npos);
   assert(data.find("\"dynamic_smem_bytes\":4096") != std::string::npos);
   assert(data.find("\"maxrregcount\":96") != std::string::npos);
