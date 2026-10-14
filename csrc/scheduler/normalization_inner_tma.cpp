@@ -105,8 +105,10 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
       n_compute_warp_groups * n_rows_per_compute_warp_group;
   const int64_t smem_limited_stages =
       (int64_t)dev_prop->sharedMemPerBlockOptin * 8 / smem_size_bit;
-  const int64_t n_stages = std::min(smem_limited_stages, iter_limited_stages);
-  const bool native_warp_specialized = n_stages >= 2 && bdimx == 128;
+  const int64_t native_n_stages =
+      std::min(smem_limited_stages, iter_limited_stages);
+  const bool native_warp_specialized =
+      native_n_stages >= 2 && bdimx == 128;
   bool use_warp_specialized = native_warp_specialized;
   const auto jev_mode = scheduler::jev::mode();
   if (jev_mode != scheduler::jev::Mode::Off) {
@@ -168,6 +170,47 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
           "ws";
     }
   }
+  int64_t selected_n_stages = native_n_stages;
+  if (use_warp_specialized && jev_mode != scheduler::jev::Mode::Off) {
+    // Each candidate is bounded by both native resource ceilings. Keep every
+    // small stage count and sample larger counts geometrically; the native
+    // maximum is always offered, even when it is not a power of two.
+    std::vector<scheduler::jev::ChoiceOption> stage_options;
+    auto add_stage = [&](int64_t stages) {
+      stage_options.push_back({
+          "s" + std::to_string(stages),
+          "Use " + std::to_string(stages) +
+              " stages for warp-specialized TMA circular buffering"});
+    };
+    for (int64_t stages = 2; stages <= std::min<int64_t>(16, native_n_stages);
+         ++stages) {
+      add_stage(stages);
+    }
+    for (int64_t stages = 32; stages < native_n_stages;) {
+      add_stage(stages);
+      if (stages > native_n_stages / 2) {
+        break;
+      }
+      stages *= 2;
+    }
+    if (native_n_stages > 16) {
+      add_stage(native_n_stages);
+    }
+    const std::string stage_state =
+        "inner_persistent.tma_stages.v1\niteration_numel=" +
+        std::to_string(total_iter_count) + "\nsm_count=" +
+        std::to_string(sm_count) + "\npersistent_buffer_bits=" +
+        std::to_string(prop.max_persistent_buffer_size_bit) +
+        "\nsmem_per_block_bytes=" +
+        std::to_string(dev_prop->sharedMemPerBlockOptin);
+    const std::string native_stage_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "s" + std::to_string(native_n_stages)
+        : "";
+    const std::string selected_stage_choice = scheduler::jev::chooseDecision(
+        "IP3.stages", stage_state, stage_options, native_stage_choice);
+    selected_n_stages = std::stoll(selected_stage_choice.substr(1));
+  }
   if (use_warp_specialized) {
     gdimx = sm_count;
     bdimy = n_compute_warp_groups;
@@ -196,7 +239,9 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
           kWarpSpecializationPaddedThreads);
     }
     CircularBufferOptions circular_buffer_options{
-        .type = ws, .stage = n_stages, .prefetch = n_stages - 1};
+        .type = ws,
+        .stage = selected_n_stages,
+        .prefetch = selected_n_stages - 1};
     params->circular_buffer_options = circular_buffer_options;
     params->is_circular_buffer_regs_cached = true;
     // Set launch parameters
