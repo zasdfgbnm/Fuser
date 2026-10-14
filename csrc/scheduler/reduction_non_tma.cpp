@@ -1868,8 +1868,10 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
   const int64_t unroll8 = budgetMaxUnroll(8, n_tensor_inputs >> 2);
   const int64_t unroll32 = budgetMaxUnroll(32, n_tensor_inputs);
   const auto jev_mode = scheduler::jev::mode();
-  int64_t max_unroll = has_mufu_computation ? unroll8 : unroll32;
-  if (jev_mode != scheduler::jev::Mode::Off) {
+  int64_t max_unroll = 0;
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    max_unroll = has_mufu_computation ? unroll8 : unroll32;
+  } else {
     NVF_ERROR(
         unroll8 > 0 && unroll32 > 0,
         "RD9 register policies require positive unroll budgets");
