@@ -12,6 +12,7 @@
 #include "ir/printer.h"
 #include "multidevice/utils.h"
 #include "scheduler/cache_policy_refiner.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/registry.h"
 #include "scheduler/runtime_info.h"
 
@@ -215,6 +216,98 @@ BreakPointInfo getBreakPoint(
   result.right_elem_count = 0;
   result.is_outer_broadcast_dominated = false;
 
+  // PW2's choice includes both the split and the BID binding. Keep the view
+  // and nonempty-left checks in nvFuser: they define which plans are legal.
+  // The request carries measurements only, never the native winning plan.
+  const auto jev_mode =
+      is_tma ? scheduler::jev::Mode::Off : scheduler::jev::mode();
+  struct JevBreakpointRequest {
+    std::string state;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::vector<BreakPointInfo> plans;
+  };
+  auto make_jev_request = [&]() {
+    JevBreakpointRequest request;
+    request.state = "pointwise.breakpoint.v1\n";
+    std::vector<int64_t> disjoint;
+    std::vector<int64_t> lhs;
+    std::vector<int64_t> rhs;
+    disjoint.reserve(ref_loop.size());
+    lhs.reserve(ref_loop.size());
+    rhs.reserve(ref_loop.size());
+    for (const auto i : arange(ref_loop.size())) {
+      disjoint.push_back(
+          scheduler_utils::breakIsDisjoint(view_disjoint_sets, i));
+      lhs.push_back(broadcast_bit_multiples[i].lhs_multiple);
+      rhs.push_back(broadcast_bit_multiples[i].rhs_multiple);
+    }
+    auto append_vector = [&](std::string_view name, const auto& values) {
+      request.state += std::string(name) + '=';
+      for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+          request.state += ',';
+        }
+        request.state += std::to_string(values[i]);
+      }
+      request.state += '\n';
+    };
+    append_vector("elements", elem_counts);
+    append_vector("disjoint", disjoint);
+    append_vector("lhs_bit_multiples", lhs);
+    append_vector("rhs_bit_multiples", rhs);
+    request.state += "dtype_sum_bits=" + std::to_string(dtype_sum_bit) + '\n';
+    request.state += "max_vectorization=" + std::to_string(max_vect_factor) + '\n';
+    request.state += "warp_size=" +
+        std::to_string(at::cuda::getCurrentDeviceProperties()->warpSize) + '\n';
+    request.state += "l2_cache_bytes=" +
+        std::to_string(at::cuda::getCurrentDeviceProperties()->l2CacheSize);
+
+    request.options.push_back({"bp0", "Use one-dimensional scheduling"});
+    request.plans.emplace_back();
+    int64_t right_count = 1;
+    for (int64_t i = static_cast<int64_t>(ref_loop.size()) - 1; i >= 1; --i) {
+      right_count *= elem_counts[i];
+      if (!disjoint[i] || n_elems / right_count <= 1) {
+        continue;
+      }
+      BreakPointInfo plan;
+      plan.break_point = static_cast<int>(i);
+      plan.right_elem_count = right_count;
+      plan.is_outer_broadcast_dominated = lhs[i] < rhs[i];
+      const std::string prefix = "bp" + std::to_string(i);
+      request.options.push_back({
+          prefix + "_normal",
+          "Split at axis " + std::to_string(i) + ", normal BID binding"});
+      request.plans.push_back(plan);
+      plan.flip_grid_binding = true;
+      request.options.push_back({
+          prefix + "_flip",
+          "Split at axis " + std::to_string(i) + ", flipped BID binding"});
+      request.plans.push_back(plan);
+    }
+    return request;
+  };
+
+  if (jev_mode == scheduler::jev::Mode::Remote) {
+    auto request = make_jev_request();
+    const auto selected =
+        scheduler::jev::chooseDecision("PW2", request.state, request.options);
+    for (size_t i = 0; i < request.options.size(); ++i) {
+      if (request.options[i].id != selected) {
+        continue;
+      }
+      const auto& plan = request.plans[i];
+      NVF_ERROR(
+          plan.break_point == 0 ||
+              (scheduler_utils::breakIsDisjoint(
+                   view_disjoint_sets, plan.break_point) &&
+               n_elems / plan.right_elem_count > 1),
+          "Remote PW2 choice violated a native legality guard");
+      return plan;
+    }
+    NVF_ERROR(false, "Remote PW2 choice is not in its candidate set");
+  }
+
   // Figure out break point position
   // How much would this transfer cost if it was done as a 1-D schedule
   int64_t transfer_size_1d_bit = 1;
@@ -309,6 +402,16 @@ BreakPointInfo getBreakPoint(
     // when lhs byte multiple is smaller than rhs byte multiple,
     // there is broadcast in the lhs, which is outer broadcast.
     result.is_outer_broadcast_dominated = lhs_bit_multiple < rhs_bit_multiple;
+  }
+
+  if (jev_mode == scheduler::jev::Mode::Record) {
+    auto request = make_jev_request();
+    const auto native_choice = result.break_point == 0
+        ? std::string("bp0")
+        : "bp" + std::to_string(result.break_point) +
+            (result.flip_grid_binding ? "_flip" : "_normal");
+    (void)scheduler::jev::chooseDecision(
+        "PW2", request.state, request.options, native_choice);
   }
 
   return result;

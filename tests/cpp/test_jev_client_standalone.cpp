@@ -118,6 +118,12 @@ int main() {
   require(chooseDecision("PW2", state, options, "bp0", "case-1") == "bp0", "record changed choice");
   require(readFile(path).find("\"case_key\":\"case-1\"") != std::string::npos,
           "record lacks case key");
+  require(readFile(path).find("\"request\":{\"model\":\"jev-latest\"") != std::string::npos,
+          "record lacks the model-visible request");
+  require(readFile(path).find("\"instructions\":\"Choose nvFuser scheduler decision PW2\"") != std::string::npos,
+          "record lacks Choice instructions");
+  require(readFile(path).find("\"criteria\":{\"bp0\":\"one dimensional\",\"bp1\":\"split\"}") != std::string::npos,
+          "record lacks candidate descriptions");
 
   ::setenv("NVFUSER_JEV_MODE", "remote", 1);
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,

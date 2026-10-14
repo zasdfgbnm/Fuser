@@ -464,17 +464,20 @@ std::string chooseDecision(
   const std::string log_case_key =
       case_key.empty() ? env("NVFUSER_JEV_CASE_KEY") : std::string(case_key);
 
+  // Keep the exact model-visible question in both local logs. In record mode
+  // this is the request that the remote mode would have sent, without the
+  // native winner; comparing it catches mismatched option descriptions too.
+  std::string request = "{\"model\":\"jev-latest\",\"state\":" + quote(state) +
+      ",\"questions\":{" + quote(site) + ":{\"type\":\"choice\",\"instructions\":" +
+      quote("Choose nvFuser scheduler decision " + std::string(site)) + ",\"criteria\":{";
+  for (size_t i = 0; i < options.size(); ++i) {
+    if (i != 0) request += ',';
+    request += quote(options[i].id) + ':' + quote(options[i].description);
+  }
+  request += "}}}}";
   std::string selected(native_choice);
   int64_t roundtrip_us = 0;
   if (current_mode == Mode::Remote) {
-    std::string request = "{\"model\":\"jev-latest\",\"state\":" + quote(state) +
-        ",\"questions\":{" + quote(site) + ":{\"type\":\"choice\",\"instructions\":" +
-        quote("Choose nvFuser scheduler decision " + std::string(site)) + ",\"criteria\":{";
-    for (size_t i = 0; i < options.size(); ++i) {
-      if (i != 0) request += ',';
-      request += quote(options[i].id) + ':' + quote(options[i].description);
-    }
-    request += "}}}}";
     const auto begin = Clock::now();
     const std::string response = post(request);
     roundtrip_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count();
@@ -488,6 +491,7 @@ std::string chooseDecision(
   candidates += ']';
   appendLog("{\"site\":" + quote(site) + ",\"case_key\":" + quote(log_case_key) +
       ",\"state\":" + quote(state) + ",\"candidates\":" + candidates +
+      ",\"request\":" + request +
       ",\"selected\":" + quote(selected) + ",\"mode\":" +
       quote(current_mode == Mode::Record ? "record" : "remote") +
       ",\"roundtrip_us\":" + std::to_string(roundtrip_us) + '}');
