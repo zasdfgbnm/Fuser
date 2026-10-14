@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -9,6 +10,9 @@ namespace nvfuser::scheduler::jev {
 
 enum class Mode { Off, Record, Remote };
 Mode mode();
+
+// Reuse the client's JSON string escaping for local diagnostic snapshots.
+std::string jsonQuote(std::string_view value);
 
 // The identifier is the wire-format Choice key. Descriptions provide the
 // model with context; neither field contains the native decision.
@@ -38,5 +42,43 @@ void recordCoverageSkip(
     std::string_view site,
     std::string_view reason,
     std::string_view case_key = {});
+
+// Pointwise Record uses a separate outcome JSONL so the existing Choice-only
+// decision log and its record/remote comparator keep their wire contract.
+// NVFUSER_JEV_POINTWISE_OUTCOME_LOG overrides the default
+// NVFUSER_JEV_LOG + ".pointwise.jsonl". Each invocation has a begin row and
+// exactly one final row on successful computeHeuristics return. Choice rows
+// carry the same invocation_id and a shared event_index (begin is zero);
+// an incomplete invocation has no final row.
+class PointwiseRecordScope {
+ public:
+  PointwiseRecordScope();
+  ~PointwiseRecordScope() noexcept;
+  PointwiseRecordScope(const PointwiseRecordScope&) = delete;
+  PointwiseRecordScope& operator=(const PointwiseRecordScope&) = delete;
+
+  bool recording() const {
+    return recording_;
+  }
+
+  // JSON objects are the complete returned parameters and raw launch/compile
+  // settings after all native correctness caps. "empty" denotes no runtime
+  // properties; other successful backends are "tma" or "ordinary".
+  void complete(
+      std::string_view backend,
+      std::string_view final_params_json,
+      std::string_view launch_json,
+      std::string_view compile_json);
+
+ private:
+  std::string invocation_id_;
+  std::string case_key_;
+  std::string previous_invocation_id_;
+  std::string previous_case_key_;
+  uint64_t previous_event_index_ = 0;
+  bool previous_completed_ = false;
+  bool recording_ = false;
+  bool completed_ = false;
+};
 
 } // namespace nvfuser::scheduler::jev

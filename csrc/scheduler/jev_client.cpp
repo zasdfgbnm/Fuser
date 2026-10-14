@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -34,6 +36,17 @@ constexpr size_t kMaxRequest = 64 * 1024;
 constexpr size_t kMaxResponse = 64 * 1024;
 constexpr size_t kMaxHeaders = 8 * 1024;
 constexpr auto kTimeout = std::chrono::milliseconds(2000);
+constexpr std::string_view kPointwiseOutcomeSchema =
+    "nvfuser.jev.pointwise.outcome.v1";
+
+struct ActiveInvocation {
+  std::string id;
+  std::string case_key;
+  uint64_t event_index = 0;
+  bool completed = false;
+};
+thread_local ActiveInvocation active_invocation;
+std::atomic<uint64_t> next_invocation{0};
 
 [[noreturn]] void fail(std::string_view detail) {
   throw std::runtime_error("nvFuser Jev client: " + std::string(detail));
@@ -374,9 +387,7 @@ std::string post(std::string_view body) {
   return response.substr(header_end, body_size);
 }
 
-void appendLog(std::string_view line) {
-  const std::string path = env("NVFUSER_JEV_LOG");
-  if (path.empty()) fail("NVFUSER_JEV_LOG is required in record/remote mode");
+void appendLineToPath(const std::string& path, std::string_view line) {
   static std::mutex mutex;
   std::lock_guard<std::mutex> guard(mutex);
   // Resolve the final component without following a symlink. O_NONBLOCK also
@@ -397,6 +408,24 @@ void appendLog(std::string_view line) {
     else if (count < 0 && errno == EINTR) continue;
     else fail("failed to write NVFUSER_JEV_LOG");
   }
+}
+
+void appendLog(std::string_view line) {
+  const std::string path = env("NVFUSER_JEV_LOG");
+  if (path.empty()) fail("NVFUSER_JEV_LOG is required in record/remote mode");
+  appendLineToPath(path, line);
+}
+
+void appendPointwiseOutcome(std::string_view line) {
+  std::string path = env("NVFUSER_JEV_POINTWISE_OUTCOME_LOG");
+  const std::string decision_path = env("NVFUSER_JEV_LOG");
+  if (path.empty()) {
+    if (decision_path.empty()) fail("NVFUSER_JEV_LOG is required in record mode");
+    path = decision_path + ".pointwise.jsonl";
+  }
+  if (path == decision_path)
+    fail("Pointwise outcome log must differ from the Choice log");
+  appendLineToPath(path, line);
 }
 
 std::string selectedFromResponse(
@@ -449,6 +478,72 @@ Mode mode() {
   fail("NVFUSER_JEV_MODE must be off, record, or remote");
 }
 
+std::string jsonQuote(std::string_view value) {
+  return quote(value);
+}
+
+PointwiseRecordScope::PointwiseRecordScope() {
+  if (mode() != Mode::Record) return;
+  if (env("NVFUSER_JEV_LOG").empty())
+    fail("NVFUSER_JEV_LOG is required in record mode");
+  invocation_id_ = std::to_string(::getpid()) + "-" +
+      std::to_string(next_invocation.fetch_add(1, std::memory_order_relaxed) + 1);
+  case_key_ = env("NVFUSER_JEV_CASE_KEY");
+  std::string active_id = invocation_id_;
+  std::string active_case = case_key_;
+  appendPointwiseOutcome(
+      "{\"schema\":" + quote(kPointwiseOutcomeSchema) +
+      ",\"kind\":\"begin\",\"mode\":\"record\",\"invocation_id\":" +
+      quote(invocation_id_) + ",\"event_index\":0,\"case_key\":" +
+      quote(case_key_) + '}');
+  previous_invocation_id_.swap(active_invocation.id);
+  previous_case_key_.swap(active_invocation.case_key);
+  previous_event_index_ = active_invocation.event_index;
+  previous_completed_ = active_invocation.completed;
+  active_invocation.id.swap(active_id);
+  active_invocation.case_key.swap(active_case);
+  active_invocation.event_index = 0;
+  active_invocation.completed = false;
+  recording_ = true;
+}
+
+PointwiseRecordScope::~PointwiseRecordScope() noexcept {
+  if (recording_) {
+    active_invocation.id.swap(previous_invocation_id_);
+    active_invocation.case_key.swap(previous_case_key_);
+    active_invocation.event_index = previous_event_index_;
+    active_invocation.completed = previous_completed_;
+  }
+}
+
+void PointwiseRecordScope::complete(
+    std::string_view backend,
+    std::string_view final_params_json,
+    std::string_view launch_json,
+    std::string_view compile_json) {
+  if (!recording_) return;
+  if (completed_ || active_invocation.id != invocation_id_)
+    fail("Pointwise Record invocation completion is out of order");
+  if (backend != "tma" && backend != "ordinary" && backend != "empty")
+    fail("invalid Pointwise final backend");
+  for (auto object : {final_params_json, launch_json, compile_json}) {
+    if (JsonReader(object).parse().kind != Json::Kind::Object)
+      fail("Pointwise final snapshot must contain JSON objects");
+  }
+  const auto event_index = ++active_invocation.event_index;
+  appendPointwiseOutcome(
+      "{\"schema\":" + quote(kPointwiseOutcomeSchema) +
+      ",\"kind\":\"final\",\"mode\":\"record\",\"invocation_id\":" +
+      quote(invocation_id_) + ",\"event_index\":" +
+      std::to_string(event_index) + ",\"case_key\":" + quote(case_key_) +
+      ",\"backend\":" + quote(backend) +
+      ",\"final_params\":" + std::string(final_params_json) +
+      ",\"launch\":" + std::string(launch_json) +
+      ",\"compile\":" + std::string(compile_json) + '}');
+  completed_ = true;
+  active_invocation.completed = true;
+}
+
 std::string chooseDecision(
     std::string_view site,
     std::string_view state,
@@ -470,8 +565,12 @@ std::string chooseDecision(
   }
   if (current_mode == Mode::Record && !seen.count(std::string(native_choice)))
     fail("native choice is not an allowed candidate");
-  const std::string log_case_key =
-      case_key.empty() ? env("NVFUSER_JEV_CASE_KEY") : std::string(case_key);
+  if (!active_invocation.id.empty() && active_invocation.completed)
+    fail("Pointwise Choice followed a final Record outcome");
+  const std::string log_case_key = case_key.empty()
+      ? (active_invocation.id.empty() ? env("NVFUSER_JEV_CASE_KEY")
+                                      : active_invocation.case_key)
+      : std::string(case_key);
 
   // Keep the exact model-visible question in both local logs. In record mode
   // this is the request that the remote mode would have sent, without the
@@ -498,7 +597,13 @@ std::string chooseDecision(
     candidates += quote(options[i].id);
   }
   candidates += ']';
+  const auto event_index = active_invocation.id.empty()
+      ? uint64_t{0}
+      : ++active_invocation.event_index;
   appendLog("{\"site\":" + quote(site) + ",\"case_key\":" + quote(log_case_key) +
+      (active_invocation.id.empty() ? std::string()
+                                    : ",\"invocation_id\":" + quote(active_invocation.id) +
+                                          ",\"event_index\":" + std::to_string(event_index)) +
       ",\"state\":" + quote(state) + ",\"candidates\":" + candidates +
       ",\"request\":" + request +
       ",\"selected\":" + quote(selected) + ",\"mode\":" +
@@ -513,11 +618,24 @@ void recordCoverageSkip(
     std::string_view case_key) {
   if (mode() != Mode::Record) fail("coverage skip requires record mode");
   if (site.empty() || reason.empty()) fail("coverage skip needs site and reason");
-  const std::string log_case_key =
-      case_key.empty() ? env("NVFUSER_JEV_CASE_KEY") : std::string(case_key);
+  if (!active_invocation.id.empty() && active_invocation.completed)
+    fail("Pointwise coverage skip followed a final Record outcome");
+  const std::string log_case_key = case_key.empty()
+      ? (active_invocation.id.empty() ? env("NVFUSER_JEV_CASE_KEY")
+                                      : active_invocation.case_key)
+      : std::string(case_key);
   appendLog("{\"kind\":\"coverage_skip\",\"site\":" + quote(site) +
       ",\"case_key\":" + quote(log_case_key) +
       ",\"mode\":\"record\",\"reason\":" + quote(reason) + '}');
+  if (!active_invocation.id.empty()) {
+    const auto event_index = ++active_invocation.event_index;
+    appendPointwiseOutcome(
+        "{\"schema\":" + quote(kPointwiseOutcomeSchema) +
+        ",\"kind\":\"coverage_skip\",\"mode\":\"record\",\"invocation_id\":" +
+        quote(active_invocation.id) + ",\"event_index\":" +
+        std::to_string(event_index) + ",\"case_key\":" + quote(log_case_key) +
+        ",\"site\":" + quote(site) + ",\"reason\":" + quote(reason) + '}');
+  }
 }
 
 } // namespace nvfuser::scheduler::jev

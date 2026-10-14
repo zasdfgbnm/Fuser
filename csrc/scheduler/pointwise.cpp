@@ -10,6 +10,7 @@
 
 #include <ranges>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -422,6 +423,112 @@ bool mayUseTma(
   }
   return true;
 }
+
+// These snapshots describe the returned plan, after the block-quantization
+// cap. Candidate Choice rows alone cannot distinguish a discarded ordinary
+// plan from the TMA plan actually returned by computeHeuristics.
+class PointwiseRecordObject {
+ public:
+  void add(std::string_view key, std::string_view value) {
+    addRaw(key, scheduler::jev::jsonQuote(value));
+  }
+
+  void add(std::string_view key, const char* value) {
+    add(key, std::string_view(value));
+  }
+
+  void add(std::string_view key, int64_t value) {
+    addRaw(key, std::to_string(value));
+  }
+
+  void add(std::string_view key, bool value) {
+    addRaw(key, value ? "true" : "false");
+  }
+
+  void addRaw(std::string_view key, std::string_view value) {
+    if (body_.size() != 1) body_ += ',';
+    body_ += scheduler::jev::jsonQuote(key) + ':' + std::string(value);
+  }
+
+  std::string str() const {
+    return body_ + '}';
+  }
+
+ private:
+  std::string body_ = "{";
+};
+
+void recordFinalPointwisePlan(
+    scheduler::jev::PointwiseRecordScope& scope,
+    const PointwiseParams& params,
+    bool has_runtime_properties) {
+  if (!scope.recording()) return;
+
+  PointwiseRecordObject final_params;
+  final_params.add("scheduler_type", "PointWise");
+  final_params.add("tag", params.tag);
+  final_params.add("break_point", params.break_point);
+  final_params.add("split_block", params.split_block);
+  final_params.add("symbolic_1d_cta", params.symbolic_1d_cta);
+  final_params.add("split_grid_y_dim", params.split_grid_y_dim);
+  final_params.add("flip_grid_binding", params.flip_grid_binding);
+  final_params.add("vectorization_factor", params.vectorization_factor);
+  final_params.add("vectorize_casts", params.vectorize_casts);
+  final_params.add("unroll_factor_outer", params.unroll_factor_outer);
+  final_params.add("unroll_factor_inner", params.unroll_factor_inner);
+  final_params.add("use_tma_load", params.use_tma_load);
+  final_params.add("use_tma_store", params.use_tma_store);
+  final_params.add("tma_domain_inner", params.tma_domain_inner);
+  final_params.add("tma_tile_outer", params.tma_tile_outer);
+  final_params.add("tma_tile_inner", params.tma_tile_inner);
+
+  PointwiseRecordObject launch;
+  launch.add("grid_x_raw", params.lparams.getRawVal(ParallelType::BIDx));
+  launch.add("grid_y_raw", params.lparams.getRawVal(ParallelType::BIDy));
+  launch.add("grid_z_raw", params.lparams.getRawVal(ParallelType::BIDz));
+  launch.add("block_x_raw", params.lparams.getRawVal(ParallelType::TIDx));
+  launch.add("block_y_raw", params.lparams.getRawVal(ParallelType::TIDy));
+  launch.add("block_z_raw", params.lparams.getRawVal(ParallelType::TIDz));
+  launch.add("dynamic_smem_bytes", params.lparams.smem());
+
+  PointwiseRecordObject compile;
+  const auto add_optional_number = [&](std::string_view key, const auto& value) {
+    if (value.has_value()) {
+      compile.add(key, static_cast<int64_t>(*value));
+    } else {
+      compile.addRaw(key, "null");
+    }
+  };
+  add_optional_number("index_type", params.cparams.index_type);
+  compile.add("maxrregcount", params.cparams.maxrregcount);
+  compile.add("enable_magic_zero", params.cparams.enable_magic_zero);
+  compile.add("enable_ptxas_verbose", params.cparams.enable_ptxas_verbose);
+  if (params.cparams.device.has_value()) {
+    compile.add("device", params.cparams.device->str());
+  } else {
+    compile.addRaw("device", "null");
+  }
+  std::string include_paths = "[";
+  for (size_t i = 0; i < params.cparams.include_paths.size(); ++i) {
+    if (i != 0) include_paths += ',';
+    include_paths += scheduler::jev::jsonQuote(params.cparams.include_paths[i]);
+  }
+  include_paths += ']';
+  compile.addRaw("include_paths", include_paths);
+  add_optional_number("block_x", params.cparams.bdimx);
+  add_optional_number("block_y", params.cparams.bdimy);
+  add_optional_number("block_z", params.cparams.bdimz);
+  add_optional_number("compute_block_x", params.cparams.compute_bdimx);
+  add_optional_number("compute_block_y", params.cparams.compute_bdimy);
+  add_optional_number("compute_block_z", params.cparams.compute_bdimz);
+
+  scope.complete(
+      !has_runtime_properties ? "empty"
+                              : params.use_tma_load ? "tma" : "ordinary",
+      final_params.str(),
+      launch.str(),
+      compile.str());
+}
 } // namespace
 
 std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
@@ -429,6 +536,7 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {
   FUSER_PERF_SCOPE("PointWiseScheduler::computeHeuristics");
+  scheduler::jev::PointwiseRecordScope record_scope;
 
   auto prop_opt = pointwise_utils::getFusionRuntimeProperties(
       fusion, runtime_info, data_cache);
@@ -437,6 +545,7 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
     auto pwise_params = std::make_unique<PointwiseParams>();
     pwise_params->tag = "Pointwise heuristics";
     pwise_params->cparams.index_type = runtime_info.getIndexType();
+    recordFinalPointwisePlan(record_scope, *pwise_params, false);
     return pwise_params;
   }
   const auto& prop = prop_opt.value();
@@ -511,6 +620,8 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
         4, pparams->as<PointwiseParams>()->vectorization_factor);
   }
 
+  recordFinalPointwisePlan(
+      record_scope, *pparams->as<PointwiseParams>(), true);
   return pparams;
 }
 

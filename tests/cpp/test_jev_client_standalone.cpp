@@ -110,6 +110,11 @@ int main() {
   ::setenv("NVFUSER_JEV_MODE", "off", 1);
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Off,
           "mode() did not report off");
+  {
+    nvfuser::scheduler::jev::PointwiseRecordScope scope;
+    require(!scope.recording(), "off mode enabled Pointwise diagnostics");
+    scope.complete("ordinary", "{}", "{}", "{}");
+  }
   require(chooseDecision("PW2", state, options, "bp0") == "bp0", "off mode changed choice");
   require(readFile(path).empty(), "off mode wrote a record");
 
@@ -141,13 +146,55 @@ int main() {
               appended.size() > first_record.size(),
           "record mode did not append to a regular log file");
 
+  // Pointwise candidate plans can be discarded. Correlate their Choice rows
+  // with the returned plan in a separate, complete outcome stream.
+  ::setenv("NVFUSER_JEV_CASE_KEY", "pointwise-case", 1);
+  const std::string outcome_path = std::string(path) + ".pointwise.jsonl";
+  {
+    nvfuser::scheduler::jev::PointwiseRecordScope scope;
+    require(scope.recording(), "Pointwise Record scope was not enabled");
+    require(chooseDecision("PW2", state, options, "bp0") == "bp0",
+            "Pointwise Record scope changed the native choice");
+    nvfuser::scheduler::jev::recordCoverageSkip("PW4.tile", "no safe tile");
+    scope.complete(
+        "tma", "{\"use_tma_load\":true,\"vectorization_factor\":4}",
+        "{\"block_x_raw\":128}", "{\"index_type\":null}");
+  }
+  const std::string outcome = readFile(outcome_path);
+  require(outcome.find("\"kind\":\"begin\"") != std::string::npos &&
+              outcome.find("\"kind\":\"final\"") != std::string::npos &&
+              outcome.find("\"kind\":\"coverage_skip\"") != std::string::npos &&
+              outcome.find("\"event_index\":0") != std::string::npos &&
+              outcome.find("\"event_index\":2") != std::string::npos &&
+              outcome.find("\"event_index\":3") != std::string::npos &&
+              outcome.find("\"backend\":\"tma\"") != std::string::npos &&
+              outcome.find("\"final_params\":{\"use_tma_load\":true") !=
+                  std::string::npos,
+          "Pointwise outcome is missing its terminal plan or coverage event");
+  const std::string id_key = "\"invocation_id\":\"";
+  const auto id_start = outcome.find(id_key);
+  require(id_start != std::string::npos, "Pointwise outcome lacks invocation ID");
+  const auto id_end = outcome.find('"', id_start + id_key.size());
+  const std::string invocation_id = outcome.substr(
+      id_start + id_key.size(), id_end - id_start - id_key.size());
+  require(!invocation_id.empty() &&
+              outcome.find(id_key + invocation_id + '"', id_end) != std::string::npos &&
+              readFile(path).find(id_key + invocation_id + "\",\"event_index\":1") !=
+                  std::string::npos,
+          "Pointwise Choice and outcome rows do not share an invocation ID");
+  require(readFile(path).find("\"kind\":\"coverage_skip\",\"site\":\"PW4.tile\"") !=
+              std::string::npos,
+          "Choice-only log coverage contract changed");
+  ::unsetenv("NVFUSER_JEV_CASE_KEY");
+  const std::string before_link = readFile(path);
+
   const std::string link_path = std::string(path) + ".link";
   require(::symlink(path, link_path.c_str()) == 0, "symlink creation failed");
   ::setenv("NVFUSER_JEV_LOG", link_path.c_str(), 1);
   bool link_rejected = false;
   try { (void)chooseDecision("PW2", state, options, "bp0", "symlink"); }
   catch (const std::runtime_error&) { link_rejected = true; }
-  require(link_rejected && readFile(path) == appended,
+  require(link_rejected && readFile(path) == before_link,
           "symlink log path was followed or changed its target");
   ::unlink(link_path.c_str());
 
@@ -180,6 +227,13 @@ int main() {
   ::setenv("NVFUSER_JEV_MODE", "remote", 1);
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,
           "mode() did not report remote");
+  {
+    nvfuser::scheduler::jev::PointwiseRecordScope scope;
+    require(!scope.recording(), "remote mode enabled Pointwise Record diagnostics");
+    scope.complete("ordinary", "{}", "{}", "{}");
+    require(readFile(outcome_path) == outcome,
+            "remote mode changed the Pointwise Record outcome log");
+  }
   {
     FakeServer server(answer("bp\\u0031"));
     ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
@@ -218,4 +272,5 @@ int main() {
     require(rejected, "oversized request accepted");
   }
   ::unlink(path);
+  ::unlink(outcome_path.c_str());
 }
