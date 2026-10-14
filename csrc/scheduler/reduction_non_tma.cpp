@@ -1607,7 +1607,8 @@ OuterGridWarpPlans buildOuterGridWarpPlans(
     int64_t sm_count,
     int64_t max_threads_per_sm,
     int64_t n_waves,
-    int64_t min_warp_size) {
+    int64_t min_warp_size,
+    int64_t sm_cta_thread_divisor = 4) {
   const int64_t n_elems = total_reduction_numel * total_iteration_numel;
   // Set some targets for parallelization
   int64_t target_threads_in_block = min_warp_size;
@@ -1632,12 +1633,14 @@ OuterGridWarpPlans buildOuterGridWarpPlans(
       available_parallelism() > 1 &&
       (
           //  There's a place to put it in the block
-          target_threads_in_block < ceilDiv(max_threads_per_sm, (int64_t)4)
+          target_threads_in_block <
+              ceilDiv(max_threads_per_sm, sm_cta_thread_divisor)
           // There's a place to put it in the device
           || target_blocks < sm_count * n_waves
           // There's a place to put it in unrolling
           || target_unroll < max_unroll)) {
-    if (target_threads_in_block < ceilDiv(max_threads_per_sm, (int64_t)4)) {
+    if (target_threads_in_block <
+        ceilDiv(max_threads_per_sm, sm_cta_thread_divisor)) {
       target_threads_in_block *= 2;
     }
 
@@ -2041,7 +2044,80 @@ OuterReductionParams getGridOuterReduction(
         "RD9 warp target is outside hard-valid candidates");
     min_warp_size = selected == "warp16" ? 16 : 32;
   }
-  const auto plans = makeWarpPlans(min_warp_size);
+  int64_t cta_share = 4;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // The quarter-SM CTA target is an empirical performance preference. Build
+    // both complete reduction-grid plans for each alternative before offering
+    // it; their block, vector, grid, and unroll bounds remain native checks.
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t share : {2, 4, 8}) {
+      const auto candidate = buildOuterGridWarpPlans(
+          total_reduction_numel,
+          total_iteration_numel,
+          max_dtype_size_bit_for_vectorization,
+          vectorize_factor,
+          max_unroll,
+          sm_count,
+          max_threads_per_sm,
+          n_waves,
+          min_warp_size,
+          share);
+      if (outerGridWarpPlansHardValid(
+              candidate,
+              total_reduction_numel,
+              total_iteration_numel,
+              vectorize_factor,
+              max_unroll,
+              max_threads_per_block)) {
+        options.push_back(
+            {"q" + std::to_string(share),
+             "Target approximately SM thread capacity / " +
+                 std::to_string(share) + " threads per CTA"});
+      }
+    }
+    const auto native = std::find_if(
+        options.begin(), options.end(), [](const auto& option) {
+          return option.id == "q4";
+        });
+    NVF_ERROR(
+        native != options.end(), "Native RD9 CTA plan violates hard bounds");
+    const std::string state =
+        "reduction.outer_cta.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) +
+        "\niteration_numel=" + std::to_string(total_iteration_numel) +
+        "\ndtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\nsm_count=" + std::to_string(sm_count) +
+        "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+        "\nmax_threads_per_block=" +
+        std::to_string(max_threads_per_block) +
+        "\nmax_unroll=" + std::to_string(max_unroll) +
+        "\nvector_width=" + std::to_string(vectorize_factor) +
+        "\nwaves=" + std::to_string(n_waves) +
+        "\nwarp=" + std::to_string(min_warp_size);
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD9.cta",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "q4" : "");
+    const auto found = std::find_if(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == selected;
+        });
+    NVF_ERROR(found != options.end(), "RD9 CTA target is outside hard bounds");
+    cta_share = std::stoll(selected.substr(1));
+  }
+  const auto plans = buildOuterGridWarpPlans(
+      total_reduction_numel,
+      total_iteration_numel,
+      max_dtype_size_bit_for_vectorization,
+      vectorize_factor,
+      max_unroll,
+      sm_count,
+      max_threads_per_sm,
+      n_waves,
+      min_warp_size,
+      cta_share);
   if (jev_mode == scheduler::jev::Mode::Off) {
     return plans.native_use_stride ? plans.stride_capped : plans.baseline;
   }

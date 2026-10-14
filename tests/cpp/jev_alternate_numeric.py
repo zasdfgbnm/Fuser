@@ -91,6 +91,7 @@ def check_alternate_report(report: dict[str, Any],
                            alternate: str, case_key: str,
                            require_grid: bool = False,
                            require_outer_width: bool = False,
+                           require_outer_cta: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False,
@@ -215,6 +216,41 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected decision comparison issues: {issues}")
+    elif require_outer_cta:
+        if (site != "RD9.cta" or event["native"] != "q4" or
+                alternate != "q8" or
+                set(event["candidates"]) != {"q2", "q4", "q8"}):
+            raise ValueError("outer CTA fixture lacks its three complete plans")
+        for upstream in ("RD9.reg_budget", "RD9.width", "RD9.waves", "RD9.warp"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with CTA target: {rows}")
+        strides = [row for row in report["multiplicity"]
+                   if row["site"] == "RD9.stride"]
+        record_stride = [row for row in strides
+                         if sum(row["record"].values()) == 1 and not row["remote"]]
+        remote_stride = [row for row in strides
+                         if sum(row["remote"].values()) == 1 and not row["record"]]
+        if len(strides) != 2 or len(record_stride) != 1 or len(remote_stride) != 1:
+            raise ValueError(f"CTA target did not replace RD9.stride state: {strides}")
+        def fields(row: dict[str, Any]) -> dict[str, str]:
+            return dict(line.split("=", 1) for line in
+                        row["request"]["state"].splitlines()[1:])
+        before, after = fields(record_stride[0]), fields(remote_stride[0])
+        if (before["bdimx"] != "16" or before["bdimy"] != "32" or
+                before["base_grdim"] != "32" or
+                after["bdimx"] != "16" or after["bdimy"] != "16" or
+                after["base_grdim"] != "64"):
+            raise ValueError(f"outer CTA did not reshape the grid plan: {before}, {after}")
+        expected = [intended,
+            {"kind": "record_only_state", "site": "RD9.stride",
+             "request_sha256": record_stride[0]["request_sha256"]},
+            {"kind": "remote_only_state", "site": "RD9.stride",
+             "request_sha256": remote_stride[0]["request_sha256"]}]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected outer CTA comparison issues: {issues}")
     elif require_outer_width:
         if (site != "RD9.width" or event["native"] != "w4" or
                 alternate != "w1" or
@@ -437,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--case-key", default=CASE_KEY)
     parser.add_argument("--require-grid", action="store_true")
     parser.add_argument("--require-outer-width", action="store_true")
+    parser.add_argument("--require-outer-cta", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
@@ -541,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
             alternate=args.alternate, case_key=args.case_key,
             require_grid=args.require_grid,
             require_outer_width=args.require_outer_width,
+            require_outer_cta=args.require_outer_cta,
             require_inner_targets=args.require_inner_targets,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
