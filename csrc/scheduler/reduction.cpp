@@ -9,10 +9,15 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include "debug.h"
 #include "instrumentation.h"
 #include "ir/utils.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/reduction_non_tma.h"
 #include "scheduler/reduction_outer_tma.h"
 #include "scheduler/reduction_tma.h"
@@ -196,7 +201,22 @@ bool ReductionScheduler::canScheduleRunTime(
 
 namespace {
 
-bool mayUseTma(
+bool hasIterationAxis(Fusion* fusion) {
+  const auto reduction_tvs = scheduler_utils::getReductionTvs(fusion);
+  if (reduction_tvs.empty()) {
+    return false;
+  }
+  for (const auto* axis : reduction_tvs.front()->getLoopDomain()) {
+    if (!axis->isReduction() && !axis->isDeviceDim()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Only hard TMA requirements belong here. The 16 KiB transfer preference is
+// applied after both complete scheduler parameter plans are available.
+bool canUseTmaInner(
     Fusion* fusion,
     const reduction_scheduler_utils::FusionRuntimeProperties& props) {
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
@@ -210,18 +230,8 @@ bool mayUseTma(
   }
 
   // Require the reduction shape is 2D inner reduction: [I, R]
-  if (!props.fastest_dim_reduction ||
+  if (!props.fastest_dim_reduction || !hasIterationAxis(fusion) ||
       props.total_reduction_numel != props.inner_most_dimension_numel) {
-    return false;
-  }
-
-  int64_t dtype_bytes = props.max_dtype_size_bit_for_vectorization / 8;
-  uint64_t total_reduction_bytes = props.total_reduction_numel * dtype_bytes;
-
-  // Minimum TMA transfer size, below which it seems much slower than non-TMA.
-  uint64_t min_tma_bytes = 16384;
-
-  if (total_reduction_bytes < min_tma_bytes) {
     return false;
   }
 
@@ -261,7 +271,7 @@ bool mayUseTma(
   return true;
 }
 
-bool mayUseTmaOuter(
+bool canUseTmaOuter(
     Fusion* fusion,
     const reduction_scheduler_utils::FusionRuntimeProperties& props) {
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
@@ -275,18 +285,11 @@ bool mayUseTmaOuter(
   }
 
   // Require outer reduction
-  if (props.fastest_dim_reduction) {
+  if (props.fastest_dim_reduction || !hasIterationAxis(fusion)) {
     return false;
   }
 
   int64_t dtype_bytes = props.max_dtype_size_bit_for_vectorization / 8;
-  uint64_t total_reduction_bytes = props.total_reduction_numel * dtype_bytes;
-
-  // Minimum TMA transfer size
-  uint64_t min_tma_bytes = 16384;
-  if (total_reduction_bytes < min_tma_bytes) {
-    return false;
-  }
 
   // Check that TMA tiles for all inputs fit in shared memory.
   // The heuristic will shrink tiles to fit, but the minimum tile size is
@@ -325,6 +328,16 @@ bool mayUseTmaOuter(
 
   return true;
 }
+
+bool nativePrefersTma(
+    const reduction_scheduler_utils::FusionRuntimeProperties& props) {
+  constexpr uint64_t kMinTmaBytes = 16384;
+  const auto dtype_bytes =
+      static_cast<uint64_t>(props.max_dtype_size_bit_for_vectorization / 8);
+  NVF_ERROR(dtype_bytes > 0);
+  return static_cast<uint64_t>(props.total_reduction_numel) >=
+      (kMinTmaBytes + dtype_bytes - 1) / dtype_bytes;
+}
 } // namespace
 
 std::unique_ptr<HeuristicParams> ReductionScheduler::computeHeuristics(
@@ -338,27 +351,80 @@ std::unique_ptr<HeuristicParams> ReductionScheduler::computeHeuristics(
 
   bool tma_enabled = isOptionEnabled(EnableOption::TmaReduction);
 
-  std::unique_ptr<HeuristicParams> rparams = nullptr;
+  const bool outer_tma_legal = tma_enabled && canUseTmaOuter(fusion, props);
+  const bool inner_tma_legal =
+      !outer_tma_legal && tma_enabled && canUseTmaInner(fusion, props);
+  const auto jev_mode = scheduler::jev::mode();
 
-  // Try outer TMA scheduler for outer reductions
-  if (tma_enabled && mayUseTmaOuter(fusion, props)) {
-    rparams = reduction::outer_tma::getReductionHeuristics(
-        fusion, runtime_info, data_cache, props);
+  // Preserve the original fast path and its fallback behavior in off mode.
+  if (jev_mode == scheduler::jev::Mode::Off ||
+      (!outer_tma_legal && !inner_tma_legal)) {
+    const bool prefer_tma =
+        (outer_tma_legal || inner_tma_legal) && nativePrefersTma(props);
+    std::unique_ptr<HeuristicParams> params;
+    if (prefer_tma && outer_tma_legal) {
+      params = reduction::outer_tma::getReductionHeuristics(
+          fusion, runtime_info, data_cache, props);
+    } else if (prefer_tma && inner_tma_legal) {
+      params = reduction::tma::getReductionHeuristics(
+          fusion, runtime_info, data_cache, props);
+    }
+    if (params == nullptr) {
+      params = reduction::non_tma::getReductionHeuristics(
+          fusion, runtime_info, data_cache, props);
+    }
+    NVF_ERROR(params != nullptr);
+    return params;
   }
 
-  // Try inner TMA scheduler for inner reductions
-  if (rparams == nullptr && tma_enabled && mayUseTma(fusion, props)) {
-    rparams = reduction::tma::getReductionHeuristics(
+  // Build complete plans before asking about performance. A failed TMA plan
+  // keeps the ordinary fallback; a missing ordinary plan cannot be offered.
+  std::unique_ptr<HeuristicParams> tma_params;
+  if (outer_tma_legal) {
+    tma_params = reduction::outer_tma::getReductionHeuristics(
         fusion, runtime_info, data_cache, props);
+  } else {
+    tma_params = reduction::tma::getReductionHeuristics(
+        fusion, runtime_info, data_cache, props);
+  }
+  if (tma_params == nullptr) {
+    auto ordinary = reduction::non_tma::getReductionHeuristics(
+        fusion, runtime_info, data_cache, props);
+    NVF_ERROR(ordinary != nullptr);
+    return ordinary;
+  }
+  auto ordinary_params = reduction::non_tma::getReductionHeuristics(
+      fusion, runtime_info, data_cache, props);
+  if (ordinary_params == nullptr) {
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      NVF_ERROR(
+          nativePrefersTma(props),
+          "No ordinary reduction plan for native fallback");
+    }
+    return tma_params;
   }
 
-  // Fallback to non-TMA scheduler if TMA is not applicable
-  if (rparams == nullptr) {
-    rparams = reduction::non_tma::getReductionHeuristics(
-        fusion, runtime_info, data_cache, props);
-  }
-  NVF_ERROR(rparams != nullptr);
-  return rparams;
+  const std::string site = outer_tma_legal ? "RD6" : "RD1";
+  const std::string state =
+      "reduction.tma_preference.v1\naxis=" +
+      std::string(outer_tma_legal ? "outer" : "inner") +
+      "\nreduction_numel=" + std::to_string(props.total_reduction_numel) +
+      "\ndtype_bits=" +
+      std::to_string(props.max_dtype_size_bit_for_vectorization);
+  const std::vector<scheduler::jev::ChoiceOption> options = {
+      {"tma", "Use the complete TMA reduction plan"},
+      {"ordinary", "Use the complete ordinary reduction plan"}};
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record
+      ? (nativePrefersTma(props) ? "tma" : "ordinary")
+      : "";
+  const auto selected = scheduler::jev::chooseDecision(
+      site, state, options, native_choice);
+  NVF_ERROR(
+      selected == "tma" || selected == "ordinary",
+      "TMA preference must select a complete native reduction plan");
+  return selected == "tma" ? std::move(tma_params)
+                           : std::move(ordinary_params);
 }
 
 void ReductionScheduler::schedule(
