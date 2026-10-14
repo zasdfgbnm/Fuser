@@ -86,6 +86,57 @@ class AlternateChoice:
         return changed, analysis
 
 
+def paired_state_rows(report: dict[str, Any], site: str
+                      ) -> tuple[dict[str, Any], dict[str, Any],
+                                 list[dict[str, str]]]:
+    """Require one request on each side of a changed dependent state."""
+    rows = [row for row in report["multiplicity"] if row["site"] == site]
+    record = [row for row in rows if row["record"] and not row["remote"]]
+    remote = [row for row in rows if row["remote"] and not row["record"]]
+    if (len(rows) != 2 or len(record) != 1 or len(remote) != 1 or
+            len(record[0]["record"]) != 1 or
+            list(record[0]["record"].values()) != [1] or
+            len(remote[0]["remote"]) != 1 or
+            list(remote[0]["remote"].values()) != [1] or
+            record[0]["request_sha256"] == remote[0]["request_sha256"]):
+        raise ValueError(f"expected exactly one paired {site} state replacement: {rows}")
+    return record[0], remote[0], [
+        {"kind": "record_only_state", "site": site,
+         "request_sha256": record[0]["request_sha256"]},
+        {"kind": "remote_only_state", "site": site,
+         "request_sha256": remote[0]["request_sha256"]},
+    ]
+
+
+def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
+    lines = row["request"]["state"].splitlines()
+    if not lines or lines[0] != version:
+        raise ValueError(f"unexpected {row['site']} state version: {lines}")
+    fields: dict[str, str] = {}
+    for line in lines[1:]:
+        key, separator, value = line.partition("=")
+        if not separator or key in fields:
+            raise ValueError(f"malformed {row['site']} state: {line}")
+        fields[key] = value
+    return fields
+
+
+def check_outer_grid_plan(record: dict[str, Any], remote: dict[str, Any],
+                          record_stride: dict[str, Any],
+                          remote_stride: dict[str, Any]) -> None:
+    if record["record"] != {"grid": 1} or remote["remote"] != {"grid": 1}:
+        raise ValueError("selected grid plan changed the RD8 winner")
+    for rd8, stride in ((record, record_stride), (remote, remote_stride)):
+        plan = state_fields(rd8, "reduction.outer_plan.v1")
+        selected = state_fields(stride, "reduction.outer_grid_stride.v1")
+        for plan_key, stride_key in (("grid_gidim", "gidim"),
+                                     ("grid_grdim", "base_grdim"),
+                                     ("grid_iter_unroll", "iter_unroll")):
+            if (plan_key not in plan or stride_key not in selected or
+                    plan[plan_key] != selected[stride_key]):
+                raise ValueError(f"RD8 omitted selected stride plan: {plan}, {selected}")
+
+
 def check_alternate_report(report: dict[str, Any],
                            events: list[dict[str, Any]], *, site: str,
                            alternate: str, case_key: str,
@@ -229,28 +280,29 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed with CTA target: {rows}")
-        strides = [row for row in report["multiplicity"]
-                   if row["site"] == "RD9.stride"]
-        record_stride = [row for row in strides
-                         if sum(row["record"].values()) == 1 and not row["remote"]]
-        remote_stride = [row for row in strides
-                         if sum(row["remote"].values()) == 1 and not row["record"]]
-        if len(strides) != 2 or len(record_stride) != 1 or len(remote_stride) != 1:
-            raise ValueError(f"CTA target did not replace RD9.stride state: {strides}")
-        def fields(row: dict[str, Any]) -> dict[str, str]:
-            return dict(line.split("=", 1) for line in
-                        row["request"]["state"].splitlines()[1:])
-        before, after = fields(record_stride[0]), fields(remote_stride[0])
+        record_stride, remote_stride, stride_issues = paired_state_rows(
+            report, "RD9.stride")
+        before = state_fields(record_stride, "reduction.outer_grid_stride.v1")
+        after = state_fields(remote_stride, "reduction.outer_grid_stride.v1")
         if (before["bdimx"] != "16" or before["bdimy"] != "32" or
                 before["base_grdim"] != "32" or
                 after["bdimx"] != "16" or after["bdimy"] != "16" or
-                after["base_grdim"] != "64"):
+                after["base_grdim"] != "64" or
+                record_stride["record"] != {"g32": 1} or
+                remote_stride["remote"] != {"g64": 1}):
             raise ValueError(f"outer CTA did not reshape the grid plan: {before}, {after}")
-        expected = [intended,
-            {"kind": "record_only_state", "site": "RD9.stride",
-             "request_sha256": record_stride[0]["request_sha256"]},
-            {"kind": "remote_only_state", "site": "RD9.stride",
-             "request_sha256": remote_stride[0]["request_sha256"]}]
+        record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
+        check_outer_grid_plan(record_plan, remote_plan, record_stride, remote_stride)
+        plan_before = state_fields(record_plan, "reduction.outer_plan.v1")
+        plan_after = state_fields(remote_plan, "reduction.outer_plan.v1")
+        if (plan_before.get("grid_grdim") != "32" or
+                plan_after.get("grid_grdim") != "64" or
+                {key: value for key, value in plan_before.items()
+                 if key != "grid_grdim"} !=
+                {key: value for key, value in plan_after.items()
+                 if key != "grid_grdim"}):
+            raise ValueError("CTA target changed more than the RD8 grid size")
+        expected = [intended, *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer CTA comparison issues: {issues}")
     elif require_outer_width:
@@ -258,43 +310,40 @@ def check_alternate_report(report: dict[str, Any],
                 alternate != "w1" or
                 set(event["candidates"]) != {"w1", "w2", "w4"}):
             raise ValueError("outer width fixture lacks its aligned width menu")
-        if any(issue["site"] not in {"RD9.width", "RD9.warp", "RD9.stride", "RD8"}
-               for issue in issues):
-            raise ValueError(f"unrelated outer-width decision issue: {issues}")
-        for upstream in ("RD9.reg_budget", "RD9.waves"):
+        for upstream in ("RD9.reg_budget", "RD9.waves", "RD9.warp"):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == upstream]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed with width: {rows}")
-        strides = [row for row in report["multiplicity"]
-                   if row["site"] == "RD9.stride"]
-        record_stride = [row for row in strides
-                         if sum(row["record"].values()) == 1 and
-                         not row["remote"]]
-        remote_stride = [row for row in strides
-                         if sum(row["remote"].values()) == 1 and
-                         not row["record"]]
-        if len(strides) != 2 or len(record_stride) != 1 or len(remote_stride) != 1:
-            raise ValueError(f"selected width did not replace RD9.stride state: {strides}")
-        def fields(row: dict[str, Any]) -> dict[str, str]:
-            return dict(line.split("=", 1) for line in
-                        row["request"]["state"].splitlines()[1:])
-        record_unroll = int(fields(record_stride[0])["iter_unroll"])
-        remote_unroll = int(fields(remote_stride[0])["iter_unroll"])
+        record_cta, remote_cta, cta_issues = paired_state_rows(report, "RD9.cta")
+        cta_before = state_fields(record_cta, "reduction.outer_cta.v1")
+        cta_after = state_fields(remote_cta, "reduction.outer_cta.v1")
+        if (record_cta["record"] != {"q4": 1} or
+                remote_cta["remote"] != {"q4": 1} or
+                cta_before.get("vector_width") != "4" or
+                cta_after.get("vector_width") != "1" or
+                {key: value for key, value in cta_before.items()
+                 if key != "vector_width"} !=
+                {key: value for key, value in cta_after.items()
+                 if key != "vector_width"}):
+            raise ValueError("width changed the CTA winner or upstream CTA state")
+        record_stride, remote_stride, stride_issues = paired_state_rows(
+            report, "RD9.stride")
+        before = state_fields(record_stride, "reduction.outer_grid_stride.v1")
+        after = state_fields(remote_stride, "reduction.outer_grid_stride.v1")
+        record_unroll = int(before["iter_unroll"])
+        remote_unroll = int(after["iter_unroll"])
         if record_unroll <= remote_unroll or remote_unroll != 1:
             raise ValueError("outer width did not lower dependent iteration unroll")
-        required = [intended,
-                    {"kind": "record_only_state", "site": "RD9.stride",
-                     "request_sha256": record_stride[0]["request_sha256"]},
-                    {"kind": "remote_only_state", "site": "RD9.stride",
-                     "request_sha256": remote_stride[0]["request_sha256"]}]
-        if any(item not in issues for item in required):
-            raise ValueError(f"missing expected width-dependent state issues: {issues}")
-        for issue in issues:
-            if issue not in required and issue["kind"] not in {
-                    "record_only_state", "remote_only_state"}:
-                raise ValueError(f"unexpected outer-width winner issue: {issues}")
+        if (record_stride["record"] != {"g32": 1} or
+                remote_stride["remote"] != {"g8": 1}):
+            raise ValueError("width changed the stride winner unexpectedly")
+        record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
+        check_outer_grid_plan(record_plan, remote_plan, record_stride, remote_stride)
+        expected = [intended, *cta_issues, *stride_issues, *plan_issues]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected outer-width comparison issues: {issues}")
     elif require_grid:
         if set(event["candidates"]) != {"warp16", "warp32"}:
             raise ValueError("outer warp test did not reach both hard-valid plans")
