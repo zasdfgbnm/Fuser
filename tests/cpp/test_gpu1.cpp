@@ -5821,6 +5821,44 @@ TEST_F(Gpu1Test, JevAlternateInnerGrid_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// A large output axis keeps the 2D inner reduction on one block per tile.
+// Force a second output per thread and compare the completed block schedule
+// with an ATen reduction; the native measured preference remains one.
+TEST_F(Gpu1Test, JevAlternateInnerIterUnroll_CUDA) {
+  constexpr int output_size = 1024;
+  constexpr int reduction_size = 1024;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->cross_grid_inner_reduction);
+  ASSERT_EQ(
+      rparams->unroll_factor_iter_dom,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 2 : 1);
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Hold the native 3D reduction block/grid plan fixed while the local API
 // chooses a smaller, still aligned vector width for its innermost axis.
 TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {

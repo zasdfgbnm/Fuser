@@ -539,10 +539,9 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     }
   }
 
-  // Set iteration dims, iter = [BIDy, o-Unroll, TIDy]
-  // outer unroll is not used since test shows lower performance compared with
-  // inner unroll because the lack of a iteration domain grouped warp
-  // reduction. So each block needs to call warp reduction [o-Unroll] times.
+  // Set iteration dims, iter = [BIDy, o-Unroll, TIDy]. The native preference
+  // for outer unroll is one: without an iteration-domain grouped warp
+  // reduction, each block repeats the warp reduction for every output unroll.
   int64_t bdimy = 1, outer_unroll = 1, godim = 1;
 
   // fill bdimy, but don't go over target_threads_per_block
@@ -631,6 +630,47 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     }
     // This could mess up parallelization which could be redone, but that would
     // require iterating over this entire function.
+  }
+
+  // RD3.iter_unroll offers complete output tiles only after the grid
+  // reduction decision. A cross-grid reduction cannot unroll this axis, and
+  // changing godim before RD3.grid would alter that decision's legal set.
+  // Cap the speculative per-thread output work at four; the other bounds are
+  // structural and the grid split below remains native.
+  if (jev_mode != scheduler::jev::Mode::Off && grdim == 1 &&
+      total_iteration_numel / bdimy >= 2) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    const int64_t max_factor = std::min<int64_t>(
+        4, total_iteration_numel / bdimy);
+    for (int64_t factor = 1; factor <= max_factor; factor *= 2) {
+      options.push_back(
+          {"u" + std::to_string(factor),
+           "Unroll " + std::to_string(factor) +
+               " output(s) per thread in the completed block plan"});
+    }
+    std::string state = "reduction.inner_iter_unroll.v1\n";
+    state += "iteration_numel=" +
+        std::to_string(total_iteration_numel) + '\n';
+    state += "bdimy=" + std::to_string(bdimy) + '\n';
+    state += "pre_unroll_godim=" + std::to_string(godim) + '\n';
+    state += "grid_reduction_factor=" + std::to_string(grdim) + '\n';
+    state += "max_grid_x=" +
+        std::to_string(scheduler_utils::x_grid_limit) + '\n';
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD3.iter_unroll",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "u1" : "");
+    const auto found = std::find_if(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == selected;
+        });
+    NVF_ERROR(
+        found != options.end(),
+        "RD3.iter_unroll response exceeds the native block-plan bounds");
+    outer_unroll = std::stoll(selected.substr(1));
+    godim = ceilDiv(ceilDiv(total_iteration_numel, bdimy), outer_unroll);
+    NVF_ERROR(godim >= 1, "RD3.iter_unroll produced an invalid output grid");
   }
 
   auto rparams = std::make_unique<ReductionParams>();

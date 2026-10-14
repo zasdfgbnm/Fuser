@@ -204,6 +204,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_width: bool = False,
                            require_outer_cta: bool = False,
                            require_outer_ragged: bool = False,
+                           require_inner_iter_unroll: bool = False,
                            require_inner_width: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
@@ -496,6 +497,27 @@ def check_alternate_report(report: dict[str, Any],
         if (width_fields.get("max_legal_width") != "4" or
                 width_fields.get("inner_numel") != "1024"):
             raise ValueError(f"unexpected layout-safe width bound: {width_fields}")
+    elif require_inner_iter_unroll:
+        if (site != "RD3.iter_unroll" or event["native"] != "u1" or
+                alternate != "u2" or
+                set(event["candidates"]) != {"u1", "u2", "u4"}):
+            raise ValueError("inner reduction fixture lacks complete output tiles")
+        fields = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "reduction.inner_iter_unroll.v1")
+        if (fields.get("iteration_numel") != "1024" or
+                fields.get("grid_reduction_factor") != "1" or
+                fields.get("max_grid_x") != str((1 << 31) - 1) or
+                int(fields.get("pre_unroll_godim", "0")) !=
+                (1024 + int(fields.get("bdimy", "0")) - 1) //
+                int(fields.get("bdimy", "1"))):
+            raise ValueError(f"output unroll did not receive the block plan: {fields}")
+        for row in report["multiplicity"]:
+            if row["site"].startswith("RD3.") and row["site"] != site and (
+                    row["record"] != row["remote"] or
+                    sum(row["record"].values()) != 1):
+                raise ValueError(f"upstream inner decision changed: {row}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected output unroll comparison issues: {issues}")
     elif require_inner_targets:
         if (site != "IP5.targets" or event["native"] != "o16_w28" or
                 alternate != "o32_w16" or
@@ -691,6 +713,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-cta", action="store_true")
     parser.add_argument("--require-outer-ragged", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
+    parser.add_argument("--require-inner-iter-unroll", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
@@ -799,6 +822,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_cta=args.require_outer_cta,
             require_outer_ragged=args.require_outer_ragged,
             require_inner_targets=args.require_inner_targets,
+            require_inner_iter_unroll=args.require_inner_iter_unroll,
             require_inner_width=args.require_inner_width,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
