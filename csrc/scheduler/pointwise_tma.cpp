@@ -10,6 +10,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
+
 #include "exceptions.h"
 #include "ir/utils.h"
 #include "scheduler/debug_utils.h"
@@ -91,31 +93,21 @@ int64_t getInputBitsPerElement(
   return bits_per_element;
 }
 
-std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
+std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    const pointwise_utils::FusionRuntimeProperties& prop) {
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise_utils::BreakPointInfo& bp_info,
+    scheduler::jev::Mode jev_mode,
+    bool* hard_valid = nullptr) {
   constexpr int64_t threads_per_warp = 32;
-  const auto jev_mode = scheduler::jev::mode();
 
   auto params = std::make_unique<PointwiseParams>();
   params->tag = "Pointwise TMA heuristics";
   params->cparams.index_type = prop.index_type;
   params->use_tma_load = true;
 
-  // ========== Step 0: Determine Break Point ==========
-  // The break point determines the scheduling strategy:
-  //
-  // break_point == 0: Use 1D scheduler
-  //   - All iteration domains are flattened into a single dimension
-  //   - This is then split into [tma_domain_outer, tma_domain_inner]
-  //
-  // break_point > 0: Use 2D scheduler
-  //   - Iteration domains are merged at the break point into two dimensions
-  //   - These directly correspond to [tma_domain_outer, tma_domain_inner]
-  auto bp_info = pointwise_utils::getBreakPoint(
-      fusion, prop, data_cache, /*is_tma =*/true);
   params->break_point = bp_info.break_point;
 
   // check which input is suitable for TMA load
@@ -307,6 +299,13 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     return legal_inner(candidate) &&
         legal_outer(candidate, minimum_outer);
   };
+
+  if (hard_valid != nullptr) {
+    *hard_valid = tma_domain_outer > 1 && bits_per_sm >= 8 &&
+        legal_inner_plan(tma_tile_inner) &&
+        tma_tile_outer >= first_outer &&
+        legal_outer(tma_tile_inner, tma_tile_outer);
+  }
 
   bool route_tile_choices = jev_mode != scheduler::jev::Mode::Off;
   if (jev_mode == scheduler::jev::Mode::Record) {
@@ -601,6 +600,129 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     debug() << "============================================\n";
   }
   return params;
+}
+
+std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    HeuristicDataCache* data_cache,
+    const pointwise_utils::FusionRuntimeProperties& prop) {
+  const auto mode = scheduler::jev::mode();
+  if (mode == scheduler::jev::Mode::Off) {
+    const auto native = pointwise_utils::getBreakPoint(
+        fusion, prop, data_cache, /*is_tma=*/true);
+    return getPointwiseHeuristicsForBreakPoint(
+        fusion, runtime_info, data_cache, prop, native, mode);
+  }
+
+  // Build the legacy plan first in record mode. It preserves the existing
+  // fallback to ordinary pointwise when TMA cannot materialize and records
+  // the downstream tile/width decisions exactly once.
+  pointwise_utils::BreakPointInfo native;
+  std::unique_ptr<PointwiseParams> native_params;
+  if (mode == scheduler::jev::Mode::Record) {
+    native = pointwise_utils::getBreakPoint(
+        fusion, prop, data_cache, /*is_tma=*/true);
+    native_params = getPointwiseHeuristicsForBreakPoint(
+        fusion, runtime_info, data_cache, prop, native, mode);
+    if (native_params == nullptr) {
+      return nullptr;
+    }
+  }
+
+  const auto search = pointwise_utils::getTmaBreakPointSearch(prop, data_cache);
+  if (prop.elem_counts.size() > 32) {
+    if (mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.breakpoint", "more than 32 loop dimensions");
+      return native_params;
+    }
+    NVF_ERROR(false, "PW4.breakpoint supports at most 32 loop dimensions");
+  }
+
+  std::vector<scheduler::jev::ChoiceOption> options;
+  std::vector<pointwise_utils::BreakPointInfo> plans;
+  const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+  const int64_t reference_dtype_bits =
+      dataTypeSizeBit(prop.largest_out->getDataType(), prop.index_type);
+  for (const auto& candidate : search.candidates) {
+    // These are structural TMA guards. The complete native parameter builder
+    // below checks tile alignment, shared memory, CTA/grid limits and width.
+    if (candidate.break_point == 0) {
+      if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
+          prop.n_elems % (256 / min_dtype_bits) != 0) {
+        continue;
+      }
+      const auto inner = scheduler_utils::getTmaDomainInner(
+          prop.n_elems, 512, min_dtype_bits);
+      if (inner <= 1 || inner >= prop.n_elems) {
+        continue;
+      }
+    } else if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
+               candidate.right_elem_count < 256 / min_dtype_bits ||
+               prop.n_elems % candidate.right_elem_count != 0 ||
+               ((candidate.right_elem_count % 128) *
+                (reference_dtype_bits % 128)) % 128 != 0) {
+      continue;
+    }
+    bool hard_valid = false;
+    std::unique_ptr<PointwiseParams> materialized;
+    try {
+      materialized = getPointwiseHeuristicsForBreakPoint(
+          fusion,
+          runtime_info,
+          data_cache,
+          prop,
+          candidate,
+          scheduler::jev::Mode::Off,
+          &hard_valid);
+    } catch (const nvfError&) {
+      // A candidate that cannot complete the native plan is outside the
+      // Choice menu. The original plan is built separately above in record.
+      continue;
+    }
+    if (materialized == nullptr || !hard_valid) {
+      continue;
+    }
+    const auto id = "bp" + std::to_string(candidate.break_point);
+    options.push_back(
+        {id,
+         candidate.break_point == 0
+             ? "Flatten to the one-dimensional TMA domain"
+             : "Split before loop axis " +
+                   std::to_string(candidate.break_point)});
+    plans.push_back(candidate);
+  }
+
+  if (mode == scheduler::jev::Mode::Record) {
+    const auto native_id = "bp" + std::to_string(native.break_point);
+    if (std::none_of(
+            options.begin(), options.end(), [&](const auto& option) {
+              return option.id == native_id;
+            })) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.breakpoint",
+          "native TMA plan is outside the conservative complete-plan menu");
+      return native_params;
+    }
+    (void)scheduler::jev::chooseDecision(
+        "PW4.breakpoint", search.state, options, native_id);
+    return native_params;
+  }
+
+  NVF_ERROR(!options.empty(), "PW4.breakpoint has no native-valid TMA plan");
+  const auto selected = scheduler::jev::chooseDecision(
+      "PW4.breakpoint", search.state, options);
+  for (size_t i = 0; i < options.size(); ++i) {
+    if (options[i].id != selected) {
+      continue;
+    }
+    // The API selects only from plans that passed native materialization.
+    // Rebuild the selected plan in remote mode for the downstream Choices.
+    return getPointwiseHeuristicsForBreakPoint(
+        fusion, runtime_info, data_cache, prop, plans[i], mode);
+  }
+  NVF_ERROR(false, "PW4.breakpoint response is outside the materialized menu");
 }
 
 // TODO: Inline intermediate operations (avoid inlining unrolled/vectorized

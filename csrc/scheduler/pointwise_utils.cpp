@@ -9,6 +9,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <string_view>
+
 #include "ir/printer.h"
 #include "multidevice/utils.h"
 #include "scheduler/cache_policy_refiner.h"
@@ -173,6 +175,65 @@ std::optional<FusionRuntimeProperties> getFusionRuntimeProperties(
   prop.index_type = index_type;
 
   return prop;
+}
+
+TmaBreakPointSearch getTmaBreakPointSearch(
+    const FusionRuntimeProperties& prop,
+    HeuristicDataCache* data_cache) {
+  const auto& largest_out = prop.largest_out;
+  const auto index_type = prop.index_type;
+  auto broadcast_info_entry = HeuristicDataCacheEntry<
+      HeuristicCompileTime::BroadcastMultiples>(
+      data_cache, [&largest_out, &index_type]() {
+        return std::make_unique<scheduler_utils::BroadcastMultipleInformation>(
+            scheduler_utils::getBroadcastMultiples(largest_out, index_type));
+      });
+  const auto& info = broadcast_info_entry.get();
+  const auto& extents = prop.elem_counts;
+  NVF_ERROR_EQ(extents.size(), info.broadcast_multiples.size());
+
+  TmaBreakPointSearch search;
+  search.state = "pointwise.tma_breakpoint.v1\n";
+  auto append = [&](std::string_view key, const auto& value) {
+    search.state += std::string(key) + '=';
+    for (size_t i = 0; i < value.size(); ++i) {
+      if (i != 0) {
+        search.state += ',';
+      }
+      search.state += std::to_string(value[i]);
+    }
+    search.state += '\n';
+  };
+  std::vector<int64_t> disjoint;
+  std::vector<int64_t> lhs;
+  std::vector<int64_t> rhs;
+  for (size_t i = 0; i < extents.size(); ++i) {
+    disjoint.push_back(
+        scheduler_utils::breakIsDisjoint(info.view_disjoint_set_ids, i));
+    lhs.push_back(info.broadcast_multiples[i].lhs_multiple);
+    rhs.push_back(info.broadcast_multiples[i].rhs_multiple);
+  }
+  append("elements", extents);
+  append("disjoint", disjoint);
+  append("lhs_bit_multiples", lhs);
+  append("rhs_bit_multiples", rhs);
+
+  // bp0 is the existing one-dimensional fallback, even when no split is
+  // view-disjoint. Other candidates need a real left and right side.
+  search.candidates.emplace_back();
+  int64_t right_count = 1;
+  for (int64_t i = static_cast<int64_t>(extents.size()) - 1; i >= 1; --i) {
+    right_count *= extents[i];
+    if (!disjoint[i] || prop.n_elems / right_count <= 1) {
+      continue;
+    }
+    BreakPointInfo candidate;
+    candidate.break_point = static_cast<int>(i);
+    candidate.right_elem_count = right_count;
+    candidate.is_outer_broadcast_dominated = lhs[i] < rhs[i];
+    search.candidates.push_back(candidate);
+  }
+  return search;
 }
 
 BreakPointInfo getBreakPoint(

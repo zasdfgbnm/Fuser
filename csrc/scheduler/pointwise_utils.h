@@ -8,6 +8,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "compute_at_map.h"
@@ -77,6 +78,18 @@ struct BreakPointInfo {
   int64_t right_elem_count = 0;
   bool is_outer_broadcast_dominated = false;
 };
+
+// Raw measurements and structurally legal split positions for the TMA
+// pointwise Choice. TMA-specific alignment and resource checks remain with
+// the TMA plan builder.
+struct TmaBreakPointSearch {
+  std::string state;
+  std::vector<BreakPointInfo> candidates;
+};
+
+TmaBreakPointSearch getTmaBreakPointSearch(
+    const FusionRuntimeProperties& prop,
+    HeuristicDataCache* data_cache);
 
 // Calculate optimal break point for 2D scheduling
 // Returns just the break point information without thread/grid dimensions
