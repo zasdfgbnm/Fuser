@@ -133,7 +133,9 @@ def check_parity(report: dict[str, Any], case_key: str, prefix: str) -> None:
     cases = report["case_coverage"]
     if set(cases) != {case_key}:
         raise ValueError(f"decision logs contain unexpected case keys: {sorted(cases)}")
-    if min(cases[case_key].values()) == 0:
+    # The comparison report also counts coverage skips. Zero skips is the
+    # ordinary successful case, so inspect the two required event counts.
+    if min(cases[case_key][key] for key in ("record_events", "remote_events")) == 0:
         raise ValueError("the case key has no record or remote events")
     sites = report["site_coverage"]
     if not any(site.startswith(prefix) and value["status"] == "covered"
