@@ -892,6 +892,44 @@ TEST_F(GreedySchedulerTest, JevAlternateMultiScanBatch_CUDA) {
       testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
 }
 
+// Force one b4 decision for three compatible Scan operations. Publish all
+// intermediate results so each Scan is checked against an ATen prefix sum.
+TEST_F(GreedySchedulerTest, JevAlternateThreeScanBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto first = scan(input_tv, -1, BinaryOpType::Add);
+  auto second = scan(first, -1, BinaryOpType::Add);
+  auto third = scan(second, -1, BinaryOpType::Add);
+  fusion.addOutput(first);
+  fusion.addOutput(second);
+  fusion.addOutput(third);
+
+  auto input = at::zeros(
+      shape, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  input.select(-1, 0).fill_(1.0);
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  ASSERT_EQ(outputs.size(), 3);
+  auto reference = input;
+  for (int64_t i = 0; i < 3; ++i) {
+    reference = reference.cumsum(-1);
+    // One impulse per row keeps even the third prefix below 2^24, so
+    // Float addition remains exact for all three independent checks.
+    EXPECT_TRUE(at::equal(outputs[i].as<at::Tensor>(), reference));
+  }
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+}
+
 TEST_P(GreedySchedulerTestConstraintSize, ScanLargeConstrainedIDs) {
   auto fusion_ptr = std::make_unique<Fusion>();
   Fusion& fusion = *fusion_ptr.get();

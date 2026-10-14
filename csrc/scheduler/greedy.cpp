@@ -937,14 +937,16 @@ class HeuristicsBuilder : private IterVisitor {
         out_tv);
   }
 
-  // Both Scan calls use the same TIDx extent. Offer only one shared batch for
-  // an exact two-Scan fusion, after checking the combined CUB storage and a
-  // conservative register budget for each input and output. Other mixes
-  // keep the native independent batches until their full plans are proven.
+  // Two or three compatible Scan calls use the same TIDx extent. Offer one
+  // shared batch after checking their combined CUB storage and a conservative
+  // register budget for every Scan input and output. Other mixes keep their
+  // native independent batches until their full plans are proven.
   std::optional<int64_t> chooseMultiScanBatch(
       const std::vector<Expr*>& constrained_ops) {
     const auto jev_mode = scheduler::jev::mode();
-    if (jev_mode == scheduler::jev::Mode::Off || constrained_ops.size() != 2 ||
+    const auto scan_count = constrained_ops.size();
+    if (jev_mode == scheduler::jev::Mode::Off ||
+        (scan_count != 2 && scan_count != 3) ||
         !std::ranges::all_of(constrained_ops, [](Expr* op) {
           return op->isA<ScanOp>();
         })) {
@@ -952,15 +954,7 @@ class HeuristicsBuilder : private IterVisitor {
     }
 
     auto* first = constrained_ops.front()->as<ScanOp>();
-    auto* second = constrained_ops.back()->as<ScanOp>();
     auto* first_tv = ir_utils::getTvOutput(first);
-    auto* second_tv = ir_utils::getTvOutput(second);
-    if (first->dim() != second->dim() ||
-        first_tv->dtype() != second_tv->dtype() ||
-        first_tv->getLogicalDomain().size() !=
-            second_tv->getLogicalDomain().size()) {
-      return std::nullopt;
-    }
     auto extent_of = [&](TensorView* tv, int64_t dim)
         -> std::optional<int64_t> {
       auto value = runtime_info_.expressionEvaluator().evaluate(
@@ -969,9 +963,18 @@ class HeuristicsBuilder : private IterVisitor {
                               : std::nullopt;
     };
     const auto extent = extent_of(first_tv, first->dim());
-    if (!extent.has_value() || *extent <= 0 ||
-        extent_of(second_tv, second->dim()) != extent) {
+    if (!extent.has_value() || *extent <= 0) {
       return std::nullopt;
+    }
+    for (Expr* op : constrained_ops) {
+      auto* scan = op->as<ScanOp>();
+      auto* tv = ir_utils::getTvOutput(scan);
+      if (scan->dim() != first->dim() || tv->dtype() != first_tv->dtype() ||
+          tv->getLogicalDomain().size() !=
+              first_tv->getLogicalDomain().size() ||
+          extent_of(tv, scan->dim()) != extent) {
+        return std::nullopt;
+      }
     }
 
     const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
@@ -982,35 +985,42 @@ class HeuristicsBuilder : private IterVisitor {
     const int64_t registers = dev_prop->regsPerBlock;
     const int64_t shmem = dev_prop->sharedMemPerBlock;
     if (max_threads <= 0 || max_threads_x <= 0 || item_bytes <= 0 ||
-        item_bytes > std::numeric_limits<int64_t>::max() / 4) {
+        item_bytes >
+            std::numeric_limits<int64_t>::max() /
+                (2 * static_cast<int64_t>(scan_count))) {
       return std::nullopt;
     }
     const int64_t native_batch = ceilDiv(*extent, max_threads);
     const int64_t native_threads = ceilDiv(*extent, native_batch);
     auto storage_fits = [&](int64_t threads, int64_t batch) {
       scheduler_tools::CubSharedMemoryBuffer storage;
-      storage.registerScan(threads, batch, first_tv->dtype());
-      storage.registerScan(threads, batch, second_tv->dtype());
+      for (size_t i = 0; i < scan_count; ++i) {
+        storage.registerScan(threads, batch, first_tv->dtype());
+      }
       const int64_t required = storage.getTotalSizeInBytes();
       return required <= shmem && (required + 127) / 128 * 128 <= shmem;
     };
     if (native_threads > max_threads_x || !storage_fits(native_threads, native_batch)) {
       NVF_ERROR(
           jev_mode != scheduler::jev::Mode::Remote,
-          "Unable to prove native two-Scan CUB capacity");
+          "Unable to prove native multi-Scan CUB capacity");
       return std::nullopt;
     }
 
     std::vector<scheduler::jev::ChoiceOption> options;
     auto add_option = [&](int64_t batch, int64_t threads) {
+      const auto scope = scan_count == 2
+          ? "both Scan ops"
+          : "all three Scan ops";
       options.push_back({
           "b" + std::to_string(batch),
           "Use " + std::to_string(batch) +
-              " items per thread for both Scan ops with " +
+              " items per thread for " + scope + " with " +
               std::to_string(threads) + " TIDx threads"});
     };
     add_option(native_batch, native_threads);
-    const int64_t bytes_per_item = 4 * item_bytes;
+    const int64_t bytes_per_item =
+        2 * static_cast<int64_t>(scan_count) * item_bytes;
     for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
       if (native_batch > std::numeric_limits<int64_t>::max() / factor) {
         continue;
@@ -1037,7 +1047,8 @@ class HeuristicsBuilder : private IterVisitor {
     }
 
     const std::string state =
-        "greedy.multi_scan_batch.v1\nscan_count=2\nextent=" +
+        "greedy.multi_scan_batch.v1\nscan_count=" +
+        std::to_string(scan_count) + "\nextent=" +
         std::to_string(*extent) +
         "\nmax_threads_per_block=" + std::to_string(max_threads) +
         "\nmax_threads_x=" + std::to_string(max_threads_x) +
@@ -1054,7 +1065,7 @@ class HeuristicsBuilder : private IterVisitor {
         options.begin(),
         options.end(),
         [&](const auto& option) { return option.id == selected; });
-    NVF_ERROR(option_it != options.end(), "Unknown two-Scan batch");
+    NVF_ERROR(option_it != options.end(), "Unknown multi-Scan batch");
     return std::stoll(selected.substr(1));
   }
 
