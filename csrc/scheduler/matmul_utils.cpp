@@ -608,13 +608,18 @@ bool fillDefaultHopperHeuristic(
     for (int64_t cm : arange(1L, 9L)) {
       for (int64_t cn : arange(1L, 9L)) {
         int64_t cga_size = cm * cn;
-        if (Mtiles % cm != 0 || Ntiles % cn != 0 || cga_size > max_cga_size) {
+        // The two-CTA ceiling for large grids is a performance rule, not a
+        // hardware restriction. Keep it for the native answer while allowing
+        // the remote choice to consider every shape the default Hopper path
+        // already supports on small grids.
+        if (Mtiles % cm != 0 || Ntiles % cn != 0 ||
+            cga_size > (jev_cluster_enabled ? 4L : max_cga_size)) {
           continue;
         }
         if (jev_cluster_enabled) {
           legal_cgas.push_back({cm, cn});
         }
-        if (compute_native_cluster &&
+        if (compute_native_cluster && cga_size <= max_cga_size &&
             (largest_cga == -1L || cga_size > largest_cga)) {
           largest_cga = cga_size;
           largest_cga_cfg = {cm, cn};
