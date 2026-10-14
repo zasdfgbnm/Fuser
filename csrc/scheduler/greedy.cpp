@@ -8,6 +8,7 @@
 
 #include "scheduler/greedy.h"
 
+#include <limits>
 #include <ranges>
 #include <vector>
 
@@ -26,6 +27,7 @@
 #include "ops/all_ops.h"
 #include "options.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/cub_utils.h"
@@ -856,6 +858,10 @@ class HeuristicsBuilder : private IterVisitor {
     params_ = std::make_unique<GreedyParams>();
     params_->cparams.index_type = runtime_info.getIndexType();
 
+    const auto constrained_ops = getAllConstrainedOps(fusion);
+    single_scan_ = constrained_ops.size() == 1 &&
+        constrained_ops.front()->isA<ScanOp>();
+
     traverse(fusion);
   }
 
@@ -875,7 +881,9 @@ class HeuristicsBuilder : private IterVisitor {
     addHeuristicsFor(
         ir_utils::getTvOutput(scan),
         ir_utils::getTvOutput(scan)->getLogicalDomain(),
-        {scan->dim()});
+        {scan->dim()},
+        /*consumer=*/nullptr,
+        /*allow_scan_choice=*/single_scan_);
   }
 
   void handle(ScatterOp* scatter) override {
@@ -924,7 +932,8 @@ class HeuristicsBuilder : private IterVisitor {
       TensorView* constrained_tv,
       const std::vector<IterDomain*>& domain_to_schedule,
       const std::vector<int64_t>& constrained_id_offsets,
-      TensorView* consumer = nullptr) {
+      TensorView* consumer = nullptr,
+      bool allow_scan_choice = false) {
     const bool as_consumer = consumer == nullptr;
 
     int64_t size_of_constrained_ids = 1;
@@ -947,6 +956,102 @@ class HeuristicsBuilder : private IterVisitor {
 
     auto batch_size = ceilDiv(size_of_constrained_ids, bdim);
 
+    // With exactly one constrained Scan, its batch alone sets TIDx and its
+    // Group extent. Other constrained ops may have coupled TIDx or CUB
+    // storage requirements, so they retain their native parameters here.
+    const auto jev_mode = scheduler::jev::mode();
+    if (allow_scan_choice && jev_mode != scheduler::jev::Mode::Off) {
+      const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+      const int64_t warp_size = dev_prop->warpSize;
+      const int64_t item_bytes = dataTypeSizeByte(constrained_tv->dtype());
+      const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+      const int64_t registers = dev_prop->regsPerBlock;
+      const int64_t shmem = dev_prop->sharedMemPerBlock;
+      std::vector<scheduler::jev::ChoiceOption> options;
+      std::vector<int64_t> batches;
+
+      auto storage_fits = [&](int64_t threads, int64_t batch) {
+        scheduler_tools::CubSharedMemoryBuffer scan_storage;
+        scan_storage.registerScan(threads, batch, constrained_tv->dtype());
+        const int64_t required = scan_storage.getScanTotalSizeInBytes();
+        return required <= shmem && (required + 127) / 128 * 128 <= shmem;
+      };
+      auto add_option = [&](int64_t batch, int64_t threads) {
+        options.push_back({
+            "b" + std::to_string(batch),
+            "Use " + std::to_string(batch) +
+                " scan items per thread with " +
+                std::to_string(threads) + " TIDx threads"});
+        batches.push_back(batch);
+      };
+
+      if (size_of_constrained_ids > 0 && max_threads > 0 &&
+          batch_size > 0 && item_bytes > 0) {
+        const int64_t native_threads =
+            ceilDiv(size_of_constrained_ids, batch_size);
+        // The native batch remains a choice even if its last Group item is
+        // a padded tail. Only alternatives require exact divisibility.
+        if (storage_fits(native_threads, batch_size)) {
+          add_option(batch_size, native_threads);
+          for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+            if (batch_size > std::numeric_limits<int64_t>::max() / factor) {
+              continue;
+            }
+            const int64_t candidate_batch = batch_size * factor;
+            if (size_of_constrained_ids % candidate_batch != 0) {
+              continue;
+            }
+            const int64_t threads =
+                size_of_constrained_ids / candidate_batch;
+            // Warp-aligned blocks use the CUB BlockScan storage path whose
+            // estimate is checked against actual static SMEM in test_scan.
+            if (warp_size != 32 || threads < warp_size ||
+                threads > max_threads || threads % warp_size != 0 ||
+                candidate_batch > (255 - 20) * 4 / item_bytes) {
+              continue;
+            }
+            const int64_t estimated_registers =
+                candidate_batch * item_bytes / 4 + 20;
+            if (estimated_registers > 255 ||
+                estimated_registers > registers / threads ||
+                !storage_fits(threads, candidate_batch)) {
+              continue;
+            }
+            add_option(candidate_batch, threads);
+          }
+        }
+      }
+
+      // If this narrow proof cannot cover even the native plan, preserve
+      // record/off behavior and fail closed for a remote request.
+      if (options.empty()) {
+        NVF_ERROR(
+            jev_mode != scheduler::jev::Mode::Remote,
+            "Unable to prove native Greedy Scan CUB capacity");
+      } else {
+        const std::string state =
+            "greedy.scan_batch.v1\nextent=" +
+            std::to_string(size_of_constrained_ids) +
+            "\nmax_threads_per_block=" + std::to_string(max_threads) +
+            "\nwarp_size=" + std::to_string(warp_size) +
+            "\nitem_bytes=" + std::to_string(item_bytes) +
+            "\nregs_per_block=" + std::to_string(registers) +
+            "\nsmem_per_block_bytes=" + std::to_string(shmem);
+        const auto selected = scheduler::jev::chooseDecision(
+            "GR1.scan_batch",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? options.front().id
+                                                      : "");
+        const auto option_it = std::find_if(
+            options.begin(),
+            options.end(),
+            [&](const auto& option) { return option.id == selected; });
+        NVF_ERROR(option_it != options.end(), "Unknown Greedy Scan batch");
+        batch_size = batches.at(std::distance(options.begin(), option_it));
+      }
+    }
+
     if (as_consumer) {
       NVF_ERROR(
           params_->setConsumerParams(constrained_tv, {batch_size}),
@@ -964,6 +1069,7 @@ class HeuristicsBuilder : private IterVisitor {
   SchedulerRuntimeInfo& runtime_info_;
 
   std::unique_ptr<GreedyParams> params_;
+  bool single_scan_ = false;
 };
 
 // Propagate all reshape transformations throughout the fusion.
