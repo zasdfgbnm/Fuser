@@ -26,7 +26,7 @@ from typing import Any
 
 GTEST_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\Z")
 CASE_KEY = re.compile(r"jev_remote_numeric_[a-z_]+\Z")
-SITE_PREFIX = re.compile(r"(?:PW|RD|TR|IP|OP|IOP)\Z")
+SITE_PREFIX = re.compile(r"(?:PW|RD|RS|TR|IP|OP|IOP)\Z")
 REQUIRED_SITE = re.compile(r"[A-Z]{2,3}[0-9]+(?:\.[a-z][a-z0-9_]*)?\Z")
 PASSED = re.compile(r"^\[\s+PASSED\s+\]\s+(\d+) tests?\.$", re.M)
 RUNNING = re.compile(r"^\[==========\] Running (\d+) tests? from", re.M)

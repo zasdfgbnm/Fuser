@@ -1156,6 +1156,10 @@ if(BUILD_TEST)
   # no machine-specific workspace path is embedded in this source tree.
   function(add_jev_remote_numeric_test FAMILY GTEST_FILTER SITE_PREFIX)
     set(TEST_NAME "jev_remote_numeric_${FAMILY}")
+    set(REQUIRED_SITE_ARG)
+    if(ARGC GREATER 3)
+      list(APPEND REQUIRED_SITE_ARG --required-site "${ARGV3}")
+    endif()
     add_test(NAME ${TEST_NAME}
       COMMAND "${Python_EXECUTABLE}"
         "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
@@ -1163,11 +1167,24 @@ if(BUILD_TEST)
         --gtest-filter "${GTEST_FILTER}"
         --case-key "${TEST_NAME}"
         --site-prefix "${SITE_PREFIX}"
+        ${REQUIRED_SITE_ARG}
         --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
     set_tests_properties(${TEST_NAME} PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   endfunction()
   add_jev_remote_numeric_test(pointwise
     "Gpu2Test.FusionPointwiseBroadcast_CUDA" "PW")
+  add_jev_remote_numeric_test(resize
+    "ResizeTest.JevAlternateCta_CUDA" "RS" "RS1.cta")
+  add_test(NAME jev_alternate_numeric_resize_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RS1.cta --alternate t64
+      --gtest ResizeTest.JevAlternateCta_CUDA
+      --case-key jev_alternate_numeric_resize_cta)
+  set_tests_properties(jev_alternate_numeric_resize_cta PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   foreach(CTA_THREADS IN ITEMS 32 64)
     add_test(NAME jev_alternate_numeric_pointwise_1d_cta_x${CTA_THREADS}
       COMMAND "${Python_EXECUTABLE}"

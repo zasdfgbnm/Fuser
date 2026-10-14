@@ -8,6 +8,8 @@
 
 #include "scheduler/resize.h"
 
+#include <ATen/cuda/CUDAContext.h>
+
 #include <memory>
 #include <ranges>
 #include <string>
@@ -221,13 +223,11 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
   params->tag = "Resize heuristics";
   params->cparams.index_type = runtime_info.getIndexType();
 
-  const int64_t bdimx = 128;
-
   const auto& [largest_output, max_num_elms] =
       getLargestTensor(fusion->outputs(), runtime_info);
 
   params->split_grid_x_dim =
-      ceilDiv(max_num_elms, bdimx) > ResizeParams::max_gdimx;
+      ceilDiv(max_num_elms, params->cta_threads) > ResizeParams::max_gdimx;
 
   const auto largest_input =
       getLargestTensor(fusion->inputs(), runtime_info).first;
@@ -357,6 +357,67 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
           selected == "keep" && largest_input != nullptr,
           "RS1.reorder response is outside native hard bounds");
     }
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Native analysis fixes the reference and bounds the already selected
+    // vector width. A CTA candidate only changes the final flattened split
+    // and its derived grid split.
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    const int64_t warp_size = device->warpSize;
+    const int64_t max_threads_x = device->maxThreadsDim[0];
+    const int64_t max_threads_per_block = device->maxThreadsPerBlock;
+    const int64_t max_grid_x = device->maxGridSize[0];
+    auto legal = [&](int64_t threads) {
+      if (threads < warp_size || threads % warp_size != 0 ||
+          threads > max_threads_x || threads > max_threads_per_block ||
+          max_grid_x < 1) {
+        return false;
+      }
+      const int64_t grid_blocks = ceilDiv(max_num_elms, threads);
+      const bool split_grid = grid_blocks > ResizeParams::max_gdimx;
+      // Split-grid always creates a max_gdimx-wide BIDx dimension; otherwise
+      // the exact unsplit grid must fit the hardware's x dimension.
+      return max_num_elms >= 0 && layout_max >= 1 &&
+          params->vectorization_factor >= 1 &&
+          layout_max % params->vectorization_factor == 0 &&
+          (split_grid ? ResizeParams::max_gdimx <= max_grid_x
+                      : grid_blocks <= max_grid_x);
+    };
+    NVF_ERROR(legal(128), "RS1.cta native CTA is outside physical bounds");
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t threads : {64, 128, 256}) {
+      if (legal(threads)) {
+        options.push_back({
+            "t" + std::to_string(threads),
+            "Use " + std::to_string(threads) + " threads per Resize CTA"});
+      }
+    }
+    const std::string state =
+        "resize.cta.v1\nmax_output_elements=" +
+        std::to_string(max_num_elms) + "\nlayout_max=" +
+        std::to_string(layout_max) + "\nvector_width=" +
+        std::to_string(params->vectorization_factor) + "\nwarp_size=" +
+        std::to_string(warp_size) + "\nmax_threads_x=" +
+        std::to_string(max_threads_x) + "\nmax_threads_per_block=" +
+        std::to_string(max_threads_per_block) + "\nmax_grid_x=" +
+        std::to_string(max_grid_x) + '\n';
+    const std::string selected = scheduler::jev::chooseDecision(
+        "RS1.cta",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "t128" : std::string());
+    bool matched = false;
+    for (int64_t threads : {64, 128, 256}) {
+      if (selected == "t" + std::to_string(threads) && legal(threads)) {
+        params->cta_threads = threads;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "RS1.cta response is outside physical bounds");
+    params->split_grid_x_dim =
+        ceilDiv(max_num_elms, params->cta_threads) > ResizeParams::max_gdimx;
   }
 
   return params;
@@ -593,7 +654,7 @@ void ResizeScheduler::schedule(Fusion* fusion, const HeuristicParams* params) {
     ref_tv->reorder(permutation);
   }
 
-  const int64_t bdimx = 128;
+  const int64_t bdimx = resize_params->cta_threads;
 
   // Make sure the DID ID located at the outermost position
   auto outermost_pos = scheduler_utils::reorderDevicesToOuter(ref_tv);

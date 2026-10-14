@@ -16,6 +16,7 @@
 #include "runtime/executor.h"
 #include "runtime/executor_utils.h"
 #include "runtime/fusion_executor_cache.h"
+#include "scheduler/resize_heuristic.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/tools/loop_domain_scheduler.h"
 #include "scheduler/tools/resize_utils.h"
@@ -54,6 +55,45 @@ void checkLoopDomainEquivalence(
 } // namespace
 
 using ResizeTest = NVFuserTest;
+
+TEST_F(ResizeTest, JevAlternateCta_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  auto* output = pad(
+      input, {IrBuilder::create<Val>(1L), IrBuilder::create<Val>(2L)});
+  fusion.addOutput(output);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({37, 1001}, options);
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  EXPECT_TRUE(params->cta_threads == 64 || params->cta_threads == 128);
+  EXPECT_FALSE(params->split_grid_x_dim);
+
+  // The selected parameter must reach the actual TIDx split; the reference
+  // checks every padded element for both native and forced API choices.
+  auto tidx = std::ranges::find_if(output->getLoopDomain(), [](IterDomain* id) {
+    return id->getParallelType() == ParallelType::TIDx;
+  });
+  ASSERT_NE(tidx, output->getLoopDomain().end());
+  EXPECT_EQ((*tidx)->extent()->evaluate(), params->cta_threads);
+  const auto launch = result.kernel_executor->lastLaunchParams();
+  EXPECT_EQ(launch.bdimx(), params->cta_threads);
+  EXPECT_EQ(
+      launch.gdimx(),
+      (37 * 1004 + params->vectorization_factor * params->cta_threads - 1) /
+          (params->vectorization_factor * params->cta_threads));
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {1, 2})},
+      __LINE__,
+      __FILE__);
+}
 
 using ResizeSchedulerTest = NVFuserFixtureParamTest<bool>;
 
