@@ -983,12 +983,12 @@ int64_t chooseInner2DCTASeed(
     int64_t batch = 0;
     int64_t physical_x = 0;
     int64_t physical_y = 0;
+    bool pad_to_warp = false;
     int64_t register_cap = 0;
     int64_t grid_x = 0;
     bool valid = false;
   };
   std::vector<SeedPlan> plans;
-  std::vector<scheduler::jev::ChoiceOption> options;
   if (first_seed > 0 && first_seed <= max_threads && parallel > 0 &&
       buffer_bits > 0 && properties.total_iteration_numel > 0) {
     for (int64_t seed = first_seed;; seed = std::min(seed * 2, max_threads)) {
@@ -1001,6 +1001,7 @@ int64_t chooseInner2DCTASeed(
         plan.batch_min = resources.batch_min;
         plan.batch_max = resources.batch_max;
         plan.batch = preview.batches_per_block_inner_reduction;
+        plan.pad_to_warp = preview.pad_inner_reduction_to_warp;
         plan.physical_y = preview.lparams.bdimy() ==
                 LaunchParams::UNINITIALIZED_VAL
             ? 1
@@ -1008,7 +1009,7 @@ int64_t chooseInner2DCTASeed(
         plan.register_cap = preview.cparams.maxrregcount;
         if (resources.supported_menu && plan.batch > 0) {
           const int64_t x = ceilDiv(parallel, plan.batch);
-          plan.physical_x = preview.pad_inner_reduction_to_warp
+          plan.physical_x = plan.pad_to_warp
               ? ceilDiv(x, warp) * warp
               : x;
           plan.grid_x =
@@ -1037,14 +1038,6 @@ int64_t chooseInner2DCTASeed(
         plan = SeedPlan{seed};
       }
       plans.push_back(plan);
-      if (plan.valid) {
-        options.push_back({
-            "t" + std::to_string(seed),
-            "Minimum CTA target " + std::to_string(seed) +
-                "; checked batch " + std::to_string(plan.batch) +
-                ", physical CTA " + std::to_string(plan.physical_x) + "x" +
-                std::to_string(plan.physical_y)});
-      }
       if (seed == max_threads) {
         break;
       }
@@ -1061,6 +1054,49 @@ int64_t chooseInner2DCTASeed(
     scheduler::jev::recordCoverageSkip(
         "IP5.cta_seed", "Native CTA seed lacks a complete physical plan");
     return native_seed;
+  }
+  const auto same_schedule = [](const SeedPlan& a, const SeedPlan& b) {
+    return a.batch == b.batch && a.physical_x == b.physical_x &&
+        a.physical_y == b.physical_y &&
+        a.pad_to_warp == b.pad_to_warp &&
+        a.register_cap == b.register_cap && a.grid_x == b.grid_x;
+  };
+  std::vector<const SeedPlan*> offered;
+  const auto native_plan = std::find_if(
+      plans.begin(), plans.end(), [&](const SeedPlan& plan) {
+        return plan.seed == native_seed;
+      });
+  offered.push_back(&*native_plan);
+  for (const auto& plan : plans) {
+    if (!plan.valid || plan.seed == native_seed ||
+        std::any_of(offered.begin(), offered.end(), [&](const SeedPlan* prior) {
+          return same_schedule(plan, *prior);
+        })) {
+      continue;
+    }
+    offered.push_back(&plan);
+  }
+  if (offered.size() == 1) {
+    if (mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP5.cta_seed", "All proved CTA seeds have the same schedule");
+    }
+    return native_seed;
+  }
+  std::vector<scheduler::jev::ChoiceOption> options;
+  // Retain ascending seed order on the wire. Representative selection above
+  // preserves the native schedule without exposing its identity in ordering.
+  for (const auto& plan : plans) {
+    if (std::find(offered.begin(), offered.end(), &plan) == offered.end()) {
+      continue;
+    }
+    options.push_back({
+        "t" + std::to_string(plan.seed),
+        "Minimum CTA target " + std::to_string(plan.seed) +
+            "; checked batch " + std::to_string(plan.batch) +
+            ", physical CTA " + std::to_string(plan.physical_x) + "x" +
+            std::to_string(plan.physical_y) + ", register cap " +
+            std::to_string(plan.register_cap)});
   }
 
   std::string state =
@@ -1098,6 +1134,7 @@ int64_t chooseInner2DCTASeed(
         std::to_string(plan.batch) + ":" +
         std::to_string(plan.physical_x) + ":" +
         std::to_string(plan.physical_y) + ":" +
+        std::to_string(plan.pad_to_warp) + ":" +
         std::to_string(plan.register_cap) + ":" +
         std::to_string(plan.grid_x);
   }
