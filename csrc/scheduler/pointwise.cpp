@@ -9,11 +9,15 @@
 #include "scheduler/pointwise.h"
 
 #include <ranges>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 
 #include "instrumentation.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
 #include "scheduler/pointwise_utils.h"
@@ -437,17 +441,47 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
   }
   const auto& prop = prop_opt.value();
 
-  bool use_tma =
+  const bool use_tma =
       mayUseTma(fusion, prop) && isOptionEnabled(EnableOption::TmaPointwise);
+  const auto jev_mode = scheduler::jev::mode();
   std::unique_ptr<HeuristicParams> pparams = nullptr;
   if (use_tma) {
     pparams = pointwise::tma::getPointwiseHeuristics(
         fusion, runtime_info, data_cache, prop);
   }
-  // Fallback to non-TMA scheduler if TMA is not applicable
   if (pparams == nullptr) {
+    // TMA eligibility and plan construction are native correctness gates.
     pparams = pointwise::non_tma::getPointwiseHeuristics(
         fusion, runtime_info, data_cache, prop);
+  } else if (jev_mode != scheduler::jev::Mode::Off) {
+    // Both completed plans must exist before the backend preference can be a
+    // Choice. Off mode keeps the original TMA-first fast path unchanged.
+    auto ordinary_params = pointwise::non_tma::getPointwiseHeuristics(
+        fusion, runtime_info, data_cache, prop);
+    if (ordinary_params != nullptr) {
+      const std::string state =
+          "pointwise.tma_preference.v1\nn_elems=" +
+          std::to_string(prop.n_elems) + "\nsm_count=" +
+          std::to_string(prop.device_multiprocessor_count) +
+          "\nmin_dtype_bits=" +
+          std::to_string(prop.min_dtype_size_bit_for_vectorization) +
+          "\nmax_dtype_bits=" +
+          std::to_string(prop.max_dtype_size_bit_for_vectorization);
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"tma", "Use the complete TMA pointwise plan"},
+          {"ordinary", "Use the complete ordinary pointwise plan"}};
+      // The original policy prefers every materialized TMA pointwise plan.
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record ? "tma" : "";
+      const auto selected = scheduler::jev::chooseDecision(
+          "PW1", state, options, native_choice);
+      NVF_ERROR(
+          selected == "tma" || selected == "ordinary",
+          "PW1 must select a complete native pointwise plan");
+      if (selected == "ordinary") {
+        pparams = std::move(ordinary_params);
+      }
+    }
   }
   NVF_ERROR(pparams != nullptr);
 
