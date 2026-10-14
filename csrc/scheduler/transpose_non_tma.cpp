@@ -603,6 +603,70 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
         grouped_inputs_outputs[1]);
   }
 
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // The tile and group widths have already been chosen. Both groups use the
+    // same TIDx extent, while the tile, block grid, and shared allocations are
+    // unchanged by this choice. Require exact tile coverage, a bounded amount
+    // of per-thread tile work, and the device launch bound for alternatives.
+    const int64_t tile_elements = tparams->tile_size1 * tparams->tile_size2;
+    const int64_t native_threads = tparams->getThreadsPerBlock();
+    const int64_t tile_vectors1 =
+        ceilDiv(tile_elements, tparams->vectorize_factor1);
+    const int64_t tile_vectors2 =
+        ceilDiv(tile_elements, tparams->vectorize_factor2);
+    const int64_t device_max_threads =
+        at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock;
+    const int64_t device_max_threads_x =
+        at::cuda::getCurrentDeviceProperties()->maxThreadsDim[0];
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"t" + std::to_string(native_threads),
+         "Use " + std::to_string(native_threads) +
+             " threads per CTA for both transpose groups"}};
+    const bool exact_tile_vectors =
+        tile_elements % tparams->vectorize_factor1 == 0 &&
+        tile_elements % tparams->vectorize_factor2 == 0;
+    for (const int64_t threads : {64L, 256L}) {
+      if (threads == native_threads || !exact_tile_vectors ||
+          threads > device_max_threads || threads > device_max_threads_x ||
+          tile_elements % threads != 0 ||
+          tile_elements / threads > 16 || tile_vectors1 % threads != 0 ||
+          tile_vectors2 % threads != 0) {
+        continue;
+      }
+      options.push_back(
+          {"t" + std::to_string(threads),
+           "Use " + std::to_string(threads) +
+               " threads per CTA for both transpose groups"});
+    }
+    const std::string state =
+        "transpose.cta.v1\ntile1=" + std::to_string(tparams->tile_size1) +
+        "\ntile2=" + std::to_string(tparams->tile_size2) +
+        "\nwidth1=" + std::to_string(tparams->vectorize_factor1) +
+        "\nwidth2=" + std::to_string(tparams->vectorize_factor2) +
+        "\nmax_threads_per_block=" + std::to_string(device_max_threads) +
+        "\nmax_threads_x=" + std::to_string(device_max_threads_x);
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR2.cta",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record
+            ? "t" + std::to_string(native_threads)
+            : "");
+    if (jev_mode == scheduler::jev::Mode::Remote) {
+      bool found = false;
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          if (selected != "t" + std::to_string(native_threads)) {
+            tparams->threads_per_block_cap = std::stoll(selected.substr(1));
+          }
+          found = true;
+          break;
+        }
+      }
+      NVF_ERROR(found, "TR2.cta response is outside native hard bounds");
+    }
+  }
+
   tparams->lparams.bind(tparams->getThreadsPerBlock(), ParallelType::TIDx);
 
   if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {

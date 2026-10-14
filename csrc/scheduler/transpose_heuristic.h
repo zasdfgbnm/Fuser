@@ -46,6 +46,10 @@ class TransposeParams : public HeuristicParams {
   // Vectorization factor for tensors in the second group
   int64_t vectorize_factor2 = 1;
 
+  // Performance cap for the common TIDx binding of both transpose groups.
+  // Keep the native value unless a complete alternate CTA plan is selected.
+  int64_t threads_per_block_cap = getMaxThreadsPerBlock();
+
   // TODO: support symbolic tile size
   // https://github.com/csarofeen/pytorch/pull/1854#discussion_r928143729
 
@@ -70,6 +74,7 @@ class TransposeParams : public HeuristicParams {
         other->dims_merged_with_2 == dims_merged_with_2 &&
         other->vectorize_factor1 == vectorize_factor1 &&
         other->vectorize_factor2 == vectorize_factor2 &&
+        other->threads_per_block_cap == threads_per_block_cap &&
         other->tile_size1 == tile_size1 && other->tile_size2 == tile_size2;
     return attr_equal;
   }
@@ -151,6 +156,7 @@ class TransposeParams : public HeuristicParams {
         dims_merged_with_2,
         vectorize_factor1,
         vectorize_factor2,
+        threads_per_block_cap,
         tile_size1,
         tile_size2);
   }
@@ -163,7 +169,7 @@ class TransposeParams : public HeuristicParams {
     int64_t tile_vectors1 = ceilDiv(tile_size1 * tile_size2, vectorize_factor1);
     int64_t tile_vectors2 = ceilDiv(tile_size1 * tile_size2, vectorize_factor2);
     int64_t tile_vectors = std::min(tile_vectors1, tile_vectors2);
-    return std::min(getMaxThreadsPerBlock(), tile_vectors);
+    return std::min(threads_per_block_cap, tile_vectors);
   }
 };
 
