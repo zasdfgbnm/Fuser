@@ -518,81 +518,134 @@ void innerPersistentHeuristic2D(
   }
 
   if (jev_mode != scheduler::jev::Mode::Off) {
-    // Native analysis owns the candidate plans and their CTA/register limits.
-    // The service gets unranked measurements and independently applies the
-    // empirical comparison; it never receives the native winner.
-    std::string state =
-        "inner_persistent.reg_batch.v1\nparallel_after_vectorize=" +
-        std::to_string(parallel_after_vectorize) +
-        "\ntotal_iteration_numel=" +
-        std::to_string(properties.total_iteration_numel) +
-        "\nmin_threads_per_block=" + std::to_string(min_threads_per_block) +
-        "\nmax_multi_reduction_factor=" +
-        std::to_string(max_multi_reduction_factor) +
-        "\nbuffer_bits_per_batch=" + std::to_string(buffer_bits_per_batch) +
-        "\nhigh_bandwidth_flops_ratio=" +
-        std::to_string(is_high_bandwidth_flops_ratio) +
-        "\nhas_exp_op=" + std::to_string(has_exp_op) +
-        "\ndisable_projection_avoid_recompute=" +
-        std::to_string(disable_project_to_avoid_recompute) +
-        "\nwarp_size=" + std::to_string(threads_per_warp) +
-        "\nmax_threads_per_block=" + std::to_string(max_threads_in_block) +
-        "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
-        "\nsm_count=" + std::to_string(device_multiprocessor_count) +
-        "\nbits_per_register=" +
-        std::to_string(scheduler_utils::bits_per_register) +
-        "\nbatch_min=" +
-        std::to_string(batches_per_block_inner_reduction_min) +
-        "\nbatch_max=" +
-        std::to_string(batches_per_block_inner_reduction_max);
-    std::vector<scheduler::jev::ChoiceOption> options;
-    options.reserve(candidate_heuristics.size());
-    for (const auto& candidate : candidate_heuristics) {
-      state += "\nplan=" + std::to_string(candidate.persistent_batch_size) +
-          ":" + std::to_string(candidate.bdimx) +
-          ":" + std::to_string(candidate.bdimy) +
-          ":" + std::to_string(candidate.padded_bdimx) +
-          ":" + std::to_string(candidate.register_per_thread) +
-          ":" + std::to_string(candidate.non_buffer_registers) +
-          ":" + std::to_string(candidate.occupancy) +
-          ":" + std::to_string(candidate.n_wave) +
-          ":" + std::to_string(candidate.n_persistent_tails);
-      options.push_back({
-          "b" + std::to_string(candidate.persistent_batch_size),
-          "Persistent batch " +
-              std::to_string(candidate.persistent_batch_size) +
-              ", CTA " + std::to_string(candidate.bdimx) + "x" +
-              std::to_string(candidate.bdimy) + ", maxrregcount " +
-              std::to_string(candidate.register_per_thread)});
+    // getMaxPersistentBatch caps the upper batch bound at 10 or 12. If the
+    // physical-block lower bound exceeds that cap, max becomes min, yielding
+    // a singleton. Thus at most 12 plans enter the 255-option/64-KiB client.
+    // Recheck every plan before offering it, not only the returned selection.
+    const bool supported_menu = candidate_heuristics.size() <= 12 &&
+        std::all_of(
+            candidate_heuristics.begin(),
+            candidate_heuristics.end(),
+            [&](const NormInnerParams& candidate) {
+              if (candidate.persistent_batch_size <= 0 || candidate.bdimx <= 0 ||
+                  candidate.bdimx > max_threads_in_block ||
+                  candidate.bdimy <= 0 ||
+                  candidate.bdimy > max_threads_in_block ||
+                  candidate.padded_bdimx < candidate.bdimx ||
+                  candidate.padded_bdimx >
+                      max_threads_in_block + threads_per_warp) {
+                return false;
+              }
+              const int64_t padded_threads =
+                  candidate.padded_bdimx * candidate.bdimy;
+              const bool should_pad =
+                  candidate.bdimx > 16 && padded_threads <= max_threads_in_block;
+              const int64_t threads = should_pad
+                  ? padded_threads
+                  : candidate.bdimx * candidate.bdimy;
+              return candidate.is_pad_bdimx == should_pad && threads > 0 &&
+                  threads <= max_threads_in_block &&
+                  candidate.register_per_thread > 0 &&
+                  candidate.register_per_thread <= 255 &&
+                  candidate.register_per_thread <= dev_prop->regsPerBlock / threads;
+            });
+    // A future change to candidate generation must not silently send an
+    // oversized or physically invalid menu. Record retains the native plan;
+    // remote fails closed because it has no trusted native winner.
+    NVF_ERROR(
+        supported_menu || jev_mode == scheduler::jev::Mode::Record,
+        "Unsupported register-backed inner persistent batch menu");
+    if (supported_menu) {
+      // Native analysis owns the candidate plans and their CTA/register limits.
+      // The service gets unranked measurements and independently applies the
+      // empirical comparison; it never receives the native winner.
+      std::string state =
+          "inner_persistent.reg_batch.v1\nparallel_after_vectorize=" +
+          std::to_string(parallel_after_vectorize) +
+          "\ntotal_iteration_numel=" +
+          std::to_string(properties.total_iteration_numel) +
+          "\nmin_threads_per_block=" + std::to_string(min_threads_per_block) +
+          "\nmax_multi_reduction_factor=" +
+          std::to_string(max_multi_reduction_factor) +
+          "\nbuffer_bits_per_batch=" + std::to_string(buffer_bits_per_batch) +
+          "\nhigh_bandwidth_flops_ratio=" +
+          std::to_string(is_high_bandwidth_flops_ratio) +
+          "\nhas_exp_op=" + std::to_string(has_exp_op) +
+          "\ndisable_projection_avoid_recompute=" +
+          std::to_string(disable_project_to_avoid_recompute) +
+          "\nwarp_size=" + std::to_string(threads_per_warp) +
+          "\nmax_threads_per_block=" + std::to_string(max_threads_in_block) +
+          "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+          "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+          "\nbits_per_register=" +
+          std::to_string(scheduler_utils::bits_per_register) +
+          "\nbatch_min=" +
+          std::to_string(batches_per_block_inner_reduction_min) +
+          "\nbatch_max=" +
+          std::to_string(batches_per_block_inner_reduction_max);
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(candidate_heuristics.size());
+      for (const auto& candidate : candidate_heuristics) {
+        state += "\nplan=" + std::to_string(candidate.persistent_batch_size) +
+            ":" + std::to_string(candidate.bdimx) +
+            ":" + std::to_string(candidate.bdimy) +
+            ":" + std::to_string(candidate.padded_bdimx) +
+            ":" + std::to_string(candidate.register_per_thread) +
+            ":" + std::to_string(candidate.non_buffer_registers) +
+            ":" + std::to_string(candidate.occupancy) +
+            ":" + std::to_string(candidate.n_wave) +
+            ":" + std::to_string(candidate.n_persistent_tails);
+        options.push_back({
+            "b" + std::to_string(candidate.persistent_batch_size),
+            "Persistent batch " +
+                std::to_string(candidate.persistent_batch_size) +
+                ", CTA " + std::to_string(candidate.bdimx) + "x" +
+                std::to_string(candidate.bdimy) + ", maxrregcount " +
+                std::to_string(candidate.register_per_thread)});
+      }
+      // The state uses only ASCII digits, separators and newlines, so JSON
+      // quoting at most doubles its size. Option text needs no escaping.
+      // These limits leave ample room for the fixed envelope under 64 KiB.
+      size_t option_text_bytes = 0;
+      for (const auto& option : options) {
+        option_text_bytes += option.id.size() + option.description.size();
+      }
+      const bool request_fits =
+          state.size() <= 16 * 1024 && option_text_bytes <= 16 * 1024;
+      NVF_ERROR(
+          request_fits || jev_mode == scheduler::jev::Mode::Record,
+          "Register-backed inner persistent Choice request exceeds safe size");
+      if (request_fits) {
+        const std::string native_choice =
+            jev_mode == scheduler::jev::Mode::Record
+            ? "b" + std::to_string(best_heuristic.persistent_batch_size)
+            : "";
+        const std::string selected = scheduler::jev::chooseDecision(
+            "IP5.batch", state, options, native_choice);
+        const auto selected_it = std::find_if(
+            candidate_heuristics.begin(),
+            candidate_heuristics.end(),
+            [&](const auto& candidate) {
+              return selected == "b" +
+                  std::to_string(candidate.persistent_batch_size);
+            });
+        NVF_ERROR(
+            selected_it != candidate_heuristics.end(),
+            "Unknown register-backed inner persistent batch plan");
+        const int64_t selected_threads =
+            (selected_it->bdimx > 16 &&
+             selected_it->padded_bdimx * selected_it->bdimy <=
+                 max_threads_in_block)
+            ? selected_it->padded_bdimx * selected_it->bdimy
+            : selected_it->bdimx * selected_it->bdimy;
+        NVF_ERROR(
+            selected_threads > 0 && selected_threads <= max_threads_in_block &&
+                selected_it->register_per_thread > 0 &&
+                selected_it->register_per_thread <= 255,
+            "Selected inner persistent batch exceeds CTA/register limits");
+        best_heuristic = *selected_it;
+      }
     }
-    const std::string native_choice =
-        jev_mode == scheduler::jev::Mode::Record
-        ? "b" + std::to_string(best_heuristic.persistent_batch_size)
-        : "";
-    const std::string selected = scheduler::jev::chooseDecision(
-        "IP5.batch", state, options, native_choice);
-    const auto selected_it = std::find_if(
-        candidate_heuristics.begin(),
-        candidate_heuristics.end(),
-        [&](const auto& candidate) {
-          return selected == "b" +
-              std::to_string(candidate.persistent_batch_size);
-        });
-    NVF_ERROR(
-        selected_it != candidate_heuristics.end(),
-        "Unknown register-backed inner persistent batch plan");
-    const int64_t selected_threads =
-        (selected_it->bdimx > 16 &&
-         selected_it->padded_bdimx * selected_it->bdimy <=
-             max_threads_in_block)
-        ? selected_it->padded_bdimx * selected_it->bdimy
-        : selected_it->bdimx * selected_it->bdimy;
-    NVF_ERROR(
-        selected_threads > 0 && selected_threads <= max_threads_in_block &&
-            selected_it->register_per_thread > 0 &&
-            selected_it->register_per_thread <= 255,
-        "Selected inner persistent batch exceeds CTA/register limits");
-    best_heuristic = *selected_it;
   }
 
   // Fill in the reduction params
