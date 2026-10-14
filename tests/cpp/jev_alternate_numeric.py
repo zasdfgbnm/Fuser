@@ -998,13 +998,31 @@ def check_alternate_report(report: dict[str, Any],
                 "max_dtype_bits": "32", "vector_width": "4",
                 "sm_count": "128", "warp_size": "32"}.items()):
             raise ValueError(f"3D warp fixture escaped the proved shape: {fields}")
+        cta_record, cta_remote, cta_issues = paired_state_rows(
+            report, "RD5.cta")
+        common = {key: fields[key] for key in (
+            "reduction_numel", "iteration_numel", "inner_numel",
+            "n_tensor_inputs", "max_dtype_bits", "vector_width",
+            "sm_count", "max_threads_per_sm", "max_threads_per_block")}
+        for row, side, choice, logical_warp, hard_valid, menu in (
+                (cta_record, "record", "t32", "8", "16,32,64",
+                 {"t16", "t32", "t64"}),
+                (cta_remote, "remote", "t16", "4", "8,16,32",
+                 {"t8", "t16", "t32"})):
+            cta_fields = state_fields(row, "reduction.inner3d_cta_target.v1")
+            expected_fields = {**common, "logical_warp": logical_warp,
+                               "hard_valid_targets": hard_valid}
+            criteria = row["request"]["questions"]["RD5.cta"]["criteria"]
+            if (row[side] != {choice: 1} or cta_fields != expected_fields or
+                    set(criteria) != menu):
+                raise ValueError(f"3D warp changed the dependent CTA plan: {row}")
         for dependent_site in ("RD4", "RD5.iter_unroll", "RD5.width"):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == dependent_site]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"3D warp changed {dependent_site}: {rows}")
-        if issues != [intended]:
+        if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
             raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
     elif require_inner_warp_target:
         if (site != "RD3.warp" or event["native"] != "m8" or
