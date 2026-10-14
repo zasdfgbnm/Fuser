@@ -483,28 +483,116 @@ void innerPersistentHeuristic2D(
     }
   }
 
-  // Sort the heuristics and select the best one.
-  // If no persistent batch size can achieve the target occupancy, and
+  // Select the best plan. When none reaches the target occupancy, retain the
+  // first plan with maximum occupancy; otherwise apply the empirical sort.
+  const auto jev_mode = scheduler::jev::mode();
+  // Keep the original, ascending-batch candidate order for the Choice
+  // request. The native stable sort below would otherwise put its winner
+  // first and reveal the preference to the service.
+  const std::vector<NormInnerParams> candidate_heuristics =
+      jev_mode == scheduler::jev::Mode::Off
+      ? std::vector<NormInnerParams>{}
+      : all_heuristics;
   NormInnerParams best_heuristic;
-  if (current_max_occupancy < target_warps_per_sm) {
-    best_heuristic = all_heuristics.at(idx_max_occupancy);
-  } else {
-    std::stable_sort(
-        all_heuristics.begin(),
-        all_heuristics.end(),
-        [&register_overhead,
-         &target_warps_per_sm,
-         &is_high_bandwidth_flops_ratio,
-         &has_exp_op](const NormInnerParams& a, const NormInnerParams& b) {
-          return compareTwoHeuristics(
-              a,
-              b,
-              register_overhead,
-              target_warps_per_sm,
-              is_high_bandwidth_flops_ratio,
-              has_exp_op);
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    if (current_max_occupancy < target_warps_per_sm) {
+      best_heuristic = all_heuristics.at(idx_max_occupancy);
+    } else {
+      std::stable_sort(
+          all_heuristics.begin(),
+          all_heuristics.end(),
+          [&register_overhead,
+           &target_warps_per_sm,
+           &is_high_bandwidth_flops_ratio,
+           &has_exp_op](const NormInnerParams& a, const NormInnerParams& b) {
+            return compareTwoHeuristics(
+                a,
+                b,
+                register_overhead,
+                target_warps_per_sm,
+                is_high_bandwidth_flops_ratio,
+                has_exp_op);
+          });
+      best_heuristic = all_heuristics.at(0);
+    }
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Native analysis owns the candidate plans and their CTA/register limits.
+    // The service gets unranked measurements and independently applies the
+    // empirical comparison; it never receives the native winner.
+    std::string state =
+        "inner_persistent.reg_batch.v1\nparallel_after_vectorize=" +
+        std::to_string(parallel_after_vectorize) +
+        "\ntotal_iteration_numel=" +
+        std::to_string(properties.total_iteration_numel) +
+        "\nmin_threads_per_block=" + std::to_string(min_threads_per_block) +
+        "\nmax_multi_reduction_factor=" +
+        std::to_string(max_multi_reduction_factor) +
+        "\nbuffer_bits_per_batch=" + std::to_string(buffer_bits_per_batch) +
+        "\nhigh_bandwidth_flops_ratio=" +
+        std::to_string(is_high_bandwidth_flops_ratio) +
+        "\nhas_exp_op=" + std::to_string(has_exp_op) +
+        "\ndisable_projection_avoid_recompute=" +
+        std::to_string(disable_project_to_avoid_recompute) +
+        "\nwarp_size=" + std::to_string(threads_per_warp) +
+        "\nmax_threads_per_block=" + std::to_string(max_threads_in_block) +
+        "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+        "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+        "\nbits_per_register=" +
+        std::to_string(scheduler_utils::bits_per_register) +
+        "\nbatch_min=" +
+        std::to_string(batches_per_block_inner_reduction_min) +
+        "\nbatch_max=" +
+        std::to_string(batches_per_block_inner_reduction_max);
+    std::vector<scheduler::jev::ChoiceOption> options;
+    options.reserve(candidate_heuristics.size());
+    for (const auto& candidate : candidate_heuristics) {
+      state += "\nplan=" + std::to_string(candidate.persistent_batch_size) +
+          ":" + std::to_string(candidate.bdimx) +
+          ":" + std::to_string(candidate.bdimy) +
+          ":" + std::to_string(candidate.padded_bdimx) +
+          ":" + std::to_string(candidate.register_per_thread) +
+          ":" + std::to_string(candidate.non_buffer_registers) +
+          ":" + std::to_string(candidate.occupancy) +
+          ":" + std::to_string(candidate.n_wave) +
+          ":" + std::to_string(candidate.n_persistent_tails);
+      options.push_back({
+          "b" + std::to_string(candidate.persistent_batch_size),
+          "Persistent batch " +
+              std::to_string(candidate.persistent_batch_size) +
+              ", CTA " + std::to_string(candidate.bdimx) + "x" +
+              std::to_string(candidate.bdimy) + ", maxrregcount " +
+              std::to_string(candidate.register_per_thread)});
+    }
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "b" + std::to_string(best_heuristic.persistent_batch_size)
+        : "";
+    const std::string selected = scheduler::jev::chooseDecision(
+        "IP5.batch", state, options, native_choice);
+    const auto selected_it = std::find_if(
+        candidate_heuristics.begin(),
+        candidate_heuristics.end(),
+        [&](const auto& candidate) {
+          return selected == "b" +
+              std::to_string(candidate.persistent_batch_size);
         });
-    best_heuristic = all_heuristics.at(0);
+    NVF_ERROR(
+        selected_it != candidate_heuristics.end(),
+        "Unknown register-backed inner persistent batch plan");
+    const int64_t selected_threads =
+        (selected_it->bdimx > 16 &&
+         selected_it->padded_bdimx * selected_it->bdimy <=
+             max_threads_in_block)
+        ? selected_it->padded_bdimx * selected_it->bdimy
+        : selected_it->bdimx * selected_it->bdimy;
+    NVF_ERROR(
+        selected_threads > 0 && selected_threads <= max_threads_in_block &&
+            selected_it->register_per_thread > 0 &&
+            selected_it->register_per_thread <= 255,
+        "Selected inner persistent batch exceeds CTA/register limits");
+    best_heuristic = *selected_it;
   }
 
   // Fill in the reduction params
