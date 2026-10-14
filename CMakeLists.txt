@@ -1212,6 +1212,16 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_outer_grid_base)
   set_tests_properties(jev_alternate_numeric_outer_grid_base PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_targets
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.targets --alternate o32_w16
+      --gtest Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA
+      --case-key jev_alternate_numeric_inner_targets --require-inner-targets)
+  set_tests_properties(jev_alternate_numeric_inner_targets PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()

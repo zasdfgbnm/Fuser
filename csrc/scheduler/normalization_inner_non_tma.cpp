@@ -552,8 +552,7 @@ void innerPersistentHeuristic2DPlan(
                   scheduler_utils::bits_per_register;
               const int64_t godim =
                   ceilDiv(properties.total_iteration_numel, candidate.bdimy);
-              const int64_t grid_x_limit = std::min<int64_t>(
-                  scheduler_utils::x_grid_limit, dev_prop->maxGridSize[0]);
+              const int64_t grid_x_limit = scheduler_utils::x_grid_limit;
               const int64_t grid_y_limit = std::min<int64_t>(
                   scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]);
               return candidate.is_pad_bdimx == should_pad && threads > 0 &&
@@ -567,6 +566,9 @@ void innerPersistentHeuristic2DPlan(
                   candidate.register_per_thread >=
                   buffer_registers + register_overhead &&
                   godim > 0 && grid_x_limit > 0 && grid_y_limit > 0 &&
+                  (godim <= dev_prop->maxGridSize[0] ||
+                   (godim > grid_x_limit &&
+                    grid_x_limit <= dev_prop->maxGridSize[0])) &&
                   ceilDiv(godim, grid_x_limit) <= grid_y_limit;
             });
     if (policy_resources != nullptr) {

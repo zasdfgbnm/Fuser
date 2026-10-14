@@ -89,7 +89,8 @@ class AlternateChoice:
 def check_alternate_report(report: dict[str, Any],
                            events: list[dict[str, Any]], *, site: str,
                            alternate: str, case_key: str,
-                           require_grid: bool = False) -> dict[str, Any]:
+                           require_grid: bool = False,
+                           require_inner_targets: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -154,6 +155,35 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError(f"alternate warp did not reach the grid plan: {rd8}")
         if not any(issue["site"] in {"RD9.stride", "RD8"} for issue in issues):
             raise ValueError("alternate warp did not alter downstream grid analysis")
+    elif require_inner_targets:
+        if (site != "IP5.targets" or event["native"] != "o16_w28" or
+                alternate != "o32_w16" or
+                set(event["candidates"]) != {
+                    "o16_w16", "o16_w28", "o32_w16", "o32_w28"}):
+            raise ValueError("inner target fixture lacks its expected four-policy menu")
+        expected_issues = sorted((
+            ("winner_mismatch", "IP5.targets"),
+            ("record_only_state", "IP5.batch"),
+            ("remote_only_state", "IP5.batch"),
+        ))
+        if sorted((issue["kind"], issue["site"]) for issue in issues) != expected_issues:
+            raise ValueError(f"unexpected inner target comparison issues: {issues}")
+        nested = [row for row in report["multiplicity"]
+                  if row["site"] == "IP5.batch"]
+        if len(nested) != 2:
+            raise ValueError(f"expected one record and one remote IP5.batch state: {nested}")
+        for row in nested:
+            record_count = sum(row["record"].values())
+            remote_count = sum(row["remote"].values())
+            if (record_count, remote_count) not in {(1, 0), (0, 1)}:
+                raise ValueError(f"duplicate or shared nested batch request: {row}")
+            state = row["request"]["state"]
+            expected_overhead, expected_warps = ((16, 28) if record_count
+                                                   else (32, 16))
+            if (not state.startswith("inner_persistent.reg_batch.v2\n") or
+                    f"\npolicy_register_overhead={expected_overhead}\n" not in state or
+                    f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
+                raise ValueError(f"nested batch did not use selected target policy: {row}")
     elif issues != [intended]:
         raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
@@ -177,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gtest", default=GTEST)
     parser.add_argument("--case-key", default=CASE_KEY)
     parser.add_argument("--require-grid", action="store_true")
+    parser.add_argument("--require-inner-targets", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -274,7 +305,8 @@ def main(argv: list[str] | None = None) -> int:
         summary = check_alternate_report(
             report, override.events, site=args.site,
             alternate=args.alternate, case_key=args.case_key,
-            require_grid=args.require_grid)
+            require_grid=args.require_grid,
+            require_inner_targets=args.require_inner_targets)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)
