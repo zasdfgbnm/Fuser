@@ -413,14 +413,11 @@ void getHeuristics(
   int64_t vectorization_factor_outer =
       std::min(workload_per_thread, max_tmp_gmem_vect_factor);
 
-  // The final outer reduction reads the temporary global buffer in a
-  // different thread layout from the producer. Keep its physical write width
-  // and the already checked WS topology fixed. A narrower read vector divides
-  // the producer width and never increases the per-thread vector footprint.
-  // The native 2/4 rule is a performance preference within this envelope.
-  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
-    const bool legal_width_envelope =
-        inner_dim_numel > 0 && vect_factor > 0 && vect_factor <= 128 &&
+  // The read and write choices only change vectorization of the intermediate
+  // global buffer. The TMA input layout, WS topology, and resource plan stay
+  // fixed. Check that plan again after the preceding choices have completed.
+  const auto has_valid_tmp_width_envelope = [&]() {
+    return inner_dim_numel > 0 && vect_factor > 0 && vect_factor <= 128 &&
         (vect_factor & (vect_factor - 1)) == 0 &&
         inner_dim_numel % vect_factor == 0 &&
         computation_dtype_size_bit >= 8 &&
@@ -443,6 +440,14 @@ void getHeuristics(
         gdimy <= dev_prop->maxGridSize[1] &&
         is_enough_regs(iter_unroll, bdimx, bdimy) &&
         is_enough_smem(iter_unroll, n_stages, bdimx, bdimy);
+  };
+
+  // The final outer reduction reads the temporary global buffer in a
+  // different thread layout from the producer. A narrower read vector divides
+  // the producer width and never increases the per-thread vector footprint.
+  // The native 2/4 rule is a performance preference within this envelope.
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool legal_width_envelope = has_valid_tmp_width_envelope();
     if (!legal_width_envelope) {
       if (jev_mode == scheduler::jev::Mode::Record) {
         scheduler::jev::recordCoverageSkip(
@@ -472,6 +477,59 @@ void getHeuristics(
               ? "w" + std::to_string(vectorization_factor_outer)
               : "");
       vectorization_factor_outer = std::stoll(selected.substr(1));
+    }
+  }
+
+  // The selected reader has a complete fixed layout. A smaller power-of-two
+  // store divides the original inner vector; keep it at least as wide as the
+  // reader, so the existing producer/consumer vector invariant is preserved.
+  // The temporary store remains at most 128 bits, and the TMA input alignment
+  // and WS register/shared-memory plan are unchanged.
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool legal_write_width_envelope =
+        has_valid_tmp_width_envelope() &&
+        tmp_gmem_write_vect == max_tmp_gmem_vect_factor &&
+        tmp_gmem_write_vect <= vect_factor &&
+        tmp_gmem_write_vect % vectorization_factor_outer == 0;
+    if (!legal_write_width_envelope) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP2.tmp_write_width",
+            "WS temporary write width lacks hard bounds");
+      } else {
+        NVF_ERROR(false, "No hard-valid IOP2 temporary write width");
+      }
+    } else if (vectorization_factor_outer == max_tmp_gmem_vect_factor) {
+      // The reader already requires the maximum safe store width. There is no
+      // performance alternative, so keep the locally determined native width.
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP2.tmp_write_width",
+            "reader already requires the maximum temporary write width");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> write_options;
+      for (int64_t width = vectorization_factor_outer;
+           width <= max_tmp_gmem_vect_factor; width *= 2) {
+        write_options.push_back({
+            "w" + std::to_string(width),
+            "Write partial outer reduction to global memory with vector "
+            "width " + std::to_string(width)});
+      }
+      const std::string state =
+          "inner_outer.tma_ws_tmp_write_width.v1\ninner_dim_numel=" +
+          std::to_string(inner_dim_numel) + "\ninner_vector_width=" +
+          std::to_string(vect_factor) + "\nouter_read_width=" +
+          std::to_string(vectorization_factor_outer) + "\ntmp_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.tmp_write_width",
+          state,
+          write_options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "w" + std::to_string(tmp_gmem_write_vect)
+              : "");
+      tmp_gmem_write_vect = std::stoll(selected.substr(1));
     }
   }
 
