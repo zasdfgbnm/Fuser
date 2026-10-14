@@ -203,12 +203,19 @@ std::unique_ptr<HeuristicParams> InnerPersistentKernelScheduler::
   FUSER_PERF_SCOPE("InnerPersistentKernelScheduler::computeHeuristics");
 
   // Get properties of the fusion
+  // The TMA schedule always projects inputs, regardless of the property
+  // preference. Offer a projection Choice only when this compute path is
+  // guaranteed to use the non-TMA scheduler, so every answer is honored.
+  const bool enable_jev_projection =
+      at::cuda::getCurrentDeviceProperties()->major < 9 ||
+      !isOptionEnabled(EnableOption::TmaInnerPersistent);
   const auto& prop =
       normalization_scheduler_utils::getPersistentKernelProperties(
           fusion,
           runtime_info,
           data_cache,
-          InnerPersistentKernelScheduler::schedulerType());
+          InnerPersistentKernelScheduler::schedulerType(),
+          enable_jev_projection);
 
   // Check if TMA can be used
   bool use_tma = mayUseTma(fusion, prop) &&

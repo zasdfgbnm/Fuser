@@ -242,11 +242,14 @@ struct PersistentKernelProperties {
     return ss.str();
   }
 };
+// enable_jev_projection is only for final InnerPersistent computeHeuristics
+// on a guaranteed non-TMA path. Other callers retain native analysis.
 PersistentKernelProperties getPersistentKernelProperties(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    SchedulerType heuristic);
+    SchedulerType heuristic,
+    bool enable_jev_projection = false);
 
 // Verify the presence of a reduction TensorView connected to a Fusion input
 void checkReductionTvForScheduling(Fusion* fusion, TensorView* ref_red_tv);

@@ -19,6 +19,7 @@
 #include "iter_visitor.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/runtime_info.h"
@@ -931,7 +932,8 @@ PersistentKernelProperties getPersistentKernelProperties(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    SchedulerType scheduler_type) {
+    SchedulerType scheduler_type,
+    bool enable_jev_projection) {
   FUSER_PERF_SCOPE(
       "normalization_scheduler_utils::getPersistentKernelProperties");
 
@@ -1005,14 +1007,115 @@ PersistentKernelProperties getPersistentKernelProperties(
   // reducing buffer size is larger than the pains of recalculations.
   bool can_use_smem_persistent =
       properties.inner_most_dimension_numel == properties.total_reduction_numel;
-  auto project_strategy = isProjectBufferToInputs(
-      fusion,
-      runtime_info,
-      reduction_tvs,
-      persistent_buffer_info,
-      persistent_buffer_size_info,
-      scheduler_type,
-      can_use_smem_persistent);
+  // Keep the shared projection helper fully native: canScheduleRunTime also
+  // calls it, and scheduler eligibility must not depend on the API. This
+  // Choice is made only while building the final InnerPersistent heuristics.
+  const auto jev_mode =
+      enable_jev_projection && scheduler_type == SchedulerType::InnerPersistent
+      ? scheduler::jev::mode()
+      : scheduler::jev::Mode::Off;
+  BufferProjectionStrategy project_strategy;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    project_strategy = isProjectBufferToInputs(
+        fusion,
+        runtime_info,
+        reduction_tvs,
+        persistent_buffer_info,
+        persistent_buffer_size_info,
+        scheduler_type,
+        can_use_smem_persistent);
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const int64_t original_bits =
+        persistent_buffer_size_info.persistent_buffer_size_bit;
+    const int64_t projected_bits =
+        persistent_buffer_size_info.projected_persistent_buffer_size_bit;
+    const bool projection_exists = !persistent_buffer_info.has_view_ops &&
+        projected_bits > 0 && projected_bits < original_bits;
+    bool both_plans_legal = false;
+    if (!projection_exists) {
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        project_strategy = BufferProjectionStrategy::NoProjectOtherReasons;
+      }
+    } else {
+      const int64_t original_capacity =
+          getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+              fusion,
+              runtime_info,
+              reduction_tvs,
+              persistent_buffer_info,
+              can_use_smem_persistent,
+              /*project_to_inputs=*/false);
+      if (original_bits > original_capacity) {
+        // The unprojected plan cannot fit. Preserve this native hard gate,
+        // including its precedence over the RNG recomputation test.
+        if (jev_mode == scheduler::jev::Mode::Remote) {
+          project_strategy = BufferProjectionStrategy::ProjectToInputs;
+        }
+      } else if (persistent_buffer_info.projection_with_rng_op) {
+        if (jev_mode == scheduler::jev::Mode::Remote) {
+          project_strategy = BufferProjectionStrategy::NoProjectOtherReasons;
+        }
+      } else {
+        // A model must never select a projected layout that cannot fit its
+        // own storage overhead. canScheduleRunTime enforces the native plan;
+        // this check covers an alternative that it did not choose.
+        const int64_t projected_capacity =
+            getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+                fusion,
+                runtime_info,
+                reduction_tvs,
+                persistent_buffer_info,
+                can_use_smem_persistent,
+                /*project_to_inputs=*/true);
+        both_plans_legal = projected_bits <= projected_capacity;
+        if (!both_plans_legal && jev_mode == scheduler::jev::Mode::Remote) {
+          project_strategy = BufferProjectionStrategy::NoProjectOtherReasons;
+        }
+      }
+    }
+
+    if (both_plans_legal) {
+      // The source's remaining preference is entirely empirical: recompute
+      // cheap operations, but retain exp buffers below a device-ratio-specific
+      // threshold. Send the raw hardware facts so the server can derive the
+      // ratio and preference without a native winner in the request.
+      const auto* device = at::cuda::getCurrentDeviceProperties();
+      const int device_index = at::cuda::current_device();
+      int memory_clock_khz = 0;
+      int gpu_clock_khz = 0;
+      cudaDeviceGetAttribute(
+          &memory_clock_khz, cudaDevAttrMemoryClockRate, device_index);
+      cudaDeviceGetAttribute(
+          &gpu_clock_khz, cudaDevAttrClockRate, device_index);
+      const std::string state =
+          "inner_persistent.projection.v1\noriginal_bits=" +
+          std::to_string(original_bits) + "\nprojected_bits=" +
+          std::to_string(projected_bits) + "\nprojection_has_exp=" +
+          (persistent_buffer_info.projection_with_exp_op ? "1" : "0") +
+          "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+          "\nsm_major=" + std::to_string(device->major) +
+          "\nsm_minor=" + std::to_string(device->minor) +
+          "\nmemory_bus_bits=" + std::to_string(device->memoryBusWidth) +
+          "\nmemory_clock_khz=" + std::to_string(memory_clock_khz) +
+          "\ngpu_clock_khz=" + std::to_string(gpu_clock_khz);
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"project", "Recompute persistent buffers from cached inputs"},
+          {"keep", "Keep the original persistent buffers"}};
+      std::string native_choice;
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        native_choice = project_strategy == BufferProjectionStrategy::ProjectToInputs
+            ? "project"
+            : "keep";
+      }
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IP1.projection", state, options, native_choice);
+      project_strategy = selected == "project"
+          ? BufferProjectionStrategy::ProjectToInputs
+          : BufferProjectionStrategy::NoProjectToAvoidRecompute;
+    }
+  }
   bool project_persistent_buffers =
       (project_strategy == BufferProjectionStrategy::ProjectToInputs);
   bool disable_project_to_avoid_recompute =
