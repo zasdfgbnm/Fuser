@@ -661,6 +661,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner_cta_envelope: bool = False,
                            require_inner3d_warp_target: bool = False,
                            require_inner3d_cta_target: bool = False,
+                           require_inner3d_cta_full: bool = False,
                            require_inner3d_grid_wave: bool = False,
                            require_inner_width: bool = False,
                            require_inner_batch_cap: bool = False,
@@ -1195,10 +1196,13 @@ def check_alternate_report(report: dict[str, Any],
                 raise ValueError(f"3D grid changed unrelated decision: {row}")
         if issues != [intended]:
             raise ValueError(f"unexpected 3D grid comparison issues: {issues}")
-    elif require_inner3d_cta_target:
+    elif require_inner3d_cta_target or require_inner3d_cta_full:
+        expected_alternate = "t128" if require_inner3d_cta_full else "t64"
+        expected_targets = tuple(range(8, 249, 8))
         if (site != "RD5.cta" or event["native"] != "t32" or
-                alternate != "t64" or
-                set(event["candidates"]) != {"t16", "t32", "t64"}):
+                alternate != expected_alternate or
+                set(event["candidates"]) != {
+                    f"t{target}" for target in expected_targets}):
             raise ValueError("3D CTA fixture lacks its complete hard-valid menu")
         fields = state_fields({"site": site, "request": {
             "state": event["state"]}}, "reduction.inner3d_cta_target.v1")
@@ -1207,7 +1211,8 @@ def check_alternate_report(report: dict[str, Any],
                 "inner_numel": "128", "n_tensor_inputs": "1",
                 "max_dtype_bits": "32", "vector_width": "4",
                 "sm_count": "128", "logical_warp": "8",
-                "hard_valid_targets": "16,32,64"}.items()):
+                "hard_valid_targets": ",".join(map(str, expected_targets))
+                }.items()):
             raise ValueError(f"3D CTA fixture escaped the proved shape: {fields}")
         for dependent_site in ("RD4", "RD5.iter_unroll", "RD5.width"):
             rows = [row for row in report["multiplicity"]
@@ -1237,17 +1242,15 @@ def check_alternate_report(report: dict[str, Any],
             "reduction_numel", "iteration_numel", "inner_numel",
             "n_tensor_inputs", "max_dtype_bits", "vector_width",
             "sm_count", "max_threads_per_sm", "max_threads_per_block")}
-        for row, side, choice, logical_warp, hard_valid, menu in (
-                (cta_record, "record", "t32", "8", "16,32,64",
-                 {"t16", "t32", "t64"}),
-                (cta_remote, "remote", "t16", "4", "8,16,32",
-                 {"t8", "t16", "t32"})):
+        for row, side, choice, logical_warp, targets in (
+                (cta_record, "record", "t32", "8", range(8, 249, 8)),
+                (cta_remote, "remote", "t16", "4", range(4, 253, 4))):
             cta_fields = state_fields(row, "reduction.inner3d_cta_target.v1")
             expected_fields = {**common, "logical_warp": logical_warp,
-                               "hard_valid_targets": hard_valid}
+                               "hard_valid_targets": ",".join(map(str, targets))}
             criteria = row["request"]["questions"]["RD5.cta"]["criteria"]
             if (row[side] != {choice: 1} or cta_fields != expected_fields or
-                    set(criteria) != menu):
+                    set(criteria) != {f"t{target}" for target in targets}):
                 raise ValueError(f"3D warp changed the dependent CTA plan: {row}")
         for dependent_site in ("RD4", "RD5.iter_unroll", "RD5.width"):
             rows = [row for row in report["multiplicity"]
@@ -1946,6 +1949,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-cta-envelope", action="store_true")
     parser.add_argument("--require-inner3d-warp-target", action="store_true")
     parser.add_argument("--require-inner3d-cta-target", action="store_true")
+    parser.add_argument("--require-inner3d-cta-full", action="store_true")
     parser.add_argument("--require-inner3d-grid-wave", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner-batch-cap", action="store_true")
@@ -2070,6 +2074,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner_cta_envelope=args.require_inner_cta_envelope,
             require_inner3d_warp_target=args.require_inner3d_warp_target,
             require_inner3d_cta_target=args.require_inner3d_cta_target,
+            require_inner3d_cta_full=args.require_inner3d_cta_full,
             require_inner3d_grid_wave=args.require_inner3d_grid_wave,
             require_inner_width=args.require_inner_width,
             require_inner_batch_cap=args.require_inner_batch_cap,

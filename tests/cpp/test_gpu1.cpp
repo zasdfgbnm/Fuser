@@ -6036,6 +6036,41 @@ TEST_F(Gpu1Test, JevAlternateInner3dCtaTarget_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// Exercise a preflighted CTA target beyond the original neighboring menu.
+// The same shape grows from one to four z reduction threads per block.
+TEST_F(Gpu1Test, JevAlternateInner3dCtaFull_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 32, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(rparams->lparams.bdimx(), 32);
+  ASSERT_EQ(
+      rparams->lparams.bdimz(),
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 4 : 1);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // On SM89 this layout makes two raw inner-reduction grid pieces across 65
 // outputs. Native ragged-wave cleanup folds the grid to one piece; the remote
 // alternate keeps both complete grids and must still match the ATen sum.

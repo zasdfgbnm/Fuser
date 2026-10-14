@@ -1291,27 +1291,24 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   }
 
   // The four-wave/quarter-SM CTA target is a performance preference. Keep
-  // native arithmetic above for Record mode, then let Remote choose among
-  // nearby targets whose *complete* downstream 3D plans pass native checks.
-  // In particular, the preflight covers physical CTA size, all later output
-  // unroll choices, grid extents, and the unsupported 3D-to-2D fallback.
+  // native arithmetic above for Record mode. Offer every multiple of the
+  // logical warp in the first 255 such targets, up to the physical block
+  // limit, whose *complete* downstream 3D plan passes native checks. The
+  // finite envelope respects the Choice API's 255-option limit. In
+  // particular, preflight covers physical CTA size, all later output-unroll
+  // choices, grid extents, and the unsupported 3D-to-2D fallback.
   if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
       min_warp_size >= 1 && min_warp_size <= 16 &&
       target_threads_in_block >= min_warp_size &&
       target_threads_in_block <= dev_prop->maxThreadsPerBlock) {
     const int64_t native_target = target_threads_in_block;
-    std::vector<int64_t> nearby_targets = {native_target};
-    if (native_target / 2 >= min_warp_size &&
-        (native_target / 2) % min_warp_size == 0) {
-      nearby_targets.push_back(native_target / 2);
-    }
-    if (native_target <= dev_prop->maxThreadsPerBlock / 2) {
-      nearby_targets.push_back(native_target * 2);
-    }
-    std::sort(nearby_targets.begin(), nearby_targets.end());
+    const int64_t candidate_limit =
+        std::min(int64_t{255} * min_warp_size,
+                 int64_t{dev_prop->maxThreadsPerBlock});
     std::vector<scheduler::jev::ChoiceOption> options;
     std::string hard_valid_targets;
-    for (const int64_t candidate : nearby_targets) {
+    for (int64_t candidate = min_warp_size; candidate <= candidate_limit;
+         candidate += min_warp_size) {
       if (!inner3dWarpPlanIsSafe(
               total_reduction_numel,
               total_iteration_numel,
