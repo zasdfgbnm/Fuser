@@ -187,11 +187,12 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   constexpr int64_t cta_per_sm = 8;
   const int64_t bits_per_sm = scheduler_utils::getRequiredBitsInFlight();
   const int64_t bits_per_cta = bits_per_sm / cta_per_sm;
-  if (bits_per_element == 0) {
-    return nullptr;
-  }
-  const int64_t elements_per_cta = scheduler_utils::roundUpToN(
-      ceilDiv(bits_per_cta, bits_per_element), 1024);
+  // This occupancy target is a performance preference. Remote mode sends the
+  // raw measurements and lets the service recompute it.
+  const int64_t elements_per_cta = jev_mode == scheduler::jev::Mode::Remote
+      ? 0
+      : scheduler_utils::roundUpToN(
+            ceilDiv(bits_per_cta, bits_per_element), 1024);
 
   // ========== Step 3: Compute TMA Tile Dimensions ==========
   // TMA tiles define the tile size loaded by each TMA operation:
@@ -217,23 +218,236 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // tma_tile_inner: Actual tma tile in inner dimension
   // Start with warp size, then grow by powers of 2 until reaching
   // tma_tile_inner_max e.g. 16, 32, 64, 128, 256
-  int64_t tma_tile_inner = std::min(tma_tile_inner_max, threads_per_warp);
-  while (tma_tile_inner * 2 <= tma_tile_inner_max) {
-    tma_tile_inner *= 2;
+  int64_t tma_tile_inner = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    tma_tile_inner = std::min(tma_tile_inner_max, threads_per_warp);
+    while (tma_tile_inner * 2 <= tma_tile_inner_max) {
+      tma_tile_inner *= 2;
+    }
   }
 
-  // tma_tile_outer: Actual tma tile in outer dimension
-  // Compute to achieve target elements_per_cta, capped by tma_tile_outer_max
-  const int64_t tma_tile_outer = std::max(
-      1L, std::min(elements_per_cta / tma_tile_inner, tma_tile_outer_max));
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+  const int64_t max_dtype_bits = prop.max_dtype_size_bit_for_vectorization;
+  const int64_t max_grid_x_dim = device->maxGridSize[0];
+  const int64_t max_grid_y_dim = device->maxGridSize[1];
+  const int64_t smem_per_block_bytes = device->sharedMemPerBlockOptin;
+  const int64_t max_threads_per_block = device->maxThreadsPerBlock;
+  NVF_ERROR(
+      min_dtype_bits > 0 && max_dtype_bits > 0,
+      "PW4.tile requires positive dtype widths");
+  int64_t tma_input_count = 0;
+  int64_t smem_bits_per_element = 0;
+  const int64_t n_valid_dims =
+      scheduler_utils::nLogicalDims(prop.largest_out);
+  for (const auto* input : fusion->inputs()) {
+    const auto* tv = dynamic_cast<const TensorView*>(input);
+    if (tv != nullptr && isTvSuitableForTma(tv, n_valid_dims)) {
+      ++tma_input_count;
+      smem_bits_per_element +=
+          dataTypeSizeBit(tv->getDataType(), prop.index_type);
+    }
+  }
+  bool has_block_quantization = false;
+  bool requires_quant_width_two = false;
+  for (auto* op : ir_utils::getOpsOfType<BlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    requires_quant_width_two |= dataTypeSizeBit(
+        op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
+  }
+  for (auto* op : ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    requires_quant_width_two |= dataTypeSizeBit(
+        op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
+  }
+
+  // The box's contiguous dimension must satisfy every TMA input's 16-byte
+  // alignment. The width bound also keeps the later vectorized split inside
+  // one tile. Small native boxes can be non-powers of two; larger native boxes
+  // grow from one warp by doubling. This complete bounded menu includes both.
+  auto legal_inner = [&](int64_t candidate) {
+    return candidate > 0 && candidate <= tma_tile_inner_max &&
+        candidate * min_dtype_bits % 128 == 0 &&
+        candidate >= 128 / max_dtype_bits &&
+        ceilDiv(tma_domain_inner, candidate) <= max_grid_x_dim;
+  };
+
+  // Compute the source outer preference only in off/record modes. In remote
+  // mode the service must derive it from the raw bandwidth measurements.
+  int64_t tma_tile_outer = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    tma_tile_outer = std::max(
+        1L, std::min(elements_per_cta / tma_tile_inner, tma_tile_outer_max));
+  }
+
+  // Count all TMA-loaded inputs for the shared-memory bound, including inputs
+  // excluded from the narrower bandwidth preference calculation above.
+  auto legal_outer = [&](int64_t inner, int64_t outer) {
+    if (inner <= 0 || outer <= 0 || outer > tma_tile_outer_max) {
+      return false;
+    }
+    const int64_t area = inner * outer;
+    const int64_t smem_upper_bytes =
+        ceilDiv(area * smem_bits_per_element, 8) +
+        128 * tma_input_count + 4096;
+    const int64_t bdimx = std::min(threads_per_warp, inner);
+    const int64_t bdimy = std::min(128L / bdimx, outer);
+    const int64_t grid_y = ceilDiv(tma_domain_outer, outer);
+    return smem_upper_bytes <= smem_per_block_bytes &&
+        bdimx * bdimy <= max_threads_per_block &&
+        (!has_block_quantization || grid_y <= max_grid_y_dim);
+  };
+  const int64_t first_outer = tma_tile_outer_max == 256 ? 2 : 1;
+  const int64_t minimum_outer = std::max(
+      first_outer,
+      has_block_quantization
+          ? ceilDiv(tma_domain_outer, max_grid_y_dim)
+          : 1L);
+  auto legal_inner_plan = [&](int64_t candidate) {
+    return legal_inner(candidate) &&
+        legal_outer(candidate, minimum_outer);
+  };
+
+  bool route_tile_choices = jev_mode != scheduler::jev::Mode::Off;
+  if (jev_mode == scheduler::jev::Mode::Record) {
+    std::string skip_reason;
+    if (bits_per_sm < 8) {
+      skip_reason = "bandwidth estimate below one CTA target bit";
+    } else if (!legal_inner_plan(tma_tile_inner)) {
+      skip_reason = "native inner tile has no aligned, resource-valid TMA plan";
+    } else if ((tma_tile_outer < first_outer) ||
+               !legal_outer(tma_tile_inner, tma_tile_outer)) {
+      skip_reason = "native outer tile exceeds CTA, grid, or shared-memory bound";
+    }
+    if (!skip_reason.empty()) {
+      scheduler::jev::recordCoverageSkip("PW4.tile", skip_reason);
+      route_tile_choices = false;
+    }
+  }
+  if (jev_mode == scheduler::jev::Mode::Remote) {
+    NVF_ERROR(bits_per_sm >= 8, "PW4.tile bandwidth state has no legal CTA target");
+  }
+
+  if (route_tile_choices) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t candidate = 1;
+         candidate <= std::min<int64_t>(tma_tile_inner_max, 32);
+         ++candidate) {
+      if (legal_inner_plan(candidate)) {
+        options.push_back(
+            {"i" + std::to_string(candidate),
+             "TMA inner box " + std::to_string(candidate) + " elements"});
+      }
+    }
+    for (int64_t candidate = 64; candidate <= tma_tile_inner_max;
+         candidate *= 2) {
+      if (legal_inner_plan(candidate)) {
+        options.push_back(
+            {"i" + std::to_string(candidate),
+             "TMA inner box " + std::to_string(candidate) + " elements"});
+      }
+    }
+    NVF_ERROR(!options.empty(), "PW4.tile_inner has no hard-valid candidate");
+    std::string state = "pointwise.tma_tile_inner.v1\n";
+    state += "domain_inner=" + std::to_string(tma_domain_inner) + '\n';
+    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+    state += "max_dtype_bits=" + std::to_string(max_dtype_bits) + '\n';
+    state += "max_grid_x=" + std::to_string(max_grid_x_dim) + '\n';
+    state += "domain_outer=" + std::to_string(tma_domain_outer) + '\n';
+    state += "max_grid_y=" + std::to_string(max_grid_y_dim) + '\n';
+    state += "max_threads_per_block=" +
+        std::to_string(max_threads_per_block) + '\n';
+    state += "smem_per_block_bytes=" +
+        std::to_string(smem_per_block_bytes) + '\n';
+    state += "tma_input_count=" + std::to_string(tma_input_count) + '\n';
+    state += "has_block_quantization=" +
+        std::to_string(has_block_quantization) + '\n';
+    state += "bits_per_sm=" + std::to_string(bits_per_sm) + '\n';
+    state += "bits_per_element=" + std::to_string(bits_per_element) + '\n';
+    state += "smem_bits_per_element=" +
+        std::to_string(smem_bits_per_element) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "i" + std::to_string(tma_tile_inner)
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "PW4.tile_inner", state, options, native_choice);
+    bool matched = false;
+    for (const auto& option : options) {
+      if (selected == option.id) {
+        tma_tile_inner = std::stoll(selected.substr(1));
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW4.tile_inner response is outside hard bounds");
+  }
+
+  // Each candidate is a complete tile, CTA, and grid plan. Reserve space for
+  // per-input shared-memory alignment and scheduler bookkeeping. The bound is
+  // deliberately conservative because a larger tile can exceed the device's
+  // per-block shared-memory allocation even when each box dimension is legal.
+  if (route_tile_choices) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    // At outer_max=256, omit only one-row tiles: the native target is at least
+    // 1024 elements and inner <=256, so its preference is always >=4 here.
+    for (int64_t candidate = first_outer; candidate <= tma_tile_outer_max;
+         ++candidate) {
+      if (!legal_outer(tma_tile_inner, candidate)) {
+        continue;
+      }
+      const int64_t bdimx = std::min(threads_per_warp, tma_tile_inner);
+      const int64_t bdimy = std::min(128L / bdimx, candidate);
+      const int64_t grid_y = ceilDiv(tma_domain_outer, candidate);
+      options.push_back(
+          {"o" + std::to_string(candidate),
+           "TMA outer box " + std::to_string(candidate) +
+               "; CTA " + std::to_string(bdimx) + "x" +
+               std::to_string(bdimy) + "; grid " +
+               std::to_string(ceilDiv(tma_domain_inner, tma_tile_inner)) +
+               "x" + std::to_string(grid_y) +
+               "; split_y " + std::to_string(grid_y > max_grid_y_dim)});
+    }
+    NVF_ERROR(!options.empty(), "PW4.tile_outer has no hard-valid candidate");
+    std::string state = "pointwise.tma_tile_outer.v1\n";
+    state += "domain_inner=" + std::to_string(tma_domain_inner) + '\n';
+    state += "domain_outer=" + std::to_string(tma_domain_outer) + '\n';
+    state += "tile_inner=" + std::to_string(tma_tile_inner) + '\n';
+    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+    state += "max_dtype_bits=" + std::to_string(max_dtype_bits) + '\n';
+    state += "max_grid_x=" + std::to_string(max_grid_x_dim) + '\n';
+    state += "max_grid_y=" + std::to_string(max_grid_y_dim) + '\n';
+    state += "max_threads_per_block=" +
+        std::to_string(max_threads_per_block) + '\n';
+    state += "smem_per_block_bytes=" +
+        std::to_string(smem_per_block_bytes) + '\n';
+    state += "tma_input_count=" + std::to_string(tma_input_count) + '\n';
+    state += "has_block_quantization=" +
+        std::to_string(has_block_quantization) + '\n';
+    state += "bits_per_sm=" + std::to_string(bits_per_sm) + '\n';
+    state += "bits_per_element=" + std::to_string(bits_per_element) + '\n';
+    state += "smem_bits_per_element=" +
+        std::to_string(smem_bits_per_element) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "o" + std::to_string(tma_tile_outer)
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "PW4.tile_outer", state, options, native_choice);
+    bool matched = false;
+    for (const auto& option : options) {
+      if (selected == option.id) {
+        tma_tile_outer = std::stoll(selected.substr(1));
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW4.tile_outer response is outside hard bounds");
+  }
 
   params->tma_tile_inner = tma_tile_inner;
   params->tma_tile_outer = tma_tile_outer;
 
   // typical max gdimy is 65535, while max gdimx is 2^31 − 1 for most devices no
   // need to check for gdimx
-  const int64_t max_grid_y_dim =
-      at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
   int64_t gdimy = ceilDiv(tma_domain_outer, tma_tile_outer);
   params->split_grid_y_dim = gdimy > max_grid_y_dim;
 
@@ -301,19 +515,6 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     // The PointWise wrapper caps block quantization at four and rejects
     // sub-byte quantization below width two. Apply those same hard bounds to
     // this menu so a remote choice cannot newly reject a schedulable fusion.
-    bool has_block_quantization = false;
-    bool requires_quant_width_two = false;
-    for (auto* op : ir_utils::getOpsOfType<BlockQuantizationOp>(fusion)) {
-      has_block_quantization = true;
-      requires_quant_width_two |= dataTypeSizeBit(
-          op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
-    }
-    for (auto* op :
-         ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion)) {
-      has_block_quantization = true;
-      requires_quant_width_two |= dataTypeSizeBit(
-          op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
-    }
     const int64_t hard_max =
         has_block_quantization ? std::min<int64_t>(layout_max, 4) : layout_max;
     const int64_t hard_min =

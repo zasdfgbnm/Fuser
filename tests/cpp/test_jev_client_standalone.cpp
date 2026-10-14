@@ -125,6 +125,13 @@ int main() {
           "record lacks Choice instructions");
   require(readFile(path).find("\"criteria\":{\"bp0\":\"one dimensional\",\"bp1\":\"split\"}") != std::string::npos,
           "record lacks candidate descriptions");
+  nvfuser::scheduler::jev::recordCoverageSkip(
+      "PW4.tile", "native tile exceeds conservative shared-memory bound", "case-skip");
+  require(readFile(path).find("\"kind\":\"coverage_skip\",\"site\":\"PW4.tile\"") !=
+              std::string::npos &&
+              readFile(path).find("\"reason\":\"native tile exceeds conservative shared-memory bound\"") !=
+                  std::string::npos,
+          "record coverage skip lacks a reason");
   const std::string first_record = readFile(path);
   require(chooseDecision("PW2", state, options, "bp1", "case-1b") == "bp1",
           "second record changed choice");

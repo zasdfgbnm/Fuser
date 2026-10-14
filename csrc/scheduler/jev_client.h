@@ -32,4 +32,11 @@ std::string chooseDecision(
     std::string_view native_choice = {},
     std::string_view case_key = {});
 
+// Record why a native plan could not be represented by a conservative Choice
+// menu. This is a coverage event, not a decision; it preserves native params.
+void recordCoverageSkip(
+    std::string_view site,
+    std::string_view reason,
+    std::string_view case_key = {});
+
 } // namespace nvfuser::scheduler::jev

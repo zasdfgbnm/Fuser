@@ -507,4 +507,17 @@ std::string chooseDecision(
   return selected;
 }
 
+void recordCoverageSkip(
+    std::string_view site,
+    std::string_view reason,
+    std::string_view case_key) {
+  if (mode() != Mode::Record) fail("coverage skip requires record mode");
+  if (site.empty() || reason.empty()) fail("coverage skip needs site and reason");
+  const std::string log_case_key =
+      case_key.empty() ? env("NVFUSER_JEV_CASE_KEY") : std::string(case_key);
+  appendLog("{\"kind\":\"coverage_skip\",\"site\":" + quote(site) +
+      ",\"case_key\":" + quote(log_case_key) +
+      ",\"mode\":\"record\",\"reason\":" + quote(reason) + '}');
+}
+
 } // namespace nvfuser::scheduler::jev
