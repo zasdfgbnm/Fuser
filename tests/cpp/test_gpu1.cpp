@@ -7,7 +7,9 @@
 // clang-format on
 #include <algorithm>
 #include <complex>
+#include <cstdlib>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -57,6 +59,17 @@ namespace nvfuser {
 using namespace at::indexing;
 
 using Gpu1Test = NVFuserTest;
+
+namespace {
+
+// Exact alternate caps are fixtures for the numeric harness, not a contract
+// for an arbitrary remote decision server.
+bool isJevAlternateNumericCase(std::string_view expected) {
+  const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+  return case_key != nullptr && std::string_view(case_key) == expected;
+}
+
+} // namespace
 
 // A few smoke tests for IrGraphGenerator
 // (These tests exercise IrGraphGenerator through a non-trivial IR,
@@ -6431,6 +6444,25 @@ TEST_F(Gpu1Test, JevAlternateInner3dPersistentRegisterOverhead_CUDA) {
   ASSERT_TRUE(rparams->schedule_3d);
   ASSERT_TRUE(rparams->persistent_kernel);
   ASSERT_GT(rparams->batches_per_block_inner_reduction, 1);
+  ASSERT_NE(results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->schedulerType(),
+      SchedulerType::InnerPersistent);
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      isJevAlternateNumericCase(
+          "jev_alternate_numeric_inner3d_persistent_register_overhead")) {
+    EXPECT_EQ(
+        rparams->cparams.maxrregcount,
+        scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 168 : 96);
+  }
 
   at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
   at::Tensor reference =
@@ -7772,10 +7804,24 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterBatchCap_CUDA) {
   const auto* rparams = results.heuristic_params->as<ReductionParams>();
   ASSERT_FALSE(rparams->schedule_3d);
   ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_NE(results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      rparams->cparams.maxrregcount);
   if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
     ASSERT_EQ(rparams->batches_per_block_inner_reduction, 12);
   } else {
     ASSERT_LE(rparams->batches_per_block_inner_reduction, 10);
+  }
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      isJevAlternateNumericCase(
+          "jev_alternate_numeric_inner_register_batch_cap")) {
+    EXPECT_EQ(rparams->cparams.maxrregcount, 64);
   }
 
   auto squared = at::pow(aten_input.to(at::kDouble), 2);
@@ -7816,6 +7862,20 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterCTASeed_CUDA) {
   ASSERT_FALSE(rparams->schedule_3d);
   ASSERT_TRUE(rparams->persistent_kernel);
   ASSERT_EQ(rparams->unroll_factor_inner_reduction, 4);
+  ASSERT_NE(results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      rparams->cparams.maxrregcount);
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      isJevAlternateNumericCase(
+          "jev_alternate_numeric_inner_register_cta_seed")) {
+    EXPECT_EQ(rparams->cparams.maxrregcount, 64);
+  }
   const int64_t physical_x = ceilDiv(
       norm_size / rparams->unroll_factor_inner_reduction,
       rparams->batches_per_block_inner_reduction);
@@ -7863,11 +7923,9 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   const auto options =
       at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
   at::Tensor aten_input = at::randn({256, feature}, options);
-  // The generic scheduleAndRun helper omits the selected CompileParams. This
-  // test must compile and launch with the scheduler's magic-zero selection.
-  auto heuristic_params = SchedulerEntry::scheduleWith(
-      &fusion, SchedulerType::InnerPersistent, {aten_input});
-  const auto* rparams = heuristic_params->as<ReductionParams>();
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
   ASSERT_FALSE(rparams->schedule_3d);
   ASSERT_TRUE(rparams->persistent_kernel);
   ASSERT_FALSE(rparams->project_persistent_buffers);
@@ -7875,18 +7933,12 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   ASSERT_GT(rparams->batches_per_block_inner_reduction, 1);
   const bool expect_zero = scheduler::jev::mode() != scheduler::jev::Mode::Remote;
   EXPECT_EQ(rparams->cparams.enable_magic_zero, expect_zero);
-  KernelExecutor ke;
-  ke.compile(
-      &fusion,
-      {aten_input},
-      heuristic_params->lparams,
-      heuristic_params->cparams);
-  auto outputs = ke.run(
-      {aten_input},
-      {},
-      heuristic_params->lparams,
-      heuristic_params->cparams);
-  const auto code = ke.compiledKernel()->kernelString();
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()
+          ->compileParams()
+          .enable_magic_zero,
+      expect_zero);
+  const auto code = results.kernel_executor->compiledKernel()->kernelString();
   EXPECT_EQ(
       code.find("NVFUSER_DEFINE_MAGIC_ZERO;") != std::string::npos,
       expect_zero);
@@ -7895,13 +7947,13 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
   auto reference = reference_exp / reference_exp.sum(-1, true);
   testValidate(
       &fusion,
-      outputs,
+      results.outputs,
       {aten_input},
       {reference},
       __LINE__,
       __FILE__,
       "",
-      heuristic_params->lparams);
+      results.heuristic_params->lparams);
 }
 
 // Both persistent storage modes fit on SM89 for this RMS normalization. A

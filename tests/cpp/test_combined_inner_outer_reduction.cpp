@@ -6,8 +6,10 @@
  */
 // clang-format on
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -25,6 +27,7 @@
 #include "ops/all_ops.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -921,6 +924,24 @@ TEST_F(CombinedSchedulerTest, InnerOuterNoOuterBroadcastTv) {
   NVF_CHECK(
       !persistent_params->project_persistent_buffers,
       "Shouldn't project persistent buffers to inputs!");
+  ASSERT_NE(cg_results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      cg_results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      persistent_params->cparams.maxrregcount);
+  EXPECT_EQ(
+      cg_results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      persistent_params->cparams.maxrregcount);
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      case_key != nullptr &&
+      std::string_view(case_key) ==
+          "jev_alternate_numeric_inner_outer_min_batch") {
+    EXPECT_EQ(
+        persistent_params->cparams.maxrregcount,
+        scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 128 : 255);
+  }
 
   auto t1 = t0.sum({1});
   auto t2 = t1.unsqueeze(-1);
