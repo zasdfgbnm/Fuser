@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -1423,13 +1424,54 @@ void innerPersistentHeuristic3DPlan(
   }
 }
 
+bool noLargerPersistentAxis(
+    int64_t candidate_batch,
+    int64_t candidate_unroll,
+    int64_t native_batch,
+    int64_t native_unroll) {
+  if (candidate_batch <= 0 || candidate_unroll <= 0 || native_batch <= 0 ||
+      native_unroll <= 0 ||
+      candidate_batch >
+          std::numeric_limits<int64_t>::max() / candidate_unroll ||
+      native_batch > std::numeric_limits<int64_t>::max() / native_unroll) {
+    return false;
+  }
+  return candidate_batch * candidate_unroll <= native_batch * native_unroll;
+}
+
 bool isNativeValidInner3DAlternative(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& candidate,
+    const ReductionParams& native,
     const Inner3DPlanResources& resources,
     const cudaDeviceProp& device) {
   // The original four-wave plan remains available. A different wave target is
   // offered only when its *completed* CTA, register cap and grid all fit native
-  // hardware limits without relying on a later grid split.
-  return resources.threads_x > 0 && resources.threads_y > 0 &&
+  // hardware limits without relying on a later grid split. Native admission
+  // already bounds total persistent bits by the register-file budget. Requiring
+  // no larger per-thread persistent extents on either reduction axis preserves
+  // that capacity for every underlying buffer shape, including broadcasts.
+  return properties.max_persistent_buffer_size_bit > 0 &&
+      properties.max_persistent_buffer_size_bit <=
+          scheduler_utils::register_file_size_bit &&
+      candidate.schedule_3d && candidate.persistent_kernel &&
+      candidate.cross_block_inner_reduction &&
+      candidate.cross_block_outer_reduction &&
+      !candidate.cross_grid_inner_reduction &&
+      !candidate.cross_grid_outer_reduction &&
+      candidate.block_dim_inner_reduction == ParallelType::TIDx &&
+      candidate.block_dim_outer_reduction == ParallelType::TIDz &&
+      noLargerPersistentAxis(
+          candidate.batches_per_block_inner_reduction,
+          candidate.unroll_factor_inner_reduction,
+          native.batches_per_block_inner_reduction,
+          native.unroll_factor_inner_reduction) &&
+      noLargerPersistentAxis(
+          candidate.batches_per_block_outer_reduction,
+          candidate.unroll_factor_outer_reduction,
+          native.batches_per_block_outer_reduction,
+          native.unroll_factor_outer_reduction) &&
+      resources.padded_threads_x > 0 && resources.threads_y > 0 &&
       resources.threads_z > 0 &&
       resources.padded_threads_x <= device.maxThreadsDim[0] &&
       resources.threads_y <= device.maxThreadsDim[1] &&
@@ -1462,13 +1504,21 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
   };
   std::vector<Plan> plans;
   std::vector<scheduler::jev::ChoiceOption> options;
-  for (const int64_t waves : {2, 4, 8}) {
+  // Build the original plan first so every alternative can be checked against
+  // its per-thread persistent allocation before it enters the Choice menu.
+  for (const int64_t waves : {4, 2, 8}) {
     auto params = waves == 4 ? std::move(native)
                              : std::make_unique<ReductionParams>(base);
     Inner3DPlanResources resources;
     innerPersistentHeuristic3DPlan(
         properties, waves, params.get(), &resources);
-    if (waves != 4 && !isNativeValidInner3DAlternative(resources, *device)) {
+    if (waves != 4 &&
+        !isNativeValidInner3DAlternative(
+            properties,
+            *params,
+            *plans.front().params,
+            resources,
+            *device)) {
       continue;
     }
     const std::string id = "waves" + std::to_string(waves);
