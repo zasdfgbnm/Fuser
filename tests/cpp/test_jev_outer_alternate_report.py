@@ -48,15 +48,19 @@ class OuterAlternateReportTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 report, events, options = load_case(kind)
                 result = check_alternate_report(report, events, **options)
-                self.assertEqual(result["record_events"], 7)
-                self.assertEqual(result["remote_events"], 7)
-                self.assertEqual(result["server_successes"], 7)
+                expected_events = 7 + bool(rows(report, "RD9.ragged"))
+                self.assertEqual(result["record_events"], expected_events)
+                self.assertEqual(result["remote_events"], expected_events)
+                self.assertEqual(result["server_successes"], expected_events)
 
     def test_missing_or_duplicate_dependent_state_is_rejected(self) -> None:
         for kind, site in (("width", "RD9.cta"), ("width", "RD9.stride"),
                            ("width", "RD8"), ("cta", "RD9.stride"),
-                           ("cta", "RD8")):
+                           ("cta", "RD8"), ("width", "RD9.ragged"),
+                           ("cta", "RD9.ragged")):
             report, events, options = load_case(kind)
+            if not rows(report, site):
+                continue  # Prior v1 fixtures have no ragged Choice.
             with self.subTest(kind=kind, site=site, defect="missing"):
                 broken = deepcopy(report)
                 broken["multiplicity"].remove(rows(broken, site)[0])
@@ -115,6 +119,42 @@ class OuterAlternateReportTest(unittest.TestCase):
             broken["issues"].remove(next(issue for issue in broken["issues"]
                 if issue["site"] == "RD8" and issue["kind"] == "remote_only_state"))
             with self.subTest(kind=kind, defect="missing_pair_issue"):
+                with self.assertRaises(ValueError):
+                    check_alternate_report(broken, events, **options)
+
+    def test_v2_stride_policy_and_ragged_state_are_checked(self) -> None:
+        for kind in CASES:
+            report, events, options = load_case(kind)
+            if not rows(report, "RD9.ragged"):
+                continue  # This check applies to the v2 numeric fixture.
+            for old, new in (("ragged_policy=clean", "ragged_policy=raw"),
+                             ("ragged_policy=clean", ""),
+                             ("outer_grid_stride.v2", "outer_grid_stride.v1")):
+                broken = deepcopy(report)
+                remote = next(row for row in rows(broken, "RD9.stride")
+                              if row["remote"])
+                remote["request"]["state"] = remote["request"]["state"].replace(
+                    old, new)
+                with self.subTest(kind=kind, mutation=(old, new)):
+                    with self.assertRaises(ValueError):
+                        check_alternate_report(broken, events, **options)
+            for site, mutation in (("RD9.ragged", "winner"),
+                                   ("RD9.ragged", "state")):
+                broken = deepcopy(report)
+                remote = next(row for row in rows(broken, site) if row["remote"])
+                if mutation == "winner":
+                    remote["remote"] = {"raw": 1}
+                else:
+                    remote["request"]["state"] = remote["request"]["state"].replace(
+                        "base_grdim=", "base_grdim=999")
+                with self.subTest(kind=kind, mutation=mutation):
+                    with self.assertRaises(ValueError):
+                        check_alternate_report(broken, events, **options)
+            broken = deepcopy(report)
+            broken["issues"].remove(next(issue for issue in broken["issues"]
+                if issue["site"] == "RD9.ragged" and
+                issue["kind"] == "remote_only_state"))
+            with self.subTest(kind=kind, mutation="missing_ragged_issue"):
                 with self.assertRaises(ValueError):
                     check_alternate_report(broken, events, **options)
 

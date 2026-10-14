@@ -121,6 +121,66 @@ def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
     return fields
 
 
+OUTER_STRIDE_KEYS = {
+    "reduction_numel", "iteration_numel", "dtype_bits", "sm_count",
+    "min_warp_size", "bdimx", "bdimy", "iter_unroll", "redu_unroll",
+    "gidim", "base_grdim",
+}
+
+OUTER_RAGGED_FORWARD_KEYS = {
+    "reduction_numel", "iteration_numel", "dtype_bits", "sm_count",
+    "bdimx", "bdimy", "iter_unroll", "redu_unroll", "gidim", "base_grdim",
+}
+
+
+def outer_stride_fields(row: dict[str, Any]) -> dict[str, str]:
+    version = row["request"]["state"].splitlines()[0]
+    if version not in ("reduction.outer_grid_stride.v1",
+                       "reduction.outer_grid_stride.v2"):
+        raise ValueError(f"unexpected RD9.stride state version: {version}")
+    fields = state_fields(row, version)
+    expected = OUTER_STRIDE_KEYS | ({"ragged_policy"} if version.endswith("v2")
+                                    else set())
+    if set(fields) != expected:
+        raise ValueError(f"RD9.stride state keys differ from {version}: {fields}")
+    if version.endswith("v2") and fields["ragged_policy"] != "clean":
+        raise ValueError(f"dependent RD9.stride changed ragged policy: {fields}")
+    return fields
+
+
+def check_outer_ragged_dependency(report: dict[str, Any],
+                                  record_stride: dict[str, Any],
+                                  remote_stride: dict[str, Any],
+                                  vector_widths: tuple[str, str]
+                                  ) -> list[dict[str, str]]:
+    versions = [row["request"]["state"].splitlines()[0] for row in
+                (record_stride, remote_stride)]
+    if versions == ["reduction.outer_grid_stride.v1"] * 2:
+        if any(row["site"] == "RD9.ragged" for row in report["multiplicity"]):
+            raise ValueError("v1 stride unexpectedly contains RD9.ragged requests")
+        return []
+    if versions != ["reduction.outer_grid_stride.v2"] * 2:
+        raise ValueError(f"mixed dependent stride versions: {versions}")
+    record_ragged, remote_ragged, ragged_issues = paired_state_rows(
+        report, "RD9.ragged")
+    for ragged, stride, width, side in (
+            (record_ragged, record_stride, vector_widths[0], "record"),
+            (remote_ragged, remote_stride, vector_widths[1], "remote")):
+        if (ragged[side] != {"clean": 1} or
+                set(ragged["request"]["questions"]["RD9.ragged"]["criteria"]) !=
+                {"clean"}):
+            raise ValueError("dependent RD9.ragged winner or menu changed")
+        selected = state_fields(ragged, "reduction.outer_ragged.v1")
+        forwarded = outer_stride_fields(stride)
+        if (set(selected) != OUTER_RAGGED_FORWARD_KEYS | {
+                "max_threads_per_block", "max_unroll", "vector_width"} or
+                selected["vector_width"] != width or
+                any(selected[key] != forwarded[key]
+                    for key in OUTER_RAGGED_FORWARD_KEYS)):
+            raise ValueError(f"RD9.ragged omitted selected grid plan: {selected}")
+    return ragged_issues
+
+
 def check_outer_grid_plan(record: dict[str, Any], remote: dict[str, Any],
                           record_stride: dict[str, Any],
                           remote_stride: dict[str, Any]) -> None:
@@ -128,7 +188,7 @@ def check_outer_grid_plan(record: dict[str, Any], remote: dict[str, Any],
         raise ValueError("selected grid plan changed the RD8 winner")
     for rd8, stride in ((record, record_stride), (remote, remote_stride)):
         plan = state_fields(rd8, "reduction.outer_plan.v1")
-        selected = state_fields(stride, "reduction.outer_grid_stride.v1")
+        selected = outer_stride_fields(stride)
         for plan_key, stride_key in (("grid_gidim", "gidim"),
                                      ("grid_grdim", "base_grdim"),
                                      ("grid_iter_unroll", "iter_unroll")):
@@ -317,8 +377,10 @@ def check_alternate_report(report: dict[str, Any],
                 raise ValueError(f"upstream {upstream} changed with CTA target: {rows}")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
-        before = state_fields(record_stride, "reduction.outer_grid_stride.v1")
-        after = state_fields(remote_stride, "reduction.outer_grid_stride.v1")
+        before, after = (outer_stride_fields(row) for row in
+                         (record_stride, remote_stride))
+        ragged_issues = check_outer_ragged_dependency(
+            report, record_stride, remote_stride, ("4", "4"))
         if (before["bdimx"] != "16" or before["bdimy"] != "32" or
                 before["base_grdim"] != "32" or
                 after["bdimx"] != "16" or after["bdimy"] != "16" or
@@ -337,7 +399,7 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in plan_after.items()
                  if key != "grid_grdim"}):
             raise ValueError("CTA target changed more than the RD8 grid size")
-        expected = [intended, *stride_issues, *plan_issues]
+        expected = [intended, *ragged_issues, *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer CTA comparison issues: {issues}")
     elif require_outer_width:
@@ -365,8 +427,11 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("width changed the CTA winner or upstream CTA state")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
-        before = state_fields(record_stride, "reduction.outer_grid_stride.v1")
-        after = state_fields(remote_stride, "reduction.outer_grid_stride.v1")
+        before, after = (outer_stride_fields(row) for row in
+                         (record_stride, remote_stride))
+        ragged_issues = check_outer_ragged_dependency(
+            report, record_stride, remote_stride,
+            (cta_before["vector_width"], cta_after["vector_width"]))
         record_unroll = int(before["iter_unroll"])
         remote_unroll = int(after["iter_unroll"])
         if record_unroll <= remote_unroll or remote_unroll != 1:
@@ -376,7 +441,8 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("width changed the stride winner unexpectedly")
         record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
         check_outer_grid_plan(record_plan, remote_plan, record_stride, remote_stride)
-        expected = [intended, *cta_issues, *stride_issues, *plan_issues]
+        expected = [intended, *cta_issues, *ragged_issues, *stride_issues,
+                    *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
     elif require_grid:
