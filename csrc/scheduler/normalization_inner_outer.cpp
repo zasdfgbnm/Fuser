@@ -362,7 +362,18 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
         scheduler_utils::register_file_size_bit_56k;
     const int64_t smem_limit_bit =
         (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
+    auto all_buffers = native_buffers.project_to_input
+        ? persistent_buffer_info.projectable_buffer_inputs
+        : persistent_buffer_info.persistent_buffers;
+    if (native_buffers.project_to_input) {
+      for (auto* buffer : persistent_buffer_info.persistent_buffers) {
+        if (buffer->isFusionInput()) {
+          all_buffers.push_back(buffer);
+        }
+      }
+    }
     if (outer_regs_bit < 0 ||
+        native_buffers.smem_persistent_buffers != all_buffers ||
         native_buffers.regs_buffer_size_bit != outer_regs_bit ||
         native_buffers.smem_buffer_size_bit <= 0 ||
         native_buffers.smem_overhead_bit < 0 ||
