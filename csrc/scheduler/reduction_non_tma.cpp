@@ -11,6 +11,11 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <vector>
+
 #include "debug.h"
 #include "instrumentation.h"
 #include "multidevice/utils.h"
@@ -52,6 +57,32 @@ int64_t roundDownPow2OrMultipleOf(const int64_t x, const int64_t multiple) {
 
 int64_t clamp(const int64_t val, const int64_t min_val, const int64_t max_val) {
   return std::min(std::max(val, min_val), max_val);
+}
+
+struct InnerUnrollRange {
+  int64_t low;
+  int64_t high;
+  std::string id;
+};
+
+std::vector<InnerUnrollRange> innerUnrollRanges(int64_t low, int64_t high) {
+  NVF_ERROR(low >= 1 && high >= low);
+  constexpr int64_t kMaxChoices = 255;
+  const int64_t span = high - low + 1;
+  const int64_t stride = span / kMaxChoices + (span % kMaxChoices != 0);
+  std::vector<InnerUnrollRange> ranges;
+  for (int64_t first = low;;) {
+    const int64_t last = first + std::min(stride - 1, high - first);
+    const std::string id = first == last
+        ? "u" + std::to_string(first)
+        : "r" + std::to_string(first) + "_" + std::to_string(last);
+    ranges.push_back({first, last, id});
+    if (last == high) {
+      break;
+    }
+    first = last + 1;
+  }
+  return ranges;
 }
 
 // Reduce x, y, z until it's product is less than max value, reduce round robin
@@ -98,8 +129,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
       max_dtype_size_bit_for_vectorization);
 
   // RD3.width asks the local model for the performance width within the
-  // layout-derived native maximum. The remaining unroll/launch preference
-  // still uses getVectUnroll, and will be routed in a later RD3 iteration.
+  // layout-derived native maximum. RD3.unroll separately chooses the inner
+  // unroll target; CTA and grid preferences remain native.
   const auto jev_mode = scheduler::jev::mode();
   int64_t target_vect_unroll = 0;
   if (jev_mode != scheduler::jev::Mode::Remote) {
@@ -172,17 +203,6 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     }
     NVF_ERROR(matched, "RD3.width response is outside native layout bounds");
   }
-  if (jev_mode == scheduler::jev::Mode::Remote) {
-    // Only the downstream unroll/launch analysis needs this native target.
-    // It is computed after the remote width decision and never sent to Jev.
-    target_vect_unroll = reduction_scheduler_utils::getVectUnroll(
-        max_dtype_size_bit_for_vectorization,
-        max_vectorize_factor,
-        n_tensor_inputs,
-        target_threads_per_sm,
-        has_mufu_computation);
-  }
-
   // redu = [i-remainder, i-Unroll, TIDx, Vect]
   int64_t inner_unroll = 1, bdimx = 1, vect_factor = 1;
   auto getInnerRemainder = [&]() {
@@ -197,14 +217,97 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
             (int64_t)max_vectorize_factor)
       : selected_vect_factor;
   const int64_t four_warps = 4 * threads_per_warp;
-  // Preserve the native quotient in off/record mode. A remote model may
-  // choose a wider legal vector than the old performance target, so clamp
-  // only that alternative to keep downstream unroll arithmetic positive.
-  int64_t target_inner_unroll = target_vect_unroll / vect_factor;
-  if (jev_mode == scheduler::jev::Mode::Remote) {
-    target_inner_unroll = std::max<int64_t>(1, target_inner_unroll);
-  }
+  // Preserve the native quotient, including values larger than the reduction
+  // extent, in off/record mode. Only remote mode uses the model's target.
+  int64_t target_inner_unroll = jev_mode == scheduler::jev::Mode::Remote
+      ? 0
+      : target_vect_unroll / vect_factor;
   int64_t after_vect = total_reduction_numel / vect_factor;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    NVF_ERROR(after_vect >= 1, "RD3.unroll requires a nonempty reduction");
+    NVF_ERROR(
+        max_dtype_size_bit_for_vectorization <= 128,
+        "RD3.unroll requires a positive native vector/unroll target");
+    NVF_ERROR(
+        jev_mode != scheduler::jev::Mode::Record || target_inner_unroll >= 1,
+        "RD3.unroll native target must be positive");
+
+    // A factor above after_vect cannot improve the remainder search below:
+    // the per-thread remainder is then smaller than the factor. This is a
+    // structural range, independent of getVectUnroll's preferred factor.
+    const int64_t hard_max = after_vect;
+    int memory_clock_khz = 0;
+    const int64_t memory_bus_bits = has_mufu_computation
+        ? 0
+        : static_cast<int64_t>(dev_prop->memoryBusWidth);
+    if (!has_mufu_computation) {
+      NVF_ERROR(
+          cudaDeviceGetAttribute(
+              &memory_clock_khz,
+              cudaDevAttrMemoryClockRate,
+              at::cuda::current_device()) == cudaSuccess,
+          "RD3.unroll could not read CUDA memory clock");
+    }
+    std::string state_base = "reduction.inner_unroll.v1\n";
+    state_base += "reduction_numel=" +
+        std::to_string(total_reduction_numel) + '\n';
+    state_base += "vector_width=" + std::to_string(vect_factor) + '\n';
+    state_base += "layout_max=" + std::to_string(max_vectorize_factor) + '\n';
+    state_base += "max_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+    state_base += "n_tensor_inputs=" + std::to_string(n_tensor_inputs) + '\n';
+    state_base += "has_mufu=" +
+        std::to_string(has_mufu_computation ? 1 : 0) + '\n';
+    state_base += "sm_count=" + std::to_string(sm_count) + '\n';
+    state_base += "max_threads_per_sm=" +
+        std::to_string(max_threads_per_sm) + '\n';
+    state_base += "memory_bus_bits=" + std::to_string(memory_bus_bits) + '\n';
+    state_base += "memory_clock_khz=" +
+        std::to_string(memory_clock_khz) + '\n';
+
+    int64_t range_low = 1;
+    int64_t range_high = hard_max;
+    for (;;) {
+      const auto ranges = innerUnrollRanges(range_low, range_high);
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(ranges.size());
+      std::string native_choice;
+      const int64_t capped_native_target = jev_mode == scheduler::jev::Mode::Record
+          ? std::min(target_inner_unroll, hard_max)
+          : 0;
+      for (const auto& range : ranges) {
+        options.push_back(
+            {range.id,
+             "Inner unroll target in [" + std::to_string(range.low) +
+                 ", " + std::to_string(range.high) + "]"});
+        if (jev_mode == scheduler::jev::Mode::Record &&
+            range.low <= capped_native_target &&
+            capped_native_target <= range.high) {
+          native_choice = range.id;
+        }
+      }
+      const std::string state = state_base +
+          "range_low=" + std::to_string(range_low) + '\n' +
+          "range_high=" + std::to_string(range_high) + '\n';
+      const auto selected = scheduler::jev::chooseDecision(
+          "RD3.unroll", state, options, native_choice);
+      const auto selected_range = std::find_if(
+          ranges.begin(), ranges.end(), [&](const InnerUnrollRange& range) {
+            return range.id == selected;
+          });
+      NVF_ERROR(
+          selected_range != ranges.end(),
+          "RD3.unroll response is outside reduction bounds");
+      if (selected_range->low == selected_range->high) {
+        if (jev_mode == scheduler::jev::Mode::Remote) {
+          target_inner_unroll = selected_range->low;
+        }
+        break;
+      }
+      range_low = selected_range->low;
+      range_high = selected_range->high;
+    }
+  }
 
   // Empirical CTA size, both values allow thread uses 255 registers, so we
   // don't need to set maxrregcount which may affect occupancy since it is
