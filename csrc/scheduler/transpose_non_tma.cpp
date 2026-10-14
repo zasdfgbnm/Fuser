@@ -316,6 +316,54 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
       "combination of view op with small transpose dimensions are not "
       "supported by transpose scheduler");
 
+  // Choose a complete, square tile before the vector/unroll and CTA analyses.
+  // The smaller candidate is confined to untransformed original axes whose
+  // extents divide both tiles. All dependent parameters are recomputed below.
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::string state = "transpose.tile.v1\nshape=";
+    for (size_t i = 0; i < shape_in_ref1.size(); ++i) {
+      if (i != 0) {
+        state += ',';
+      }
+      state += std::to_string(shape_in_ref1[i]);
+    }
+    state += "\ninner1=" + std::to_string(inner_most_pos1_in_ref1);
+    state += "\ninner2=" + std::to_string(inner_most_pos2_in_ref1);
+    state += "\ntile1=" + std::to_string(tparams->tile_size1);
+    state += "\ntile2=" + std::to_string(tparams->tile_size2);
+    state += "\nsm_count=" + std::to_string(device_multiprocessor_count);
+    state += "\nn_elems=" + std::to_string(n_elems);
+    state += "\nhas_view=" + std::to_string(has_view);
+
+    const bool square_16_eligible =
+        !has_view && !utils::hasSmallTransposeDimensions(tparams) &&
+        tparams->tile_size1 == TransposeParams::getDefaultTileSize() &&
+        tparams->tile_size2 == TransposeParams::getDefaultTileSize() &&
+        shape_in_ref1[inner_most_pos1_in_ref1] >= 32 &&
+        shape_in_ref1[inner_most_pos2_in_ref1] >= 32 &&
+        shape_in_ref1[inner_most_pos1_in_ref1] % 32 == 0 &&
+        shape_in_ref1[inner_most_pos2_in_ref1] % 32 == 0 &&
+        n_elems / device_multiprocessor_count >= 32 * 32;
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"tile32", "Tile both transpose axes by 32"}};
+    if (square_16_eligible) {
+      options.push_back({"tile16", "Tile both transpose axes by 16"});
+    }
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR2.tile",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "tile32" : "");
+    if (selected == "tile16" && square_16_eligible) {
+      tparams->tile_size1 = 16;
+      tparams->tile_size2 = 16;
+    } else {
+      NVF_ERROR(
+          selected == "tile32",
+          "TR2.tile response is outside native hard bounds");
+    }
+  }
+
   // Note [vectorization and unroll of input and output]
   //
   // The choice of vectorization size, block size and tile sizes needs to be

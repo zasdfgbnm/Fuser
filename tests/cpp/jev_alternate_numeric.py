@@ -121,6 +121,57 @@ def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
     return fields
 
 
+def check_transpose_tile_dependency(report: dict[str, Any]
+                                    ) -> list[dict[str, str]]:
+    """Require the chosen tile to reach every downstream TR2 calculation."""
+    tr1 = [row for row in report["multiplicity"] if row["site"] == "TR1"]
+    if (len(tr1) != 1 or tr1[0]["record"] != tr1[0]["remote"] or
+            sum(tr1[0]["record"].values()) != 1):
+        raise ValueError(f"tile changed the native virtual-axis plan: {tr1}")
+
+    versions = {"TR2.unroll": "transpose.unroll_cap.v1",
+                "TR2.width1": "transpose.group_width.v1",
+                "TR2.width2": "transpose.group_width.v1",
+                "TR2.cta": "transpose.cta.v1"}
+    pairs: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    issues: list[dict[str, str]] = []
+    for site, version in versions.items():
+        before, after, replaced = paired_state_rows(report, site)
+        left, right = state_fields(before, version), state_fields(after, version)
+        if (left.get("tile1") != "32" or left.get("tile2") != "32" or
+                right.get("tile1") != "16" or right.get("tile2") != "16"):
+            raise ValueError(f"{site} did not rebuild for the selected tile")
+        if (len(before["record"]) != 1 or len(after["remote"]) != 1):
+            raise ValueError(f"{site} omitted a native or remote winner")
+        pairs[site] = (before, after)
+        issues.extend(replaced)
+
+    unroll_before, unroll_after = pairs["TR2.unroll"]
+    for site in ("TR2.width1", "TR2.width2"):
+        before, after = pairs[site]
+        for width_row, unroll_row in ((before, unroll_before),
+                                      (after, unroll_after)):
+            width_state = state_fields(width_row, versions[site])
+            cap = next(iter(unroll_row["record"] or unroll_row["remote"]))
+            if width_state["max_unroll_input"] != cap[1:]:
+                raise ValueError(f"{site} ignored the tile-dependent unroll cap")
+        left, right = state_fields(before, versions[site]), state_fields(
+            after, versions[site])
+        if (left["mapped_sizes"] != right["mapped_sizes"] or
+                left["group"] != right["group"]):
+            raise ValueError(f"{site} changed native contiguous-axis mapping")
+
+    for cta_row, side in ((pairs["TR2.cta"][0], "record"),
+                          (pairs["TR2.cta"][1], "remote")):
+        cta = state_fields(cta_row, versions["TR2.cta"])
+        for group in (1, 2):
+            width_row = pairs[f"TR2.width{group}"][0 if side == "record" else 1]
+            width = next(iter(width_row[side]))
+            if cta[f"width{group}"] != width[1:]:
+                raise ValueError("CTA plan ignored selected transpose width")
+    return issues
+
+
 IOP3_CTA_FIELDS = {
     "inner_dim", "outer_dim", "vector_width", "regs_buffer_bits",
     "tmp_dtype_bits", "warp_size", "sm_count", "max_threads_per_block",
@@ -598,7 +649,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_grid_rows: bool = False,
                            require_iop3_tmp_write: bool = False,
                            require_iop3_tmp_read: bool = False,
-                           require_iop3_inner_width: bool = False) -> dict[str, Any]:
+                           require_iop3_inner_width: bool = False,
+                           require_transpose_tile: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -618,7 +670,15 @@ def check_alternate_report(report: dict[str, Any],
                 "request_sha256": event["request_sha256"]}
     if intended not in issues:
         raise ValueError(f"missing intended winner mismatch: {issues}")
-    if site == "OP3.redu_unroll":
+    if require_transpose_tile:
+        if (site != "TR2.tile" or event["native"] != "tile32" or
+                alternate != "tile16" or
+                set(event["candidates"]) != {"tile32", "tile16"}):
+            raise ValueError("transpose fixture lacks its complete tile menu")
+        expected = [intended, *check_transpose_tile_dependency(report)]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected tile-dependent decisions: {issues}")
+    elif site == "OP3.redu_unroll":
         if event["native"] != "r1" or set(event["candidates"]) != {
                 "r1", "r2", "r4"}:
             raise ValueError("outer reduction fixture lacks its complete factor menu")
@@ -1664,6 +1724,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-iop3-tmp-write", action="store_true")
     parser.add_argument("--require-iop3-tmp-read", action="store_true")
     parser.add_argument("--require-iop3-inner-width", action="store_true")
+    parser.add_argument("--require-transpose-tile", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -1782,7 +1843,8 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_grid_rows=args.require_iop3_grid_rows,
             require_iop3_tmp_write=args.require_iop3_tmp_write,
             require_iop3_tmp_read=args.require_iop3_tmp_read,
-            require_iop3_inner_width=args.require_iop3_inner_width)
+            require_iop3_inner_width=args.require_iop3_inner_width,
+            require_transpose_tile=args.require_transpose_tile)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)

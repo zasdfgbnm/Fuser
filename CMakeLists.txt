@@ -1192,6 +1192,17 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_transpose_cta_64)
   set_tests_properties(jev_alternate_numeric_transpose_cta_64 PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_transpose_tile
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site TR2.tile --alternate tile16
+      --gtest TransposeTest.FusionScheduleTransposeTileChoice
+      --case-key jev_alternate_numeric_transpose_tile
+      --require-transpose-tile)
+  set_tests_properties(jev_alternate_numeric_transpose_tile PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(inner_persistent
     "Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA" "IP")
   add_jev_remote_numeric_test(outer_persistent
