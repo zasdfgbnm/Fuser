@@ -8,6 +8,7 @@
 #include "scheduler/normalization_inner_non_tma.h"
 
 #include <algorithm>
+#include <exception>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -2481,16 +2482,35 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
 
   auto alternate = std::make_unique<ReductionParams>(base);
   Inner3DPlanResources alternate_resources;
-  innerPersistentHeuristic3DPlan(
-      properties,
-      wave_cap,
-      alternate.get(),
-      &alternate_resources,
-      warp_target,
-      occupancy_target,
-      std::numeric_limits<int64_t>::max(),
-      -1,
-      false);
+  try {
+    innerPersistentHeuristic3DPlan(
+        properties,
+        wave_cap,
+        alternate.get(),
+        &alternate_resources,
+        warp_target,
+        occupancy_target,
+        std::numeric_limits<int64_t>::max(),
+        -1,
+        false);
+  } catch (const std::exception&) {
+    // Failure to materialize an optional plan cannot displace the proved
+    // native plan. In particular, never send an unproved singleton remotely.
+    if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP6.work_split", "alternate 3D work split failed planning");
+    }
+    return chooseInner3DOuterUnroll(
+        properties,
+        base,
+        wave_cap,
+        warp_target,
+        occupancy_target,
+        std::move(native),
+        native_resources,
+        device,
+        true);
+  }
 
   auto complete_plan = [](const ReductionParams& params,
                           const Inner3DPlanResources& resources) {
@@ -2528,6 +2548,22 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
           *native,
           alternate_resources,
           device);
+  if (!alternate_valid) {
+    if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP6.work_split", "no distinct, resource-valid 3D work split");
+    }
+    return chooseInner3DOuterUnroll(
+        properties,
+        base,
+        wave_cap,
+        warp_target,
+        occupancy_target,
+        std::move(native),
+        native_resources,
+        device,
+        true);
+  }
 
   std::vector<scheduler::jev::ChoiceOption> options = {{
       "unroll_first",
@@ -2536,16 +2572,14 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
           ", register cap=" +
           std::to_string(native_resources.registers_per_thread) +
           ", grid blocks=" + std::to_string(native_resources.grid_blocks)}};
-  if (alternate_valid) {
-    options.push_back({
-        "iter_first",
-        "Prioritize serial iterations; completed CTA=" +
-            std::to_string(alternate_resources.padded_threads_per_block) +
-            ", register cap=" +
-            std::to_string(alternate_resources.registers_per_thread) +
-            ", grid blocks=" +
-            std::to_string(alternate_resources.grid_blocks)});
-  }
+  options.push_back({
+      "iter_first",
+      "Prioritize serial iterations; completed CTA=" +
+          std::to_string(alternate_resources.padded_threads_per_block) +
+          ", register cap=" +
+          std::to_string(alternate_resources.registers_per_thread) +
+          ", grid blocks=" +
+          std::to_string(alternate_resources.grid_blocks)});
   const std::string state =
       "inner_persistent.3d_work_split.v1\nreduction_numel=" +
       std::to_string(properties.total_reduction_numel) +
