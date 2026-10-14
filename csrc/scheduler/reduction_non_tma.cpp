@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -951,8 +952,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     debug() << rparams->toString() << std::endl;
   }
 
-  // If 3d, check if it's supported by the scheduler, otherwise force 1D
-  // schedule
+  // A 3D plan cannot combine multiple reductions per CTA with a grid
+  // reduction. Keep this scheduler support check as a native hard gate.
   if (rparams->schedule_3d) {
     if (rparams->multiple_reds_per_blk &&
         (rparams->cross_grid_inner_reduction ||
@@ -969,6 +970,77 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           (int64_t)n_tensor_inputs,
           (int64_t)max_dtype_size_bit_for_vectorization,
           (int64_t)vectorize_factor,
+          has_mufu_computation);
+    }
+  }
+
+  // The same flattened 2D constructor above is also a legal alternative to a
+  // supported 3D plan: scheduleReduction canonicalizes all reduction axes to
+  // one axis when schedule_3d is false. Limit the alternative to shapes where
+  // even a 2D cross-grid plan cannot exceed BIDy, and to the native RD3
+  // Choice implementation's physical CTA and dtype bounds. The 3D default
+  // remains available outside that conservative subset.
+  const auto jev_mode = scheduler::jev::mode();
+  if (rparams->schedule_3d && jev_mode != scheduler::jev::Mode::Off) {
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const int64_t max_threads_per_block = dev_prop->maxThreadsPerBlock;
+    const int64_t max_threads_per_sm = dev_prop->maxThreadsPerMultiProcessor;
+    const int64_t sm_count = dev_prop->multiProcessorCount;
+    const bool flat2d_legal =
+        total_iteration_numel > 0 &&
+        total_iteration_numel <= scheduler_utils::y_grid_limit &&
+        512 <= max_threads_per_block &&
+        max_threads_per_block <= max_threads_per_sm &&
+        max_threads_per_sm <= 65536 && sm_count >= 1 && sm_count <= 65536 &&
+        max_dtype_size_bit_for_vectorization > 0 &&
+        max_dtype_size_bit_for_vectorization <= 128 &&
+        (max_dtype_size_bit_for_vectorization &
+         (max_dtype_size_bit_for_vectorization - 1)) == 0 &&
+        n_tensor_inputs > 0 &&
+        n_tensor_inputs <=
+            std::numeric_limits<int64_t>::max() /
+                max_dtype_size_bit_for_vectorization &&
+        vectorize_factor > 0 &&
+        vectorize_factor <= static_cast<size_t>(total_reduction_numel) &&
+        vectorize_factor <= static_cast<size_t>(std::max(
+            int64_t{1},
+            int64_t{128} / max_dtype_size_bit_for_vectorization));
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"3d", "Keep the native inner and outer reduction axes"}};
+    if (flat2d_legal) {
+      options.push_back(
+          {"flat2d", "Merge reduction axes into one native 2D plan"});
+    }
+    const std::string state =
+        "reduction.inner_mapping.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) +
+        "\niteration_numel=" + std::to_string(total_iteration_numel) +
+        "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
+        "\nlayout_width=" + std::to_string(vectorize_factor) +
+        "\nmax_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+        "\nhas_mufu=" + std::to_string(has_mufu_computation ? 1 : 0) +
+        "\nsm_count=" + std::to_string(sm_count) +
+        "\nmax_threads_per_sm=" +
+        std::to_string(max_threads_per_sm) +
+        "\nmax_threads_per_block=" +
+        std::to_string(max_threads_per_block) +
+        "\ny_grid_limit=" +
+        std::to_string(scheduler_utils::y_grid_limit);
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD4", state, options,
+        jev_mode == scheduler::jev::Mode::Record ? "3d" : "");
+    NVF_ERROR(
+        selected == "3d" || (flat2d_legal && selected == "flat2d"),
+        "RD4 response is outside the native mapping set");
+    if (selected == "flat2d") {
+      return inner2dReductionHeuristic(
+          total_reduction_numel,
+          total_iteration_numel,
+          n_tensor_inputs,
+          max_dtype_size_bit_for_vectorization,
+          static_cast<int64_t>(vectorize_factor),
           has_mufu_computation);
     }
   }
