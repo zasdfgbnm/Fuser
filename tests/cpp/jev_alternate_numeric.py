@@ -121,6 +121,48 @@ def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
     return fields
 
 
+RD5_WAVE_BASE_KEYS = (
+    "reduction_numel", "iteration_numel", "inner_numel", "n_tensor_inputs",
+    "max_dtype_bits", "vector_width", "sm_count", "max_threads_per_sm",
+    "max_threads_per_block",
+)
+
+
+def check_rd5_wave_dependency(
+        report: dict[str, Any], raw: dict[str, int | str],
+        logical_warps: tuple[int, int],
+        iteration_first: tuple[bool, bool]) -> list[dict[str, str]]:
+    """Validate wave requests rebuilt after an upstream RD5 decision."""
+    from jev_shim import (ValidationProblem, analyze_rd5_waves,
+                          parse_rd5_waves_state)
+
+    before, after, issues = paired_state_rows(report, "RD5.waves")
+    expected_raw = {key: int(raw[key]) for key in RD5_WAVE_BASE_KEYS}
+    for row, side, warp, first in (
+            (before, "record", logical_warps[0], iteration_first[0]),
+            (after, "remote", logical_warps[1], iteration_first[1])):
+        try:
+            state = parse_rd5_waves_state(row["request"]["state"])
+        except ValidationProblem as exc:
+            raise ValueError(f"invalid dependent RD5.waves state: {exc}") from exc
+        criteria = row["request"]["questions"]["RD5.waves"]["criteria"]
+        expected_criteria = {
+            f"waves{waves}": (
+                f"Cap target blocks at {waves} SM waves and target "
+                f"SM threads / {waves} per CTA")
+            for waves in state["hard_valid_waves"]}
+        native = analyze_rd5_waves(state)
+        if (row[side] != {"waves4": 1} or
+                state["logical_warp"] != warp or
+                state["iteration_first"] != first or
+                state["hard_valid_waves"] != (2, 4, 8) or
+                {key: state[key] for key in RD5_WAVE_BASE_KEYS} != expected_raw or
+                criteria != expected_criteria or
+                native.selected != "waves4" or native.native_waves != 4):
+            raise ValueError(f"RD5.waves omitted the selected upstream plan: {row}")
+    return issues
+
+
 def check_transpose_tile_dependency(report: dict[str, Any]
                                     ) -> list[dict[str, str]]:
     """Require the chosen tile to reach every downstream TR2 calculation."""
@@ -1284,6 +1326,8 @@ def check_alternate_report(report: dict[str, Any],
                 (4, 2, 2, 4) or
                 (plan.native_block_x, plan.alternate_block_x) != (16, 32)):
             raise ValueError("3D split did not reshape the complete CTA plan")
+        wave_issues = check_rd5_wave_dependency(
+            report, state, (8, 8), (False, True))
         before, after, dependent = paired_state_rows(report, "RD5.cta")
         left = parse_inner3d_cta_target_state(before["request"]["state"])
         right = parse_inner3d_cta_target_state(after["request"]["state"])
@@ -1310,7 +1354,8 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"unexpected {downstream} dependency: {rows}")
-        if sorted(issues, key=str) != sorted([intended, *dependent], key=str):
+        if sorted(issues, key=str) != sorted(
+                [intended, *wave_issues, *dependent], key=str):
             raise ValueError(f"unexpected 3D split dependencies: {issues}")
     elif require_inner3d_grid_wave:
         if (site != "RD5.grid" or event["native"] != "clean" or
@@ -1377,6 +1422,8 @@ def check_alternate_report(report: dict[str, Any],
             "reduction_numel", "iteration_numel", "inner_numel",
             "n_tensor_inputs", "max_dtype_bits", "vector_width",
             "sm_count", "max_threads_per_sm", "max_threads_per_block")}
+        wave_issues = check_rd5_wave_dependency(
+            report, common, (8, 4), (False, False))
         for row, side, choice, logical_warp, targets in (
                 (cta_record, "record", "t32", "8", range(8, 249, 8)),
                 (cta_remote, "remote", "t16", "4", range(4, 253, 4))):
@@ -1393,7 +1440,8 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"3D warp changed {dependent_site}: {rows}")
-        if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
+        if sorted(issues, key=str) != sorted(
+                [intended, *wave_issues, *cta_issues], key=str):
             raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
     elif require_inner_cta_envelope:
         if (site != "RD3.cta" or event["native"] != "t256" or

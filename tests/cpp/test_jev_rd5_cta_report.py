@@ -34,9 +34,9 @@ class Rd5WarpDependentCtaReportTest(unittest.TestCase):
     def test_replays_real_numeric_report(self) -> None:
         report, events, options = load_warp_report()
         summary = check_alternate_report(report, events, **options)
-        self.assertEqual(summary["record_events"], 5)
-        self.assertEqual(summary["remote_events"], 5)
-        self.assertEqual(summary["server_successes"], 5)
+        self.assertEqual(summary["record_events"], 6)
+        self.assertEqual(summary["remote_events"], 6)
+        self.assertEqual(summary["server_successes"], 6)
 
     def test_missing_duplicate_or_wrong_cta_plan_is_rejected(self) -> None:
         report, events, options = load_warp_report()
