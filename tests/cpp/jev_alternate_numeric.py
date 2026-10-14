@@ -369,7 +369,9 @@ def check_alternate_report(report: dict[str, Any],
                 ("IP6.occupancy", "inner_persistent.3d_occupancy_target.v1\n",
                  "inner_persistent.3d_occupancy_target.v2\n"),
                 ("IP6.warp", "inner_persistent.3d_warp_target.v1\n",
-                 "inner_persistent.3d_warp_target.v3\n")):
+                 "inner_persistent.3d_warp_target.v3\n"),
+                ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1\n",
+                 "inner_persistent.3d_outer_unroll.v1\n")):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == nested_site]
             record_only = [row for row in rows
@@ -380,6 +382,10 @@ def check_alternate_report(report: dict[str, Any],
                            not row["record"]]
             if len(rows) != 2 or len(record_only) != 1 or len(remote_only) != 1:
                 raise ValueError(f"expected one replaced {nested_site}: {rows}")
+            if nested_site == "IP6.outer_unroll" and (
+                    record_only[0]["record"] != {"u4": 1} or
+                    remote_only[0]["remote"] != {"u4": 1}):
+                raise ValueError("width unexpectedly changed outer unroll winner")
             for row, prefix, width in ((record_only[0], record_prefix, "4"),
                                        (remote_only[0], remote_prefix, "2")):
                 text = row["request"]["state"]
@@ -393,6 +399,12 @@ def check_alternate_report(report: dict[str, Any],
                     raise ValueError(f"{nested_site} omitted selected width: {fields}")
                 if width == "4" and nested_site == "IP6.waves" and fields.get(key) != width:
                     raise ValueError(f"{nested_site} omitted native width: {fields}")
+                if nested_site == "IP6.outer_unroll" and any(
+                        fields.get(name) != expected for name, expected in {
+                            "selected_wave_cap": "4",
+                            "selected_occupancy_target": "28",
+                            "selected_warp_target": "8"}.items()):
+                    raise ValueError(f"outer unroll used a different plan: {fields}")
             expected.extend((
                 {"kind": "record_only_state", "site": nested_site,
                  "request_sha256": record_only[0]["request_sha256"]},
