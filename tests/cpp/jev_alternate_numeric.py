@@ -446,6 +446,32 @@ def check_alternate_report(report: dict[str, Any],
                     *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
+    elif site == "RD3.grid":
+        if (event["native"] != "g2" or alternate != "g1" or
+                set(event["candidates"]) != {"g1", "g2"}):
+            raise ValueError("inner grid fixture lacks its two complete plans")
+        dependent = [row for row in report["multiplicity"]
+                     if row["site"] == "RD3.iter_unroll"]
+        if (len(dependent) != 1 or dependent[0]["record"] or
+                dependent[0]["remote"] != {"u1": 1}):
+            raise ValueError(f"expected one single-grid output choice: {dependent}")
+        fields = state_fields(dependent[0], "reduction.inner_iter_unroll.v1")
+        if (fields.get("iteration_numel") != "32" or
+                fields.get("bdimy") != "1" or
+                fields.get("pre_unroll_godim") != "32" or
+                fields.get("grid_reduction_factor") != "1" or
+                fields.get("max_grid_x") != str((1 << 31) - 1) or
+                dependent[0]["request"]["questions"]
+                    ["RD3.iter_unroll"]["criteria"] != {
+                        f"u{factor}":
+                            f"Unroll {factor} output(s) per thread in the completed block plan"
+                        for factor in (1, 2, 4)}):
+            raise ValueError("dependent output unroll does not follow grid g1")
+        expected = [intended, {
+            "kind": "remote_only_state", "site": "RD3.iter_unroll",
+            "request_sha256": dependent[0]["request_sha256"]}]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected inner grid comparison issues: {issues}")
     elif require_grid:
         if set(event["candidates"]) != {"warp16", "warp32"}:
             raise ValueError("outer warp test did not reach both hard-valid plans")
