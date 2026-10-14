@@ -110,7 +110,43 @@ def check_alternate_report(report: dict[str, Any],
                 "request_sha256": event["request_sha256"]}
     if intended not in issues:
         raise ValueError(f"missing intended winner mismatch: {issues}")
-    if site == "OP3.unroll":
+    if site == "OP3.redu_unroll":
+        if event["native"] != "r1" or set(event["candidates"]) != {
+                "r1", "r2", "r4"}:
+            raise ValueError("outer reduction fixture lacks its complete factor menu")
+        dependent = []
+        for nested_site, record_tag, remote_tag in (
+                ("OP3.unroll", "outer_persistent.iter_unroll.v1\n",
+                 "outer_persistent.iter_unroll.v2\n"),
+                ("OP3.cta", "outer_persistent.block_cta.v1\n",
+                 "outer_persistent.block_cta.v3\n")):
+            rows = [entry for entry in report["multiplicity"]
+                    if entry["site"] == nested_site]
+            record_only = [entry for entry in rows
+                           if sum(entry["record"].values()) == 1 and
+                           not entry["remote"]]
+            remote_only = [entry for entry in rows
+                           if sum(entry["remote"].values()) == 1 and
+                           not entry["record"]]
+            if len(rows) != 2 or len(record_only) != 1 or len(remote_only) != 1:
+                raise ValueError(f"expected exactly one replaced {nested_site}: {rows}")
+            if (not record_only[0]["request"]["state"].startswith(record_tag) or
+                    not remote_only[0]["request"]["state"].startswith(remote_tag)):
+                raise ValueError(f"{nested_site} did not use dependent state versions")
+            fields = dict(line.split("=", 1) for line in
+                          remote_only[0]["request"]["state"].splitlines()[1:])
+            if (fields.get("redu_unroll") != alternate[1:] or
+                    (nested_site == "OP3.cta" and fields.get("iter_unroll") != "1")):
+                raise ValueError(f"{nested_site} did not receive {alternate}: {fields}")
+            dependent.extend((
+                {"kind": "record_only_state", "site": nested_site,
+                 "request_sha256": record_only[0]["request_sha256"]},
+                {"kind": "remote_only_state", "site": nested_site,
+                 "request_sha256": remote_only[0]["request_sha256"]},
+            ))
+        if sorted(issues, key=str) != sorted([intended, *dependent], key=str):
+            raise ValueError(f"unexpected dependent reduction issues: {issues}")
+    elif site == "OP3.unroll":
         # The selected iteration factor changes the valid CTA menu, so the
         # downstream OP3.cta request must be replaced rather than compared
         # under the old state hash.

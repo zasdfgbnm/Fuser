@@ -218,16 +218,6 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
   };
   NormOuterParams params;
 
-  // set redu_unroll_factor
-  // This controls unroll along the reduction dimension.
-  // For case InstanceNormFP32 of [256, 28, 28, 128], if unroll 2, register
-  // usage increased from 89 to 118 but the occupancy is not changed. However,
-  // the bandwidth is dropped from 1029 GB/s to 840 GB/s due to more stalled
-  // warps. Unroll by 4 increased performance for some cases but has regression
-  // in many others. So we set redu_unroll_factor to 1.
-  params.redu_unroll_factor.set(1l);
-  params.redu_unroll_factor.finalize();
-
   // The seed TIDx is a performance preference. Every offered seed is expanded
   // to a complete block plan and checked against the native register bound.
   struct BlockPlan {
@@ -236,17 +226,20 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     int64_t batches_per_block;
     int64_t gdimx;
   };
-  const int64_t batches_per_block_min = std::min(8l, total_reduction_numel);
   const int64_t min_threads_in_block = 128l;
   const int64_t max_threads_in_block = 256l;
-  const auto make_block_plan = [&](int64_t seed_bdimx, int64_t iter_unroll)
+  const auto make_block_plan = [&](int64_t seed_bdimx, int64_t iter_unroll,
+                                   int64_t redu_unroll)
       -> std::optional<BlockPlan> {
-    if (seed_bdimx < 1 || iter_unroll < 1 ||
+    if (seed_bdimx < 1 || iter_unroll < 1 || redu_unroll < 1 ||
+        redu_unroll > total_reduction_numel ||
+        total_reduction_numel % redu_unroll != 0 ||
         seed_bdimx > max_multi_reduction_factor / iter_unroll ||
         device_warp_size % seed_bdimx != 0) {
       return std::nullopt;
     }
-    const int64_t after_unroll = total_reduction_numel;
+    const int64_t after_unroll = total_reduction_numel / redu_unroll;
+    const int64_t batches_per_block_min = std::min(8l, after_unroll);
     const int64_t bdimy_max = std::min(
         ceilDiv(after_unroll, batches_per_block_min),
         max_threads_in_block / seed_bdimx);
@@ -296,12 +289,65 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
         std::to_string(plan.batches_per_block);
   };
 
+  const auto jev_mode = scheduler::jev::mode();
+  // Reduction unrolling is an empirical choice. The old factor of one was
+  // selected after measured regressions at two and four, not by a scheduling
+  // constraint. Each offered factor divides the reduction and has a complete
+  // one-SM block plan for the native iteration factor of one. The chosen
+  // factor is applied before either downstream Choice menu is constructed.
+  int64_t selected_redu_unroll = 1;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t factor : {1l, 2l, 4l}) {
+      if (factor > total_reduction_numel ||
+          total_reduction_numel % factor != 0) {
+        continue;
+      }
+      bool has_complete_plan = false;
+      for (int64_t seed = 1;
+           seed <= std::min(max_multi_reduction_factor, device_warp_size);
+           seed *= 2) {
+        if (make_block_plan(seed, 1, factor).has_value()) {
+          has_complete_plan = true;
+          break;
+        }
+      }
+      if (has_complete_plan) {
+        options.push_back({
+            "r" + std::to_string(factor),
+            "Unroll " + std::to_string(factor) +
+                " reduction elements per thread with a complete block plan"});
+      }
+    }
+    NVF_ERROR(!options.empty(), "No legal outer persistent reduction factor");
+    const std::string state =
+        "outer_persistent.redu_unroll.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) + "\niteration_numel=" +
+        std::to_string(total_iteration_numel) + "\nvector_width=" +
+        std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+        std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
+        std::to_string(device_warp_size) + "\nregister_file_bits=" +
+        std::to_string(scheduler_utils::register_file_size_bit);
+    const std::string choice = scheduler::jev::chooseDecision(
+        "OP3.redu_unroll",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "r1" : "");
+    const auto option_it = std::find_if(
+        options.begin(),
+        options.end(),
+        [&](const auto& option) { return option.id == choice; });
+    NVF_ERROR(option_it != options.end(), "Unknown outer persistent reduction factor");
+    selected_redu_unroll = std::stoll(choice.substr(1));
+  }
+  params.redu_unroll_factor.set(selected_redu_unroll);
+  params.redu_unroll_factor.finalize();
+
   // The analyzed vector width is the alignment bound. The additional
   // divisibility check keeps every offered vectorized iteration tile complete.
   // A factor is offered only if some complete CTA plan fits one SM's register
   // budget. The model chooses a factor before the selected factor's OP3.cta
   // request is formed, so speculative plans never produce nested Choice logs.
-  const auto jev_mode = scheduler::jev::mode();
   int64_t selected_iter_unroll = 1;
   if (jev_mode != scheduler::jev::Mode::Off) {
     std::vector<scheduler::jev::ChoiceOption> options;
@@ -318,7 +364,8 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
            seed <= std::min(
                max_multi_reduction_factor / factor, device_warp_size);
            seed *= 2) {
-        if (make_block_plan(seed, factor).has_value()) {
+        if (make_block_plan(
+                seed, factor, params.redu_unroll_factor.get()).has_value()) {
           has_complete_plan = true;
           break;
         }
@@ -333,7 +380,11 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     }
     NVF_ERROR(!options.empty(), "No legal outer persistent iteration factor");
     const std::string state =
-        "outer_persistent.iter_unroll.v1\nreduction_numel=" +
+        (params.redu_unroll_factor.get() == 1
+             ? "outer_persistent.iter_unroll.v1\n"
+             : "outer_persistent.iter_unroll.v2\nredu_unroll=" +
+                   std::to_string(params.redu_unroll_factor.get()) + "\n") +
+        "reduction_numel=" +
         std::to_string(total_reduction_numel) + "\niteration_numel=" +
         std::to_string(total_iteration_numel) + "\nvector_width=" +
         std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
@@ -390,7 +441,9 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
           tmp_bdimx * params.iter_unroll_factor.get());
     }
     selected_plan = make_block_plan(
-        tmp_bdimx, params.iter_unroll_factor.get());
+        tmp_bdimx,
+        params.iter_unroll_factor.get(),
+        params.redu_unroll_factor.get());
     NVF_ERROR(selected_plan.has_value(), "Invalid native outer persistent block plan");
   }
 
@@ -400,7 +453,10 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     for (int64_t seed = 1;
          seed <= std::min(bdimx_max, device_warp_size);
          seed *= 2) {
-      auto plan = make_block_plan(seed, params.iter_unroll_factor.get());
+      auto plan = make_block_plan(
+          seed,
+          params.iter_unroll_factor.get(),
+          params.redu_unroll_factor.get());
       if (!plan.has_value()) {
         continue;
       }
@@ -422,11 +478,18 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     }
     NVF_ERROR(!options.empty(), "No legal outer persistent block plan");
     const std::string state =
-        (params.iter_unroll_factor.get() == 1
-             ? "outer_persistent.block_cta.v1\n"
-             : "outer_persistent.block_cta.v2\niter_unroll=" +
+        (params.redu_unroll_factor.get() > 1
+             ? "outer_persistent.block_cta.v3\nredu_unroll=" +
+                   std::to_string(params.redu_unroll_factor.get()) +
+                   "\niter_unroll=" +
                    std::to_string(params.iter_unroll_factor.get()) +
-                   "\nvector_width=" + std::to_string(vectorize_factor) + "\n") +
+                   "\nvector_width=" + std::to_string(vectorize_factor) + "\n"
+             : params.iter_unroll_factor.get() == 1
+                 ? "outer_persistent.block_cta.v1\n"
+                 : "outer_persistent.block_cta.v2\niter_unroll=" +
+                       std::to_string(params.iter_unroll_factor.get()) +
+                       "\nvector_width=" + std::to_string(vectorize_factor) +
+                       "\n") +
         "reduction_numel=" +
         std::to_string(total_reduction_numel) + "\niteration_numel=" +
         std::to_string(total_iteration_numel) + "\npersistent_buffer_bits=" +

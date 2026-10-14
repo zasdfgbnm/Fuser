@@ -1253,6 +1253,16 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_outer_iter_unroll)
   set_tests_properties(jev_alternate_numeric_outer_iter_unroll PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_redu_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.redu_unroll --alternate r2
+      --gtest Gpu3Test.JevAlternateOuterIterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_redu_unroll)
+  set_tests_properties(jev_alternate_numeric_outer_redu_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()
