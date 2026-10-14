@@ -109,7 +109,41 @@ def check_alternate_report(report: dict[str, Any],
                 "request_sha256": event["request_sha256"]}
     if intended not in issues:
         raise ValueError(f"missing intended winner mismatch: {issues}")
-    if require_grid:
+    if site == "OP2.base":
+        # The alternate base must produce one different dependent tail state
+        # on each run. The comparator has already checked each remote tail
+        # answer against the API server; require the expected one-for-one
+        # replacement and exact base coordinates rather than hiding it.
+        tails = [entry for entry in report["multiplicity"]
+                 if entry["site"] == "OP2.tail"]
+        record_tail = [entry for entry in tails
+                       if sum(entry["record"].values()) == 1 and not entry["remote"]]
+        remote_tail = [entry for entry in tails
+                       if sum(entry["remote"].values()) == 1 and not entry["record"]]
+        if len(tails) != 2 or len(record_tail) != 1 or len(remote_tail) != 1:
+            raise ValueError(f"expected exactly one replaced OP2.tail request: {tails}")
+        for entry, base_id in ((record_tail[0], event["native"]),
+                               (remote_tail[0], alternate)):
+            match = re.fullmatch(r"x([0-9]+)_y([0-9]+)_b([0-9]+)", base_id)
+            if match is None:
+                raise ValueError(f"invalid OP2.base Choice ID: {base_id}")
+            x, y, bx = map(int, match.groups())
+            state = dict(line.split("=", 1) for line in
+                         entry["request"]["state"].splitlines()[1:])
+            actual = tuple(int(state[key]) for key in
+                           ("base_gdimx", "base_gdimy", "base_bdimx",
+                            "base_bdimy"))
+            if actual != (x, y, bx, 256 // bx):
+                raise ValueError(f"OP2.tail does not follow {base_id}: {actual}")
+        expected = [intended,
+            {"kind": "record_only_state", "site": "OP2.tail",
+             "request_sha256": record_tail[0]["request_sha256"]},
+            {"kind": "remote_only_state", "site": "OP2.tail",
+             "request_sha256": remote_tail[0]["request_sha256"]},
+        ]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected decision comparison issues: {issues}")
+    elif require_grid:
         if set(event["candidates"]) != {"warp16", "warp32"}:
             raise ValueError("outer warp test did not reach both hard-valid plans")
         allowed = {site, "RD9.stride", "RD8"}
