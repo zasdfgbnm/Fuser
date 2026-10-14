@@ -1287,6 +1287,17 @@ if(BUILD_TEST)
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric")
   set_tests_properties(jev_alternate_numeric_inner_grid PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_cta_envelope
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD3.cta --alternate t64
+      --gtest Gpu1Test.JevAlternateInnerCtaEnvelope_CUDA
+      --case-key jev_alternate_numeric_inner_cta_envelope
+      --require-inner-cta-envelope)
+  set_tests_properties(jev_alternate_numeric_inner_cta_envelope PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_iter_unroll
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

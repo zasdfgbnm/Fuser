@@ -584,6 +584,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_grid_base: bool = False,
                            require_inner_iter_unroll: bool = False,
                            require_inner_warp_target: bool = False,
+                           require_inner_cta_envelope: bool = False,
                            require_inner3d_warp_target: bool = False,
                            require_inner3d_cta_target: bool = False,
                            require_inner_width: bool = False,
@@ -1025,6 +1026,62 @@ def check_alternate_report(report: dict[str, Any],
                 raise ValueError(f"3D warp changed {dependent_site}: {rows}")
         if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
             raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
+    elif require_inner_cta_envelope:
+        if (site != "RD3.cta" or event["native"] != "t256" or
+                alternate != "t64" or set(event["candidates"]) !=
+                {"t64", "t128", "t256", "t512", "t1024"}):
+            raise ValueError("short 2D fixture lacks its complete CTA menu")
+        cta = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "reduction.inner_cta.v2")
+        if any(cta.get(key) != value for key, value in {
+                "reduction_numel": "64", "iteration_numel": "1024",
+                "warp_size": "32", "max_threads_per_block": "1024",
+                "max_threads_dim_y": "1024",
+                "max_grid_x": str((1 << 31) - 1)}.items()):
+            raise ValueError(f"CTA did not receive the short 2D plan: {cta}")
+        after_vect = 64 // int(cta["vector_width"])
+        if (64 % int(cta["vector_width"]) or after_vect > 64 or
+                int(cta["target_inner_unroll"]) < 1):
+            raise ValueError("short CTA fixture changed the selected width/unroll")
+        warp_rows = [row for row in report["multiplicity"]
+                     if row["site"] == "RD3.warp"]
+        if len(warp_rows) != 1 or not warp_rows[0]["record"] or warp_rows[0]["remote"]:
+            raise ValueError(f"expected only the native bounded warp plan: {warp_rows}")
+        warp_fields = state_fields(warp_rows[0],
+                                   "reduction.inner_warp_target.v1")
+        if (warp_fields.get("target_threads_per_block") != "256" or
+                warp_fields.get("after_vect") != str(after_vect)):
+            raise ValueError("native warp state ignored its CTA target")
+        expected = [intended, {"kind": "record_only_state", "site": "RD3.warp",
+                               "request_sha256": warp_rows[0]["request_sha256"]}]
+        for nested_site, tag in (
+                ("RD3.grid", "reduction.inner_grid.v1"),
+                ("RD3.iter_unroll", "reduction.inner_iter_unroll.v1")):
+            before, after, pair_issues = paired_state_rows(report, nested_site)
+            expected.extend(pair_issues)
+            for row, side, target in ((before, "record", 256),
+                                      (after, "remote", 64)):
+                fields = state_fields(row, tag)
+                bdimy = target // after_vect
+                godim = (1024 + bdimy - 1) // bdimy
+                checked = ({"godim": str(godim), "inner_remainder": "1"}
+                           if nested_site == "RD3.grid" else
+                           {"iteration_numel": "1024", "bdimy": str(bdimy),
+                            "pre_unroll_godim": str(godim),
+                            "grid_reduction_factor": "1"})
+                if (row[side] != {"g1" if nested_site == "RD3.grid" else
+                                 "u1": 1} or
+                        any(fields.get(key) != value
+                            for key, value in checked.items())):
+                    raise ValueError(f"{nested_site} ignored selected CTA {target}: {row}")
+        for row in report["multiplicity"]:
+            if row["site"] not in {site, "RD3.warp", "RD3.grid",
+                                   "RD3.iter_unroll"} and (
+                    row["record"] != row["remote"] or
+                    sum(row["record"].values()) != 1):
+                raise ValueError(f"unrelated decision changed: {row}")
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected short CTA dependencies: {issues}")
     elif require_inner_warp_target:
         if (site != "RD3.warp" or event["native"] != "m8" or
                 alternate != "m16" or
@@ -1593,6 +1650,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner-iter-unroll", action="store_true")
     parser.add_argument("--require-inner-warp-target", action="store_true")
+    parser.add_argument("--require-inner-cta-envelope", action="store_true")
     parser.add_argument("--require-inner3d-warp-target", action="store_true")
     parser.add_argument("--require-inner3d-cta-target", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
@@ -1711,6 +1769,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner_targets=args.require_inner_targets,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
             require_inner_warp_target=args.require_inner_warp_target,
+            require_inner_cta_envelope=args.require_inner_cta_envelope,
             require_inner3d_warp_target=args.require_inner3d_warp_target,
             require_inner3d_cta_target=args.require_inner3d_cta_target,
             require_inner_width=args.require_inner_width,

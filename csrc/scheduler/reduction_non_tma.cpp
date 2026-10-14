@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,6 +67,71 @@ struct InnerUnrollRange {
   int64_t high;
   std::string id;
 };
+
+// A short 2D reduction is wholly covered by its CTA x dimension. Rebuild the
+// complete block and output-grid plan for an enlarged CTA target. The native
+// remainder scan then has no work and RD3.grid has only g1; later output
+// unrolling can only shrink the grid. Keep the original 128/256/floor menu for
+// shapes outside this provable domain.
+struct ShortInnerCtaPlan {
+  int64_t block_x;
+  int64_t block_y;
+  int64_t padded_block_x;
+  int64_t output_grid;
+  int64_t physical_grid_x;
+  bool split_grid_x;
+};
+
+std::optional<ShortInnerCtaPlan> shortInnerCtaPlan(
+    int64_t reduction_numel,
+    int64_t iteration_numel,
+    int64_t vector_width,
+    int64_t target_inner_unroll,
+    int64_t target_threads_per_block,
+    int64_t warp_size,
+    int64_t max_threads_per_block,
+    int64_t max_threads_dim_y) {
+  if (reduction_numel < 1 || iteration_numel < 1 || vector_width < 1 ||
+      reduction_numel % vector_width != 0 || target_inner_unroll < 1 ||
+      warp_size != 32 || max_threads_per_block < 512 ||
+      max_threads_per_block > 1024 || target_threads_per_block < 64 ||
+      target_threads_per_block > max_threads_per_block ||
+      max_threads_dim_y < 1) {
+    return std::nullopt;
+  }
+  const int64_t after_vect = reduction_numel / vector_width;
+  if (after_vect > 64 || after_vect > target_threads_per_block) {
+    return std::nullopt;
+  }
+
+  // Replaying the native seed: x=after_vect, inner_unroll=1, and the
+  // reduction remainder is one. Neither the logical minimum warp target nor
+  // the remainder Choice can change these values for this domain.
+  const int64_t block_x = after_vect;
+  const int64_t block_y =
+      std::min(iteration_numel, target_threads_per_block / block_x);
+  if (block_y < 1 || block_y > max_threads_dim_y) {
+    return std::nullopt;
+  }
+  const bool pad_x =
+      block_x > 16 && block_x * block_y < max_threads_per_block;
+  const int64_t padded_x =
+      pad_x ? ceilDiv(block_x, warp_size) * warp_size : block_x;
+  if (padded_x * block_y > max_threads_per_block) {
+    return std::nullopt;
+  }
+  const int64_t godim = ceilDiv(iteration_numel, block_y);
+  if (godim < 1 || scheduler_utils::x_grid_limit < 1) {
+    return std::nullopt;
+  }
+  return ShortInnerCtaPlan{
+      block_x,
+      block_y,
+      padded_x,
+      godim,
+      std::min(godim, scheduler_utils::x_grid_limit),
+      godim > scheduler_utils::x_grid_limit};
+}
 
 std::vector<InnerUnrollRange> innerUnrollRanges(int64_t low, int64_t high) {
   NVF_ERROR(low >= 1 && high >= low);
@@ -379,13 +445,11 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
         min_threads_per_block);
   }
 
+  std::optional<ShortInnerCtaPlan> selected_short_cta_plan;
   if (jev_mode != scheduler::jev::Mode::Off) {
-    // Both empirical starting points are at most half the physical block
-    // limit on supported devices. The occupancy floor has the same bound.
-    // This leaves room for native warp padding below (< 2x the unpadded
-    // thread count). Native bdimx, bdimy, remainder and grid calculations
-    // still run for the chosen target. A cross-grid plan has godim <= SM/2,
-    // below the BIDy limit on the supported SM-count range.
+    // Keep both existing performance policies in the menu. Short reductions
+    // can additionally offer targets on either side of the occupancy floor:
+    // their entire remainder, block and grid plan is checked above.
     NVF_ERROR(
         max_threads_per_block >= 512 && total_iteration_numel >= 1 &&
             target_threads_per_sm >= 1 && sm_count >= 1,
@@ -402,16 +466,51 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
                      " threads per CTA before native remainder and grid planning"});
       }
     }
+    for (int64_t candidate : {int64_t{64}, int64_t{512}, int64_t{1024}}) {
+      if (!shortInnerCtaPlan(
+              total_reduction_numel,
+              total_iteration_numel,
+              vect_factor,
+              target_inner_unroll,
+              candidate,
+              threads_per_warp,
+              max_threads_per_block,
+              dev_prop->maxThreadsDim[1])) {
+        continue;
+      }
+      const std::string id = "t" + std::to_string(candidate);
+      if (std::none_of(options.begin(), options.end(), [&](const auto& option) {
+            return option.id == id;
+          })) {
+        options.push_back(
+            {id,
+             "Use a complete short-reduction plan with a " +
+                 std::to_string(candidate) + "-thread CTA target"});
+      }
+    }
+    std::sort(options.begin(), options.end(), [](const auto& lhs, const auto& rhs) {
+      return std::stoll(lhs.id.substr(1)) < std::stoll(rhs.id.substr(1));
+    });
 
-    std::string state = "reduction.inner_cta.v1\n";
+    std::string state = "reduction.inner_cta.v2\n";
+    state += "reduction_numel=" +
+        std::to_string(total_reduction_numel) + '\n';
     state += "iteration_numel=" +
         std::to_string(total_iteration_numel) + '\n';
+    state += "vector_width=" + std::to_string(vect_factor) + '\n';
+    state += "target_inner_unroll=" +
+        std::to_string(target_inner_unroll) + '\n';
+    state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
     state += "has_mufu=" + std::to_string(has_mufu_computation ? 1 : 0) + '\n';
     state += "sm_count=" + std::to_string(sm_count) + '\n';
     state += "max_threads_per_sm=" +
         std::to_string(max_threads_per_sm) + '\n';
     state += "max_threads_per_block=" +
         std::to_string(max_threads_per_block) + '\n';
+    state += "max_threads_dim_y=" +
+        std::to_string(dev_prop->maxThreadsDim[1]) + '\n';
+    state += "max_grid_x=" +
+        std::to_string(scheduler_utils::x_grid_limit) + '\n';
     const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
         ? "t" + std::to_string(target_threads_per_block)
         : std::string();
@@ -425,10 +524,21 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
         break;
       }
     }
-    NVF_ERROR(matched, "RD3.cta response exceeds the native CTA target set");
+    NVF_ERROR(matched, "RD3.cta response exceeds the preflighted CTA set");
+    selected_short_cta_plan = shortInnerCtaPlan(
+        total_reduction_numel,
+        total_iteration_numel,
+        vect_factor,
+        target_inner_unroll,
+        target_threads_per_block,
+        threads_per_warp,
+        max_threads_per_block,
+        dev_prop->maxThreadsDim[1]);
     NVF_ERROR(
-        target_threads_per_block <= max_threads_per_block / 2,
-        "RD3.cta target exceeds half the physical block limit");
+        target_threads_per_block <= max_threads_per_block &&
+            (target_threads_per_block <= max_threads_per_block / 2 ||
+             selected_short_cta_plan.has_value()),
+        "RD3.cta target exceeds the preflighted physical block limit");
   }
 
   // RD3.warp chooses the empirical minimum number of reduction threads used
@@ -630,6 +740,17 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
 
   // Put what is left to godim
   godim = ceilDiv(ceilDiv(total_iteration_numel, bdimy), outer_unroll);
+  if (selected_short_cta_plan) {
+    NVF_ERROR(
+        bdimx == selected_short_cta_plan->block_x &&
+            bdimy == selected_short_cta_plan->block_y &&
+            inner_unroll == 1 && getInnerRemainder() == 1 &&
+            godim == selected_short_cta_plan->output_grid &&
+            selected_short_cta_plan->physical_grid_x >= 1 &&
+            selected_short_cta_plan->split_grid_x ==
+                (godim > scheduler_utils::x_grid_limit),
+        "RD3.cta selected plan differs from the native remainder/grid plan");
+  }
 
   // When iteration dim is small, may have unused SMs, to increase SM usage
   // needs to shift from block reduction to grid reduction.
@@ -771,6 +892,12 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     bdimx = bdimx % min_warp_size == 0
         ? bdimx
         : bdimx + min_warp_size - bdimx % min_warp_size;
+  }
+  if (selected_short_cta_plan) {
+    NVF_ERROR(
+        grdim == 1 && bdimx == selected_short_cta_plan->padded_block_x &&
+            bdimx * bdimy <= max_threads_per_block,
+        "RD3.cta selected plan violates the physical CTA or grid bound");
   }
   rparams->unroll_factor_inner_reduction = vect_factor;
   rparams->unroll_factor_top_of_vectorization = inner_unroll;
