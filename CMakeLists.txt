@@ -903,7 +903,7 @@ function(add_test_without_main TEST_NAME TEST_SRC ADDITIONAL_LINK)
   endif()
 endfunction()
 
-function(add_test TEST_NAME TEST_SRC ADDITIONAL_LINK)
+function(add_nvfuser_test TEST_NAME TEST_SRC ADDITIONAL_LINK)
   list(APPEND ADDITIONAL_LINK "GTest::gtest_main")
   add_test_without_main("${TEST_NAME}" "${TEST_SRC}" "${ADDITIONAL_LINK}")
 
@@ -935,17 +935,18 @@ function(add_isolated_test TEST_NAME TEST_SRC ADDITIONAL_LINK)
       "Expected: ${TEST_NAME}.cpp")
   endif()
 
-  # Call the standard add_test function
+  # Call the standard nvFuser test executable helper
   message(STATUS "Creating isolated test: ${TEST_NAME} with single source: ${TEST_SRC}")
-  add_test("${TEST_NAME}" "${TEST_SRC}" "${ADDITIONAL_LINK}")
+  add_nvfuser_test("${TEST_NAME}" "${TEST_SRC}" "${ADDITIONAL_LINK}")
 endfunction()
 
 if(BUILD_TEST)
+  enable_testing()
   set(TEST_BINARIES)
-  add_test(test_nvfuser "${JIT_TEST_SRCS}" "")
+  add_nvfuser_test(test_nvfuser "${JIT_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_nvfuser)
 
-  add_test(test_rng ${NVFUSER_ROOT}/tests/cpp/test_rng.cpp ${RNG_TEST_KERNELS})
+  add_nvfuser_test(test_rng ${NVFUSER_ROOT}/tests/cpp/test_rng.cpp ${RNG_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_rng)
 
   set(ARGSORT_TEST_SRCS)
@@ -953,7 +954,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_argsort.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_argsort_device_func.cpp
   )
-  add_test(test_argsort "${ARGSORT_TEST_SRCS}" ${ARGSORT_TEST_KERNELS})
+  add_nvfuser_test(test_argsort "${ARGSORT_TEST_SRCS}" ${ARGSORT_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_argsort)
 
   set(SCAN_TEST_SRCS)
@@ -961,7 +962,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_scan.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_scan_device_func.cpp
   )
-  add_test(test_scan "${SCAN_TEST_SRCS}" ${SCAN_TEST_KERNELS})
+  add_nvfuser_test(test_scan "${SCAN_TEST_SRCS}" ${SCAN_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_scan)
 
   set(CLUSTER_TEST_SRCS)
@@ -969,7 +970,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_cluster.cpp
     ${NVFUSER_ROOT}/tests/cpp/cluster_runtime_test/test_cluster_device_func.cpp
   )
-  add_test(test_cluster "${CLUSTER_TEST_SRCS}" ${CLUSTER_TEST_KERNELS})
+  add_nvfuser_test(test_cluster "${CLUSTER_TEST_SRCS}" ${CLUSTER_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_cluster)
 
   set(TOPK_TEST_SRCS)
@@ -977,14 +978,14 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_topk.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_topk_device_func.cpp
   )
-  add_test(test_topk "${TOPK_TEST_SRCS}" ${TOPK_TEST_KERNELS})
+  add_nvfuser_test(test_topk "${TOPK_TEST_SRCS}" ${TOPK_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_topk)
 
   set(MOE_TEST_SRCS)
   list(APPEND MOE_TEST_SRCS
     ${NVFUSER_ROOT}/tests/cpp/test_moe.cpp
   )
-  add_test(test_moe "${MOE_TEST_SRCS}" "")
+  add_nvfuser_test(test_moe "${MOE_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_moe)
 
   set(MULTIDEVICE_TEST_SRCS)
@@ -1022,10 +1023,10 @@ if(BUILD_TEST)
   add_test_without_main(test_multidevice_tutorial "${MULTIDEVICE_TUTORIAL_SRCS}" "")
   list(APPEND TEST_BINARIES test_multidevice_tutorial)
 
-  add_test(test_reshape "${NVFUSER_ROOT}/tests/cpp/test_reshape.cpp" "")
+  add_nvfuser_test(test_reshape "${NVFUSER_ROOT}/tests/cpp/test_reshape.cpp" "")
   list(APPEND TEST_BINARIES test_reshape)
 
-  add_test(test_layout_op ${NVFUSER_ROOT}/tests/cpp/test_layout_op.cpp "")
+  add_nvfuser_test(test_layout_op ${NVFUSER_ROOT}/tests/cpp/test_layout_op.cpp "")
   list(APPEND TEST_BINARIES test_layout_op)
 
   # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1058,13 +1059,13 @@ if(BUILD_TEST)
       ${NVFUSER_ROOT}/tests/cpp/test_cutlass_scheduler.cpp
     )
   endif()
-  add_test(test_matmul "${MATMUL_TEST_SRCS}" "")
+  add_nvfuser_test(test_matmul "${MATMUL_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_matmul)
 
-  add_test(test_greedy "${NVFUSER_ROOT}/tests/cpp/test_greedy.cpp" "")
+  add_nvfuser_test(test_greedy "${NVFUSER_ROOT}/tests/cpp/test_greedy.cpp" "")
   list(APPEND TEST_BINARIES test_greedy)
 
-  add_test(test_external_src "${NVFUSER_ROOT}/tests/cpp/test_external_src.cpp" "")
+  add_nvfuser_test(test_external_src "${NVFUSER_ROOT}/tests/cpp/test_external_src.cpp" "")
   list(APPEND TEST_BINARIES test_external_src)
 
   set(TUTORIAL_SRCS)
@@ -1073,7 +1074,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/tutorial_cute_tv_layout.cpp
     ${NVFUSER_ROOT}/tests/cpp/tutorial_tmem.cpp
     ${NVFUSER_ROOT}/tests/cpp/tutorial_ldmatrix_stmatrix.cpp)
-  add_test(test_tutorial "${TUTORIAL_SRCS}" "")
+  add_nvfuser_test(test_tutorial "${TUTORIAL_SRCS}" "")
   list(APPEND TEST_BINARIES test_tutorial)
 
   set(HOSTIR_TEST_SRCS)
@@ -1083,21 +1084,21 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_host_ir_stream_lowering.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_host_irs.cpp
   )
-  add_test(test_host_ir "${HOSTIR_TEST_SRCS}" "")
+  add_nvfuser_test(test_host_ir "${HOSTIR_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_host_ir)
 
   set(LLVM_COMPILE_TEST_SRCS)
   list(APPEND LLVM_COMPILE_TEST_SRCS
     ${NVFUSER_ROOT}/tests/cpp/test_host_ir_jit.cpp
   )
-  add_test(test_host_ir_jit "${LLVM_COMPILE_TEST_SRCS}" "")
+  add_nvfuser_test(test_host_ir_jit "${LLVM_COMPILE_TEST_SRCS}" "")
   target_link_libraries(test_host_ir_jit PUBLIC LLVM_JIT)
   list(APPEND TEST_BINARIES test_host_ir_jit)
 
 
   # We don't link CUPTI for MSVC
   if(NOT MSVC)
-    add_test(test_profiler "${NVFUSER_ROOT}/tests/cpp/test_fusion_profiler.cpp" "")
+    add_nvfuser_test(test_profiler "${NVFUSER_ROOT}/tests/cpp/test_fusion_profiler.cpp" "")
     list(APPEND TEST_BINARIES test_profiler)
   endif()
 
@@ -1110,6 +1111,36 @@ if(BUILD_TEST)
   target_include_directories(test_jev_client_standalone PRIVATE ${NVFUSER_SRCS_DIR})
   set_property(TARGET test_jev_client_standalone PROPERTY CXX_STANDARD ${NVFUSER_CPP_STANDARD})
   list(APPEND TEST_BINARIES test_jev_client_standalone)
+
+  # These run an existing scheduler GTest and compare kernel output with a
+  # numerical reference. They are a focused smoke suite, not the full nvFuser
+  # test inventory. A resource lock keeps GPU work serial even with ctest -j.
+  add_test(NAME jev_numeric_pointwise
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu2Test.FusionPointwiseBroadcast_CUDA)
+  add_test(NAME jev_numeric_reduction
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA)
+  add_test(NAME jev_numeric_transpose
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=TransposeTest.FusionScheduleTransposeSmall)
+  add_test(NAME jev_numeric_inner_persistent
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA)
+  add_test(NAME jev_numeric_outer_persistent
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.TemplateFunctionTypeMismatch)
+  add_test(NAME jev_numeric_inner_outer_persistent
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv)
+  set_tests_properties(
+    jev_numeric_pointwise jev_numeric_reduction jev_numeric_transpose
+    jev_numeric_inner_persistent jev_numeric_outer_persistent
+    jev_numeric_inner_outer_persistent
+    PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu
+      # A misspelled GTest filter exits successfully after running zero tests.
+      FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()

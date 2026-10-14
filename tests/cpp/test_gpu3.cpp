@@ -7727,8 +7727,23 @@ TEST_F(Gpu3Test, TemplateFunctionTypeMismatch) {
   auto options = at::TensorOptions()
                      .dtype(data_type_to_aten(input_dtype))
                      .device(at::kCUDA, 0);
-  auto t0 = at::randn({batch_size, hidden_size}, options);
-  scheduleAndRun(fusion, SchedulerType::OuterPersistent, {t0});
+  // Positive input keeps both normalization means away from zero, making the
+  // numerical check stable while exercising the same scheduler and codegen.
+  auto t0 = at::rand({batch_size, hidden_size}, options);
+  auto cg_results =
+      scheduleAndRun(fusion, SchedulerType::OuterPersistent, {t0});
+
+  auto ref0 = t0 * 2;
+  ref0 = ref0 / ref0.mean({0}, true);
+  auto exp_ref = ref0.exp();
+  auto ref1 = exp_ref / exp_ref.mean({0}, true);
+  testValidate(
+      fusion,
+      cg_results.outputs,
+      {t0},
+      {ref0, ref1},
+      __LINE__,
+      __FILE__);
 }
 
 // Test block reduction across TIDx and TIDz
