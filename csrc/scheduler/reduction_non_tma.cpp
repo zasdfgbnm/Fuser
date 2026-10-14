@@ -554,11 +554,56 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // When iteration dim is small, may have unused SMs, to increase SM usage
   // needs to shift from block reduction to grid reduction.
   int64_t grdim = 1;
-  while (godim * grdim * 2 <= sm_count && getInnerRemainder() / grdim >= 2) {
-    grdim *= 2;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    while (godim * grdim * 2 <= sm_count && getInnerRemainder() / grdim >= 2) {
+      grdim *= 2;
+    }
+  }
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const int64_t inner_remainder = getInnerRemainder();
+    NVF_ERROR(
+        godim >= 1 && inner_remainder >= 1 && sm_count >= 1,
+        "RD3.grid requires positive grid and reduction dimensions");
+
+    // Each doubling is permitted only while its preceding factor has at
+    // least two reduction pieces and the resulting grid fits one SM wave.
+    // This also keeps every cross-grid plan's BIDy dimension in range.
+    std::vector<scheduler::jev::ChoiceOption> options;
+    options.push_back({"g1", "Use one block per output tile"});
+    if (godim <= scheduler_utils::y_grid_limit) {
+      for (int64_t candidate = 1;
+           candidate <= sm_count / godim / 2 &&
+           inner_remainder / candidate >= 2;) {
+        candidate *= 2;
+        options.push_back(
+            {"g" + std::to_string(candidate),
+             "Use " + std::to_string(candidate) +
+                 " blocks per output tile for grid reduction"});
+      }
+    }
+
+    std::string state = "reduction.inner_grid.v1\n";
+    state += "godim=" + std::to_string(godim) + '\n';
+    state += "inner_remainder=" + std::to_string(inner_remainder) + '\n';
+    state += "sm_count=" + std::to_string(sm_count) + '\n';
+    state += "y_grid_limit=" +
+        std::to_string(scheduler_utils::y_grid_limit) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "g" + std::to_string(grdim)
+        : std::string();
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD3.grid", state, options, native_choice);
+    const auto found = std::find_if(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == selected;
+        });
+    NVF_ERROR(found != options.end(), "RD3.grid response exceeds grid bounds");
+    grdim = std::stoll(selected.substr(1));
   }
 
-  // For grid reduction, try to do some cleanup of ragged waves on device
+  // A grdim > 1 from either the native or the bounded Choice path implies
+  // godim * grdim <= sm_count. Keep the legacy ragged-wave cleanup below,
+  // although its > sm_count guard is unreachable for this inner 2D path.
   if (grdim > 1 && // If we have less than 8 waves of blocks
       grdim * godim < sm_count * 8 &&
       // And we don't have an even divisible number of blocks
