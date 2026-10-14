@@ -7,9 +7,13 @@
 // clang-format on
 #include <ATen/cuda/CUDAContext.h>
 
+#include <string>
+#include <vector>
+
 #include "base.h"
 #include "ops/arith.h"
 #include "options.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_inner_outer_utils.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/runtime_info.h"
@@ -33,7 +37,6 @@ void getHeuristics(
     const bool enable_jev_choice) {
   // IOP1 can construct this plan speculatively. Nested IOP2 choices are
   // enabled only when the WS mode is actually selected.
-  (void)enable_jev_choice;
   rparams->tma_warp_specialized = true;
   rparams->project_persistent_buffers = project_to_input;
   rparams->cparams.index_type = index_type;
@@ -238,14 +241,66 @@ void getHeuristics(
         /*target_stages=*/2, /*target_bdimy=*/1, /*target_iter_unroll=*/1);
   }
 
-  // If sufficient shared memory is available, try increasing the number of
-  // stages. Ensure n_stages is divisible by bdimy so that each computation warp
-  // group operates on a distinct circular buffer stage with its own mbarrier.
-  while (is_enough_smem(iter_unroll, n_stages * 2, bdimx, bdimy)) {
-    n_stages *= 2;
+  // The topology, register-cache mode, and load mode above are fixed before
+  // choosing the final circular-buffer depth. The initial stage count is also
+  // the lower bound: selecting a smaller count could bypass the load-mode
+  // fallback that update_heuristics uses for a single-stage plan.
+  const int64_t initial_stages = n_stages;
+  const auto jev_mode = scheduler::jev::mode();
+  if (!enable_jev_choice || jev_mode != scheduler::jev::Mode::Remote) {
+    // The IOP1 preflight also needs the native full-depth plan. On the
+    // executed branch, preserve the native preference in off/record modes.
+    while (is_enough_smem(iter_unroll, n_stages * 2, bdimx, bdimy)) {
+      n_stages *= 2;
+    }
+    // Each computation warp group needs a distinct stage and mbarrier.
+    if (n_stages % bdimy != 0) {
+      n_stages -= (n_stages % bdimy);
+    }
   }
-  if (n_stages % bdimy != 0) {
-    n_stages -= (n_stages % bdimy);
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool initial_stage_is_legal =
+        initial_stages > 0 && initial_stages % bdimy == 0 &&
+        is_enough_smem(iter_unroll, initial_stages, bdimx, bdimy);
+    if (!initial_stage_is_legal) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP2.stages", "initial warp-specialized stage exceeds hard bounds");
+      } else {
+        NVF_ERROR(false, "No hard-valid inner-outer TMA stage count");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> stage_options;
+      for (int64_t stages = initial_stages;
+           is_enough_smem(iter_unroll, stages, bdimx, bdimy); stages *= 2) {
+        stage_options.push_back({
+            "s" + std::to_string(stages),
+            "Use stage depth " + std::to_string(stages) +
+                " for inner-outer TMA circular buffering"});
+      }
+      const std::string state =
+          "inner_outer.tma_ws_stages.v1\ninitial_stages=" +
+          std::to_string(initial_stages) + "\niter_unroll=" +
+          std::to_string(iter_unroll) + "\nbdimx=" + std::to_string(bdimx) +
+          "\nbdimy=" + std::to_string(bdimy) +
+          "\ncircular_buffer_bits=" +
+          std::to_string(circular_buffered_smem_size_bit) +
+          "\nnon_circular_buffer_bits=" +
+          std::to_string(non_circular_buffered_smem_size_bit) +
+          "\ncomputation_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit) +
+          "\nnon_circular_gmem_to_regs=" +
+          std::to_string(is_non_circular_buffer_gmem_to_regs ? 1 : 0) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(dev_prop->sharedMemPerBlockOptin);
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? "s" + std::to_string(n_stages)
+          : "";
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.stages", state, stage_options, native_choice);
+      n_stages = std::stoll(selected.substr(1));
+    }
   }
 
   int64_t inner_batch = ceilDiv(after_vect, bdimx);
