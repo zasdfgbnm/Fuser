@@ -7746,6 +7746,31 @@ TEST_F(Gpu3Test, TemplateFunctionTypeMismatch) {
       __FILE__);
 }
 
+// A small reduction and a wide contiguous iteration domain keep this in the
+// block outer-persistent branch while allowing a two-element iteration vector.
+// The Jev alternate-numeric CTest runs this once with the native factor and
+// once with a legal API-selected factor of two.
+TEST_F(Gpu3Test, JevAlternateOuterIterUnroll_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  auto input = makeContigTensor(2, DataType::Float);
+  fusion.addInput(input);
+  auto value = add(input, IrBuilder::create<Val>(1.0));
+  auto stats = Welford(value, {0});
+  auto mean = broadcast(stats.avg, {true, false});
+  auto output = div(value, mean);
+  fusion.addOutput(output);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::rand({128, 8192}, options);
+  auto results = scheduleAndRun(&fusion, SchedulerType::OuterPersistent, {tensor});
+  auto doubled = tensor + 1.0;
+  auto reference = doubled / doubled.mean({0}, true);
+  testValidate(
+      &fusion, results.outputs, {tensor}, {reference}, __LINE__, __FILE__);
+}
+
 // Test block reduction across TIDx and TIDz
 TEST_F(Gpu3Test, BlockReduction3D) {
   auto test = [](const int tidx, const int tidy, const int tidz) {

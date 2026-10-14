@@ -110,7 +110,37 @@ def check_alternate_report(report: dict[str, Any],
                 "request_sha256": event["request_sha256"]}
     if intended not in issues:
         raise ValueError(f"missing intended winner mismatch: {issues}")
-    if site == "OP2.base":
+    if site == "OP3.unroll":
+        # The selected iteration factor changes the valid CTA menu, so the
+        # downstream OP3.cta request must be replaced rather than compared
+        # under the old state hash.
+        ctas = [entry for entry in report["multiplicity"]
+                if entry["site"] == "OP3.cta"]
+        record_cta = [entry for entry in ctas
+                      if sum(entry["record"].values()) == 1 and not entry["remote"]]
+        remote_cta = [entry for entry in ctas
+                      if sum(entry["remote"].values()) == 1 and not entry["record"]]
+        if len(ctas) != 2 or len(record_cta) != 1 or len(remote_cta) != 1:
+            raise ValueError(f"expected exactly one replaced OP3.cta request: {ctas}")
+        if (not record_cta[0]["request"]["state"].startswith(
+                "outer_persistent.block_cta.v1\n") or
+                not remote_cta[0]["request"]["state"].startswith(
+                    "outer_persistent.block_cta.v2\n")):
+            raise ValueError("OP3.cta state versions did not follow factor choice")
+        selected = dict(line.split("=", 1) for line in
+                        remote_cta[0]["request"]["state"].splitlines()[1:])
+        if (selected.get("iter_unroll") != alternate[1:] or
+                int(selected.get("vector_width", "0")) < int(alternate[1:])):
+            raise ValueError(f"OP3.cta did not receive selected {alternate}: {selected}")
+        expected = [intended,
+            {"kind": "record_only_state", "site": "OP3.cta",
+             "request_sha256": record_cta[0]["request_sha256"]},
+            {"kind": "remote_only_state", "site": "OP3.cta",
+             "request_sha256": remote_cta[0]["request_sha256"]},
+        ]
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected dependent CTA comparison issues: {issues}")
+    elif site == "OP2.base":
         # The alternate base must produce one different dependent tail state
         # on each run. The comparator has already checked each remote tail
         # answer against the API server; require the expected one-for-one

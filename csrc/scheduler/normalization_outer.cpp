@@ -278,9 +278,10 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     const int64_t final_bdimx = seed_bdimx * bdimy < min_threads_in_block
         ? min_threads_in_block / bdimy
         : seed_bdimx;
-    if (ceilDiv(
-            max_persistent_buffer_size_bit * final_bdimx * iter_unroll,
-            scheduler_utils::register_file_size_bit) != 1) {
+    // Compare against the register quotient before multiplying. In
+    // particular, promoting a narrow seed to the 128-thread minimum may
+    // increase bdimx beyond the seed's capacity.
+    if (final_bdimx > max_multi_reduction_factor / iter_unroll) {
       return std::nullopt;
     }
     return BlockPlan{
