@@ -117,7 +117,8 @@ def run_numeric(
 
 
 def check_parity(report: dict[str, Any], case_key: str, prefix: str,
-                 required_site: str | None = None) -> None:
+                 required_site: str | None = None,
+                 expected_record_skip: str | None = None) -> None:
     if not report["ok"]:
         kinds = sorted({issue["kind"] for issue in report["issues"]})
         raise ValueError(f"record/remote/server decision parity failed: {kinds}")
@@ -150,6 +151,13 @@ def check_parity(report: dict[str, Any], case_key: str, prefix: str,
             sites[required_site]["status"] != "covered" or
             sites[required_site]["server_events"] == 0):
         raise ValueError(f"required Choice {required_site} was not covered")
+    if expected_record_skip is not None:
+        site = sites.get(expected_record_skip, {})
+        if (site.get("record_skipped") != 1 or
+                any(site.get(key, 0) != 0 for key in
+                    ("record_events", "remote_events", "server_events"))):
+            raise ValueError(
+                f"expected one record-only singleton skip for {expected_record_skip}: {site}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -159,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--case-key", required=True)
     parser.add_argument("--site-prefix", required=True)
     parser.add_argument("--required-site")
+    parser.add_argument("--expect-record-skip")
     parser.add_argument("--analysis-only", action="store_true")
     parser.add_argument("--artifacts-root", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -173,6 +182,11 @@ def main(argv: list[str] | None = None) -> int:
             REQUIRED_SITE.fullmatch(args.required_site) is None or
             not args.required_site.startswith(args.site_prefix)):
         parser.error("invalid required Choice site")
+    if args.expect_record_skip is not None and (
+            REQUIRED_SITE.fullmatch(args.expect_record_skip) is None or
+            not args.expect_record_skip.startswith(args.site_prefix) or
+            args.expect_record_skip == args.required_site):
+        parser.error("invalid expected record-only skip site")
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
     if not args.artifacts_root.is_absolute():
@@ -187,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         "case_key": args.case_key, "gtests": names,
         "required_site_prefix": args.site_prefix,
         "required_site": args.required_site,
+        "expected_record_skip": args.expect_record_skip,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "binary": str(args.binary), "binary_sha256": file_hash(args.binary),
         "loader": str(loader), "loader_sha256": file_hash(loader),
@@ -245,7 +260,8 @@ def main(argv: list[str] | None = None) -> int:
         report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         manifest["decision_parity"] = str(report_path)
         manifest["decision_parity_sha256"] = file_hash(report_path)
-        check_parity(report, args.case_key, args.site_prefix, args.required_site)
+        check_parity(report, args.case_key, args.site_prefix,
+                     args.required_site, args.expect_record_skip)
         manifest["status"] = ("analysis_and_decision_parity_pass" if args.analysis_only
                               else "numeric_and_decision_parity_pass")
         write_manifest(manifest_path, manifest)

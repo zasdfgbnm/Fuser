@@ -1222,6 +1222,17 @@ if(BUILD_TEST)
     "Gpu3Test.TemplateFunctionTypeMismatch" "OP")
   add_jev_remote_numeric_test(inner_outer_persistent
     "CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv" "IOP")
+  add_test(NAME jev_remote_numeric_inner_outer_singleton_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_inner_outer_singleton_width
+      --site-prefix IOP
+      --expect-record-skip IOP3.inner_width)
+  set_tests_properties(jev_remote_numeric_inner_outer_singleton_width
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_outer_min_batch
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

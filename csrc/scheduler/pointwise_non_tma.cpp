@@ -476,10 +476,18 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
         dev_prop->maxGridSize[0] > 0 &&
         ceilDiv(ceilDiv(n_elems, vectorization_factor), kThreadX) <=
             dev_prop->maxGridSize[0];
-    if (hasBlockQuantizationOps(fusion, data_cache) || !native_cta_valid) {
+    if (!native_cta_valid) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "PW3.cta_1d native CTA fails conservative hard preflight");
       scheduler::jev::recordCoverageSkip(
-          "PW3.cta_1d",
-          !native_cta_valid ? "native_1d_cta_preflight" : "block_quantization");
+          "PW3.cta_1d", "native_1d_cta_preflight");
+    } else if (hasBlockQuantizationOps(fusion, data_cache)) {
+      // Block quantization requires the native CTA shape. There is no Choice.
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "PW3.cta_1d", "block_quantization");
+      }
     } else {
       std::vector<scheduler::jev::ChoiceOption> options;
       for (int64_t candidate = warp_size; candidate <= kThreadX;

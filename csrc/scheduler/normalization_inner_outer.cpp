@@ -354,7 +354,7 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
 
     const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
     const bool valid_bounds =
-        vectorize_factor >= 2 && vectorize_factor <= 128 &&
+        vectorize_factor >= 1 && vectorize_factor <= 128 &&
         (vectorize_factor & (vectorize_factor - 1)) == 0 &&
         properties.total_reduction_numel > 0 &&
         properties.total_reduction_numel % vectorize_factor == 0 &&
@@ -441,10 +441,30 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
         options.begin(), options.end(), [&](const auto& option) {
           return option.id == native_id;
         });
-    if (!native_offered || options.size() < 2 ||
-        state.size() >= 48 * 1024) {
+    if (!native_offered) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3.inner_width native width has no complete hard-valid plan");
       scheduler::jev::recordCoverageSkip(
-          "IOP3.inner_width", "no stable-storage width alternative");
+          "IOP3.inner_width", "native width lacks a complete hard-valid plan");
+      return makeMultiWave(
+          native_buffers, vectorize_factor, enable_jev_choice);
+    }
+    if (options.size() == 1) {
+      // A proved native singleton has no performance choice to send remotely.
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP3.inner_width", "only the native width is hard-valid");
+      }
+      return makeMultiWave(
+          native_buffers, vectorize_factor, enable_jev_choice);
+    }
+    if (state.size() >= 48 * 1024) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3.inner_width choice state exceeds the bounded request size");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.inner_width", "choice state exceeds bounded request size");
       return makeMultiWave(
           native_buffers, vectorize_factor, enable_jev_choice);
     }

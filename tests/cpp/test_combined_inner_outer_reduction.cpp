@@ -937,6 +937,47 @@ TEST_F(CombinedSchedulerTest, InnerOuterNoOuterBroadcastTv) {
       persistent_params->lparams);
 }
 
+// An odd inner extent has a hard maximum vector width of one. The native
+// multiwave plan is the only IOP3.inner_width candidate and still has to run
+// in remote mode, with downstream choices delegated as usual.
+TEST_F(CombinedSchedulerTest, InnerOuterSingletonVectorWidth) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  constexpr int64_t dim0 = 1024, dim1 = 1987;
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = sum(tv0, {1});
+  auto tv2 = broadcast(tv1, {false, true});
+  auto tv3 = add(tv2, tv0);
+  auto tv4 = sum(tv0, {0});
+  fusion.addOutput(tv3);
+  fusion.addOutput(tv4);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor input = at::randn({dim0, dim1}, options);
+  auto result =
+      scheduleAndRun(&fusion, SchedulerType::InnerOuterPersistent, {input});
+  const auto* params = result.heuristic_params->as<ReductionParams>();
+  NVF_CHECK(
+      params->unroll_factor_inner_reduction == 1,
+      "Odd inner extent must have a singleton vector width");
+
+  auto inner_sum = input.sum({1});
+  auto expected_pointwise = input + inner_sum.unsqueeze(-1);
+  auto expected_outer_sum = input.sum({0});
+  testValidate(
+      &fusion,
+      result.outputs,
+      {input},
+      {expected_pointwise, expected_outer_sum},
+      __LINE__,
+      __FILE__,
+      "",
+      params->lparams);
+}
+
 // Reproduce error found in:
 // thunder/tests/test_torch_compile_executor.py::test_torch_compile_cat_nvfuser_phi2_tanh
 // Only happens when shared memory persistent is used.
