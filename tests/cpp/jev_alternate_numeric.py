@@ -12,6 +12,7 @@ The production analysis server and scheduler are never patched on disk.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime, timezone
 import hashlib
 import importlib
@@ -33,6 +34,28 @@ ALTERNATE = "g1"
 GTEST = "Gpu1Test.JevAlternateInnerGrid_CUDA"
 CASE_KEY = "jev_alternate_numeric_inner_grid"
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+
+
+def cuda_compute_capability(libraries: list[str]) -> tuple[int, int]:
+    """Query the selected CUDA device before running an SM89-only fixture."""
+    runtime = next(
+        (Path(folder) / name for folder in libraries
+         for name in ("libcudart.so.12", "libcudart.so")
+         if (Path(folder) / name).is_file()), None)
+    if runtime is None:
+        raise ValueError("CUDA runtime library is absent from numeric libraries")
+    cudart = ctypes.CDLL(str(runtime))
+    device = ctypes.c_int()
+    if cudart.cudaGetDevice(ctypes.byref(device)) != 0:
+        raise ValueError("cudaGetDevice failed during capability check")
+    result = []
+    for attribute in (75, 76):  # cudaDevAttrComputeCapabilityMajor/Minor
+        value = ctypes.c_int()
+        if cudart.cudaDeviceGetAttribute(
+                ctypes.byref(value), attribute, device.value) != 0:
+            raise ValueError("cudaDeviceGetAttribute failed during capability check")
+        result.append(value.value)
+    return result[0], result[1]
 
 
 def request_hash(request: dict[str, Any]) -> str:
@@ -733,6 +756,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner_width: bool = False,
                            require_inner_batch_cap: bool = False,
                            require_inner_cta_seed: bool = False,
+                           require_inner_magic_zero: bool = False,
                            require_inner_targets: bool = False,
                            require_inner_storage: bool = False,
                            require_inner3d_warp: bool = False,
@@ -1709,6 +1733,21 @@ def check_alternate_report(report: dict[str, Any],
                     raise ValueError("shared CTA ignored the selected storage plan")
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected storage-dependent decisions: {issues}")
+    elif require_inner_magic_zero:
+        from jev_shim import (analyze_inner_reg_magic_zero,
+                              parse_inner_reg_magic_zero_state)
+
+        if (site != "IP5.magic_zero" or event["native"] != "on" or
+                alternate != "off" or event["candidates"] != ["off", "on"]):
+            raise ValueError("magic-zero fixture lacks the complete on/off menu")
+        magic = parse_inner_reg_magic_zero_state(event["state"])
+        if (analyze_inner_reg_magic_zero(magic) != "on" or
+                (magic.sm_major, magic.sm_minor) != (8, 9) or
+                not magic.disable_projection_avoid_recompute or
+                magic.register_cap <= 0 or magic.vector_width <= 1):
+            raise ValueError("magic-zero fixture lacks the checked 2D plan")
+        if issues != [intended]:
+            raise ValueError(f"magic zero changed unrelated decisions: {issues}")
     elif require_inner_cta_seed:
         from jev_shim import parse_inner_reg_cta_seed_state
 
@@ -2361,6 +2400,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner-batch-cap", action="store_true")
     parser.add_argument("--require-inner-cta-seed", action="store_true")
+    parser.add_argument("--require-inner-magic-zero", action="store_true")
+    parser.add_argument("--require-sm89", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -2390,6 +2431,12 @@ def main(argv: list[str] | None = None) -> int:
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.case_key):
         parser.error("--case-key must use lowercase letters, digits, underscores")
     module_dir, loader, libraries = checked_environment()
+    if args.require_sm89:
+        capability = cuda_compute_capability(libraries)
+        if capability != (8, 9):
+            print(f"Skipping SM89-only fixture on SM{capability[0]}{capability[1]}",
+                  flush=True)
+            return 77
     args.artifacts_root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix=args.case_key + "-", dir=args.artifacts_root))
     manifest_path = directory / "manifest.json"
@@ -2498,6 +2545,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner_width=args.require_inner_width,
             require_inner_batch_cap=args.require_inner_batch_cap,
             require_inner_cta_seed=args.require_inner_cta_seed,
+            require_inner_magic_zero=args.require_inner_magic_zero,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,

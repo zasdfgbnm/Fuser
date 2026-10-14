@@ -7840,6 +7840,48 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterCTASeed_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// On an unprojected register-backed softmax, magic zero changes generated
+// index/predicate code while preserving the numerical result.
+TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major != 8 || device->minor != 9) {
+    GTEST_SKIP() << "SM89-specific magic-zero Choice fixture";
+  }
+  constexpr int64_t feature = 1028;
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(softmax(input, 1));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, feature}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_TRUE(rparams->smem_persistent_buffers.empty());
+  const bool expect_zero = scheduler::jev::mode() != scheduler::jev::Mode::Remote;
+  EXPECT_EQ(rparams->cparams.enable_magic_zero, expect_zero);
+  const auto code = results.kernel_executor->compiledKernel()->kernelString();
+  EXPECT_EQ(
+      code.find("NVFUSER_DEFINE_MAGIC_ZERO;") != std::string::npos,
+      expect_zero);
+
+  auto reference = at::_softmax(aten_input.to(at::kDouble), -1, false);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Both persistent storage modes fit on SM89 for this RMS normalization. A
 // forced shared plan must execute and match the same ATen numerical reference.
 TEST_F(Gpu1Test, JevAlternateInnerStorage_CUDA) {

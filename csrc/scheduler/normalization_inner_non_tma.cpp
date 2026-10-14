@@ -21,6 +21,7 @@
 
 #include "instrumentation.h"
 #include "ir/utils.h"
+#include "options.h"
 #include "scheduler/debug_utils.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
@@ -3391,6 +3392,93 @@ std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
     const auto width_properties = chooseInner2DVectorWidth(
         prop, *rparams, native_overhead, native_warps);
     innerPersistentHeuristic2D(width_properties, rparams.get());
+    // Magic zero is a value-preserving index/predicate protection. The native
+    // policy omits it only for a cheap, unprojected persistent buffer. Keep
+    // that resource condition, the selected register-backed plan, and the
+    // runtime's TMA/global-disable constraints local. The bandwidth ratio is
+    // then only the native performance preference between two legal forms.
+    const auto jev_mode = scheduler::jev::mode();
+    if (jev_mode != scheduler::jev::Mode::Off) {
+      const auto exprs = fusion->exprs();
+      const bool has_tma = std::any_of(
+          exprs.begin(), exprs.end(),
+          [](Expr* expr) { return ir_utils::isCpAsyncBulk(expr); });
+      const bool eligible =
+          width_properties.disable_project_to_avoid_recompute &&
+          rparams->persistent_kernel && !rparams->schedule_3d &&
+          rparams->smem_persistent_buffers.empty() &&
+          rparams->cparams.maxrregcount > 0 &&
+          rparams->cparams.maxrregcount <= 255 &&
+          rparams->batches_per_block_inner_reduction > 0 &&
+          rparams->unroll_factor_inner_reduction > 0 && !has_tma &&
+          !isOptionDisabled(DisableOption::MagicZero);
+      if (!eligible) {
+        if (jev_mode == scheduler::jev::Mode::Record) {
+          scheduler::jev::recordCoverageSkip(
+              "IP5.magic_zero", "No proved register-backed magic-zero pair");
+        }
+      } else {
+        // Send the same primitive device facts used by the original
+        // bandwidth/flops heuristic. Sending its boolean result here would
+        // reveal the native magic-zero answer for this eligible domain.
+        const auto* device = at::cuda::getCurrentDeviceProperties();
+        const int device_index = at::cuda::current_device();
+        int memory_clock_khz = 0;
+        int gpu_clock_khz = 0;
+        cudaDeviceGetAttribute(
+            &memory_clock_khz, cudaDevAttrMemoryClockRate, device_index);
+        cudaDeviceGetAttribute(
+            &gpu_clock_khz, cudaDevAttrClockRate, device_index);
+        const bool valid_hardware =
+            device->multiProcessorCount > 0 &&
+            device->multiProcessorCount <= 65536 && device->major >= 3 &&
+            device->major <= 20 &&
+            device->minor >= 0 && device->minor <= 9 &&
+            device->memoryBusWidth > 0 && memory_clock_khz > 0 &&
+            gpu_clock_khz > 0;
+        if (!valid_hardware) {
+          NVF_ERROR(
+              jev_mode == scheduler::jev::Mode::Record,
+              "Cannot reconstruct magic-zero bandwidth preference");
+          scheduler::jev::recordCoverageSkip(
+              "IP5.magic_zero", "Device bandwidth inputs unavailable");
+        } else {
+          const std::string state =
+              "inner_persistent.reg_magic_zero.v1\n"
+              "sm_count=" + std::to_string(device->multiProcessorCount) +
+              "\nsm_major=" + std::to_string(device->major) +
+              "\nsm_minor=" + std::to_string(device->minor) +
+              "\nmemory_bus_bits=" + std::to_string(device->memoryBusWidth) +
+              "\nmemory_clock_khz=" + std::to_string(memory_clock_khz) +
+              "\ngpu_clock_khz=" + std::to_string(gpu_clock_khz) +
+              "\ndisable_projection_avoid_recompute=" +
+              std::to_string(
+                  width_properties.disable_project_to_avoid_recompute) +
+              "\nregister_cap=" +
+              std::to_string(rparams->cparams.maxrregcount) +
+              "\npersistent_batch=" +
+              std::to_string(rparams->batches_per_block_inner_reduction) +
+              "\nvector_width=" +
+              std::to_string(rparams->unroll_factor_inner_reduction) +
+              "\nno_tma=" + std::to_string(!has_tma) +
+              "\nmagic_zero_available=" +
+              std::to_string(!isOptionDisabled(DisableOption::MagicZero));
+          const std::vector<scheduler::jev::ChoiceOption> options = {
+              {"off", "Omit zero-valued index and predicate protection"},
+              {"on", "Use zero-valued index and predicate protection"}};
+          const std::string native_choice =
+              jev_mode == scheduler::jev::Mode::Record
+              ? (rparams->cparams.enable_magic_zero ? "on" : "off")
+              : "";
+          const std::string selected = scheduler::jev::chooseDecision(
+              "IP5.magic_zero", state, options, native_choice);
+          NVF_ERROR(
+              selected == "on" || selected == "off",
+              "Unknown 2D register magic-zero choice");
+          rparams->cparams.enable_magic_zero = selected == "on";
+        }
+      }
+    }
   } else {
     rparams->tag = "3D Register Inner Persistent Heuristic.\n";
     rparams = innerPersistentHeuristic3D(prop, *rparams);

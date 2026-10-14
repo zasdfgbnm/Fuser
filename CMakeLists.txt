@@ -1620,6 +1620,17 @@ if(BUILD_TEST)
       --require-inner-cta-seed)
   set_tests_properties(jev_alternate_numeric_inner_register_cta_seed PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_register_magic_zero
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.magic_zero --alternate off
+      --gtest Gpu1Test.JevAlternateInnerRegisterMagicZero_CUDA
+      --case-key jev_alternate_numeric_inner_register_magic_zero
+      --require-inner-magic-zero --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner_register_magic_zero PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_inner_storage
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
