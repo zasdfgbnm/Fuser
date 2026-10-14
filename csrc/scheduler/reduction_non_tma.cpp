@@ -1588,58 +1588,27 @@ OuterReductionParams getBlockOuterReduction(
   return params;
 }
 
-OuterReductionParams getGridOuterReduction(
-    const int64_t total_reduction_numel,
-    const int64_t total_iteration_numel,
-    const int64_t n_tensor_inputs,
-    const int64_t max_dtype_size_bit_for_vectorization,
-    const int64_t vectorize_factor,
-    const int64_t max_unroll,
-    const int64_t sm_count,
-    const int64_t max_threads_per_sm) {
-  // grid or block reduction
+struct OuterGridWarpPlans {
+  OuterReductionParams baseline;
+  OuterReductionParams stride_capped;
+  int64_t base_grdim;
+  bool native_use_stride;
+};
+
+// Construct both complete grid plans for one logical warp target. This is pure
+// arithmetic: candidate preflight must not send nested Choices or emit a
+// SchedulerDebug schedule for a plan that will never be selected.
+OuterGridWarpPlans buildOuterGridWarpPlans(
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t max_dtype_size_bit_for_vectorization,
+    int64_t vectorize_factor,
+    int64_t max_unroll,
+    int64_t sm_count,
+    int64_t max_threads_per_sm,
+    int64_t n_waves,
+    int64_t min_warp_size) {
   const int64_t n_elems = total_reduction_numel * total_iteration_numel;
-  // Try to use 4 * SM blocks to reduce communication cost. But still
-  // use 8 * SM blocks if the problem size is large, it increased requested
-  // waves, helps hiding memory latency, if still use 4 * SM blocks, about 5%
-  // regression for compute bound kernels. Not much change for memory bound.
-  int64_t n_waves = 0;
-  const auto jev_mode = scheduler::jev::mode();
-  if (jev_mode == scheduler::jev::Mode::Off) {
-    n_waves = n_elems >= (int64_t)64 * 1024 * 1024 ? 8 : 4;
-  } else {
-    // RD9 delegates only the empirical wave target. The native algorithm
-    // still turns that target into block, unroll, and grid dimensions.
-    const std::string state =
-        "reduction.outer_waves.v1\nreduction_numel=" +
-        std::to_string(total_reduction_numel) +
-        "\niteration_numel=" + std::to_string(total_iteration_numel);
-    const std::vector<scheduler::jev::ChoiceOption> options = {
-        {"waves4", "Target four waves of SM blocks"},
-        {"waves8", "Target eight waves of SM blocks"}};
-    const std::string native_choice =
-        jev_mode == scheduler::jev::Mode::Record
-        ? (n_elems >= (int64_t)64 * 1024 * 1024 ? "waves8" : "waves4")
-        : "";
-    const auto selected = scheduler::jev::chooseDecision(
-        "RD9.waves", state, options, native_choice);
-    NVF_ERROR(
-        selected == "waves4" || selected == "waves8",
-        "RD9 wave target is outside native choices");
-    n_waves = selected == "waves8" ? 8 : 4;
-  }
-
-  // if data fits in l2 and we need more parallelization in the iter dim,
-  // we can use a smaller warp size. While thread local data fits in l1, and
-  // iter dim is really small, we can use <32 threads per warp.
-  // TODO: Could get a much more accurate estimation of it the problem fits in
-  // L2
-  const bool fits_in_l2 =
-      n_elems * max_dtype_size_bit_for_vectorization * n_tensor_inputs <
-      at::cuda::getCurrentDeviceProperties()->l2CacheSize * 8;
-
-  const int64_t min_warp_size = fits_in_l2 ? 16 : 32;
-
   // Set some targets for parallelization
   int64_t target_threads_in_block = min_warp_size;
   // Start target blocks at roughly a quarter wave if available
@@ -1831,60 +1800,224 @@ OuterReductionParams getGridOuterReduction(
   };
   const int64_t base_plan = cleanRaggedWaves(base_grdim);
   const int64_t stride_plan = cleanRaggedWaves(stride_grdim);
+  auto makePlan = [&](int64_t reduction_grid) {
+    OuterReductionParams params(total_iteration_numel, total_reduction_numel);
+    params.bdimx = bdimx;
+    params.bdimy = bdimy;
+    params.grdim = reduction_grid;
+    params.gidim = gidim;
+    params.iter_unroll_factor = iter_unroll_factor;
+    params.redu_unroll_factor = inner_reduction_unroll_factor;
+    return params;
+  };
+  return {
+      makePlan(base_plan),
+      makePlan(stride_plan),
+      base_grdim,
+      rDimAvail() > 16 &&
+          ceilDiv(total_iteration_numel, min_warp_size) < sm_count * 2};
+}
+
+// These bounds are independent of the L2 preference. The grid dimensions may
+// exceed CUDA launch limits because heuristicParaToSchedulerPara splits them.
+bool outerGridWarpPlansHardValid(
+    const OuterGridWarpPlans& plans,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t max_unroll,
+    int64_t max_threads_per_block) {
+  const auto valid = [&](const OuterReductionParams& params) {
+    if (params.bdimx < 1 || params.bdimy < 1 || params.gidim < 1 ||
+        params.grdim < 1 || params.iter_unroll_factor < 1 ||
+        params.redu_unroll_factor < 1 ||
+        params.bdimx > max_threads_per_block / params.bdimy ||
+        params.iter_unroll_factor > vectorize_factor ||
+        params.iter_unroll_factor > max_unroll ||
+        params.redu_unroll_factor > max_unroll / params.iter_unroll_factor ||
+        total_iteration_numel % params.iter_unroll_factor != 0) {
+      return false;
+    }
+    const int64_t iter_per_block =
+        params.bdimx * params.iter_unroll_factor;
+    const int64_t reduction_per_block =
+        params.bdimy * params.redu_unroll_factor;
+    return params.gidim ==
+        ceilDiv(total_iteration_numel, iter_per_block) &&
+        params.grdim <=
+        ceilDiv(total_reduction_numel, reduction_per_block);
+  };
+  return valid(plans.baseline) && valid(plans.stride_capped);
+}
+
+OuterReductionParams getGridOuterReduction(
+    const int64_t total_reduction_numel,
+    const int64_t total_iteration_numel,
+    const int64_t n_tensor_inputs,
+    const int64_t max_dtype_size_bit_for_vectorization,
+    const int64_t vectorize_factor,
+    const int64_t max_unroll,
+    const int64_t sm_count,
+    const int64_t max_threads_per_sm,
+    const int64_t max_threads_per_block) {
+  // grid or block reduction
+  const int64_t n_elems = total_reduction_numel * total_iteration_numel;
+  // Try to use 4 * SM blocks to reduce communication cost. But still
+  // use 8 * SM blocks if the problem size is large, it increased requested
+  // waves, helps hiding memory latency, if still use 4 * SM blocks, about 5%
+  // regression for compute bound kernels. Not much change for memory bound.
+  int64_t n_waves = 0;
+  const auto jev_mode = scheduler::jev::mode();
   if (jev_mode == scheduler::jev::Mode::Off) {
-    grdim =
-        rDimAvail() > 16 &&
-            ceilDiv(total_iteration_numel, min_warp_size) < sm_count * 2
-        ? stride_plan
-        : base_plan;
+    n_waves = n_elems >= (int64_t)64 * 1024 * 1024 ? 8 : 4;
   } else {
+    // RD9 delegates only the empirical wave target. The native algorithm
+    // still turns that target into block, unroll, and grid dimensions.
     const std::string state =
-        "reduction.outer_grid_stride.v1\nreduction_numel=" +
+        "reduction.outer_waves.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) +
+        "\niteration_numel=" + std::to_string(total_iteration_numel);
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"waves4", "Target four waves of SM blocks"},
+        {"waves8", "Target eight waves of SM blocks"}};
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? (n_elems >= (int64_t)64 * 1024 * 1024 ? "waves8" : "waves4")
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD9.waves", state, options, native_choice);
+    NVF_ERROR(
+        selected == "waves4" || selected == "waves8",
+        "RD9 wave target is outside native choices");
+    n_waves = selected == "waves8" ? 8 : 4;
+  }
+
+  // L2 residency is an empirical preference for a 16-thread logical warp.
+  // The planner and hard bounds above make either target a legal schedule.
+  const int64_t l2_cache_bytes =
+      at::cuda::getCurrentDeviceProperties()->l2CacheSize;
+  int64_t native_min_warp_size = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    const bool fits_in_l2 =
+        n_elems * max_dtype_size_bit_for_vectorization * n_tensor_inputs <
+        l2_cache_bytes * 8;
+    native_min_warp_size = fits_in_l2 ? 16 : 32;
+  }
+  const auto makeWarpPlans = [&](int64_t warp_size) {
+    return buildOuterGridWarpPlans(
+        total_reduction_numel,
+        total_iteration_numel,
+        max_dtype_size_bit_for_vectorization,
+        vectorize_factor,
+        max_unroll,
+        sm_count,
+        max_threads_per_sm,
+        n_waves,
+        warp_size);
+  };
+  int64_t min_warp_size = native_min_warp_size;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const auto plans16 = makeWarpPlans(16);
+    const auto plans32 = makeWarpPlans(32);
+    const bool valid16 = outerGridWarpPlansHardValid(
+        plans16,
+        total_reduction_numel,
+        total_iteration_numel,
+        vectorize_factor,
+        max_unroll,
+        max_threads_per_block);
+    const bool valid32 = outerGridWarpPlansHardValid(
+        plans32,
+        total_reduction_numel,
+        total_iteration_numel,
+        vectorize_factor,
+        max_unroll,
+        max_threads_per_block);
+    std::vector<scheduler::jev::ChoiceOption> options;
+    if (valid16) {
+      options.push_back({"warp16", "Use a 16-thread logical warp target"});
+    }
+    if (valid32) {
+      options.push_back({"warp32", "Use a 32-thread logical warp target"});
+    }
+    NVF_ERROR(!options.empty(), "RD9 has no hard-valid warp target");
+    const std::string state =
+        "reduction.outer_warp.v1\nreduction_numel=" +
         std::to_string(total_reduction_numel) +
         "\niteration_numel=" + std::to_string(total_iteration_numel) +
         "\ndtype_bits=" +
         std::to_string(max_dtype_size_bit_for_vectorization) +
-        "\nsm_count=" + std::to_string(sm_count) +
-        "\nmin_warp_size=" + std::to_string(min_warp_size) +
-        "\nbdimx=" + std::to_string(bdimx) +
-        "\nbdimy=" + std::to_string(bdimy) +
-        "\niter_unroll=" + std::to_string(iter_unroll_factor) +
-        "\nredu_unroll=" + std::to_string(inner_reduction_unroll_factor) +
-        "\ngidim=" + std::to_string(gidim) +
-        "\nbase_grdim=" + std::to_string(base_grdim);
-    std::vector<scheduler::jev::ChoiceOption> options = {
-        {"g" + std::to_string(base_plan), "Use the baseline reduction grid"}};
-    if (stride_plan != base_plan) {
-      options.push_back(
-          {"g" + std::to_string(stride_plan),
-           "Use the stride-capped reduction grid"});
-    }
+        "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+        "\nl2_cache_bytes=" + std::to_string(l2_cache_bytes) +
+        "\nwarp16_valid=" + std::to_string(valid16 ? 1 : 0) +
+        "\nwarp32_valid=" + std::to_string(valid32 ? 1 : 0);
     const std::string native_choice =
         jev_mode == scheduler::jev::Mode::Record
-        ? "g" + std::to_string(
-              rDimAvail() > 16 &&
-                      ceilDiv(total_iteration_numel, min_warp_size) <
-                          sm_count * 2
-                  ? stride_plan
-                  : base_plan)
+        ? (native_min_warp_size == 16 ? "warp16" : "warp32")
         : "";
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      NVF_ERROR(
+          (native_min_warp_size == 16 && valid16) ||
+              (native_min_warp_size == 32 && valid32),
+          "Native RD9 warp target is outside hard bounds");
+    }
     const auto selected = scheduler::jev::chooseDecision(
-        "RD9.stride", state, options, native_choice);
+        "RD9.warp", state, options, native_choice);
     NVF_ERROR(
-        selected == options.front().id ||
-            (options.size() == 2 && selected == options.back().id),
-        "RD9 stride plan is outside native candidates");
-    grdim = selected == options.front().id ? base_plan : stride_plan;
+        (selected == "warp16" && valid16) ||
+            (selected == "warp32" && valid32),
+        "RD9 warp target is outside hard-valid candidates");
+    min_warp_size = selected == "warp16" ? 16 : 32;
   }
-
-  OuterReductionParams params(total_iteration_numel, total_reduction_numel);
-  params.bdimx = bdimx;
-  params.bdimy = bdimy;
-  params.grdim = grdim;
-  params.gidim = gidim;
-  params.iter_unroll_factor = iter_unroll_factor;
-  params.redu_unroll_factor = inner_reduction_unroll_factor;
-  return params;
+  const auto plans = makeWarpPlans(min_warp_size);
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    return plans.native_use_stride ? plans.stride_capped : plans.baseline;
+  }
+  NVF_ERROR(
+      outerGridWarpPlansHardValid(
+          plans,
+          total_reduction_numel,
+          total_iteration_numel,
+          vectorize_factor,
+          max_unroll,
+          max_threads_per_block),
+      "Selected RD9 warp plan violates hard bounds");
+  const auto& baseline = plans.baseline;
+  const auto& stride = plans.stride_capped;
+  const std::string state =
+      "reduction.outer_grid_stride.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) +
+      "\niteration_numel=" + std::to_string(total_iteration_numel) +
+      "\ndtype_bits=" +
+      std::to_string(max_dtype_size_bit_for_vectorization) +
+      "\nsm_count=" + std::to_string(sm_count) +
+      "\nmin_warp_size=" + std::to_string(min_warp_size) +
+      "\nbdimx=" + std::to_string(baseline.bdimx) +
+      "\nbdimy=" + std::to_string(baseline.bdimy) +
+      "\niter_unroll=" + std::to_string(baseline.iter_unroll_factor) +
+      "\nredu_unroll=" + std::to_string(baseline.redu_unroll_factor) +
+      "\ngidim=" + std::to_string(baseline.gidim) +
+      "\nbase_grdim=" + std::to_string(plans.base_grdim);
+  std::vector<scheduler::jev::ChoiceOption> options = {
+      {"g" + std::to_string(baseline.grdim),
+       "Use the baseline reduction grid"}};
+  if (stride.grdim != baseline.grdim) {
+    options.push_back(
+        {"g" + std::to_string(stride.grdim),
+         "Use the stride-capped reduction grid"});
+  }
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record
+      ? "g" + std::to_string(
+            plans.native_use_stride ? stride.grdim : baseline.grdim)
+      : "";
+  const auto selected = scheduler::jev::chooseDecision(
+      "RD9.stride", state, options, native_choice);
+  NVF_ERROR(
+      selected == options.front().id ||
+          (options.size() == 2 && selected == options.back().id),
+      "RD9 stride plan is outside native candidates");
+  return selected == options.front().id ? baseline : stride;
 }
 
 std::unique_ptr<ReductionParams> outerReductionHeuristic(
@@ -1963,7 +2096,8 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
       (int64_t)vectorize_factor,
       max_unroll,
       sm_count,
-      max_threads_per_sm);
+      max_threads_per_sm,
+      max_threads_per_block);
 
   // block reduction heuristic
   auto block_params = getBlockOuterReduction(
