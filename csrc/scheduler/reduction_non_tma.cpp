@@ -979,7 +979,9 @@ bool inner3dWarpPlanIsSafe(
     int64_t max_threads_per_block,
     int64_t requested_target_threads = 0,
     bool iteration_first = false,
-    int64_t* completed_block_x = nullptr) {
+    int64_t* completed_block_x = nullptr,
+    int64_t target_waves = 4,
+    int64_t* completed_block_z = nullptr) {
   // Keep every intermediate product bounded, and fix the vector work budget
   // to four. Other shapes retain the native heuristic without a warp request.
   if (reduction_numel <= inner_numel || reduction_numel > 4096 ||
@@ -989,7 +991,8 @@ bool inner3dWarpPlanIsSafe(
       logical_warp < 1 || logical_warp > 16 || sm_count < 1 ||
       sm_count > 256 || max_threads_per_sm < 256 ||
       max_threads_per_sm > 4096 || max_threads_per_block < 256 ||
-      max_threads_per_block > 2048) {
+      max_threads_per_block > 2048 ||
+      (target_waves != 2 && target_waves != 4 && target_waves != 8)) {
     return false;
   }
   const auto div = [](int64_t numerator, int64_t denominator) {
@@ -1020,11 +1023,11 @@ bool inner3dWarpPlanIsSafe(
     target_blocks =
         div(n_elems, logical_warp * target_unroll * target_iterations);
   }
-  target_blocks = std::min(target_blocks, sm_count * 4);
+  target_blocks = std::min(target_blocks, sm_count * target_waves);
   if (target_blocks * target_unroll * target_iterations < n_elems) {
     target_threads = std::min(
         div(n_elems, target_blocks * target_unroll),
-        div(max_threads_per_sm, 4));
+        div(max_threads_per_sm, target_waves));
   }
   target_threads = div(target_threads, logical_warp) * logical_warp;
   if (requested_target_threads != 0) {
@@ -1119,6 +1122,9 @@ bool inner3dWarpPlanIsSafe(
   }
   if (completed_block_x != nullptr) {
     *completed_block_x = padded_x;
+  }
+  if (completed_block_z != nullptr) {
+    *completed_block_z = z;
   }
   return true;
 }
@@ -1348,14 +1354,96 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     }
   }
 
-  // Cap target blocks to 4 waves
-  target_blocks = std::min(target_blocks, device_multiprocessor_count * 4);
+  // The wave cap couples the block count and the per-CTA SM thread budget.
+  // Offer a bounded subset only when each complete 3D plan passes the same
+  // CTA, grid, and unsupported-fallback checks as the later RD5.cta menu.
+  int64_t target_waves = 4;
+  if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
+      min_warp_size >= 1 && min_warp_size <= 16) {
+    int64_t native_x = 0;
+    int64_t native_z = 0;
+    if (inner3dWarpPlanIsSafe(
+            total_reduction_numel,
+            total_iteration_numel,
+            inner_most_dimension_numel,
+            min_warp_size,
+            device_multiprocessor_count,
+            max_threads_per_sm,
+            dev_prop->maxThreadsPerBlock,
+            0,
+            iteration_first,
+            &native_x,
+            4,
+            &native_z)) {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t waves : {2, 4, 8}) {
+        int64_t candidate_x = 0;
+        int64_t candidate_z = 0;
+        if (!inner3dWarpPlanIsSafe(
+                total_reduction_numel,
+                total_iteration_numel,
+                inner_most_dimension_numel,
+                min_warp_size,
+                device_multiprocessor_count,
+                max_threads_per_sm,
+                dev_prop->maxThreadsPerBlock,
+                0,
+                iteration_first,
+                &candidate_x,
+                waves,
+                &candidate_z)) {
+          continue;
+        }
+        if (waves == 4 || candidate_x != native_x ||
+            candidate_z != native_z) {
+          options.push_back(
+              {"waves" + std::to_string(waves),
+               "Cap target blocks at " + std::to_string(waves) +
+                   " SM waves and target SM threads / " +
+                   std::to_string(waves) + " per CTA"});
+        }
+      }
+      if (options.size() > 1) {
+        const std::string state =
+            std::string(iteration_first ? "reduction.inner3d_waves.v2\n"
+                                        : "reduction.inner3d_waves.v1\n") +
+            "reduction_numel=" + std::to_string(total_reduction_numel) +
+            "\niteration_numel=" + std::to_string(total_iteration_numel) +
+            "\ninner_numel=" +
+            std::to_string(inner_most_dimension_numel) +
+            "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+            "\nmax_dtype_bits=" +
+            std::to_string(max_dtype_size_bit_for_vectorization) +
+            "\nvector_width=" + std::to_string(vectorize_factor) +
+            "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+            "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+            "\nmax_threads_per_block=" +
+            std::to_string(dev_prop->maxThreadsPerBlock) +
+            "\nlogical_warp=" + std::to_string(min_warp_size) +
+            (iteration_first ? "\nwork_split=iter_first" : "");
+        const auto selected = scheduler::jev::chooseDecision(
+            "RD5.waves",
+            state,
+            options,
+            jev_mode_warp == scheduler::jev::Mode::Record ? "waves4" : "");
+        const auto found = std::find_if(
+            options.begin(), options.end(), [&](const auto& option) {
+              return option.id == selected;
+            });
+        NVF_ERROR(found != options.end(), "RD5.waves exceeds preflighted plans");
+        target_waves = std::stoll(selected.substr(5));
+      }
+    }
+  }
+
+  target_blocks =
+      std::min(target_blocks, device_multiprocessor_count * target_waves);
 
   if (target_blocks * target_unroll * target_iterations < n_elems) {
-    // targetting 4 waves, so try to use a quarter of available threads
+    // Balance the selected block-wave cap with the available SM threads.
     target_threads_in_block = std::min(
         ceilDiv(n_elems, target_blocks * target_unroll),
-        ceilDiv(max_threads_per_sm, (int64_t)4));
+        ceilDiv(max_threads_per_sm, target_waves));
   }
 
   // Round up to nearest warp.
@@ -1392,7 +1480,9 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
               max_threads_per_sm,
               dev_prop->maxThreadsPerBlock,
               candidate,
-              iteration_first)) {
+              iteration_first,
+              nullptr,
+              target_waves)) {
         continue;
       }
       if (!hard_valid_targets.empty()) {
@@ -1409,8 +1499,13 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           return option.id == "t" + std::to_string(native_target);
         })) {
       const std::string state =
-          std::string(iteration_first ? "reduction.inner3d_cta_target.v2\n"
-                                      : "reduction.inner3d_cta_target.v1\n") +
+          std::string(target_waves == 4
+                          ? (iteration_first
+                                 ? "reduction.inner3d_cta_target.v2\n"
+                                 : "reduction.inner3d_cta_target.v1\n")
+                          : (iteration_first
+                                 ? "reduction.inner3d_cta_target.v4\n"
+                                 : "reduction.inner3d_cta_target.v3\n")) +
           "reduction_numel=" +
           std::to_string(total_reduction_numel) +
           "\niteration_numel=" + std::to_string(total_iteration_numel) +
@@ -1425,6 +1520,9 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           std::to_string(dev_prop->maxThreadsPerBlock) +
           "\nlogical_warp=" + std::to_string(min_warp_size) +
           (iteration_first ? "\nwork_split=iter_first" : "") +
+          (target_waves == 4
+               ? ""
+               : "\ntarget_waves=" + std::to_string(target_waves)) +
           "\nhard_valid_targets=" + hard_valid_targets;
       const auto selected = scheduler::jev::chooseDecision(
           "RD5.cta", state, options,

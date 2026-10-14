@@ -6106,6 +6106,43 @@ TEST_F(Gpu1Test, JevAlternateInner3dWorkSplit_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// The wave cap changes the complete CTA: four waves target five outer
+// reduction threads, while eight waves target four for this bounded shape.
+TEST_F(Gpu1Test, JevAlternateInner3dWaves_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, 65, 4}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(rparams->lparams.bdimx(), 8);
+  ASSERT_TRUE(rparams->cross_grid_outer_reduction);
+  ASSERT_EQ(rparams->lparams.gdimz(), 2);
+  ASSERT_EQ(
+      rparams->lparams.bdimz(),
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 4 : 5);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // On SM89 this layout makes two raw inner-reduction grid pieces across 65
 // outputs. Native ragged-wave cleanup folds the grid to one piece; the remote
 // alternate keeps both complete grids and must still match the ATen sum.

@@ -684,6 +684,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_cta_target: bool = False,
                            require_inner3d_cta_full: bool = False,
                            require_reduction_inner3d_work_split: bool = False,
+                           require_reduction_inner3d_waves: bool = False,
                            require_inner3d_grid_wave: bool = False,
                            require_inner_width: bool = False,
                            require_inner_batch_cap: bool = False,
@@ -1218,6 +1219,48 @@ def check_alternate_report(report: dict[str, Any],
                     *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
+    elif require_reduction_inner3d_waves:
+        from jev_shim import (analyze_inner3d_cta_target, analyze_rd5_waves,
+                              parse_inner3d_cta_target_state,
+                              parse_rd5_waves_state)
+
+        if (site != "RD5.waves" or event["native"] != "waves4" or
+                alternate != "waves8" or
+                event["candidates"] != ["waves2", "waves4", "waves8"]):
+            raise ValueError("3D reduction fixture lacks its live wave menu")
+        state = parse_rd5_waves_state(event["state"])
+        plan = analyze_rd5_waves(state)
+        if (state["reduction_numel"] != 1024 or
+                state["iteration_numel"] != 65 or
+                state["inner_numel"] != 4 or
+                state["logical_warp"] != 8 or
+                state["iteration_first"] or
+                plan.native_block != (8, 5) or
+                plan.hard_valid_waves != (2, 4, 8)):
+            raise ValueError("RD5 wave cap did not reshape the bounded CTA")
+        before, after, dependent = paired_state_rows(report, "RD5.cta")
+        left = parse_inner3d_cta_target_state(before["request"]["state"])
+        right = parse_inner3d_cta_target_state(after["request"]["state"])
+        if (before["record"] != {"t40": 1} or
+                after["remote"] != {"t32": 1} or
+                left.get("target_waves", 4) != 4 or
+                right.get("target_waves") != 8 or
+                analyze_inner3d_cta_target(left).native_threads != 40 or
+                analyze_inner3d_cta_target(right).native_threads != 32 or
+                any(left[key] != right[key] for key in
+                    ("reduction_numel", "iteration_numel", "inner_numel",
+                     "n_tensor_inputs", "max_dtype_bits", "vector_width",
+                     "sm_count", "max_threads_per_sm",
+                     "max_threads_per_block", "logical_warp"))):
+            raise ValueError("selected wave cap did not reach dependent CTA")
+        for unchanged in ("RD4", "RD5.warp", "RD5.iter_unroll", "RD5.width"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == unchanged]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"unexpected {unchanged} dependency: {rows}")
+        if sorted(issues, key=str) != sorted([intended, *dependent], key=str):
+            raise ValueError(f"unexpected 3D wave dependencies: {issues}")
     elif require_reduction_inner3d_work_split:
         from jev_shim import (analyze_inner3d_cta_target,
                               analyze_inner3d_work_split,
@@ -2215,6 +2258,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-cta-full", action="store_true")
     parser.add_argument("--require-reduction-inner3d-work-split",
                         action="store_true")
+    parser.add_argument("--require-reduction-inner3d-waves",
+                        action="store_true")
     parser.add_argument("--require-inner3d-grid-wave", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner-batch-cap", action="store_true")
@@ -2347,6 +2392,8 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_cta_full=args.require_inner3d_cta_full,
             require_reduction_inner3d_work_split=(
                 args.require_reduction_inner3d_work_split),
+            require_reduction_inner3d_waves=(
+                args.require_reduction_inner3d_waves),
             require_inner3d_grid_wave=args.require_inner3d_grid_wave,
             require_inner_width=args.require_inner_width,
             require_inner_batch_cap=args.require_inner_batch_cap,
