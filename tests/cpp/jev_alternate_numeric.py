@@ -440,7 +440,8 @@ def check_iop3_inner_width_dependency(
         report: dict[str, Any], event: dict[str, Any],
         intended: dict[str, str], issues: list[dict[str, str]]) -> None:
     """Pair and replay every IOP3 request after a narrower inner vector."""
-    from jev_shim import (evaluate, parse_inner_outer_inner_width_state)
+    from jev_shim import (evaluate, parse_inner_outer_inner_width_state,
+                          parse_inner_outer_storage_state)
 
     target = parse_inner_outer_inner_width_state(event["state"])
     if (event["native"] != "w4" or event["requested_alternate"] != "w2" or
@@ -450,7 +451,7 @@ def check_iop3_inner_width_dependency(
     target_plans = {plan[0]: plan for plan in target.plans}
     paired = {}
     expected = [intended]
-    for site in ("IOP3.min_batch", "IOP3.tmp_read_width",
+    for site in ("IOP3.storage", "IOP3.min_batch", "IOP3.tmp_read_width",
                  "IOP3.grid_rows", "IOP3.cta", "IOP3.tmp_write_width"):
         before, after, pair_issues = paired_state_rows(report, site)
         paired[site] = (before, after)
@@ -464,12 +465,15 @@ def check_iop3_inner_width_dependency(
             if row[side] != {native: 1}:
                 raise ValueError(f"dependent {site} changed its native winner")
 
+    storage_rows = paired["IOP3.storage"]
     batch_rows = paired["IOP3.min_batch"]
     read_rows = paired["IOP3.tmp_read_width"]
     rows_rows = paired["IOP3.grid_rows"]
     cta_rows = paired["IOP3.cta"]
     write_rows = paired["IOP3.tmp_write_width"]
     for index, width in enumerate((4, 2)):
+        side = "record" if index == 0 else "remote"
+        storage = storage_rows[index]
         batch = batch_rows[index]
         read = read_rows[index]
         rows = rows_rows[index]
@@ -483,10 +487,17 @@ def check_iop3_inner_width_dependency(
         write_fields = state_fields(write, "inner_outer_multi_wave.tmp_write_width.v2")
         cta_fields, cta_plans = iop3_rows_expected_cta(
             rows["request"]["state"], 8)
+        storage_state = parse_inner_outer_storage_state(
+            storage["request"]["state"])
         cta_lines = cta["request"]["state"].splitlines()
         actual_cta_fields = dict(line.split("=", 1) for line in cta_lines[1:]
                                  if not line.startswith("plan="))
-        if (batch_state[0] != "inner_outer_multi_wave.minimum_batch.v1" or
+        if (storage[side] != {"shared": 1} or
+                storage_state.selected_inner_width != width or
+                storage_state.outer_accumulator_bits != target_plans[width][1] or
+                storage_state.shared_buffer_bits != target_plans[width][2] or
+                storage_state.shared_overhead_bits != target_plans[width][3] or
+                batch_state[0] != "inner_outer_multi_wave.minimum_batch.v1" or
                 batch_fields.get("vector_width") != str(width) or
                 batch_fields.get("after_vector") != str(2048 // width) or
                 read_fields["inner_vector_width"] != str(width) or
@@ -503,6 +514,16 @@ def check_iop3_inner_width_dependency(
                 write_fields["outer_read_width"] != "2" or
                 write_fields["tmp_dtype_bits"] != "32"):
             raise ValueError("inner width did not produce the exact dependent plan")
+    shared_storage, narrow_storage = (
+        parse_inner_outer_storage_state(row["request"]["state"])
+        for row in storage_rows)
+    changing_storage = {"selected_inner_width", "shared_buffer_bits",
+                        "shared_plan", "register_plan"}
+    if ({key: value for key, value in vars(shared_storage).items()
+         if key not in changing_storage} !=
+            {key: value for key, value in vars(narrow_storage).items()
+             if key not in changing_storage}):
+        raise ValueError("inner width changed unrelated storage measurements")
     for site, version, changing in (
             ("IOP3.tmp_read_width", "inner_outer_multi_wave.tmp_read_width.v1",
              {"inner_vector_width", "legal_widths"}),
