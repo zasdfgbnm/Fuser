@@ -1564,6 +1564,76 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
         MatmulParams::CircularBufferingStrategy::Pipelined;
   }
 
+  // The default Hopper scheduler circular-buffers both operand caches. Once
+  // MM2.stages has selected their common stage count, prefetch gap is a
+  // performance choice. Keep the schedule's stricter positive prefetch
+  // distance, and leave plugin-owned configurations untouched.
+  if (jev_mode != scheduler::jev::Mode::Off &&
+      isHopper(mparams->mma_macro) &&
+      !matmul_heuristic_plugin::hasPlugin()) {
+    const int stages =
+        mparams->circular_buffer_options.smem_circular_buffer_stage;
+    if (stages < 3) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "MM2.prefetch_gap", "fewer than three operand stages");
+      }
+    } else {
+      const auto a_it = tensor_roles.find(MatmulTensorRole::OPERAND_A);
+      const auto b_it = tensor_roles.find(MatmulTensorRole::OPERAND_B);
+      const bool warp_specialized =
+          mparams->circular_buffering_strategy ==
+          MatmulParams::CircularBufferingStrategy::WarpSpecialized;
+      const bool smem_write =
+          mparams->circular_buffer_options.circular_buffer_smem_write;
+      const bool valid_operand_plan =
+          a_it != tensor_roles.end() && !a_it->second.empty() &&
+          b_it != tensor_roles.end() && !b_it->second.empty() &&
+          mparams->async_gmem_load_operands && smem_write && warp_specialized;
+      if (!valid_operand_plan) {
+        if (jev_mode == scheduler::jev::Mode::Record) {
+          scheduler::jev::recordCoverageSkip(
+              "MM2.prefetch_gap", "operand circular-buffer plan is unproved");
+        } else {
+          NVF_ERROR(false, "MM2.prefetch_gap operand plan is unproved");
+        }
+      } else {
+        const std::string state =
+            "matmul.hopper_prefetch_gap.v1\nstage_count=" +
+            std::to_string(stages) +
+            "\noperand_a_count=" + std::to_string(a_it->second.size()) +
+            "\noperand_b_count=" + std::to_string(b_it->second.size()) +
+            "\nnum_problems=" + std::to_string(patterns.size()) +
+            "\nasync_load=" +
+            std::to_string(mparams->async_gmem_load_operands ? 1 : 0) +
+            "\nwarp_specialized=" +
+            std::to_string(warp_specialized ? 1 : 0) +
+            "\nsmem_write=" + std::to_string(smem_write ? 1 : 0);
+        std::vector<scheduler::jev::ChoiceOption> options;
+        for (int gap = 1; gap <= std::min(stages - 1, 4); ++gap) {
+          options.push_back({
+              "g" + std::to_string(gap),
+              "Prefetch both operands " + std::to_string(stages - gap) +
+                  " stage(s) ahead"});
+        }
+        const std::string selected = scheduler::jev::chooseDecision(
+            "MM2.prefetch_gap",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? "g1" : "");
+        const auto selected_it = std::find_if(
+            options.begin(), options.end(), [&](const auto& option) {
+              return option.id == selected;
+            });
+        NVF_ERROR(
+            selected_it != options.end(),
+            "MM2.prefetch_gap response is outside the checked stage menu");
+        mparams->circular_buffer_options.smem_circular_buffer_prefetch_gap =
+            std::stoi(selected.substr(1));
+      }
+    }
+  }
+
   // Disable magic zero for matmul kernels
   mparams->cparams.enable_magic_zero = false;
 
