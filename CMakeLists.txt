@@ -1788,6 +1788,16 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_greedy_three_scan_batch)
   set_tests_properties(jev_alternate_numeric_greedy_three_scan_batch PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_greedy_four_scan_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_greedy>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site GR1.multi_scan_batch --alternate b4
+      --gtest GreedySchedulerTest.JevAlternateFourScanBatch_CUDA
+      --case-key jev_alternate_numeric_greedy_four_scan_batch)
+  set_tests_properties(jev_alternate_numeric_greedy_four_scan_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()

@@ -937,7 +937,7 @@ class HeuristicsBuilder : private IterVisitor {
         out_tv);
   }
 
-  // Two or three compatible Scan calls use the same TIDx extent. Offer one
+  // Two to four compatible Scan calls use the same TIDx extent. Offer one
   // shared batch after checking their combined CUB storage and a conservative
   // register budget for every Scan input and output. Other mixes keep their
   // native independent batches until their full plans are proven.
@@ -945,11 +945,29 @@ class HeuristicsBuilder : private IterVisitor {
       const std::vector<Expr*>& constrained_ops) {
     const auto jev_mode = scheduler::jev::mode();
     const auto scan_count = constrained_ops.size();
-    if (jev_mode == scheduler::jev::Mode::Off ||
-        (scan_count != 2 && scan_count != 3) ||
-        !std::ranges::all_of(constrained_ops, [](Expr* op) {
-          return op->isA<ScanOp>();
-        })) {
+    if (jev_mode == scheduler::jev::Mode::Off || scan_count < 2) {
+      return std::nullopt;
+    }
+    const bool all_scans = std::ranges::all_of(constrained_ops, [](Expr* op) {
+      return op->isA<ScanOp>();
+    });
+    if (!all_scans) {
+      if (jev_mode == scheduler::jev::Mode::Record &&
+          std::ranges::any_of(constrained_ops, [](Expr* op) {
+            return op->isA<ScanOp>();
+          })) {
+        scheduler::jev::recordCoverageSkip(
+            "GR1.multi_scan_batch",
+            "mixed constrained operations have no joint batch proof");
+      }
+      return std::nullopt;
+    }
+    if (scan_count > 4) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "GR1.multi_scan_batch",
+            "more than four Scans are outside the checked joint batch domain");
+      }
       return std::nullopt;
     }
 
@@ -1011,7 +1029,7 @@ class HeuristicsBuilder : private IterVisitor {
     auto add_option = [&](int64_t batch, int64_t threads) {
       const auto scope = scan_count == 2
           ? "both Scan ops"
-          : "all three Scan ops";
+          : scan_count == 3 ? "all three Scan ops" : "all four Scan ops";
       options.push_back({
           "b" + std::to_string(batch),
           "Use " + std::to_string(batch) +
