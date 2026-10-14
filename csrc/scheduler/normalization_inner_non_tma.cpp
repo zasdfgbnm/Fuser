@@ -1015,6 +1015,13 @@ int64_t chooseInner2DCTASeed(
           plan.grid_x =
               ceilDiv(properties.total_iteration_numel, plan.physical_y);
           const int64_t threads = plan.physical_x * plan.physical_y;
+          const bool grid_fits = plan.grid_x > 0 &&
+              (plan.grid_x <= device->maxGridSize[0] ||
+               (scheduler_utils::x_grid_limit <= device->maxGridSize[0] &&
+                ceilDiv(plan.grid_x, scheduler_utils::x_grid_limit) <=
+                    std::min<int64_t>(
+                        scheduler_utils::y_grid_limit,
+                        device->maxGridSize[1])));
           plan.valid = plan.batch >= plan.batch_min &&
               plan.batch <= plan.batch_max && plan.physical_x > 0 &&
               plan.physical_x <= device->maxThreadsDim[0] &&
@@ -1022,14 +1029,7 @@ int64_t chooseInner2DCTASeed(
               plan.physical_y <= device->maxThreadsDim[1] && threads > 0 &&
               threads <= max_threads && plan.register_cap > 0 &&
               plan.register_cap <= 255 &&
-              plan.register_cap <= device->regsPerBlock / threads &&
-              plan.grid_x > 0 &&
-              (plan.grid_x <= device->maxGridSize[0] ||
-               (scheduler_utils::x_grid_limit <= device->maxGridSize[0] &&
-                ceilDiv(plan.grid_x, scheduler_utils::x_grid_limit) <=
-                    std::min<int64_t>(
-                        scheduler_utils::y_grid_limit,
-                        device->maxGridSize[1]));
+              plan.register_cap <= device->regsPerBlock / threads && grid_fits;
         }
       } catch (const std::exception&) {
         // A failed alternate preflight never becomes an API option.
