@@ -100,7 +100,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
     const pointwise_utils::FusionRuntimeProperties& prop,
     const pointwise_utils::BreakPointInfo& bp_info,
     scheduler::jev::Mode jev_mode,
-    bool* hard_valid = nullptr) {
+    bool* hard_valid = nullptr,
+    bool emit_debug = true) {
   constexpr int64_t threads_per_warp = 32;
 
   auto params = std::make_unique<PointwiseParams>();
@@ -564,7 +565,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
   // TMA store
   params->use_tma_store = false;
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (emit_debug && isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << "\n==== Pointwise TMA Scheduler Heuristics ====\n";
     debug() << "Domain sizes:\n";
     debug() << "  n_elems: " << prop.n_elems << "\n";
@@ -668,6 +669,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     bool hard_valid = false;
     std::unique_ptr<PointwiseParams> materialized;
     try {
+      // Materialize every candidate for the hard guards, but only the final
+      // plan should appear in SchedulerDebug output.
       materialized = getPointwiseHeuristicsForBreakPoint(
           fusion,
           runtime_info,
@@ -675,7 +678,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
           prop,
           candidate,
           scheduler::jev::Mode::Off,
-          &hard_valid);
+          &hard_valid,
+          /*emit_debug=*/false);
     } catch (const nvfError&) {
       // A candidate that cannot complete the native plan is outside the
       // Choice menu. The original plan is built separately above in record.

@@ -8,12 +8,24 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <utility>
+#include <unistd.h>
+
+#include "debug.h"
 #include "fusion.h"
 #include "ir/interface_nodes.h"
+#include "options.h"
 #include "ops/all_ops.h"
 #include "optimization_pass.h"
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/fusion_executor_cache.h"
+#include "scheduler/pointwise_tma.h"
+#include "scheduler/pointwise_utils.h"
+#include "scheduler/runtime_info.h"
 #include "scheduler/tools/domain_map.h"
 #include "scheduler/tools/inlining.h"
 #include "tests/cpp/utils.h"
@@ -35,6 +47,28 @@ class PointwiseTestP : public NVFuserFixtureParamTest<ParamType> {
 };
 
 namespace {
+
+class ScopedTestEnv {
+ public:
+  ScopedTestEnv(std::string name, const char* value) : name_(std::move(name)) {
+    if (const char* previous = std::getenv(name_.c_str())) {
+      previous_ = previous;
+    }
+    NVF_CHECK(::setenv(name_.c_str(), value, 1) == 0);
+  }
+
+  ~ScopedTestEnv() {
+    if (previous_.has_value()) {
+      ::setenv(name_.c_str(), previous_->c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
 
 int64_t getVecSizeForPointwise(const FusionExecutorCache& executor_cache) {
   FusionKernelRuntime* runtime = executor_cache.getMostRecentKernelRuntime();
@@ -1470,6 +1504,68 @@ int64_t getVectorizationFactor(const FusionExecutorCache& executor_cache) {
       ->vectorization_factor;
 }
 } // namespace tma_check
+
+// Call the TMA heuristic directly so this checks candidate analysis on any
+// CUDA device without compiling or executing a Hopper kernel.
+TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
+  char log_path[] = "/tmp/nvfuser-pw4-preflight-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {32, 4096}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+  EXPECT_EQ(
+      pointwise_utils::getTmaBreakPointSearch(*prop, nullptr).candidates.size(),
+      2);
+
+  DebugDumpOptionsGuard debug_options;
+  DebugDumpOptionsGuard::getCurOptions().set(DebugDumpOption::SchedulerDebug);
+  std::stringstream debug_output;
+  std::unique_ptr<PointwiseParams> params;
+  {
+    DebugStreamGuard debug_guard(debug_output);
+    params = pointwise::tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop);
+  }
+  ASSERT_NE(params, nullptr);
+  const std::string marker = "==== Pointwise TMA Scheduler Heuristics ====";
+  const std::string output = debug_output.str();
+  const size_t first = output.find(marker);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(output.find(marker, first + marker.size()), std::string::npos);
+  EXPECT_THAT(
+      output,
+      ::testing::HasSubstr(
+          "break_point: " + std::to_string(params->break_point) + "\n"));
+
+  std::ifstream log_file(log_path);
+  std::stringstream log_output;
+  log_output << log_file.rdbuf();
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.breakpoint\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.tile_inner\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.tile_outer\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.width\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp0\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp1\""));
+}
 
 // Non-parameterized TMA pointwise test fixture (for TEST_F)
 class TmaPointwiseTestF : public PointwiseTest {
