@@ -4,7 +4,8 @@
 
 CTest invokes this under the governed resource wrapper. The in-process server
 first runs the unmodified parity evaluator, including its full request and
-candidate validation. This test then changes one named answer to a legal option.
+candidate validation. The selected test then changes one named answer to a
+legal option.
 The production analysis server and scheduler are never patched on disk.
 """
 
@@ -87,7 +88,8 @@ class AlternateChoice:
 
 def check_alternate_report(report: dict[str, Any],
                            events: list[dict[str, Any]], *, site: str,
-                           alternate: str, case_key: str) -> dict[str, Any]:
+                           alternate: str, case_key: str,
+                           require_grid: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -100,13 +102,26 @@ def check_alternate_report(report: dict[str, Any],
             entry["record"] != {event["native"]: 1} or
             entry["remote"] != {alternate: 1}):
         raise ValueError(f"{site} record/remote requests or winners differ: {entry}")
-    issue = [{"kind": problem["kind"], "site": problem.get("site"),
-              "request_sha256": problem.get("request_sha256")}
-             for problem in report["issues"]]
-    expected = [{"kind": "winner_mismatch", "site": site,
-                 "request_sha256": event["request_sha256"]}]
-    if issue != expected:
-        raise ValueError(f"unexpected decision comparison issues: {issue}")
+    issues = [{"kind": problem["kind"], "site": problem.get("site"),
+               "request_sha256": problem.get("request_sha256")}
+              for problem in report["issues"]]
+    intended = {"kind": "winner_mismatch", "site": site,
+                "request_sha256": event["request_sha256"]}
+    if intended not in issues:
+        raise ValueError(f"missing intended winner mismatch: {issues}")
+    if require_grid:
+        if set(event["candidates"]) != {"warp16", "warp32"}:
+            raise ValueError("outer warp test did not reach both hard-valid plans")
+        allowed = {site, "RD9.stride", "RD8"}
+        if any(issue["site"] not in allowed for issue in issues):
+            raise ValueError(f"unrelated decision comparison issues: {issues}")
+        rd8 = [row for row in report["multiplicity"] if row["site"] == "RD8"]
+        if sum(row["remote"].get("grid", 0) for row in rd8) != 1:
+            raise ValueError(f"alternate warp did not reach the grid plan: {rd8}")
+        if not any(issue["site"] in {"RD9.stride", "RD8"} for issue in issues):
+            raise ValueError("alternate warp did not alter downstream grid analysis")
+    elif issues != [intended]:
+        raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
         raise ValueError("remote and server request counts differ")
     if set(report["case_coverage"]) != {case_key}:
@@ -127,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alternate", default=ALTERNATE)
     parser.add_argument("--gtest", default=GTEST)
     parser.add_argument("--case-key", default=CASE_KEY)
+    parser.add_argument("--require-grid", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -134,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--artifacts-root must be an absolute directory")
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", args.site):
         parser.error("--site must be a single decision name")
-    if not re.fullmatch(r"[a-z][0-9]+", args.alternate):
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", args.alternate):
         parser.error("--alternate must be a single width or grid choice")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", args.gtest):
         parser.error("--gtest must be one exact GTest name")
@@ -223,7 +239,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest["decision_comparison_sha256"] = file_hash(report_path)
         summary = check_alternate_report(
             report, override.events, site=args.site,
-            alternate=args.alternate, case_key=args.case_key)
+            alternate=args.alternate, case_key=args.case_key,
+            require_grid=args.require_grid)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)

@@ -1191,6 +1191,16 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_inner3d_width)
   set_tests_properties(jev_alternate_numeric_inner3d_width PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_warp
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.warp --alternate warp32
+      --gtest Gpu1Test.JevAlternateOuterWarp_CUDA
+      --case-key jev_alternate_numeric_outer_warp --require-grid)
+  set_tests_properties(jev_alternate_numeric_outer_warp PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()

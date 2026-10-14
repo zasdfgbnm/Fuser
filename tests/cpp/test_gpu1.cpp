@@ -5659,6 +5659,39 @@ TEST_F(Gpu1Test, FusionReductionScheduler_CUDA) {
       cg_results.heuristic_params->lparams);
 }
 
+// Exercise an outer reduction large enough to use a grid plan but small
+// enough to fit the SM89 L2 cache. The odd output extent exercises masked
+// iteration-grid coverage. The alternate numeric harness forces the opposite
+// logical-warp target after both native grid plans pass hard bounds.
+TEST_F(Gpu1Test, JevAlternateOuterWarp_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 513;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Keep the output dimension small enough that the inner reduction grid has
 // both one- and two-block plans on SM89. The alternate Choice test exercises
 // the non-native plan and checks its result against the ATen reference.
