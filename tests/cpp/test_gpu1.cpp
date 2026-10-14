@@ -5746,7 +5746,8 @@ TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
   auto results =
       scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
   ASSERT_TRUE(results.heuristic_params->as<ReductionParams>()->schedule_3d);
-  auto reference = aten_input.to(at::kDouble).sum({0, 2});
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
   testValidate(
       &fusion,
       results.outputs,
