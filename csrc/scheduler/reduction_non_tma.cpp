@@ -171,12 +171,6 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   const int64_t sm_count = dev_prop->multiProcessorCount;
   const int64_t target_threads_per_sm = max_threads_per_sm / 2;
 
-  const int64_t min_warp_size = reduction_scheduler_utils::getL1L2WarpSize(
-      total_reduction_numel,
-      total_iteration_numel,
-      n_tensor_inputs,
-      max_dtype_size_bit_for_vectorization);
-
   // RD3.width asks the local model for the performance width within the
   // layout-derived native maximum. RD3.unroll separately chooses the inner
   // unroll target, and RD3.cta chooses the CTA target before native
@@ -435,6 +429,93 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     NVF_ERROR(
         target_threads_per_block <= max_threads_per_block / 2,
         "RD3.cta target exceeds half the physical block limit");
+  }
+
+  // RD3.warp chooses the empirical minimum number of reduction threads used
+  // by the seed and remainder search. getL1L2WarpSize returns any integer in
+  // [1, 16], not just a power of two. Keep every native value in the menu.
+  // This is the 2D path only; the 3D planner has a separate use of the same
+  // utility. The bounds below cover the complete downstream plan for *each*
+  // candidate, without running speculative scheduler/API calls: x <= CTA,
+  // unroll >= 1, and the remainder scan has at most one seed plus
+  // (CTA - four_warps + 1) widths. Warp padding is less than 2x x, while
+  // CTA <= half the physical block limit. Native grid bounds remain in force.
+  int64_t min_warp_size = 0;
+  const int64_t l2_cache_bytes = dev_prop->l2CacheSize;
+  const bool bounded_warp_plan =
+      threads_per_warp == 32 && total_reduction_numel >= 1 &&
+      total_iteration_numel >= 1 &&
+      total_iteration_numel <= scheduler_utils::y_grid_limit &&
+      n_tensor_inputs >= 1 && max_dtype_size_bit_for_vectorization >= 1 &&
+      max_dtype_size_bit_for_vectorization <= 128 &&
+      (max_dtype_size_bit_for_vectorization &
+       (max_dtype_size_bit_for_vectorization - 1)) == 0 &&
+      n_tensor_inputs <= std::numeric_limits<int64_t>::max() /
+          max_dtype_size_bit_for_vectorization &&
+      total_reduction_numel <=
+          std::numeric_limits<int64_t>::max() / total_iteration_numel &&
+      target_inner_unroll >= 1 && target_inner_unroll <= after_vect &&
+      target_inner_unroll <= 65536 && target_threads_per_block >= four_warps &&
+      target_threads_per_block <= max_threads_per_block / 2 &&
+      target_threads_per_block <= 32768 && l2_cache_bytes >= 1 &&
+      l2_cache_bytes <= std::numeric_limits<int64_t>::max() / 8;
+  bool choose_warp = bounded_warp_plan;
+  if (choose_warp) {
+    const int64_t input_bits =
+        n_tensor_inputs * max_dtype_size_bit_for_vectorization;
+    const int64_t n_elems = total_reduction_numel * total_iteration_numel;
+    const int64_t max_remainder_widths =
+        1 + target_threads_per_block - four_warps + 1;
+    choose_warp =
+        input_bits <= std::numeric_limits<int64_t>::max() / 1024 &&
+        n_elems <= std::numeric_limits<int64_t>::max() / input_bits &&
+        max_remainder_widths <= 32768 &&
+        target_inner_unroll <= 2000000 / max_remainder_widths;
+  }
+  if (jev_mode != scheduler::jev::Mode::Remote || !choose_warp) {
+    min_warp_size = reduction_scheduler_utils::getL1L2WarpSize(
+        total_reduction_numel,
+        total_iteration_numel,
+        n_tensor_inputs,
+        max_dtype_size_bit_for_vectorization);
+  }
+  if (jev_mode != scheduler::jev::Mode::Off && choose_warp) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t warp = 1; warp <= 16; ++warp) {
+      options.push_back(
+          {"m" + std::to_string(warp),
+           "Use " + std::to_string(warp) +
+               " minimum reduction threads in the 2D block plan"});
+    }
+    std::string state = "reduction.inner_warp_target.v1\n";
+    state += "reduction_numel=" + std::to_string(total_reduction_numel) + '\n';
+    state += "iteration_numel=" + std::to_string(total_iteration_numel) + '\n';
+    state += "n_tensor_inputs=" + std::to_string(n_tensor_inputs) + '\n';
+    state += "max_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+    state += "l2_cache_bytes=" + std::to_string(l2_cache_bytes) + '\n';
+    state += "vector_width=" + std::to_string(vect_factor) + '\n';
+    state += "after_vect=" + std::to_string(after_vect) + '\n';
+    state += "target_inner_unroll=" +
+        std::to_string(target_inner_unroll) + '\n';
+    state += "target_threads_per_block=" +
+        std::to_string(target_threads_per_block) + '\n';
+    state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
+    state += "max_threads_per_block=" +
+        std::to_string(max_threads_per_block) + '\n';
+    state += "max_grid_y=" +
+        std::to_string(scheduler_utils::y_grid_limit) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "m" + std::to_string(min_warp_size)
+        : std::string();
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD3.warp", state, options, native_choice);
+    const auto found = std::find_if(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == selected;
+        });
+    NVF_ERROR(found != options.end(), "RD3.warp response exceeds 2D plan bounds");
+    min_warp_size = std::stoll(selected.substr(1));
   }
 
   // Put inner remainder to bdimx, but don't go over 4 warps

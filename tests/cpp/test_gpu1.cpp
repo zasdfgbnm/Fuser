@@ -5859,6 +5859,41 @@ TEST_F(Gpu1Test, JevAlternateInnerIterUnroll_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// An odd reduction extent disables vector loads and enters the 2D remainder
+// scan. On SM89 the native logical minimum is eight; the alternate sixteen
+// changes the legal scan widths and therefore the selected CTA x dimension.
+TEST_F(Gpu1Test, JevAlternateInnerWarpTarget_CUDA) {
+  constexpr int output_size = 1024;
+  constexpr int reduction_size = 1025;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->schedule_3d);
+  const auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Hold the native 3D reduction block/grid plan fixed while the local API
 // chooses a smaller, still aligned vector width for its innermost axis.
 TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {

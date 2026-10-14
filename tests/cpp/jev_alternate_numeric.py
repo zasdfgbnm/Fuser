@@ -270,6 +270,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_cta: bool = False,
                            require_outer_ragged: bool = False,
                            require_inner_iter_unroll: bool = False,
+                           require_inner_warp_target: bool = False,
                            require_inner_width: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
@@ -546,6 +547,54 @@ def check_alternate_report(report: dict[str, Any],
                     *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
+    elif require_inner_warp_target:
+        if (site != "RD3.warp" or event["native"] != "m8" or
+                alternate != "m16" or
+                set(event["candidates"]) != {
+                    f"m{warp}" for warp in range(1, 17)}):
+            raise ValueError("2D inner warp fixture lacks its complete target menu")
+        warp = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "reduction.inner_warp_target.v1")
+        if any(warp.get(key) != value for key, value in {
+                "reduction_numel": "1025", "iteration_numel": "1024",
+                "vector_width": "1", "after_vect": "1025",
+                "target_threads_per_block": "256", "warp_size": "32",
+                "max_grid_y": "65535"}.items()):
+            raise ValueError(f"warp target did not receive the odd 2D plan: {warp}")
+        if not 2 <= int(warp.get("target_inner_unroll", "0")) <= 4:
+            raise ValueError(f"fixture missed the native remainder scan: {warp}")
+        expected = [intended]
+        for nested_site, native_x, selected_x in (
+                ("RD3.remainder_x", None, None),
+                ("RD3.remainder_u", "200", "192")):
+            before, after, pair_issues = paired_state_rows(report, nested_site)
+            expected.extend(pair_issues)
+            tag = ("reduction.inner_remainder_x.v1" if native_x is None
+                   else "reduction.inner_remainder_u.v1")
+            record_fields = state_fields(before, tag)
+            remote_fields = state_fields(after, tag)
+            for fields, minimum, chosen in (
+                    (record_fields, "8", native_x),
+                    (remote_fields, "16", selected_x)):
+                if (fields.get("min_warp_size") != minimum or
+                        fields.get("after_vect") != "1025" or
+                        fields.get("target_threads_per_block") != "256" or
+                        fields.get("target_inner_unroll") !=
+                        warp["target_inner_unroll"] or
+                        (chosen is not None and
+                         fields.get("chosen_bdimx") != chosen)):
+                    raise ValueError(f"{nested_site} ignored selected warp: {fields}")
+            if nested_site == "RD3.remainder_u" and (
+                    before["record"] != after["remote"]):
+                raise ValueError("inner unroll changed outside warp's x scan")
+        for row in report["multiplicity"]:
+            if row["site"].startswith("RD3.") and row["site"] not in {
+                    site, "RD3.remainder_x", "RD3.remainder_u"} and (
+                    row["record"] != row["remote"] or
+                    sum(row["record"].values()) != 1):
+                raise ValueError(f"unrelated 2D reduction decision changed: {row}")
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected inner warp dependencies: {issues}")
     elif site == "RD3.grid":
         if (event["native"] != "g2" or alternate != "g1" or
                 set(event["candidates"]) != {"g1", "g2"}):
@@ -916,6 +965,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-ragged", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner-iter-unroll", action="store_true")
+    parser.add_argument("--require-inner-warp-target", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
@@ -1027,6 +1077,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_ragged=args.require_outer_ragged,
             require_inner_targets=args.require_inner_targets,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
+            require_inner_warp_target=args.require_inner_warp_target,
             require_inner_width=args.require_inner_width,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
