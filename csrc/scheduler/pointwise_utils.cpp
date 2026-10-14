@@ -444,12 +444,59 @@ BlockGridConfig getBlockGridConfig(
 
     int64_t cur_left_elem_count = n_elems / result.right_elem_count;
 
-    // Start bdimx with 1 warp, increase if split is divisible
+    // Preserve the native preference in off and record modes. Remote mode
+    // derives it from raw extents and hardware data in the local model.
     int64_t after_vect = ceilDiv(result.right_elem_count, max_vect_factor);
-    result.bdimx = std::min(after_vect, threads_per_warp);
-    while (result.bdimx * 2 <= kThreadX && result.bdimx * 2 <= after_vect &&
-           after_vect % (result.bdimx * 2) == 0) {
-      result.bdimx *= 2;
+    const auto jev_mode = scheduler::jev::mode();
+    if (jev_mode != scheduler::jev::Mode::Remote) {
+      result.bdimx = std::min(after_vect, threads_per_warp);
+      while (result.bdimx * 2 <= kThreadX &&
+             result.bdimx * 2 <= after_vect &&
+             after_vect % (result.bdimx * 2) == 0) {
+        result.bdimx *= 2;
+      }
+    }
+    if (jev_mode != scheduler::jev::Mode::Off) {
+      NVF_ERROR(
+          n_elems > 0 && result.right_elem_count > 0 && max_vect_factor > 0 &&
+              threads_per_warp > 0 && threads_per_warp <= kThreadX &&
+              kThreadX == 128 &&
+              result.right_elem_count <= n_elems &&
+              n_elems % result.right_elem_count == 0,
+          "PW3.launch requires valid two-dimensional extents and CTA bounds");
+
+      // The schedule splits both axes by symbolic thread dimensions and
+      // predicates tails. Any positive TIDx dimension up to the CTA cap is
+      // structurally valid, including overprovisioned or non-power-of-two
+      // dimensions. TIDy=floor(kThreadX/TIDx) keeps the CTA within that cap.
+      // Offer the full set so its upper bound never reveals the native winner.
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(kThreadX);
+      for (int64_t candidate = 1; candidate <= kThreadX; ++candidate) {
+        options.push_back(
+            {"x" + std::to_string(candidate),
+             "Use " + std::to_string(candidate) + " TIDx threads"});
+      }
+      std::string state = "pointwise.launch.v1\n";
+      state += "n_elems=" + std::to_string(n_elems) + '\n';
+      state += "right_elems=" + std::to_string(result.right_elem_count) + '\n';
+      state += "vector_width=" + std::to_string(max_vect_factor) + '\n';
+      state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
+      state += "cta_threads=" + std::to_string(kThreadX) + '\n';
+      const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+          ? "x" + std::to_string(result.bdimx)
+          : std::string();
+      const auto selected = scheduler::jev::chooseDecision(
+          "PW3.launch", state, options, native_choice);
+      bool matched = false;
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          result.bdimx = std::stoll(option.id.substr(1));
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "PW3.launch response is outside hard CTA bounds");
     }
     result.bdimy = kThreadX / result.bdimx;
     result.gdim_left = ceilDiv(cur_left_elem_count, result.bdimy);
