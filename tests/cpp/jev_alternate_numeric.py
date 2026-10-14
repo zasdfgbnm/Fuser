@@ -151,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]*", args.site):
         parser.error("--site must be a single decision name")
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.alternate):
-        parser.error("--alternate must be a single width or grid choice")
+        parser.error("--alternate must be a single Choice identifier")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", args.gtest):
         parser.error("--gtest must be one exact GTest name")
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.case_key):

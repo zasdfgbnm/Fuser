@@ -639,13 +639,15 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
       allow_jev_tail_choice && scheduler::jev::mode() != scheduler::jev::Mode::Off &&
       dev_prop->major >= 8 && dev_prop->major <= 20 &&
       dev_prop->minor <= 9 && dev_prop->multiProcessorCount >= 2 &&
-      dev_prop->multiProcessorCount <= 65536 && vectorize_factor > 0 &&
+      // Fewer than 128 topology bases (two block shapes × two grid halves).
+      // The Jev client accepts no more than 255 Choice options.
+      dev_prop->multiProcessorCount <= 1024 && vectorize_factor > 0 &&
       vectorize_factor <= 128 &&
       (vectorize_factor & (vectorize_factor - 1)) == 0 &&
       total_iteration_numel % vectorize_factor == 0 &&
       total_reduction_numel <= max_int / 256 &&
       total_iteration_numel <= max_int / (128 * 16) &&
-      persistent_buffer_size_bit <= max_int / vectorize_factor;
+      persistent_buffer_size_bit <= max_int / 256;
   std::optional<GridBasePlan> native_base;
 
   const auto finalize = [](const GridBasePlan& plan) {
