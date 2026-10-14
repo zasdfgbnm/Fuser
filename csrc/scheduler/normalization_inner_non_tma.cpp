@@ -1359,6 +1359,8 @@ struct Inner3DPlanResources {
   int64_t registers_per_thread = 0;
   int64_t grid_blocks = 0;
   int64_t pre_outer_threads_z = 0;
+  int64_t target_unroll = 0;
+  int64_t target_iterations = 0;
 };
 
 // Retain the exact L1/L2 estimate used by the native 3D planner.
@@ -1395,7 +1397,8 @@ void innerPersistentHeuristic3DPlan(
     int64_t warp_target = -1,
     int64_t occupancy_target = 28,
     int64_t outer_unroll_cap = std::numeric_limits<int64_t>::max(),
-    int64_t register_overhead_override = -1) {
+    int64_t register_overhead_override = -1,
+    bool unroll_first = true) {
   // Define two free parameters used in this heuristic.
   // register_overhead is all registers except those for the persistent
   // buffers. The register in each thread = register_overhead +
@@ -1470,7 +1473,7 @@ void innerPersistentHeuristic3DPlan(
 
     // Spread across unrolling and iterations, want a balance of the two so flip
     // back and forth to alternate adding to them.
-    bool flip = true;
+    bool flip = unroll_first;
 
     while (available_unroll > 1 &&
            (target_unroll < max_unroll ||
@@ -1861,7 +1864,9 @@ void innerPersistentHeuristic3DPlan(
         (pad_bdimx ? padded_bdimx : bdimx) * bdimy * bdimz,
         nvrtc_register_per_thread,
         godim,
-        pre_outer_threads_z};
+        pre_outer_threads_z,
+        target_unroll,
+        target_iterations};
   }
 }
 
@@ -2158,7 +2163,8 @@ std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
     int64_t outer_unroll_cap,
     std::unique_ptr<ReductionParams> native,
     const Inner3DPlanResources& native_resources,
-    const cudaDeviceProp& device) {
+    const cudaDeviceProp& device,
+    bool unroll_first) {
   const int64_t native_overhead = properties.has_exp_op ? 32 : 16;
   const int64_t alternate_overhead = native_overhead + 8;
   struct Plan {
@@ -2236,7 +2242,8 @@ std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
         warp_target,
         occupancy_target,
         outer_unroll_cap,
-        alternate_overhead);
+        alternate_overhead,
+        unroll_first);
     const bool eligible =
         resources.registers_per_thread >
             native_resources.registers_per_thread &&
@@ -2303,7 +2310,8 @@ std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
     int64_t occupancy_target,
     std::unique_ptr<ReductionParams> native,
     const Inner3DPlanResources& native_resources,
-    const cudaDeviceProp& device) {
+    const cudaDeviceProp& device,
+    bool unroll_first) {
   struct Plan {
     int64_t target;
     std::unique_ptr<ReductionParams> params;
@@ -2368,7 +2376,9 @@ std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
         &resources,
         warp_target,
         occupancy_target,
-        target);
+        target,
+        -1,
+        unroll_first);
     const bool eligible =
         params->unroll_factor_outer_reduction == target &&
         isNativeValidInner3DAlternative(
@@ -2435,7 +2445,158 @@ std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
       plan_it->target,
       std::move(plan_it->params),
       plan_it->resources,
-      device);
+      device,
+      unroll_first);
+}
+
+std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t wave_cap,
+    int64_t warp_target,
+    int64_t occupancy_target,
+    std::unique_ptr<ReductionParams> native,
+    const Inner3DPlanResources& native_resources,
+    const cudaDeviceProp& device) {
+  // The target-unroll/iteration flip-flop is a performance preference. Both
+  // orders must finish the complete register-backed 3D plan before selection.
+  if (!isNativeValidInner3DAlternative(
+          properties, *native, *native, native_resources, device)) {
+    NVF_ERROR(
+        scheduler::jev::mode() != scheduler::jev::Mode::Remote,
+        "Cannot prove the native inner 3D work-split plan");
+    scheduler::jev::recordCoverageSkip(
+        "IP6.work_split", "native 3D plan failed complete resource preflight");
+    return chooseInner3DOuterUnroll(
+        properties,
+        base,
+        wave_cap,
+        warp_target,
+        occupancy_target,
+        std::move(native),
+        native_resources,
+        device,
+        true);
+  }
+
+  auto alternate = std::make_unique<ReductionParams>(base);
+  Inner3DPlanResources alternate_resources;
+  innerPersistentHeuristic3DPlan(
+      properties,
+      wave_cap,
+      alternate.get(),
+      &alternate_resources,
+      warp_target,
+      occupancy_target,
+      std::numeric_limits<int64_t>::max(),
+      -1,
+      false);
+
+  auto complete_plan = [](const ReductionParams& params,
+                          const Inner3DPlanResources& resources) {
+    return std::to_string(params.batches_per_block_inner_reduction) + "," +
+        std::to_string(params.unroll_factor_inner_reduction) + "," +
+        std::to_string(params.batches_per_block_outer_reduction) + "," +
+        std::to_string(params.unroll_factor_outer_reduction) + "," +
+        std::to_string(resources.padded_threads_x) + "," +
+        std::to_string(resources.threads_y) + "," +
+        std::to_string(resources.threads_z) + "," +
+        std::to_string(resources.padded_threads_per_block) + "," +
+        std::to_string(resources.registers_per_thread) + "," +
+        std::to_string(resources.grid_blocks) + "," +
+        std::to_string(params.schedule_3d) + "," +
+        std::to_string(params.persistent_kernel) + "," +
+        std::to_string(params.cross_block_inner_reduction) + "," +
+        std::to_string(params.cross_block_outer_reduction) + "," +
+        std::to_string(params.cross_grid_inner_reduction) + "," +
+        std::to_string(params.cross_grid_outer_reduction) + "," +
+        std::to_string(params.block_dim_inner_reduction == ParallelType::TIDx) +
+        "," +
+        std::to_string(params.block_dim_outer_reduction == ParallelType::TIDz);
+  };
+  const std::string native_plan = complete_plan(*native, native_resources);
+  const std::string alternate_plan =
+      complete_plan(*alternate, alternate_resources);
+  const bool alternate_valid =
+      (native_resources.target_unroll != alternate_resources.target_unroll ||
+       native_resources.target_iterations !=
+           alternate_resources.target_iterations) &&
+      alternate_plan != native_plan &&
+      isNativeValidInner3DAlternative(
+          properties,
+          *alternate,
+          *native,
+          alternate_resources,
+          device);
+
+  std::vector<scheduler::jev::ChoiceOption> options = {{
+      "unroll_first",
+      "Prioritize unrolling; completed CTA=" +
+          std::to_string(native_resources.padded_threads_per_block) +
+          ", register cap=" +
+          std::to_string(native_resources.registers_per_thread) +
+          ", grid blocks=" + std::to_string(native_resources.grid_blocks)}};
+  if (alternate_valid) {
+    options.push_back({
+        "iter_first",
+        "Prioritize serial iterations; completed CTA=" +
+            std::to_string(alternate_resources.padded_threads_per_block) +
+            ", register cap=" +
+            std::to_string(alternate_resources.registers_per_thread) +
+            ", grid blocks=" +
+            std::to_string(alternate_resources.grid_blocks)});
+  }
+  const std::string state =
+      "inner_persistent.3d_work_split.v1\nreduction_numel=" +
+      std::to_string(properties.total_reduction_numel) +
+      "\ninner_numel=" +
+      std::to_string(properties.inner_most_dimension_numel) +
+      "\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nselected_vector_width=" +
+      std::to_string(properties.vectorize_factor) +
+      "\nselected_wave_cap=" + std::to_string(wave_cap) +
+      "\nselected_occupancy_target=" +
+      std::to_string(occupancy_target) +
+      "\nselected_warp_target=" + std::to_string(warp_target) +
+      "\nmax_dtype_bits=" + std::to_string(properties.max_dtype_size_bit) +
+      "\nn_tensor_inputs=" + std::to_string(properties.n_tensor_inputs) +
+      "\nsm_count=" + std::to_string(device.multiProcessorCount) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit) +
+      "\nmax_threads_x=" + std::to_string(device.maxThreadsDim[0]) +
+      "\nmax_threads_y=" + std::to_string(device.maxThreadsDim[1]) +
+      "\nmax_threads_z=" + std::to_string(device.maxThreadsDim[2]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(device.maxThreadsPerBlock) +
+      "\nregisters_per_block=" + std::to_string(device.regsPerBlock) +
+      "\nmax_grid_x=" + std::to_string(device.maxGridSize[0]) +
+      "\nplan_unroll_first=" + native_plan + "," +
+      std::to_string(native_resources.target_unroll) + "," +
+      std::to_string(native_resources.target_iterations) +
+      "\nplan_iter_first=" + alternate_plan + "," +
+      std::to_string(alternate_resources.target_unroll) + "," +
+      std::to_string(alternate_resources.target_iterations);
+  const std::string native_choice =
+      scheduler::jev::mode() == scheduler::jev::Mode::Record
+      ? "unroll_first"
+      : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP6.work_split", state, options, native_choice);
+  const bool unroll_first = selected == "unroll_first";
+  NVF_ERROR(
+      unroll_first || (selected == "iter_first" && alternate_valid),
+      "Unknown inner 3D work split");
+  return chooseInner3DOuterUnroll(
+      properties,
+      base,
+      wave_cap,
+      warp_target,
+      occupancy_target,
+      unroll_first ? std::move(native) : std::move(alternate),
+      unroll_first ? native_resources : alternate_resources,
+      device,
+      unroll_first);
 }
 
 std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
@@ -2526,7 +2687,7 @@ std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
       [&](const auto& option) { return option.id == selected; });
   NVF_ERROR(option_it != options.end(), "Unknown inner 3D warp target");
   auto& chosen_plan = plans.at(std::distance(options.begin(), option_it));
-  return chooseInner3DOuterUnroll(
+  return chooseInner3DWorkSplit(
       properties,
       base,
       wave_cap,

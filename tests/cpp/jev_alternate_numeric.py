@@ -692,6 +692,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_occupancy: bool = False,
                            require_inner3d_width: bool = False,
                            require_inner3d_outer_unroll: bool = False,
+                           require_inner3d_work_split: bool = False,
                            require_inner3d_register_overhead: bool = False,
                            require_iop3_min_batch: bool = False,
                            require_iop3_grid_rows: bool = False,
@@ -1635,6 +1636,49 @@ def check_alternate_report(report: dict[str, Any],
                     f"\npolicy_register_overhead={expected_overhead}\n" not in state or
                     f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
                 raise ValueError(f"nested batch did not use selected target policy: {row}")
+    elif require_inner3d_work_split:
+        from jev_shim import parse_inner3d_work_split_state
+
+        if (site != "IP6.work_split" or event["native"] != "unroll_first" or
+                alternate != "iter_first" or
+                set(event["candidates"]) != {"unroll_first", "iter_first"}):
+            raise ValueError("inner 3D fixture lacks a live work-split choice")
+        state = parse_inner3d_work_split_state(event["state"])
+        native = state.unroll_first.complete
+        selected = state.iter_first.complete
+        if (state.reduction_numel != 1024 or state.inner_numel != 128 or
+                state.iteration_numel != 8 or
+                state.selected_vector_width != 4 or
+                (state.unroll_first.target_unroll,
+                 state.unroll_first.target_iterations) != (4, 2) or
+                (state.iter_first.target_unroll,
+                 state.iter_first.target_iterations) != (2, 4) or
+                (native.inner_batch, native.cta_threads) != (2, 16) or
+                (selected.inner_batch, selected.cta_threads) != (1, 32)):
+            raise ValueError("work split did not change the completed 3D plan")
+        for upstream in ("IP6.width", "IP6.waves", "IP6.occupancy", "IP6.warp"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed: {rows}")
+        expected = [intended]
+        for nested_site, version, plan_key in (
+                ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1",
+                 "plan4"),
+                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1",
+                 "plan32")):
+            before, after, dependent = paired_state_rows(report, nested_site)
+            left = state_fields(before, version)
+            right = state_fields(after, version)
+            if (left[plan_key].split(",")[0] != "2" or
+                    right[plan_key].split(",")[0] != "1" or
+                    before["record"] != after["remote"] or
+                    sum(before["record"].values()) != 1):
+                raise ValueError(f"{nested_site} ignored the selected work split")
+            expected.extend(dependent)
+        if sorted(issues, key=str) != sorted(expected, key=str):
+            raise ValueError(f"unexpected work-split dependencies: {issues}")
     elif require_inner3d_register_overhead:
         from jev_shim import parse_inner3d_register_overhead_state
 
@@ -2052,6 +2096,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
     parser.add_argument("--require-inner3d-outer-unroll", action="store_true")
+    parser.add_argument("--require-inner3d-work-split", action="store_true")
     parser.add_argument("--require-inner3d-register-overhead", action="store_true")
     parser.add_argument("--require-iop3-min-batch", action="store_true")
     parser.add_argument("--require-iop3-grid-rows", action="store_true")
@@ -2179,6 +2224,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,
             require_inner3d_outer_unroll=args.require_inner3d_outer_unroll,
+            require_inner3d_work_split=args.require_inner3d_work_split,
             require_inner3d_register_overhead=args.require_inner3d_register_overhead,
             require_iop3_min_batch=args.require_iop3_min_batch,
             require_iop3_grid_rows=args.require_iop3_grid_rows,
