@@ -110,6 +110,12 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
   bool use_warp_specialized = native_warp_specialized;
   const auto jev_mode = scheduler::jev::mode();
   if (jev_mode != scheduler::jev::Mode::Off) {
+    // A projected input that exceeds the opt-in shared-memory capacity cannot
+    // form even the basic TMA plan. Preserve the old path in record mode and
+    // fail closed before a remote answer could select an invalid candidate.
+    const bool basic_smem_fits =
+        prop.max_persistent_buffer_size_bit <=
+        (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
     // The basic TMA schedule works with the same width and persistent batch.
     // Only the warp-specialized plan needs the extra producer warp group,
     // static CTA, circular-buffer stages, and one-CTA-per-SM grid. These
@@ -118,7 +124,14 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
         native_warp_specialized && dev_prop->major >= 9 &&
         bdimx * (n_compute_warp_groups + 1) <= max_threads_per_cta &&
         sm_count <= dev_prop->maxGridSize[0];
-    if (jev_mode == scheduler::jev::Mode::Record &&
+    if (!basic_smem_fits) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IP2.tma_mode", "basic TMA shared-memory estimate exceeds capacity");
+      } else {
+        NVF_ERROR(false, "No hard-valid inner TMA mode fits shared memory");
+      }
+    } else if (jev_mode == scheduler::jev::Mode::Record &&
         native_warp_specialized && !warp_specialized_legal) {
       scheduler::jev::recordCoverageSkip(
           "IP2.tma_mode", "native warp-specialized plan is outside hard bounds");
