@@ -101,7 +101,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
     const pointwise_utils::BreakPointInfo& bp_info,
     scheduler::jev::Mode jev_mode,
     bool* hard_valid = nullptr,
-    bool emit_debug = true) {
+    bool emit_debug = true,
+    int64_t tma_domain_inner_target = 512) {
   constexpr int64_t threads_per_warp = 32;
 
   auto params = std::make_unique<PointwiseParams>();
@@ -133,7 +134,82 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
   // tma_domain_outer: Number of "rows" after splitting
   // The full TMA domain is now [tma_domain_outer, tma_domain_inner]
   // where tma_domain_outer * tma_domain_inner = n_elems
-  constexpr int64_t tma_domain_inner_target = 512;
+  // The one-dimensional row target is an empirical locality preference.
+  // Materialize each complete alternate plan with the native scheduler before
+  // offering it. Off-mode preflight uses no shared breakpoint-dependent cache
+  // and emits neither nested Choices nor SchedulerDebug output.
+  if (bp_info.break_point == 0 && jev_mode != scheduler::jev::Mode::Off &&
+      prop.n_elems > (1LL << 40)) {
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.domain_inner", "extent exceeds bounded divisor replay");
+    } else {
+      NVF_ERROR(false, "PW4.domain_inner extent exceeds bounded divisor replay");
+    }
+  }
+  if (bp_info.break_point == 0 && jev_mode != scheduler::jev::Mode::Off &&
+      prop.n_elems <= (1LL << 40)) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (const int64_t target : {256L, 512L, 1024L}) {
+      bool candidate_valid = false;
+      std::unique_ptr<PointwiseParams> candidate;
+      try {
+        candidate = getPointwiseHeuristicsForBreakPoint(
+            fusion,
+            runtime_info,
+            nullptr,
+            prop,
+            bp_info,
+            scheduler::jev::Mode::Off,
+            &candidate_valid,
+            /*emit_debug=*/false,
+            target);
+      } catch (const nvfError&) {
+        continue;
+      }
+      if (candidate == nullptr || !candidate_valid) {
+        continue;
+      }
+      const int64_t inner = candidate->tma_domain_inner;
+      options.push_back(
+          {"t" + std::to_string(target),
+           "Target " + std::to_string(target) +
+               " elements; TMA domain " + std::to_string(inner) + "x" +
+               std::to_string(prop.n_elems / inner)});
+    }
+
+    const auto native = std::find_if(
+        options.begin(), options.end(), [](const auto& option) {
+          return option.id == "t512";
+        });
+    if (jev_mode == scheduler::jev::Mode::Record && native == options.end()) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.domain_inner",
+          "native 512-element target is outside the complete-plan menu");
+    } else {
+      NVF_ERROR(
+          native != options.end(),
+          "PW4.domain_inner has no complete native TMA plan");
+      std::string state = "pointwise.tma_domain_inner.v1\n";
+      state += "n_elems=" + std::to_string(prop.n_elems) + '\n';
+      state += "min_dtype_bits=" +
+          std::to_string(prop.min_dtype_size_bit_for_vectorization) + '\n';
+      const auto selected = scheduler::jev::chooseDecision(
+          "PW4.domain_inner",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "t512" : std::string());
+      bool matched = false;
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          tma_domain_inner_target = std::stoll(selected.substr(1));
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "PW4.domain_inner response is outside hard bounds");
+    }
+  }
 
   const int64_t tma_domain_inner = bp_info.break_point == 0
       ? scheduler_utils::getTmaDomainInner(

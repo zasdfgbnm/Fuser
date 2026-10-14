@@ -1142,6 +1142,14 @@ if(BUILD_TEST)
       # A misspelled GTest filter exits successfully after running zero tests.
       FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
 
+  # TMA parameter analysis runs on any CUDA device; no Hopper kernel executes.
+  add_test(NAME jev_pointwise_tma_analysis
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=PointwiseTest.TmaBreakpointPreflightDebugOnlyFinalPlan:PointwiseTest.TmaDomainTargetCompletePlanAnalysis)
+  set_tests_properties(jev_pointwise_tma_analysis PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu
+    FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
+
   # Each remote test runs the same numerical GTests twice (native record and
   # local API), then checks the complete decision exchange. The harness needs
   # an explicit parity-module directory and CUDA loader from its environment;

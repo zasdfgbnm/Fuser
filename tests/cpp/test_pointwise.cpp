@@ -1587,6 +1587,52 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
       HeuristicCompileTime::ResizeVectorizationFactors::EntryType));
 }
 
+// Exercise the 1D target menu without compiling a Hopper-only TMA kernel.
+TEST_F(PointwiseTest, TmaDomainTargetCompletePlanAnalysis) {
+  char log_path[] = "/tmp/nvfuser-pw4-domain-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {131072}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  const auto params = pointwise::tma::getPointwiseHeuristics(
+      &fusion, runtime_info, nullptr, *prop);
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->break_point, 0);
+  EXPECT_EQ(params->tma_domain_inner, 512);
+
+  std::ifstream log_file(log_path);
+  std::stringstream log_output;
+  log_output << log_file.rdbuf();
+  const std::string records = log_output.str();
+  const std::string site = "\"site\":\"PW4.domain_inner\"";
+  const size_t first = records.find(site);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(records.find(site, first + site.size()), std::string::npos);
+  EXPECT_THAT(records, ::testing::HasSubstr("\"t256\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"t512\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"t1024\""));
+}
+
 // Non-parameterized TMA pointwise test fixture (for TEST_F)
 class TmaPointwiseTestF : public PointwiseTest {
  protected:
