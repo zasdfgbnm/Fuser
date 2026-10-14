@@ -38,6 +38,63 @@ int myFavoriteFunction(int a, int b) {
 
 using UtilsTest = NVFuserTest;
 
+TEST_F(UtilsTest, CacheableFusionInputMatchesInputCache) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  auto* used = makeSymbolicTensor(1);
+  auto* pad_only = makeSymbolicTensor(1);
+  auto* unused = makeSymbolicTensor(1);
+  auto* scalar = makeSymbolicTensor(0);
+  fusion.addInput(used);
+  fusion.addInput(pad_only);
+  fusion.addInput(unused);
+  fusion.addInput(scalar);
+  fusion.addOutput(add(used, fusion.oneVal()));
+  fusion.addOutput(pad(pad_only, {fusion.zeroVal(), fusion.oneVal()}));
+  fusion.addOutput(add(scalar, fusion.oneVal()));
+
+  EXPECT_TRUE(scheduler_utils::canCacheFusionInput(used));
+  EXPECT_FALSE(scheduler_utils::canCacheFusionInput(pad_only));
+  EXPECT_FALSE(scheduler_utils::canCacheFusionInput(unused));
+  EXPECT_FALSE(scheduler_utils::canCacheFusionInput(scalar));
+  const auto cached = scheduler_utils::cacheInputs(&fusion, true);
+  ASSERT_EQ(cached.size(), 1);
+  EXPECT_EQ(cached.front().second, 0);
+}
+
+TEST_F(UtilsTest, CacheableFusionInputKeepsNonPadUses) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  auto* input = makeSymbolicTensor(1);
+  fusion.addInput(input);
+  fusion.addOutput(pad(input, {fusion.zeroVal(), fusion.oneVal()}));
+  fusion.addOutput(add(input, fusion.oneVal()));
+
+  EXPECT_TRUE(scheduler_utils::canCacheFusionInput(input));
+  const auto cached = scheduler_utils::cacheInputs(&fusion, true);
+  ASSERT_EQ(cached.size(), 1);
+  EXPECT_EQ(cached.front().second, 0);
+}
+
+TEST_F(UtilsTest, IndexSelectLookupIsNotCacheable) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  auto* data = makeSymbolicTensor(2);
+  auto* lookup = makeSymbolicTensor(1, DataType::Int);
+  fusion.addInput(data);
+  fusion.addInput(lookup);
+  fusion.addOutput(indexSelect(data, 0, lookup));
+
+  EXPECT_TRUE(scheduler_utils::canCacheFusionInput(data));
+  EXPECT_FALSE(scheduler_utils::canCacheFusionInput(lookup));
+  const auto cached = scheduler_utils::cacheInputs(&fusion, true);
+  ASSERT_EQ(cached.size(), 1);
+  EXPECT_EQ(cached.front().second, 0);
+}
+
 TEST_F(UtilsTest, FunctionTrace1) {
 #ifndef NDEBUG
   std::stringstream ss;

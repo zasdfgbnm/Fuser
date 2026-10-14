@@ -1438,6 +1438,47 @@ void applyPDL(
   }
 }
 
+namespace {
+
+// Keep this predicate shared with the read-only eligibility query. The
+// returned uses are exactly those that cacheInputs replaces with its cache.
+std::vector<Expr*> cacheableInputUses(TensorView* tv) {
+  if (tv == nullptr || tv->nDims() == 0 || tv->uses().empty() ||
+      ir_utils::isIndexSelectLookupTv(tv) ||
+      ir_utils::isTvUsedByOpsOfType<SelectOp>(tv)) {
+    // Select/gather/index-select lookup tensors must remain in global memory.
+    return {};
+  }
+
+  // Pad and Slice inputs are vectorized directly. Gather lookups and grouped
+  // matmul offsets must likewise remain in global memory.
+  auto is_gather_lookup_use = [tv](Expr* use) {
+    return use->isA<GatherOp>() && use->as<GatherOp>()->lookupTv() == tv;
+  };
+  auto is_group_offsets_use = [tv](Expr* use) {
+    if (auto op = dynamic_cast<PreprocessGroupedMatmulInputSf*>(use)) {
+      return tv == op->inputOffsets() || tv == op->outputOffsets();
+    } else if (auto op = dynamic_cast<GroupedBlockQuantizationOp*>(use)) {
+      return tv == op->inputOffsets() || tv == op->outputOffsets();
+    }
+    return false;
+  };
+  std::vector<Expr*> cached_uses;
+  for (auto* use : tv->uses()) {
+    if (!use->isOneOf<PadOp, SliceOp>() && !is_gather_lookup_use(use) &&
+        !is_group_offsets_use(use)) {
+      cached_uses.push_back(use);
+    }
+  }
+  return cached_uses;
+}
+
+} // namespace
+
+bool canCacheFusionInput(TensorView* input) {
+  return !cacheableInputUses(input).empty();
+}
+
 // Returns the pairs of <cache, input_index> for each cached fusion input.
 // input_index is the position in fusion->inputs(). Otherwise return empty
 // vector.
@@ -1451,65 +1492,16 @@ std::vector<std::pair<TensorView*, int64_t>> cacheInputs(
   std::vector<std::pair<TensorView*, int64_t>> cached_inputs;
   // If we're going to unroll, make a cache of the inputs
   for (auto [input_idx, input] : enumerate(fusion->inputs())) {
-    auto tv = dynamic_cast<TensorView*>(input);
-    if (!tv) {
-      continue;
-    }
-
-    if (tv->nDims() == 0 || tv->uses().empty() ||
-        ir_utils::isIndexSelectLookupTv(tv) ||
-        ir_utils::isTvUsedByOpsOfType<SelectOp>(tv)) {
-      // Right now, tensors that are input to the select, gather and
-      // index_select ops can't be cached as they must be in global memory.
-      continue;
-    }
-
-    // TODO: might need to reverse this when scheduler handles pad directly
-    // Do not insert a cache for pad as vectorization needs to be
-    // done directly.
-    //
-    // Note that this means that if an input is padded and also is
-    // used without padding, it will be read twice, once for pad and
-    // once more for caching load. It would make sense to use the PTX
-    // caching load instructions.
-    // For gatherOp, the lookupTv should stay in global memory, don't replace
-    // the original lookupTv with the cached_tv.
-    auto isGatherLookUpTvInUse = [tv](Expr* use) {
-      if (!use->isA<GatherOp>()) {
-        return false;
-      }
-      return use->as<GatherOp>()->lookupTv() == tv;
-    };
-
-    // TODO: we might need to explicitly promote offsets to global memory
-    // We expect offsets to remain in global memory, so we do not add it to
-    // cache
-    auto isGroupOffsets = [tv](Expr* use) {
-      if (auto op = dynamic_cast<PreprocessGroupedMatmulInputSf*>(use)) {
-        return tv == op->inputOffsets() || tv == op->outputOffsets();
-      } else if (auto op = dynamic_cast<GroupedBlockQuantizationOp*>(use)) {
-        return tv == op->inputOffsets() || tv == op->outputOffsets();
-      }
-      return false;
-    };
-    std::vector<Expr*> cached_uses;
-    for (auto use : tv->uses()) {
-      if (!use->isOneOf<PadOp, SliceOp>() && !isGatherLookUpTvInUse(use) &&
-          !isGroupOffsets(use)) {
-        cached_uses.push_back(use);
-      }
-    }
-
+    auto* tv = dynamic_cast<TensorView*>(input);
+    auto cached_uses = cacheableInputUses(tv);
     if (cached_uses.empty()) {
       continue;
     }
-
-    auto cached_tv = tv->cacheAfter(
+    auto* cached_tv = tv->cacheAfter(
         /*op_type=*/LoadStoreOpType::Set,
         /*cache_op=*/CacheOp::Unspecified,
         /*propagate_allocation_domain=*/true,
         /*cached_uses=*/cached_uses);
-
     cached_inputs.emplace_back(cached_tv, input_idx);
   }
   return cached_inputs;

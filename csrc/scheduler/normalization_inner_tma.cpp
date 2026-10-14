@@ -13,6 +13,7 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -64,6 +65,8 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
   // Issue ldg (load global) instructions early to hide memory latency
   params->pre_load_ldg_tvs = true;
 
+  const auto jev_mode = scheduler::jev::mode();
+
   // Configure reduction domain structure: [persistent_batch_size, bdimx, vect]
   // Prioritize vectorization for memory access efficiency
   params->vectorization_factor = prop.vectorize_factor;
@@ -110,22 +113,24 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
   const bool native_warp_specialized =
       native_n_stages >= 2 && bdimx == 128;
   bool use_warp_specialized = native_warp_specialized;
-  const auto jev_mode = scheduler::jev::mode();
+  const bool basic_smem_fits =
+      prop.max_persistent_buffer_size_bit <=
+      (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
+  const bool warp_specialized_legal =
+      native_warp_specialized && dev_prop->major >= 9 &&
+      bdimx * (n_compute_warp_groups + 1) <= max_threads_per_cta &&
+      sm_count <= dev_prop->maxGridSize[0];
+  const bool native_tma_plan_hard_valid =
+      basic_smem_fits &&
+      (!native_warp_specialized || warp_specialized_legal);
   if (jev_mode != scheduler::jev::Mode::Off) {
     // A projected input that exceeds the opt-in shared-memory capacity cannot
     // form even the basic TMA plan. Preserve the old path in record mode and
     // fail closed before a remote answer could select an invalid candidate.
-    const bool basic_smem_fits =
-        prop.max_persistent_buffer_size_bit <=
-        (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
     // The basic TMA schedule works with the same width and persistent batch.
     // Only the warp-specialized plan needs the extra producer warp group,
     // static CTA, circular-buffer stages, and one-CTA-per-SM grid. These
     // resource and topology checks are native hard gates, not model choices.
-    const bool warp_specialized_legal =
-        native_warp_specialized && dev_prop->major >= 9 &&
-        bdimx * (n_compute_warp_groups + 1) <= max_threads_per_cta &&
-        sm_count <= dev_prop->maxGridSize[0];
     if (!basic_smem_fits) {
       if (jev_mode == scheduler::jev::Mode::Record) {
         scheduler::jev::recordCoverageSkip(
@@ -260,6 +265,74 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
     params->cparams.compute_bdimx = compute_bdimx;
     params->cparams.compute_bdimy = compute_bdimy;
     params->cparams.compute_bdimz = compute_bdimz;
+  }
+
+  // setupPersistentSchedule projects buffers before cacheInputs. An ordinary
+  // input is not a persistent buffer, so projecting persistent buffers cannot
+  // remove its existing direct uses. The shared cacheability predicate proves
+  // that at least one such use becomes an LDG cache in either TMA mode.
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    auto persistent_info_entry =
+        HeuristicDataCacheEntry<HeuristicCompileTime::PersistentBufferInfo>(
+            data_cache, [&fusion]() {
+              return std::make_unique<scheduler_utils::PersistentBufferInfo>(
+                  scheduler_utils::persistentBuffers(fusion));
+            });
+    const auto& persistent_info = persistent_info_entry.get();
+    std::unordered_set<TensorView*> persistent_inputs{
+        persistent_info.projectable_buffer_inputs.begin(),
+        persistent_info.projectable_buffer_inputs.end()};
+    for (auto* buffer : persistent_info.persistent_buffers) {
+      if (buffer->isFusionInput()) {
+        persistent_inputs.insert(buffer);
+      }
+    }
+    int64_t ldg_inputs = 0;
+    int64_t tma_inputs = 0;
+    for (auto* input : fusion->inputs()) {
+      auto* tv = dynamic_cast<TensorView*>(input);
+      if (tv == nullptr) {
+        continue;
+      }
+      if (!scheduler_utils::canCacheFusionInput(tv)) {
+        continue;
+      }
+      if (persistent_inputs.contains(tv)) {
+        ++tma_inputs;
+      } else {
+        ++ldg_inputs;
+      }
+    }
+    const char* skip_reason = nullptr;
+    if (ldg_inputs > 0 && tma_inputs == 0) {
+      skip_reason = "no cacheable TMA input remains for inner persistent schedule";
+    } else if (ldg_inputs > 0 && !native_tma_plan_hard_valid) {
+      skip_reason = "native TMA mode exceeds basic or warp-specialized hard bounds";
+    }
+    if (skip_reason != nullptr) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip("IP3.ldg_preload", skip_reason);
+      } else {
+        NVF_ERROR(false, "Cannot prove inner TMA LDG preload Choice: ", skip_reason);
+      }
+    } else if (ldg_inputs > 0) {
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"pre", "Keep ordinary LDG inputs outside aggressive inlineMost"},
+          {"inline", "Include ordinary LDG inputs in aggressive inlineMost"}};
+      const std::string state =
+          "inner_persistent.tma_ldg_preload.v1\nldg_inputs=" +
+          std::to_string(ldg_inputs) + "\ntma_inputs=" +
+          std::to_string(tma_inputs) + "\nreduction_numel=" +
+          std::to_string(total_redu_count) + "\niteration_numel=" +
+          std::to_string(total_iter_count);
+      params->pre_load_ldg_tvs = scheduler::jev::chooseDecision(
+                                      "IP3.ldg_preload",
+                                      state,
+                                      options,
+                                      jev_mode == scheduler::jev::Mode::Record
+                                          ? "pre"
+                                          : "") == "pre";
+    }
   }
 
   // Set index type

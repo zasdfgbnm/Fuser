@@ -406,6 +406,10 @@ std::vector<std::pair<TensorView*, int64_t>> cacheInputs(
     Fusion* fusion,
     bool unroll);
 
+// Read-only form of cacheInputs' input eligibility check. This applies to the
+// current fusion; callers must account for any graph edits before cacheInputs.
+bool canCacheFusionInput(TensorView* input);
+
 // Returns the pairs of <cache, output_index> for each cached fusion output.
 // output_index is the position in fusion->outputs(). Otherwise return empty
 // vector.
