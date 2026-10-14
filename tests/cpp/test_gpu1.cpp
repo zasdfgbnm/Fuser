@@ -7394,8 +7394,9 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterBatchCap_CUDA) {
   FusionGuard fg(&fusion);
   TensorView* input = makeContigTensor(2);
   fusion.addInput(input);
-  auto result =
-      rms_norm(input, {norm_size}, nullptr, IrBuilder::create<Val>(eps));
+  const std::vector<int64_t> norm_shape{norm_size};
+  auto result = rms_norm(
+      input, norm_shape, nullptr, IrBuilder::create<Val>(eps));
   fusion.addOutput(result.output);
   fusion.addOutput(result.invstd);
 
