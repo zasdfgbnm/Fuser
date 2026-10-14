@@ -1383,11 +1383,16 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
         mparams.get(), tensor_roles, /*num_problems=*/(size_t)patterns.size());
   }
 
-  // Resource capacity is computed above. K-loop work and the existing
-  // eight-stage ceiling bound the default Hopper Choice menu. The server
-  // independently reconstructs the native maximum from raw measurements;
-  // changing the stage count is followed by the unchanged specialization and
-  // epilogue analysis below.
+  // Resource capacity is computed above. K-loop work bounds the Hopper Choice
+  // menu. The native eight-stage ceiling is a performance preference, but the
+  // existing resource estimate assumes two-byte operands. Only the simple
+  // one-matmul, one-warp-group 64x64x64 two-byte-operand case may offer stages
+  // above eight: its operand SMEM is exactly 16384 bytes per stage (plus two
+  // mbarriers). For the extended menu we also reserve a full float epilogue
+  // tile in addition to the existing output allowance for other semaphores.
+  // The server reconstructs both the bounded menu and the native eight-stage
+  // winner from the raw state. Subsequent specialization and epilogue analysis
+  // still derives the complete plan from the chosen stage.
   const auto jev_mode = scheduler::jev::mode();
   const bool jev_stages_enabled =
       jev_mode != scheduler::jev::Mode::Off &&
@@ -1402,9 +1407,42 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
         mparams->circular_buffer_options.smem_circular_buffer_stage;
     const int64_t work_stages =
         circularBufferWorkStages(mparams.get(), problem_shape);
-    const int64_t hard_max_stages =
-        std::min({resource_stages, work_stages, 8L});
-    if (hard_max_stages < 1) {
+    int64_t output_dtype_bytes = 0;
+    for (TensorView* out : tensor_roles.at(MatmulTensorRole::OUTPUT)) {
+      output_dtype_bytes += dataTypeSizeByte(out->dtype());
+    }
+    const auto& operands_a = tensor_roles.at(MatmulTensorRole::OPERAND_A);
+    const auto& operands_b = tensor_roles.at(MatmulTensorRole::OPERAND_B);
+    NVF_ERROR(!operands_a.empty() && !operands_b.empty());
+    const int64_t operand_a_dtype_bytes =
+        dataTypeSizeByte(operands_a.front()->dtype());
+    const int64_t operand_b_dtype_bytes =
+        dataTypeSizeByte(operands_b.front()->dtype());
+    const GemmTile& cta_tile = mparams->tile_sizes.cta_tile;
+    const GemmTile& warp_tile = mparams->tile_sizes.warp_tile;
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    const bool exact_stage_envelope =
+        patterns.size() == 1 && operands_a.size() == 1 &&
+        operands_b.size() == 1 && cta_tile.m == 64 && cta_tile.n == 64 &&
+        cta_tile.k == 64 && warp_tile.m == 64 && warp_tile.n == 64 &&
+        warp_tile.k == 64 && operand_a_dtype_bytes == 2 &&
+        operand_b_dtype_bytes == 2 && output_dtype_bytes == 2 &&
+        device->sharedMemPerBlockOptin <= 227328;
+    int64_t safe_extended_stages = 0;
+    if (exact_stage_envelope) {
+      const int64_t per_stage_bytes =
+          2 * (cta_tile.m + cta_tile.n) * cta_tile.k + 16;
+      const int64_t reserved_bytes =
+          (output_dtype_bytes + 4) * cta_tile.m * cta_tile.n;
+      const int64_t remaining_bytes = std::max<int64_t>(
+          0, device->sharedMemPerBlockOptin - reserved_bytes);
+      safe_extended_stages = remaining_bytes / per_stage_bytes;
+    }
+    const int64_t menu_max_stages =
+        safe_extended_stages > 8
+        ? std::min({resource_stages, work_stages, safe_extended_stages})
+        : std::min({resource_stages, work_stages, 8L});
+    if (menu_max_stages < 1) {
       if (jev_mode == scheduler::jev::Mode::Record) {
         scheduler::jev::recordCoverageSkip(
             "MM2.stages", "no positive resource- and work-bounded stage");
@@ -1413,14 +1451,8 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
         NVF_ERROR(false, "MM2.stages has no valid stage candidate");
       }
     } else {
-      int64_t output_dtype_bytes = 0;
-      for (TensorView* out : tensor_roles.at(MatmulTensorRole::OUTPUT)) {
-        output_dtype_bytes += dataTypeSizeByte(out->dtype());
-      }
-      const auto* device = at::cuda::getCurrentDeviceProperties();
-      const GemmTile& cta_tile = mparams->tile_sizes.cta_tile;
       const std::string state =
-          "matmul.hopper_stages.v1\nm_extent=" +
+          "matmul.hopper_stages.v2\nm_extent=" +
           std::to_string(problem_shape[(size_t)MatmulDimRole::M]) +
           "\nn_extent=" +
           std::to_string(problem_shape[(size_t)MatmulDimRole::N]) +
@@ -1434,9 +1466,18 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
           "\nsm_count=" + std::to_string(device->multiProcessorCount) +
           "\nsmem_per_block_bytes=" +
           std::to_string(device->sharedMemPerBlockOptin) +
-          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes);
+          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes) +
+          "\nwarp_m=" + std::to_string(warp_tile.m) +
+          "\nwarp_n=" + std::to_string(warp_tile.n) +
+          "\nwarp_k=" + std::to_string(warp_tile.k) +
+          "\noperand_a_count=" + std::to_string(operands_a.size()) +
+          "\noperand_b_count=" + std::to_string(operands_b.size()) +
+          "\noperand_a_dtype_bytes=" +
+          std::to_string(operand_a_dtype_bytes) +
+          "\noperand_b_dtype_bytes=" +
+          std::to_string(operand_b_dtype_bytes);
       std::vector<scheduler::jev::ChoiceOption> options;
-      for (int64_t stages = 1; stages <= hard_max_stages; ++stages) {
+      for (int64_t stages = 1; stages <= menu_max_stages; ++stages) {
         options.push_back({
             "s" + std::to_string(stages),
             "Use " + std::to_string(stages) +
