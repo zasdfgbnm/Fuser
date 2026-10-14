@@ -82,17 +82,18 @@ TEST_F(UtilsTest, IndexSelectLookupIsNotCacheable) {
   Fusion fusion;
   FusionGuard fg(&fusion);
 
-  auto* data = makeSymbolicTensor(2);
-  auto* lookup = makeSymbolicTensor(1, DataType::Int);
-  fusion.addInput(data);
+  auto* lookup = makeSymbolicTensor(2);
+  auto* indices = makeSymbolicTensor(1, DataType::Int);
   fusion.addInput(lookup);
-  fusion.addOutput(indexSelect(data, 0, lookup));
+  fusion.addInput(indices);
+  fusion.addOutput(indexSelect(lookup, 0, indices));
 
-  EXPECT_TRUE(scheduler_utils::canCacheFusionInput(data));
+  // The lookup stays in global memory, while the indices may be cached.
   EXPECT_FALSE(scheduler_utils::canCacheFusionInput(lookup));
+  EXPECT_TRUE(scheduler_utils::canCacheFusionInput(indices));
   const auto cached = scheduler_utils::cacheInputs(&fusion, true);
   ASSERT_EQ(cached.size(), 1);
-  EXPECT_EQ(cached.front().second, 0);
+  EXPECT_EQ(cached.front().second, 1);
 }
 
 TEST_F(UtilsTest, FunctionTrace1) {
