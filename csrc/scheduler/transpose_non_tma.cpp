@@ -13,6 +13,7 @@
 #include "debug.h"
 #include "instrumentation.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/runtime_info.h"
@@ -228,20 +229,90 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
   tparams->tag = "Transpose heuristics";
   tparams->cparams.index_type = index_type;
 
-  // Expand inner-most dims to virtual inner-most dims so that the inner-most
-  // dims has at least tile_size elements
-  // See note [Supporting small transpose dimensions]
-  utils::maybeBuildVirtualInnerDims(
-      tparams.get(),
-      device_multiprocessor_count,
-      n_elems,
-      shape_in_ref1,
-      inner_most_pos1_in_ref1,
-      inner_most_pos2_in_ref1);
+  // The one-wave test is a performance preference. Keep the exact native
+  // merge/split constructor and the view guard as hard schedule constraints.
+  const auto jev_mode = scheduler::jev::mode();
+  const bool has_view = !scheduler_utils::getViewTVs(fusion).empty();
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    utils::maybeBuildVirtualInnerDims(
+        tparams.get(),
+        device_multiprocessor_count,
+        n_elems,
+        shape_in_ref1,
+        inner_most_pos1_in_ref1,
+        inner_most_pos2_in_ref1);
+  } else {
+    if (has_view) {
+      // Preserve the pre-existing unsupported combination even when a remote
+      // answer would otherwise request the original axes.
+      auto checked = std::make_unique<TransposeParams>();
+      checked->tile_size1 = tparams->tile_size1;
+      checked->tile_size2 = tparams->tile_size2;
+      utils::maybeBuildVirtualInnerDims(
+          checked.get(),
+          device_multiprocessor_count,
+          n_elems,
+          shape_in_ref1,
+          inner_most_pos1_in_ref1,
+          inner_most_pos2_in_ref1);
+      NVF_ERROR(
+          !utils::hasSmallTransposeDimensions(checked),
+          "combination of view op with small transpose dimensions are not "
+          "supported by transpose scheduler");
+    }
+
+    std::string state = "transpose.virtual_axes.v1\nshape=";
+    for (size_t i = 0; i < shape_in_ref1.size(); ++i) {
+      if (i != 0) {
+        state += ',';
+      }
+      state += std::to_string(shape_in_ref1[i]);
+    }
+    state += "\ninner1=" + std::to_string(inner_most_pos1_in_ref1);
+    state += "\ninner2=" + std::to_string(inner_most_pos2_in_ref1);
+    state += "\ntile1=" + std::to_string(tparams->tile_size1);
+    state += "\ntile2=" + std::to_string(tparams->tile_size2);
+    state += "\nsm_count=" + std::to_string(device_multiprocessor_count);
+    state += "\nn_elems=" + std::to_string(n_elems);
+    state += "\nhas_view=" + std::to_string(has_view);
+
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"original", "Tile the original inner axes"}};
+    if (!has_view) {
+      options.push_back(
+          {"virtual", "Construct the source-supported virtual inner axes"});
+    }
+
+    std::string native_choice;
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      const int64_t wave_elements = device_multiprocessor_count *
+          std::min<int64_t>(shape_in_ref1[inner_most_pos1_in_ref1],
+                            tparams->tile_size1) *
+          std::min<int64_t>(shape_in_ref1[inner_most_pos2_in_ref1],
+                            tparams->tile_size2);
+      native_choice =
+          !has_view && wave_elements < n_elems ? "virtual" : "original";
+    }
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR1", state, options, native_choice);
+    NVF_ERROR(
+        selected == "original" || (selected == "virtual" && !has_view),
+        "TR1 response is outside native hard bounds");
+    if (selected == "virtual") {
+      // The API chooses whether to request this complete native plan; it never
+      // supplies individual merge indices or split factors.
+      utils::maybeBuildVirtualInnerDims(
+          tparams.get(),
+          device_multiprocessor_count,
+          n_elems,
+          shape_in_ref1,
+          inner_most_pos1_in_ref1,
+          inner_most_pos2_in_ref1);
+    }
+  }
 
   NVF_ERROR(
-      !utils::hasSmallTransposeDimensions(tparams) ||
-          scheduler_utils::getViewTVs(fusion).empty(),
+      !utils::hasSmallTransposeDimensions(tparams) || !has_view,
       "combination of view op with small transpose dimensions are not "
       "supported by transpose scheduler");
 
