@@ -121,6 +121,71 @@ def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
     return fields
 
 
+IOP3_CTA_FIELDS = {
+    "inner_dim", "outer_dim", "vector_width", "regs_buffer_bits",
+    "tmp_dtype_bits", "warp_size", "sm_count", "max_threads_per_block",
+    "max_grid_y", "smem_total_bits", "smem_limit_bits",
+    "selected_outer_read_width",
+}
+
+
+def iop3_cta_plan_fields(row: dict[str, Any], width: int
+                         ) -> list[tuple[int, ...]]:
+    """Read repeated CTA plans while keeping scalar fields strict."""
+    lines = row["request"]["state"].splitlines()
+    if not lines or lines[0] != "inner_outer_multi_wave.cta.v2":
+        raise ValueError(f"unexpected IOP3.cta state version: {lines[:1]}")
+    fields: dict[str, str] = {}
+    plans: list[tuple[int, ...]] = []
+    for line in lines[1:]:
+        key, separator, value = line.partition("=")
+        if not separator or not value:
+            raise ValueError(f"malformed IOP3.cta field: {line}")
+        if key == "plan":
+            try:
+                plan = tuple(int(part) for part in value.split(":"))
+            except ValueError as exc:
+                raise ValueError(f"malformed IOP3.cta plan: {line}") from exc
+            if len(plan) != 14 or any(part < 1 for part in plan):
+                raise ValueError(f"incomplete IOP3.cta plan: {line}")
+            plans.append(plan)
+        elif key not in IOP3_CTA_FIELDS or key in fields:
+            raise ValueError(f"unknown or repeated IOP3.cta scalar: {line}")
+        else:
+            fields[key] = value
+    if set(fields) != IOP3_CTA_FIELDS or not 1 <= len(plans) <= 7:
+        raise ValueError("IOP3.cta omitted full state or complete plans")
+    try:
+        scalar = {key: int(value) for key, value in fields.items()}
+    except ValueError as exc:
+        raise ValueError("IOP3.cta has a nonnumeric scalar") from exc
+    if (scalar["inner_dim"] <= 1024 or scalar["vector_width"] < 1 or
+            scalar["tmp_dtype_bits"] < 1 or
+            scalar["selected_outer_read_width"] != width):
+        raise ValueError("IOP3.cta omitted the selected large-inner read width")
+    inner = scalar["inner_dim"]
+    vector = scalar["vector_width"]
+    write = min(128 // scalar["tmp_dtype_bits"], vector)
+    previous_threads = 0
+    for plan in plans:
+        (threads, inner_vect, batch, bdimx, bdimy, grid, tmp_write,
+         read, _, _, _, final_x, final_y, final_grid) = plan
+        requested_x = (inner // width + grid - 1) // grid
+        rounded_pow2 = 1 << (requested_x - 1).bit_length()
+        rounded_eight = ((requested_x + 7) // 8) * 8
+        expected_x = min(rounded_pow2, rounded_eight)
+        while threads % expected_x:
+            expected_x = min(expected_x + 8, threads)
+        if (inner_vect != vector or tmp_write != write or read != width or
+                batch != (inner // vector + threads - 1) // threads or
+                bdimx != expected_x or bdimy != threads // expected_x or
+                final_x != bdimx or final_y != bdimy or final_grid != grid or
+                (previous_threads and previous_threads != threads * 2)):
+            raise ValueError(f"IOP3.cta plan disagrees with selected width: {plan}")
+        previous_threads = threads
+    return plans
+
+
 OUTER_STRIDE_KEYS = {
     "reduction_numel", "iteration_numel", "dtype_bits", "sm_count",
     "min_warp_size", "bdimx", "bdimy", "iter_unroll", "redu_unroll",
@@ -731,9 +796,22 @@ def check_alternate_report(report: dict[str, Any],
                     sum(record_row["record"].values()) != 1):
                 raise ValueError(f"{nested_site} changed its winner: "
                                  f"{record_row}, {remote_row}")
+            cta_plans: dict[str, list[tuple[int, ...]]] = {}
             for row, width in ((record_row, "2"), (remote_row, "1")):
-                if state_fields(row, version).get(field) != width:
+                if nested_site == "IOP3.cta":
+                    cta_plans[width] = iop3_cta_plan_fields(row, int(width))
+                elif state_fields(row, version).get(field) != width:
                     raise ValueError(f"{nested_site} omitted selected read width")
+            if nested_site == "IOP3.cta":
+                record_plans = cta_plans["2"]
+                remote_plans = cta_plans["1"]
+                invariant_columns = (0, 1, 2, 5, 6, 8, 9, 10, 13)
+                if (len(record_plans) != len(remote_plans) or
+                        any(tuple(record_plan[index] for index in invariant_columns)
+                            != tuple(remote_plan[index] for index in invariant_columns)
+                            for record_plan, remote_plan in
+                            zip(record_plans, remote_plans))):
+                    raise ValueError("IOP3.cta altered unrelated plan measurements")
             expected.extend(pair_issues)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected read-width dependencies: {issues}")
