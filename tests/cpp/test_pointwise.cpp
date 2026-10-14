@@ -109,6 +109,33 @@ class DomainMapUnitTest : public scheduler_tools::DomainMap {
 
 } // namespace
 
+// A non-CTA-multiple extent exercises the 1D tail for every offered warp
+// count. The alternate numeric harness runs this with native x128 and forced
+// x32/x64 choices through the same scheduler and checks the ATen result.
+TEST_F(PointwiseTest, JevAlternateOneDimensionalCta_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(1);
+  fusion.addInput(input);
+  TensorView* output = add(input, input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor tensor = at::randn({16388}, options);
+  auto result = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  const auto* params = result.heuristic_params->as<PointwiseParams>();
+  ASSERT_EQ(params->break_point, 0);
+  ASSERT_EQ(params->vectorization_factor, 4);
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+}
+
 TEST_F(PointwiseTest, VectorizeStrideContiguity2D) {
   auto fusion_ptr = std::make_unique<Fusion>();
   auto fusion = fusion_ptr.get();

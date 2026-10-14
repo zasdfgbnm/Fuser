@@ -650,7 +650,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_tmp_write: bool = False,
                            require_iop3_tmp_read: bool = False,
                            require_iop3_inner_width: bool = False,
-                           require_transpose_tile: bool = False) -> dict[str, Any]:
+                           require_transpose_tile: bool = False,
+                           require_pointwise_1d_cta: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -678,6 +679,45 @@ def check_alternate_report(report: dict[str, Any],
         expected = [intended, *check_transpose_tile_dependency(report)]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected tile-dependent decisions: {issues}")
+    elif require_pointwise_1d_cta:
+        from jev_shim import evaluate, parse_launch_1d_state, parse_unroll_state
+
+        launch = parse_launch_1d_state(event["state"])
+        if (site != "PW3.cta_1d" or event["native"] != "x128" or
+                alternate not in {"x32", "x64"} or
+                set(event["candidates"]) != {"x32", "x64", "x128"} or
+                launch.n_elems != 16388 or launch.vector_width != 4 or
+                launch.warp_size != 32):
+            raise ValueError("1D pointwise fixture lacks its complete CTA menu")
+        before, after, dependent_issues = paired_state_rows(
+            report, "PW3.unroll")
+        original = state_fields(before, "pointwise.unroll.v1")
+        selected = state_fields(after, "pointwise.unroll.v1")
+        for row, fields, threads, side in (
+                (before, original, 128, "record"),
+                (after, selected, int(alternate[1:]), "remote")):
+            state = parse_unroll_state(row["request"]["state"])
+            response, _ = evaluate(row["request"])
+            blocks = (launch.n_elems // launch.vector_width + threads - 1) // threads
+            if (state.break_point != 0 or state.bdimx != threads or
+                    state.range_low != 1 or state.range_high != blocks or
+                    row[side] != {"u1": 1} or
+                    response["answers"]["PW3.unroll"]["choice"] != "u1" or
+                    set(row["request"]["questions"]["PW3.unroll"]["criteria"]) !=
+                    {f"u{factor}" for factor in range(1, blocks + 1)}):
+                raise ValueError("1D CTA did not reach a complete dependent unroll plan")
+        if ({key: value for key, value in original.items()
+             if key not in {"bdimx", "range_high"}} !=
+                {key: value for key, value in selected.items()
+                 if key not in {"bdimx", "range_high"}}):
+            raise ValueError("1D CTA changed unrelated unroll measurements")
+        for row in report["multiplicity"]:
+            if row["site"] not in {site, "PW3.unroll"} and (
+                    row["record"] != row["remote"] or
+                    sum(row["record"].values()) != 1):
+                raise ValueError(f"unrelated pointwise decision changed: {row}")
+        if sorted(issues, key=str) != sorted([intended, *dependent_issues], key=str):
+            raise ValueError(f"unexpected 1D CTA dependencies: {issues}")
     elif site == "OP3.redu_unroll":
         if event["native"] != "r1" or set(event["candidates"]) != {
                 "r1", "r2", "r4"}:
@@ -1725,6 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-iop3-tmp-read", action="store_true")
     parser.add_argument("--require-iop3-inner-width", action="store_true")
     parser.add_argument("--require-transpose-tile", action="store_true")
+    parser.add_argument("--require-pointwise-1d-cta", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -1844,7 +1885,8 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_tmp_write=args.require_iop3_tmp_write,
             require_iop3_tmp_read=args.require_iop3_tmp_read,
             require_iop3_inner_width=args.require_iop3_inner_width,
-            require_transpose_tile=args.require_transpose_tile)
+            require_transpose_tile=args.require_transpose_tile,
+            require_pointwise_1d_cta=args.require_pointwise_1d_cta)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)

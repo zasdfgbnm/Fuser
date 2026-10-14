@@ -137,11 +137,13 @@ int64_t getEmpiricalUnrollFactor(
 
 // calculate unroll factor based on total blocks to ensure we still
 // have 8 waves after unroll.
-int64_t getElementBasedUnrollFactor(int64_t total_blocks) {
+int64_t getElementBasedUnrollFactor(
+    int64_t total_blocks,
+    int64_t threads_per_block) {
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
   const int64_t target_waves = 8L;
   int64_t max_block_per_sm =
-      (int64_t)dev_prop->maxThreadsPerMultiProcessor / kThreadX;
+      (int64_t)dev_prop->maxThreadsPerMultiProcessor / threads_per_block;
   int64_t n_waves_wo_unroll = ceilDiv(
       total_blocks, max_block_per_sm * (int64_t)dev_prop->multiProcessorCount);
   int64_t n_elems_limited_unroll =
@@ -179,6 +181,7 @@ int64_t getUnrollFactor(
     Fusion* fusion,
     int64_t break_point,
     int64_t total_blocks,
+    int64_t threads_per_block,
     int64_t vectorization_bits,
     bool divisible_split,
     std::vector<TensorView*> vectorizable_io_tvs,
@@ -198,7 +201,8 @@ int64_t getUnrollFactor(
 
   // limit unroll factor when n_elems is small to ensure enough
   // blocks for thread level parallelism.
-  int64_t n_elems_limited_unroll = getElementBasedUnrollFactor(total_blocks);
+  int64_t n_elems_limited_unroll =
+      getElementBasedUnrollFactor(total_blocks, threads_per_block);
 
   // Avoid unrolling when the unroll factor is constrained by `n_elems` and the
   // split is not divisible. Why? While unrolling increases instruction-level
@@ -458,19 +462,78 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   bool is_outer_broadcast_dominated = config.is_outer_broadcast_dominated;
   const auto& elem_counts = prop.elem_counts;
 
+  // Each eligible 1D CTA choice defines a complete thread/grid mapping. A
+  // non-native choice uses a symbolic split so different launch dimensions
+  // can reuse the same scheduled kernel. The native 128 path remains literal.
+  if (break_point == 0 && jev_mode != scheduler::jev::Mode::Off) {
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const int64_t warp_size = dev_prop->warpSize;
+    const bool native_cta_valid =
+        warp_size > 0 && kThreadX % warp_size == 0 &&
+        kThreadX <= dev_prop->maxThreadsDim[0] &&
+        kThreadX <= dev_prop->maxThreadsPerBlock &&
+        kThreadX <= dev_prop->maxThreadsPerMultiProcessor &&
+        dev_prop->maxGridSize[0] > 0 &&
+        ceilDiv(ceilDiv(n_elems, vectorization_factor), kThreadX) <=
+            dev_prop->maxGridSize[0];
+    if (hasBlockQuantizationOps(fusion, data_cache) || !native_cta_valid) {
+      scheduler::jev::recordCoverageSkip(
+          "PW3.cta_1d",
+          !native_cta_valid ? "native_1d_cta_preflight" : "block_quantization");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t candidate = warp_size; candidate <= kThreadX;
+           candidate *= 2) {
+        if (ceilDiv(ceilDiv(n_elems, vectorization_factor), candidate) >
+            dev_prop->maxGridSize[0]) {
+          continue;
+        }
+        options.push_back(
+            {"x" + std::to_string(candidate),
+             "Use " + std::to_string(candidate) + " threads per 1D CTA"});
+      }
+      std::string state = "pointwise.launch_1d.v1\n";
+      state += "n_elems=" + std::to_string(n_elems) + '\n';
+      state += "vector_width=" + std::to_string(vectorization_factor) + '\n';
+      state += "warp_size=" + std::to_string(warp_size) + '\n';
+      state += "max_threads_x=" +
+          std::to_string(dev_prop->maxThreadsDim[0]) + '\n';
+      state += "max_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) + '\n';
+      state += "max_threads_per_sm=" +
+          std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
+      state += "max_grid_x=" +
+          std::to_string(dev_prop->maxGridSize[0]) + '\n';
+      const auto selected = scheduler::jev::chooseDecision(
+          "PW3.cta_1d", state, options,
+          jev_mode == scheduler::jev::Mode::Record ? "x128" : "");
+      bool matched = false;
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          bdimx = std::stoll(option.id.substr(1));
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "PW3.cta_1d response is outside hard CTA bounds");
+      params->symbolic_1d_cta = bdimx != kThreadX;
+    }
+  }
+
   // get unroll factor:
   int64_t total_blocks = break_point > 0
       ? gdim_left * gdim_right
-      : ceilDiv(n_elems / vectorization_factor, kThreadX);
+      : ceilDiv(n_elems / vectorization_factor, bdimx);
   bool divisible_split = break_point > 0
       ? (right_elem_count % (params->vectorization_factor * bdimx) == 0)
-      : (n_elems % (params->vectorization_factor * kThreadX) == 0);
+      : (n_elems % (params->vectorization_factor * bdimx) == 0);
   int64_t unroll_factor = 0;
   if (jev_mode != scheduler::jev::Mode::Remote) {
     unroll_factor = getUnrollFactor(
         fusion,
         break_point,
         total_blocks,
+        break_point > 0 ? kThreadX : bdimx,
         params->vectorization_factor * max_dtype_size_bit_for_vectorization,
         divisible_split,
         vectorizable_inputs_outputs,
@@ -817,7 +880,12 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams* pparams) {
       // Unswitch
       reference_tv->split(0, 1);
       // Threads
-      reference_tv->split(0, kThreadX);
+      if (pparams->symbolic_1d_cta) {
+        reference_tv->split(
+            0, NamedScalar::getParallelDim(ParallelType::TIDx));
+      } else {
+        reference_tv->split(0, kThreadX);
+      }
 
       reference_tv->axis(0)->parallelize(ParallelType::BIDx);
       reference_tv->axis(1)->parallelize(ParallelType::TIDx);
@@ -835,7 +903,12 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams* pparams) {
         reference_tv->split(0, pparams->vectorization_factor);
       }
       // Threads
-      reference_tv->split(0, kThreadX);
+      if (pparams->symbolic_1d_cta) {
+        reference_tv->split(
+            0, NamedScalar::getParallelDim(ParallelType::TIDx));
+      } else {
+        reference_tv->split(0, kThreadX);
+      }
       // Unroll
       if (pparams->unroll_factor_inner > 1) {
         reference_tv->split(0, pparams->unroll_factor_inner);
