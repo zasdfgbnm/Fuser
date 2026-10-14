@@ -90,6 +90,7 @@ def check_alternate_report(report: dict[str, Any],
                            events: list[dict[str, Any]], *, site: str,
                            alternate: str, case_key: str,
                            require_grid: bool = False,
+                           require_outer_width: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False) -> dict[str, Any]:
@@ -212,6 +213,48 @@ def check_alternate_report(report: dict[str, Any],
         ]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected decision comparison issues: {issues}")
+    elif require_outer_width:
+        if (site != "RD9.width" or event["native"] != "w4" or
+                alternate != "w1" or
+                set(event["candidates"]) != {"w1", "w2", "w4"}):
+            raise ValueError("outer width fixture lacks its aligned width menu")
+        if any(issue["site"] not in {"RD9.width", "RD9.warp", "RD9.stride", "RD8"}
+               for issue in issues):
+            raise ValueError(f"unrelated outer-width decision issue: {issues}")
+        for upstream in ("RD9.reg_budget", "RD9.waves"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed with width: {rows}")
+        strides = [row for row in report["multiplicity"]
+                   if row["site"] == "RD9.stride"]
+        record_stride = [row for row in strides
+                         if sum(row["record"].values()) == 1 and
+                         not row["remote"]]
+        remote_stride = [row for row in strides
+                         if sum(row["remote"].values()) == 1 and
+                         not row["record"]]
+        if len(strides) != 2 or len(record_stride) != 1 or len(remote_stride) != 1:
+            raise ValueError(f"selected width did not replace RD9.stride state: {strides}")
+        def fields(row: dict[str, Any]) -> dict[str, str]:
+            return dict(line.split("=", 1) for line in
+                        row["request"]["state"].splitlines()[1:])
+        record_unroll = int(fields(record_stride[0])["iter_unroll"])
+        remote_unroll = int(fields(remote_stride[0])["iter_unroll"])
+        if record_unroll <= remote_unroll or remote_unroll != 1:
+            raise ValueError("outer width did not lower dependent iteration unroll")
+        required = [intended,
+                    {"kind": "record_only_state", "site": "RD9.stride",
+                     "request_sha256": record_stride[0]["request_sha256"]},
+                    {"kind": "remote_only_state", "site": "RD9.stride",
+                     "request_sha256": remote_stride[0]["request_sha256"]}]
+        if any(item not in issues for item in required):
+            raise ValueError(f"missing expected width-dependent state issues: {issues}")
+        for issue in issues:
+            if issue not in required and issue["kind"] not in {
+                    "record_only_state", "remote_only_state"}:
+                raise ValueError(f"unexpected outer-width winner issue: {issues}")
     elif require_grid:
         if set(event["candidates"]) != {"warp16", "warp32"}:
             raise ValueError("outer warp test did not reach both hard-valid plans")
@@ -323,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gtest", default=GTEST)
     parser.add_argument("--case-key", default=CASE_KEY)
     parser.add_argument("--require-grid", action="store_true")
+    parser.add_argument("--require-outer-width", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
@@ -424,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
             report, override.events, site=args.site,
             alternate=args.alternate, case_key=args.case_key,
             require_grid=args.require_grid,
+            require_outer_width=args.require_outer_width,
             require_inner_targets=args.require_inner_targets,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy)

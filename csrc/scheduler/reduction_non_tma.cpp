@@ -1850,6 +1850,78 @@ bool outerGridWarpPlansHardValid(
   return valid(plans.baseline) && valid(plans.stride_capped);
 }
 
+// The block planner is pure arithmetic too. Check its completed plan before
+// offering a narrower iteration width; no scheduler state is mutated here.
+bool outerBlockPlanHardValid(
+    const OuterReductionParams& params,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t max_threads_per_block) {
+  return params.bdimx > 0 && params.bdimy > 0 && params.gidim > 0 &&
+      params.grdim == 1 && params.iter_unroll_factor > 0 &&
+      params.redu_unroll_factor > 0 &&
+      params.bdimx <= max_threads_per_block / params.bdimy &&
+      params.iter_unroll_factor <= vectorize_factor &&
+      total_iteration_numel % params.iter_unroll_factor == 0 &&
+      params.gidim >= ceilDiv(
+          total_iteration_numel,
+          params.bdimx * params.iter_unroll_factor);
+}
+
+// A width is offered only when a complete block plan and a complete grid
+// plan exist for each subsequent wave target. The later RD9.warp Choice
+// still checks each logical-warp plan against its native hard bounds.
+bool outerWidthHardValid(
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t max_dtype_size_bit_for_vectorization,
+    int64_t vectorize_factor,
+    int64_t max_unroll,
+    int64_t sm_count,
+    int64_t max_threads_per_sm,
+    int64_t max_threads_per_block) {
+  const auto block = getBlockOuterReduction(
+      total_reduction_numel,
+      total_iteration_numel,
+      vectorize_factor,
+      max_unroll,
+      sm_count,
+      max_threads_per_block);
+  if (!outerBlockPlanHardValid(
+          block,
+          total_iteration_numel,
+          vectorize_factor,
+          max_threads_per_block)) {
+    return false;
+  }
+  for (int64_t waves : {4, 8}) {
+    bool has_grid_plan = false;
+    for (int64_t warp : {16, 32}) {
+      const auto plans = buildOuterGridWarpPlans(
+          total_reduction_numel,
+          total_iteration_numel,
+          max_dtype_size_bit_for_vectorization,
+          vectorize_factor,
+          max_unroll,
+          sm_count,
+          max_threads_per_sm,
+          waves,
+          warp);
+      has_grid_plan |= outerGridWarpPlansHardValid(
+          plans,
+          total_reduction_numel,
+          total_iteration_numel,
+          vectorize_factor,
+          max_unroll,
+          max_threads_per_block);
+    }
+    if (!has_grid_plan) {
+      return false;
+    }
+  }
+  return true;
+}
+
 OuterReductionParams getGridOuterReduction(
     const int64_t total_reduction_numel,
     const int64_t total_iteration_numel,
@@ -2025,7 +2097,7 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
     const int64_t total_iteration_numel,
     const int64_t n_tensor_inputs,
     const int64_t max_dtype_size_bit_for_vectorization,
-    const size_t vectorize_factor,
+    const size_t max_vectorize_factor,
     const bool has_mufu_computation) {
   // WARNING: Current device for codegen may not be the target device
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
@@ -2058,6 +2130,7 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
   const int64_t unroll32 = budgetMaxUnroll(32, n_tensor_inputs);
   const auto jev_mode = scheduler::jev::mode();
   int64_t max_unroll = 0;
+  std::string selected_budget;
   if (jev_mode == scheduler::jev::Mode::Off) {
     max_unroll = has_mufu_computation ? unroll8 : unroll32;
   } else {
@@ -2084,7 +2157,97 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
     NVF_ERROR(
         selected == "b8" || selected == "b32",
         "RD9 register policy is outside native candidate bounds");
+    selected_budget = selected;
     max_unroll = selected == "b8" ? unroll8 : unroll32;
+  }
+
+  // The layout-derived factor is the largest aligned width. RD9.width asks
+  // for a performance width among its power-of-two divisors. Preflight uses
+  // only pure block/grid arithmetic, after the budget Choice has fixed its
+  // unroll cap and before any downstream Choice or schedule construction.
+  int64_t vectorize_factor = static_cast<int64_t>(max_vectorize_factor);
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool power_of_two_layout_limit =
+        max_vectorize_factor > 0 &&
+        max_vectorize_factor <=
+            static_cast<size_t>(std::numeric_limits<int64_t>::max()) &&
+        scheduler_utils::lastPow2(vectorize_factor) == vectorize_factor;
+    if (!power_of_two_layout_limit) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "RD9.width", "layout maximum is not a positive power of two");
+      } else {
+        NVF_ERROR(false, "RD9.width requires a power-of-two layout limit");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t width = 1;; width *= 2) {
+        if (outerWidthHardValid(
+                total_reduction_numel,
+                total_iteration_numel,
+                max_dtype_size_bit_for_vectorization,
+                width,
+                max_unroll,
+                sm_count,
+                max_threads_per_sm,
+                max_threads_per_block)) {
+          options.push_back(
+              {"w" + std::to_string(width),
+               "Vectorize " + std::to_string(width) +
+                   " iteration element(s) per thread"});
+        }
+        if (width == vectorize_factor) {
+          break;
+        }
+      }
+      const std::string native_id =
+          "w" + std::to_string(max_vectorize_factor);
+      const bool native_preflighted = std::any_of(
+          options.begin(),
+          options.end(),
+          [&](const scheduler::jev::ChoiceOption& option) {
+            return option.id == native_id;
+          });
+      if (!native_preflighted && jev_mode == scheduler::jev::Mode::Record) {
+        // Conservative preflight may exclude a plan that the original
+        // scheduler can still execute. Preserve that native plan in Record.
+        scheduler::jev::recordCoverageSkip(
+            "RD9.width", "complete-plan preflight excludes native width");
+      } else {
+        NVF_ERROR(
+            native_preflighted,
+            "RD9.width has no complete native plan in remote mode");
+        const std::string state =
+            "reduction.outer_width.v1\nlayout_max=" +
+            std::to_string(max_vectorize_factor) +
+            "\nreduction_numel=" + std::to_string(total_reduction_numel) +
+            "\niteration_numel=" + std::to_string(total_iteration_numel) +
+            "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+            "\ndtype_bits=" +
+            std::to_string(max_dtype_size_bit_for_vectorization) +
+            "\nsm_count=" + std::to_string(sm_count) +
+            "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+            "\nmax_threads_per_block=" +
+            std::to_string(max_threads_per_block) +
+            "\nbits_per_register=" +
+            std::to_string(scheduler_utils::bits_per_register) +
+            "\nbudget=" + selected_budget;
+        const std::string native_choice =
+            jev_mode == scheduler::jev::Mode::Record ? native_id : "";
+        const auto selected = scheduler::jev::chooseDecision(
+            "RD9.width", state, options, native_choice);
+        const auto selected_option = std::find_if(
+            options.begin(),
+            options.end(),
+            [&](const scheduler::jev::ChoiceOption& option) {
+              return option.id == selected;
+            });
+        NVF_ERROR(
+            selected_option != options.end(),
+            "RD9.width response is outside hard-valid candidates");
+        vectorize_factor = std::stoll(selected.substr(1));
+      }
+    }
   }
 
   // block or grid reduction heuristic
@@ -2093,7 +2256,7 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
       total_iteration_numel,
       n_tensor_inputs,
       max_dtype_size_bit_for_vectorization,
-      (int64_t)vectorize_factor,
+      vectorize_factor,
       max_unroll,
       sm_count,
       max_threads_per_sm,
@@ -2103,7 +2266,7 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
   auto block_params = getBlockOuterReduction(
       total_reduction_numel,
       total_iteration_numel,
-      (int64_t)vectorize_factor,
+      vectorize_factor,
       max_unroll,
       sm_count,
       max_threads_per_block);
