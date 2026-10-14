@@ -216,6 +216,175 @@ def iop3_rows_expected_cta(state: str, rows: int
     return ({key: scalars[key] for key in IOP3_CTA_FIELDS}, plans)
 
 
+def checked_iop3_rows_request(row: dict[str, Any]
+                              ) -> tuple[dict[str, str], dict[int, list[tuple[int, ...]]]]:
+    """Validate the exact rows menu, occupancy grid and complete CTA searches."""
+    text = row["request"]["state"]
+    lines = text.splitlines()
+    if not lines or lines[0] != "inner_outer_multi_wave.grid_rows.v1":
+        raise ValueError("unknown dependent grid-rows state version")
+    scalars: dict[str, str] = {}
+    groups: dict[int, list[tuple[int, ...]]] = {}
+    previous_rows = 0
+    for line in lines[1:]:
+        key, sep, value = line.partition("=")
+        if not sep or not value:
+            raise ValueError("malformed dependent grid-rows state")
+        if key == "plan":
+            fields = tuple(int(part) for part in value.split(":"))
+            if (len(fields) != 17 or any(part < 1 for part in fields) or
+                    fields[0] < previous_rows):
+                raise ValueError("incomplete dependent grid-rows plan")
+            groups.setdefault(fields[0], []).append(fields)
+            previous_rows = fields[0]
+        elif key in scalars:
+            raise ValueError("repeated dependent grid-rows scalar")
+        else:
+            scalars[key] = value
+    if (set(scalars) != IOP3_CTA_FIELDS | {
+            "selected_min_batch", "min_threads", "max_threads", "thread_cap"} or
+            set(groups) != {4, 8, 16}):
+        raise ValueError("dependent rows omitted full state or option menu")
+    numbers = {key: int(value) for key, value in scalars.items()}
+    sm_count = numbers["sm_count"]
+    if (sm_count < 1 or numbers["inner_dim"] < 1 or
+            numbers["outer_dim"] < 1 or numbers["vector_width"] < 1 or
+            numbers["selected_outer_read_width"] < 1 or
+            numbers["tmp_dtype_bits"] < 1 or numbers["warp_size"] < 1 or
+            numbers["max_grid_y"] < 1 or numbers["regs_buffer_bits"] < 0 or
+            numbers["inner_dim"] % numbers["vector_width"] or
+            numbers["selected_min_batch"] not in {1, 2, 3, 4} or
+            numbers["min_threads"] < 1 or
+            numbers["max_threads"] < numbers["min_threads"] or
+            numbers["thread_cap"] < numbers["max_threads"] or
+            numbers["smem_total_bits"] > numbers["smem_limit_bits"]):
+        raise ValueError("invalid dependent rows dimensions or resource bound")
+    expected_threads = []
+    threads = numbers["max_threads"]
+    while threads >= numbers["min_threads"]:
+        expected_threads.append(threads)
+        threads //= 2
+    if threads * 2 != numbers["min_threads"] or len(expected_threads) > 7:
+        raise ValueError("incomplete dependent rows CTA search")
+    after_vector = numbers["inner_dim"] // numbers["vector_width"]
+    minimum = max(numbers["min_threads"],
+                  (after_vector + numbers["selected_min_batch"] - 1) //
+                  numbers["selected_min_batch"])
+    maximum = min(1 << (minimum - 1).bit_length(), numbers["thread_cap"])
+    if maximum != numbers["max_threads"]:
+        raise ValueError("dependent rows ignored selected minimum batch")
+    question = row["request"]["questions"]["IOP3.grid_rows"]
+    if question != {
+            "type": "choice",
+            "instructions": "Choose nvFuser scheduler decision IOP3.grid_rows",
+            "criteria": {f"r{rows}": (
+                f"Require at least {rows} outer rows per grid-Y block "
+                f"across {len(plans)} complete CTA plans")
+                for rows, plans in groups.items()}}:
+        raise ValueError("dependent rows menu differs from complete CTA searches")
+    capacities: dict[int, tuple[int, int]] = {}
+    for rows, plans in groups.items():
+        if [plan[3] for plan in plans] != expected_threads:
+            raise ValueError("dependent rows omitted a CTA candidate")
+        cta_scalar, cta_plans = iop3_rows_expected_cta(text, rows)
+        cta_state = "\n".join((
+            "inner_outer_multi_wave.cta.v2",
+            *(f"{key}={value}" for key, value in cta_scalar.items()),
+            *("plan=" + ":".join(map(str, plan)) for plan in cta_plans)))
+        iop3_cta_plan_fields({"site": "IOP3.cta", "request": {"state": cta_state}},
+                             numbers["selected_outer_read_width"])
+        for plan in plans:
+            (_, capacity, final_capacity, tpb, vector, batch, _, _, grid,
+             tmp_write, read, warps, required, available, _, _, final_grid) = plan
+            if (capacity % sm_count or final_capacity % sm_count or
+                    capacity > 64 * sm_count or
+                    final_capacity > 64 * sm_count or
+                    final_capacity != capacity or
+                    capacity < grid or
+                    tmp_write != min(128 // numbers["tmp_dtype_bits"], vector) or
+                    read != numbers["selected_outer_read_width"] or
+                    warps != ((tpb + numbers["warp_size"] - 1) //
+                              numbers["warp_size"]) * (grid // sm_count) or
+                    required != min((numbers["regs_buffer_bits"] //
+                                     numbers["inner_dim"] * vector * batch) //
+                                    32 + 40, 255) or
+                    not 1 <= available <= 255):
+                raise ValueError("dependent rows plan changed resource measurements")
+            cap_blocks = capacity // sm_count
+            maximum_grid = ((numbers["outer_dim"] + rows - 1) // rows +
+                            sm_count - 1) // sm_count * sm_count
+            expected_grid = min(cap_blocks,
+                                max(1, maximum_grid // sm_count)) * sm_count
+            if grid != expected_grid or final_grid != expected_grid:
+                raise ValueError("dependent rows grid disagrees with occupancy cap")
+            previous = capacities.setdefault(tpb, (capacity, final_capacity))
+            if previous != (capacity, final_capacity):
+                raise ValueError("dependent rows changed occupancy capacity")
+    return scalars, groups
+
+
+def check_iop3_grid_rows_dependency(
+        report: dict[str, Any], *, batch_pair: tuple[int, int],
+        width_pair: tuple[int, int], cta_pair: tuple[str, str]
+        ) -> tuple[list[dict[str, str]], dict[str, Any], dict[str, Any]]:
+    """Check one replaced rows request and its exact downstream CTA plans."""
+    record_rows, remote_rows, rows_issues = paired_state_rows(
+        report, "IOP3.grid_rows")
+    states = []
+    for row, batch, width, side in (
+            (record_rows, batch_pair[0], width_pair[0], "record"),
+            (remote_rows, batch_pair[1], width_pair[1], "remote")):
+        state, groups = checked_iop3_rows_request(row)
+        if (row[side] != {"r8": 1} or
+                state["inner_dim"] != "2048" or
+                state["outer_dim"] != "1024" or
+                state["vector_width"] != "4" or
+                state["min_threads"] != "128" or
+                state["thread_cap"] != "512" or
+                state["selected_min_batch"] != str(batch) or
+                state["selected_outer_read_width"] != str(width) or
+                state["max_threads"] != str(512 if batch == 1 else 256)):
+            raise ValueError("dependent grid-rows request changed beyond selected upstream choice")
+        states.append((state, groups))
+    permitted = {"selected_min_batch", "selected_outer_read_width",
+                 "max_threads"}
+    record_scalars = {key: value for key, value in states[0][0].items()
+                      if key not in permitted}
+    remote_scalars = {key: value for key, value in states[1][0].items()
+                      if key not in permitted}
+    if record_scalars != remote_scalars:
+        raise ValueError("upstream choice altered unrelated rows measurements")
+    for rows in (4, 8, 16):
+        native = states[0][1][rows]
+        selected = states[1][1][rows]
+        if batch_pair[0] != batch_pair[1]:
+            if tuple(native) != tuple(selected[1:]):
+                raise ValueError("minimum batch altered the overlapping rows plans")
+        else:
+            if len(native) != len(selected):
+                raise ValueError("read width altered the CTA search cardinality")
+            for left, right in zip(native, selected):
+                invariant_columns = (0, 1, 2, 3, 4, 5, 8, 9, 11, 12, 13, 16)
+                if (tuple(left[index] for index in invariant_columns) !=
+                        tuple(right[index] for index in invariant_columns)):
+                    raise ValueError("read width altered unrelated rows plan metrics")
+    record_cta, remote_cta, cta_issues = paired_state_rows(report, "IOP3.cta")
+    for rows_row, cta_row, width, winner, side in (
+            (record_rows, record_cta, width_pair[0], cta_pair[0], "record"),
+            (remote_rows, remote_cta, width_pair[1], cta_pair[1], "remote")):
+        scalar, plans = iop3_rows_expected_cta(rows_row["request"]["state"], 8)
+        lines = cta_row["request"]["state"].splitlines()
+        if not lines or lines[0] != "inner_outer_multi_wave.cta.v2":
+            raise ValueError("dependent CTA omitted the rows plan version")
+        cta_scalar = dict(line.split("=", 1) for line in lines[1:]
+                          if not line.startswith("plan="))
+        if (cta_scalar != scalar or
+                iop3_cta_plan_fields(cta_row, width) != plans or
+                cta_row[side] != {winner: 1}):
+            raise ValueError("dependent CTA omitted exact grid-rows geometry")
+    return [*rows_issues, *cta_issues], record_cta, remote_cta
+
+
 OUTER_STRIDE_KEYS = {
     "reduction_numel", "iteration_numel", "dtype_bits", "sm_count",
     "min_warp_size", "bdimx", "bdimy", "iter_unroll", "redu_unroll",
@@ -906,8 +1075,10 @@ def check_alternate_report(report: dict[str, Any],
                 len(writes) != 1 or writes[0]["record"] != {"w4": 1} or
                 writes[0]["remote"] != {"w4": 1}):
             raise ValueError("batch search changed a temporary vector width")
-        record_cta, remote_cta, cta_issues = paired_state_rows(
-            report, "IOP3.cta")
+        dependent_issues, record_cta, remote_cta = (
+            check_iop3_grid_rows_dependency(
+                report, batch_pair=(2, 1), width_pair=(2, 2),
+                cta_pair=("t256", "t512")))
         record_plans = iop3_cta_plan_fields(record_cta, 2)
         remote_plans = iop3_cta_plan_fields(remote_cta, 2)
         if ([plan[0] for plan in record_plans] != [256, 128] or
@@ -916,7 +1087,7 @@ def check_alternate_report(report: dict[str, Any],
                 record_cta["record"] != {"t256": 1} or
                 remote_cta["remote"] != {"t512": 1}):
             raise ValueError("batch search did not extend the exact CTA menu")
-        if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
+        if sorted(issues, key=str) != sorted([intended, *dependent_issues], key=str):
             raise ValueError(f"unexpected minimum-batch dependencies: {issues}")
     elif require_iop3_grid_rows:
         if (site != "IOP3.grid_rows" or event["native"] != "r8" or
@@ -984,14 +1155,24 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("inner-outer fixture lacks its proved read-width menu")
         alternate_width = alternate[1:]
         expected = [intended]
+        dependent_issues, record_cta, remote_cta = (
+            check_iop3_grid_rows_dependency(
+                report, batch_pair=(2, 2),
+                width_pair=(2, int(alternate_width)),
+                cta_pair=("t256", "t256")))
+        expected.extend(dependent_issues)
         for nested_site, version, field in (
                 ("IOP3.cta", "inner_outer_multi_wave.cta.v2",
                  "selected_outer_read_width"),
                 ("IOP3.tmp_write_width",
                  "inner_outer_multi_wave.tmp_write_width.v2",
                  "outer_read_width")):
-            record_row, remote_row, pair_issues = paired_state_rows(
-                report, nested_site)
+            if nested_site == "IOP3.cta":
+                record_row, remote_row = record_cta, remote_cta
+                pair_issues = []
+            else:
+                record_row, remote_row, pair_issues = paired_state_rows(
+                    report, nested_site)
             if (record_row["record"] != remote_row["remote"] or
                     sum(record_row["record"].values()) != 1):
                 raise ValueError(f"{nested_site} changed its winner: "
