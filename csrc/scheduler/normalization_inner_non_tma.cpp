@@ -368,9 +368,19 @@ bool compareTwoHeuristics(
 //         Use more registers for persistent buffers.
 // This sequence ensures meeting target occupancy, promotes even workload
 // distribution, enhances register optimization, and prefers higher occupancy.
-void innerPersistentHeuristic2D(
+struct Inner2DPolicyResources {
+  int64_t batch_min = 0;
+  int64_t batch_max = 0;
+  bool supported_menu = false;
+};
+
+void innerPersistentHeuristic2DPlan(
     const PersistentKernelProperties& properties,
-    ReductionParams* rparams) {
+    ReductionParams* rparams,
+    int64_t register_overhead,
+    int64_t target_warps_per_sm,
+    bool enable_batch_choice,
+    Inner2DPolicyResources* policy_resources = nullptr) {
   bool is_high_bandwidth_flops_ratio =
       scheduler_utils::isHighBandwidthFlopsRatio();
   // Currently, we only considered the influence of exp op which is used in
@@ -380,29 +390,6 @@ void innerPersistentHeuristic2D(
   bool has_exp_op = properties.has_exp_op;
   bool disable_project_to_avoid_recompute =
       properties.disable_project_to_avoid_recompute;
-  // Define two free parameters used in this heuristic.
-  // register_overhead is all registers except those for the persistent
-  // buffers. The register in each thread = register_overhead +
-  // persistent_buffer_size_bit / bits_per_register
-  // Current values are based on tests of sofmax, layer_norm, softmax_dropout,
-  // dropout_layer_norm on A100 & H100. It directly affects maxregcount passed
-  // to NVRTC and influences the occupancy.
-  const int64_t register_overhead = has_exp_op ? 32l : 16l;
-
-  // Target occupancy required to hide memory latency.
-  // Used to calculate the maximum register count each thread can use.
-  // Used to calculate the maximum persistent batch size.
-  // Current value of 28 is based on tests of softmax, layer_norm,
-  // softmax_dropout, dropout_layer_norm on A100 & H100. When bandwidth to flops
-  // ratio is high, we may disable recompute persistent buffer from inputs to
-  // reduce computation costs. when this happens, the target occupancy is set to
-  // 16 to allow more registers per thread and larger persistent batch size for
-  // better instruction level parallelism. This empirical value is based on
-  // tests of softmax on B100.
-  const int64_t target_warps_per_sm =
-      is_high_bandwidth_flops_ratio && disable_project_to_avoid_recompute ? 16l
-                                                                          : 28l;
-
   // device properties
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
   const int64_t threads_per_warp = (int64_t)dev_prop->warpSize;
@@ -448,6 +435,19 @@ void innerPersistentHeuristic2D(
   int64_t batches_per_block_inner_reduction_max = std::max(
       batches_per_block_inner_reduction_min, std::min(pbs_max_1, pbs_max_2));
 
+  // An alternate policy is only a candidate when even its largest proposed
+  // batch can fit the architectural per-thread register cap. Check this before
+  // the occupancy helper, whose inverse estimate assumes a feasible minimum.
+  if (policy_resources != nullptr &&
+      (buffer_bits_per_batch <= 0 ||
+       batches_per_block_inner_reduction_max >
+           (scheduler_utils::max_registers_per_thread - register_overhead) *
+               scheduler_utils::bits_per_register / buffer_bits_per_batch)) {
+    policy_resources->batch_min = batches_per_block_inner_reduction_min;
+    policy_resources->batch_max = batches_per_block_inner_reduction_max;
+    return;
+  }
+
   // Compute maximum number of reductions we could do in the same kernel based
   // on persistent buffer size. Bounded by the wave count for utilization of
   // SMs.
@@ -486,12 +486,13 @@ void innerPersistentHeuristic2D(
 
   // Select the best plan. When none reaches the target occupancy, retain the
   // first plan with maximum occupancy; otherwise apply the empirical sort.
-  const auto jev_mode = scheduler::jev::mode();
+  const auto jev_mode =
+      enable_batch_choice ? scheduler::jev::mode() : scheduler::jev::Mode::Off;
   // Keep the original, ascending-batch candidate order for the Choice
   // request. The native stable sort below would otherwise put its winner
   // first and reveal the preference to the service.
   const std::vector<NormInnerParams> candidate_heuristics =
-      jev_mode == scheduler::jev::Mode::Off
+      jev_mode == scheduler::jev::Mode::Off && policy_resources == nullptr
       ? std::vector<NormInnerParams>{}
       : all_heuristics;
   NormInnerParams best_heuristic;
@@ -518,17 +519,19 @@ void innerPersistentHeuristic2D(
     }
   }
 
-  if (jev_mode != scheduler::jev::Mode::Off) {
+  if (jev_mode != scheduler::jev::Mode::Off || policy_resources != nullptr) {
     // getMaxPersistentBatch caps the upper batch bound at 10 or 12. If the
     // physical-block lower bound exceeds that cap, max becomes min, yielding
     // a singleton. Thus at most 12 plans enter the 255-option/64-KiB client.
     // Recheck every plan before offering it, not only the returned selection.
-    const bool supported_menu = candidate_heuristics.size() <= 12 &&
+    const bool supported_menu = !candidate_heuristics.empty() &&
+        candidate_heuristics.size() <= 12 &&
         std::all_of(
             candidate_heuristics.begin(),
             candidate_heuristics.end(),
             [&](const NormInnerParams& candidate) {
-              if (candidate.persistent_batch_size <= 0 || candidate.bdimx <= 0 ||
+              if (candidate.persistent_batch_size <= 0 ||
+                  candidate.bdimx <= 0 ||
                   candidate.bdimx > max_threads_in_block ||
                   candidate.bdimy <= 0 ||
                   candidate.bdimy > max_threads_in_block ||
@@ -539,112 +542,141 @@ void innerPersistentHeuristic2D(
               }
               const int64_t padded_threads =
                   candidate.padded_bdimx * candidate.bdimy;
-              const bool should_pad =
-                  candidate.bdimx > 16 && padded_threads <= max_threads_in_block;
+              const bool should_pad = candidate.bdimx > 16 &&
+                  padded_threads <= max_threads_in_block;
               const int64_t threads = should_pad
                   ? padded_threads
                   : candidate.bdimx * candidate.bdimy;
+              const int64_t buffer_registers = buffer_bits_per_batch *
+                  candidate.persistent_batch_size /
+                  scheduler_utils::bits_per_register;
+              const int64_t godim =
+                  ceilDiv(properties.total_iteration_numel, candidate.bdimy);
+              const int64_t grid_x_limit = std::min<int64_t>(
+                  scheduler_utils::x_grid_limit, dev_prop->maxGridSize[0]);
+              const int64_t grid_y_limit = std::min<int64_t>(
+                  scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]);
               return candidate.is_pad_bdimx == should_pad && threads > 0 &&
                   threads <= max_threads_in_block &&
+                  candidate.bdimx <= dev_prop->maxThreadsDim[0] &&
+                  candidate.bdimy <= dev_prop->maxThreadsDim[1] &&
                   candidate.register_per_thread > 0 &&
                   candidate.register_per_thread <= 255 &&
-                  candidate.register_per_thread <= dev_prop->regsPerBlock / threads;
+                  candidate.register_per_thread <=
+                  dev_prop->regsPerBlock / threads &&
+                  candidate.register_per_thread >=
+                  buffer_registers + register_overhead &&
+                  godim > 0 && grid_x_limit > 0 && grid_y_limit > 0 &&
+                  ceilDiv(godim, grid_x_limit) <= grid_y_limit;
             });
-    // A future change to candidate generation must not silently send an
-    // oversized or physically invalid menu. Record retains the native plan;
-    // remote fails closed because it has no trusted native winner.
-    NVF_ERROR(
-        supported_menu || jev_mode == scheduler::jev::Mode::Record,
-        "Unsupported register-backed inner persistent batch menu");
-    if (supported_menu) {
-      // Native analysis owns the candidate plans and their CTA/register limits.
-      // The service gets unranked measurements and independently applies the
-      // empirical comparison; it never receives the native winner.
-      std::string state =
-          "inner_persistent.reg_batch.v1\nparallel_after_vectorize=" +
-          std::to_string(parallel_after_vectorize) +
-          "\ntotal_iteration_numel=" +
-          std::to_string(properties.total_iteration_numel) +
-          "\nmin_threads_per_block=" + std::to_string(min_threads_per_block) +
-          "\nmax_multi_reduction_factor=" +
-          std::to_string(max_multi_reduction_factor) +
-          "\nbuffer_bits_per_batch=" + std::to_string(buffer_bits_per_batch) +
-          "\nhigh_bandwidth_flops_ratio=" +
-          std::to_string(is_high_bandwidth_flops_ratio) +
-          "\nhas_exp_op=" + std::to_string(has_exp_op) +
-          "\ndisable_projection_avoid_recompute=" +
-          std::to_string(disable_project_to_avoid_recompute) +
-          "\nwarp_size=" + std::to_string(threads_per_warp) +
-          "\nmax_threads_per_block=" + std::to_string(max_threads_in_block) +
-          "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
-          "\nsm_count=" + std::to_string(device_multiprocessor_count) +
-          "\nbits_per_register=" +
-          std::to_string(scheduler_utils::bits_per_register) +
-          "\nbatch_min=" +
-          std::to_string(batches_per_block_inner_reduction_min) +
-          "\nbatch_max=" +
-          std::to_string(batches_per_block_inner_reduction_max);
-      std::vector<scheduler::jev::ChoiceOption> options;
-      options.reserve(candidate_heuristics.size());
-      for (const auto& candidate : candidate_heuristics) {
-        state += "\nplan=" + std::to_string(candidate.persistent_batch_size) +
-            ":" + std::to_string(candidate.bdimx) +
-            ":" + std::to_string(candidate.bdimy) +
-            ":" + std::to_string(candidate.padded_bdimx) +
-            ":" + std::to_string(candidate.register_per_thread) +
-            ":" + std::to_string(candidate.non_buffer_registers) +
-            ":" + std::to_string(candidate.occupancy) +
-            ":" + std::to_string(candidate.n_wave) +
-            ":" + std::to_string(candidate.n_persistent_tails);
-        options.push_back({
-            "b" + std::to_string(candidate.persistent_batch_size),
-            "Persistent batch " +
-                std::to_string(candidate.persistent_batch_size) +
-                ", CTA " + std::to_string(candidate.bdimx) + "x" +
-                std::to_string(candidate.bdimy) + ", maxrregcount " +
-                std::to_string(candidate.register_per_thread)});
-      }
-      // The state uses only ASCII digits, separators and newlines, so JSON
-      // quoting at most doubles its size. Option text needs no escaping.
-      // These limits leave ample room for the fixed envelope under 64 KiB.
-      size_t option_text_bytes = 0;
-      for (const auto& option : options) {
-        option_text_bytes += option.id.size() + option.description.size();
-      }
-      const bool request_fits =
-          state.size() <= 16 * 1024 && option_text_bytes <= 16 * 1024;
+    if (policy_resources != nullptr) {
+      policy_resources->batch_min = batches_per_block_inner_reduction_min;
+      policy_resources->batch_max = batches_per_block_inner_reduction_max;
+      policy_resources->supported_menu = supported_menu;
+    }
+    // Candidate preflight has no nested Choice or log side effect.
+    if (jev_mode != scheduler::jev::Mode::Off) {
+      // A future change to candidate generation must not silently send an
+      // oversized or physically invalid menu. Record retains the native plan;
+      // remote fails closed because it has no trusted native winner.
       NVF_ERROR(
-          request_fits || jev_mode == scheduler::jev::Mode::Record,
-          "Register-backed inner persistent Choice request exceeds safe size");
-      if (request_fits) {
-        const std::string native_choice =
-            jev_mode == scheduler::jev::Mode::Record
-            ? "b" + std::to_string(best_heuristic.persistent_batch_size)
-            : "";
-        const std::string selected = scheduler::jev::chooseDecision(
-            "IP5.batch", state, options, native_choice);
-        const auto selected_it = std::find_if(
-            candidate_heuristics.begin(),
-            candidate_heuristics.end(),
-            [&](const auto& candidate) {
-              return selected == "b" +
-                  std::to_string(candidate.persistent_batch_size);
-            });
+          supported_menu || jev_mode == scheduler::jev::Mode::Record,
+          "Unsupported register-backed inner persistent batch menu");
+      if (supported_menu) {
+        // Native analysis owns the candidate plans and their CTA/register
+        // limits. The service gets unranked measurements and independently
+        // applies the empirical comparison; it never receives the native
+        // winner.
+        std::string state =
+            "inner_persistent.reg_batch.v2\nparallel_after_vectorize=" +
+            std::to_string(parallel_after_vectorize) +
+            "\ntotal_iteration_numel=" +
+            std::to_string(properties.total_iteration_numel) +
+            "\nmin_threads_per_block=" + std::to_string(min_threads_per_block) +
+            "\nmax_multi_reduction_factor=" +
+            std::to_string(max_multi_reduction_factor) +
+            "\nbuffer_bits_per_batch=" + std::to_string(buffer_bits_per_batch) +
+            "\nhigh_bandwidth_flops_ratio=" +
+            std::to_string(is_high_bandwidth_flops_ratio) +
+            "\nhas_exp_op=" + std::to_string(has_exp_op) +
+            "\ndisable_projection_avoid_recompute=" +
+            std::to_string(disable_project_to_avoid_recompute) +
+            "\nwarp_size=" + std::to_string(threads_per_warp) +
+            "\nmax_threads_per_block=" + std::to_string(max_threads_in_block) +
+            "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+            "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+            "\npolicy_register_overhead=" + std::to_string(register_overhead) +
+            "\npolicy_target_warps_per_sm=" +
+            std::to_string(target_warps_per_sm) + "\nbits_per_register=" +
+            std::to_string(scheduler_utils::bits_per_register) +
+            "\nbatch_min=" +
+            std::to_string(batches_per_block_inner_reduction_min) +
+            "\nbatch_max=" +
+            std::to_string(batches_per_block_inner_reduction_max);
+        std::vector<scheduler::jev::ChoiceOption> options;
+        options.reserve(candidate_heuristics.size());
+        for (const auto& candidate : candidate_heuristics) {
+          state += "\nplan=" + std::to_string(candidate.persistent_batch_size) +
+              ":" + std::to_string(candidate.bdimx) + ":" +
+              std::to_string(candidate.bdimy) + ":" +
+              std::to_string(candidate.padded_bdimx) + ":" +
+              std::to_string(candidate.register_per_thread) + ":" +
+              std::to_string(candidate.non_buffer_registers) + ":" +
+              std::to_string(candidate.occupancy) + ":" +
+              std::to_string(candidate.n_wave) + ":" +
+              std::to_string(candidate.n_persistent_tails);
+          options.push_back(
+              {"b" + std::to_string(candidate.persistent_batch_size),
+               "Persistent batch " +
+                   std::to_string(candidate.persistent_batch_size) + ", CTA " +
+                   std::to_string(candidate.bdimx) + "x" +
+                   std::to_string(candidate.bdimy) + ", maxrregcount " +
+                   std::to_string(candidate.register_per_thread)});
+        }
+        // The state uses only ASCII digits, separators and newlines, so JSON
+        // quoting at most doubles its size. Option text needs no escaping.
+        // These limits leave ample room for the fixed envelope under 64 KiB.
+        size_t option_text_bytes = 0;
+        for (const auto& option : options) {
+          option_text_bytes += option.id.size() + option.description.size();
+        }
+        const bool request_fits =
+            state.size() <= 16 * 1024 && option_text_bytes <= 16 * 1024;
         NVF_ERROR(
-            selected_it != candidate_heuristics.end(),
-            "Unknown register-backed inner persistent batch plan");
-        const int64_t selected_threads =
-            (selected_it->bdimx > 16 &&
-             selected_it->padded_bdimx * selected_it->bdimy <=
-                 max_threads_in_block)
-            ? selected_it->padded_bdimx * selected_it->bdimy
-            : selected_it->bdimx * selected_it->bdimy;
-        NVF_ERROR(
-            selected_threads > 0 && selected_threads <= max_threads_in_block &&
-                selected_it->register_per_thread > 0 &&
-                selected_it->register_per_thread <= 255,
-            "Selected inner persistent batch exceeds CTA/register limits");
-        best_heuristic = *selected_it;
+            request_fits || jev_mode == scheduler::jev::Mode::Record,
+            "Register-backed inner persistent Choice request exceeds safe "
+            "size");
+        if (request_fits) {
+          const std::string native_choice =
+              jev_mode == scheduler::jev::Mode::Record
+              ? "b" + std::to_string(best_heuristic.persistent_batch_size)
+              : "";
+          const std::string selected = scheduler::jev::chooseDecision(
+              "IP5.batch", state, options, native_choice);
+          const auto selected_it = std::find_if(
+              candidate_heuristics.begin(),
+              candidate_heuristics.end(),
+              [&](const auto& candidate) {
+                return selected ==
+                    "b" + std::to_string(candidate.persistent_batch_size);
+              });
+          NVF_ERROR(
+              selected_it != candidate_heuristics.end(),
+              "Unknown register-backed inner persistent batch plan");
+          const int64_t selected_threads =
+              (selected_it->bdimx > 16 &&
+               selected_it->padded_bdimx * selected_it->bdimy <=
+                   max_threads_in_block)
+              ? selected_it->padded_bdimx * selected_it->bdimy
+              : selected_it->bdimx * selected_it->bdimy;
+          NVF_ERROR(
+              selected_threads > 0 &&
+                  selected_threads <= max_threads_in_block &&
+                  selected_it->register_per_thread > 0 &&
+                  selected_it->register_per_thread <= 255,
+              "Selected inner persistent batch exceeds CTA/register limits");
+          best_heuristic = *selected_it;
+        }
       }
     }
   }
@@ -694,6 +726,124 @@ void innerPersistentHeuristic2D(
       LaunchParams::UNINITIALIZED_VAL,
       best_heuristic.bdimy,
       LaunchParams::UNINITIALIZED_VAL);
+}
+
+void innerPersistentHeuristic2D(
+    const PersistentKernelProperties& properties,
+    ReductionParams* rparams) {
+  // These two values are performance targets. The original exp overhead is a
+  // conservative floor for every offered policy; no alternative may enlarge
+  // the native maximum persistent batch or bypass a resource check.
+  const int64_t native_overhead = properties.has_exp_op ? 32l : 16l;
+  const bool high_bandwidth = scheduler_utils::isHighBandwidthFlopsRatio();
+  const int64_t native_warps =
+      high_bandwidth && properties.disable_project_to_avoid_recompute ? 16l
+                                                                      : 28l;
+  const auto jev_mode = scheduler::jev::mode();
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    innerPersistentHeuristic2DPlan(
+        properties, rparams, native_overhead, native_warps, false);
+    return;
+  }
+
+  Inner2DPolicyResources native_resources;
+  ReductionParams native_preview(*rparams);
+  innerPersistentHeuristic2DPlan(
+      properties,
+      &native_preview,
+      native_overhead,
+      native_warps,
+      false,
+      &native_resources);
+  if (!native_resources.supported_menu) {
+    NVF_ERROR(
+        jev_mode == scheduler::jev::Mode::Record,
+        "Native inner persistent policy has no proved batch menu");
+    scheduler::jev::recordCoverageSkip(
+        "IP5.targets", "Native 2D register policy lacks a proved batch menu");
+    innerPersistentHeuristic2DPlan(
+        properties, rparams, native_overhead, native_warps, true);
+    return;
+  }
+
+  struct Policy {
+    int64_t overhead;
+    int64_t warps;
+    Inner2DPolicyResources resources;
+    std::string id() const {
+      return "o" + std::to_string(overhead) + "_w" + std::to_string(warps);
+    }
+  };
+  std::vector<Policy> policies;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  std::string state =
+      "inner_persistent.reg_targets.v1\nhas_exp_op=" +
+      std::to_string(properties.has_exp_op) +
+      "\nhigh_bandwidth_flops_ratio=" + std::to_string(high_bandwidth) +
+      "\ndisable_projection_avoid_recompute=" +
+      std::to_string(properties.disable_project_to_avoid_recompute) +
+      "\nparallel_after_vectorize=" +
+      std::to_string(
+          properties.inner_most_dimension_numel / properties.vectorize_factor) +
+      "\ntotal_iteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nbuffer_bits_per_batch=" +
+      std::to_string(
+          properties.max_persistent_buffer_size_bit /
+          properties.total_reduction_numel * properties.vectorize_factor) +
+      "\nwarp_size=" +
+      std::to_string(at::cuda::getCurrentDeviceProperties()->warpSize) +
+      "\nmax_threads_per_block=" +
+      std::to_string(
+          at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock);
+
+  // Canonical order does not expose the native policy. Preflight computes all
+  // batch/CTA/register plans and suppresses the nested IP5.batch Choice.
+  for (const int64_t overhead : {16l, 32l}) {
+    if (overhead < native_overhead) {
+      continue;
+    }
+    for (const int64_t warps : {16l, 28l}) {
+      Inner2DPolicyResources resources;
+      if (overhead == native_overhead && warps == native_warps) {
+        resources = native_resources;
+      } else {
+        ReductionParams preview(*rparams);
+        innerPersistentHeuristic2DPlan(
+            properties, &preview, overhead, warps, false, &resources);
+      }
+      if (!resources.supported_menu ||
+          resources.batch_max > native_resources.batch_max) {
+        continue;
+      }
+      policies.push_back({overhead, warps, resources});
+      const auto& policy = policies.back();
+      options.push_back(
+          {policy.id(),
+           "Register overhead " + std::to_string(overhead) +
+               ", occupancy target " + std::to_string(warps) +
+               " warps per SM"});
+      state += "\npolicy=" + std::to_string(overhead) + ":" +
+          std::to_string(warps) + ":" + std::to_string(resources.batch_min) +
+          ":" + std::to_string(resources.batch_max);
+    }
+  }
+  NVF_ERROR(!policies.empty(), "No legal 2D register policy");
+  NVF_ERROR(
+      state.size() <= 16 * 1024, "Inner persistent policy request too large");
+  const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+      ? "o" + std::to_string(native_overhead) + "_w" +
+          std::to_string(native_warps)
+      : "";
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP5.targets", state, options, native_choice);
+  const auto policy_it =
+      std::find_if(policies.begin(), policies.end(), [&](const auto& policy) {
+        return policy.id() == selected;
+      });
+  NVF_ERROR(policy_it != policies.end(), "Unknown 2D register policy");
+  innerPersistentHeuristic2DPlan(
+      properties, rparams, policy_it->overhead, policy_it->warps, true);
 }
 
 // This heuristic is only tuned for cross entropy loss since it is the only
