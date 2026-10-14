@@ -839,6 +839,149 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   return rparams;
 }
 
+// Prove a logical-warp candidate before exposing it to the API. This bounded
+// subset covers the full native 3D block and grid arithmetic, including every
+// later RD5.iter_unroll option. No Choice is made while probing a candidate.
+bool inner3dWarpPlanIsSafe(
+    int64_t reduction_numel,
+    int64_t iteration_numel,
+    int64_t inner_numel,
+    int64_t logical_warp,
+    int64_t sm_count,
+    int64_t max_threads_per_sm,
+    int64_t max_threads_per_block) {
+  // Keep every intermediate product bounded, and fix the vector work budget
+  // to four. Other shapes retain the native heuristic without a warp request.
+  if (reduction_numel <= inner_numel || reduction_numel > 4096 ||
+      inner_numel < 4 || inner_numel > 128 ||
+      reduction_numel % inner_numel != 0 || inner_numel % 4 != 0 ||
+      iteration_numel < 1 || iteration_numel > 128 ||
+      logical_warp < 1 || logical_warp > 16 || sm_count < 1 ||
+      sm_count > 256 || max_threads_per_sm < 256 ||
+      max_threads_per_sm > 4096 || max_threads_per_block < 256 ||
+      max_threads_per_block > 2048) {
+    return false;
+  }
+  const auto div = [](int64_t numerator, int64_t denominator) {
+    return ceilDiv(numerator, denominator);
+  };
+  const int64_t n_elems = reduction_numel * iteration_numel;
+  int64_t target_threads = std::max(logical_warp, div(reduction_numel, 8));
+  int64_t target_blocks = div(n_elems, logical_warp);
+  int64_t target_unroll = 1;
+  int64_t target_iterations = 1;
+  if (target_blocks > sm_count) {
+    int64_t available = std::max(n_elems / (logical_warp * sm_count), int64_t{1});
+    bool flip = true;
+    while (available > 1 &&
+           (target_unroll < 4 || target_iterations < 4)) {
+      if (target_unroll * 2 <= 4 && flip) {
+        target_unroll *= 2;
+      }
+      if (target_iterations * 2 <= 4 && !flip) {
+        target_iterations *= 2;
+      }
+      available = std::max(
+          n_elems /
+              (logical_warp * sm_count * target_unroll * target_iterations),
+          int64_t{1});
+      flip = !flip;
+    }
+    target_blocks =
+        div(n_elems, logical_warp * target_unroll * target_iterations);
+  }
+  target_blocks = std::min(target_blocks, sm_count * 4);
+  if (target_blocks * target_unroll * target_iterations < n_elems) {
+    target_threads = std::min(
+        div(n_elems, target_blocks * target_unroll),
+        div(max_threads_per_sm, 4));
+  }
+  target_threads = div(target_threads, logical_warp) * logical_warp;
+  if (target_threads < 1 || target_threads > max_threads_per_block) {
+    return false;
+  }
+
+  int64_t inner_unroll = 4;
+  int64_t x = std::min(
+      std::max(div(inner_numel, inner_unroll), logical_warp),
+      target_threads);
+  if (x * inner_unroll != inner_numel) {
+    x = x < logical_warp ? scheduler_utils::lastPow2(x)
+                         : x - x % logical_warp;
+  }
+  if (x < 1) {
+    return false;
+  }
+  int64_t y = std::max(logical_warp / x, int64_t{1});
+  int64_t z = std::min(
+      std::min(
+          std::max(target_threads / (x * y), int64_t{1}),
+          div(reduction_numel, inner_numel)),
+      scheduler_utils::z_block_limit);
+  y = std::max(target_threads / (x * z), int64_t{1});
+  if (x * y * z < logical_warp && inner_unroll > 1) {
+    x = std::min(std::max(inner_numel, logical_warp), target_threads);
+    inner_unroll = std::min(div(inner_numel, x), int64_t{4});
+    y = std::max(logical_warp / x, int64_t{1});
+    z = std::min(
+        std::max(target_threads / (x * y), int64_t{1}),
+        div(reduction_numel, inner_numel));
+    y = std::max(target_threads / (x * z), int64_t{1});
+  }
+  // Multiple outputs per CTA plus either grid reduction triggers the native
+  // 3D-to-2D fallback. Constrain this offer to one output per CTA, where that
+  // fallback is impossible for every subsequent iteration-unroll choice.
+  if (y != 1 || z < 1 || z > scheduler_utils::z_block_limit) {
+    return false;
+  }
+  inner_unroll = std::min(scheduler_utils::lastPow2(inner_unroll), int64_t{4});
+  const int64_t outer_unroll = inner_unroll < 4
+      ? std::min(div(4, inner_unroll),
+                 div(div(reduction_numel, inner_numel), z))
+      : 1;
+  const int64_t remainder = div(
+      reduction_numel,
+      x * inner_unroll * z * outer_unroll * target_iterations);
+  const int64_t inner_remainder =
+      div(inner_numel, x * inner_unroll * target_iterations);
+  const int64_t budget = inner_unroll * outer_unroll < 4
+      ? div(4, inner_unroll * outer_unroll)
+      : 1;
+  const int64_t hard_limit = std::min(budget, div(iteration_numel, y));
+
+  const int64_t padded_x = x > 16 && x * y < max_threads_per_block
+      ? div(x, 32) * 32
+      : x;
+  if (padded_x * y * z > max_threads_per_block ||
+      padded_x > max_threads_per_block) {
+    return false;
+  }
+  for (int64_t iter_unroll = 1; iter_unroll <= hard_limit; ++iter_unroll) {
+    int64_t godim = div(iteration_numel, y * iter_unroll);
+    int64_t gridim = 1;
+    int64_t grodim = 1;
+    if ((godim < target_blocks && remainder >= 0) || remainder >= 8) {
+      const int64_t grdim = std::min(remainder, x * y * 8);
+      gridim = inner_remainder;
+      grodim = std::max(grdim / gridim, int64_t{1});
+      grodim = std::max(
+          std::min(remainder / inner_remainder, grodim), int64_t{1});
+    }
+    if (grodim > 1 || gridim > 1) {
+      godim = div(iteration_numel, y); // native grid-unroll rollback
+    }
+    // These extents need neither grid splitting nor ragged-wave cleanup.
+    if (gridim < 1 || grodim < 1 ||
+        gridim > scheduler_utils::x_grid_limit ||
+        grodim > scheduler_utils::z_grid_limit ||
+        godim > scheduler_utils::y_grid_limit ||
+        gridim * godim > sm_count) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     const int64_t total_reduction_numel,
     const int64_t total_iteration_numel,
@@ -867,12 +1010,75 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       scheduler_utils::lastPow2(
           std::max((int64_t)n_tensor_inputs >> 2, (int64_t)1)));
 
-  // Take the smaller
-  const int64_t min_warp_size = reduction_scheduler_utils::getL1L2WarpSize(
-      total_reduction_numel,
-      total_iteration_numel,
-      n_tensor_inputs,
-      max_dtype_size_bit_for_vectorization);
+  // The cache-derived logical warp is a performance target, and may be any
+  // integer from one through sixteen. Offer all such targets only after each
+  // complete 3D plan passes the native CTA, grid, and fallback preflight.
+  const auto jev_mode_warp = scheduler::jev::mode();
+  const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+  const bool bounded_warp_input =
+      dev_prop->warpSize == 32 && dev_prop->l2CacheSize > 0 &&
+      n_tensor_inputs == 1 && max_dtype_size_bit_for_vectorization == 32 &&
+      vectorize_factor == 4;
+  bool offer_warp = bounded_warp_input;
+  if (jev_mode_warp != scheduler::jev::Mode::Off && offer_warp) {
+    for (int64_t candidate = 1; candidate <= 16; ++candidate) {
+      if (!inner3dWarpPlanIsSafe(
+              total_reduction_numel,
+              total_iteration_numel,
+              inner_most_dimension_numel,
+              candidate,
+              device_multiprocessor_count,
+              max_threads_per_sm,
+              dev_prop->maxThreadsPerBlock)) {
+        offer_warp = false;
+        break;
+      }
+    }
+  }
+  int64_t min_warp_size = 0;
+  if (jev_mode_warp != scheduler::jev::Mode::Remote || !offer_warp) {
+    min_warp_size = reduction_scheduler_utils::getL1L2WarpSize(
+        total_reduction_numel,
+        total_iteration_numel,
+        n_tensor_inputs,
+        max_dtype_size_bit_for_vectorization);
+  }
+  if (jev_mode_warp != scheduler::jev::Mode::Off && offer_warp) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t warp = 1; warp <= 16; ++warp) {
+      options.push_back(
+          {"m" + std::to_string(warp),
+           "Use " + std::to_string(warp) +
+               " logical reduction threads in the completed 3D plan"});
+    }
+    const std::string state =
+        "reduction.inner3d_warp_target.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) +
+        "\niteration_numel=" + std::to_string(total_iteration_numel) +
+        "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
+        "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+        "\nmax_dtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\nvector_width=" + std::to_string(vectorize_factor) +
+        "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+        "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+        "\nmax_threads_per_block=" +
+        std::to_string(dev_prop->maxThreadsPerBlock) +
+        "\nl2_cache_bytes=" + std::to_string(dev_prop->l2CacheSize) +
+        "\nwarp_size=" + std::to_string(dev_prop->warpSize);
+    const std::string native_choice =
+        jev_mode_warp == scheduler::jev::Mode::Record
+        ? "m" + std::to_string(min_warp_size)
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD5.warp", state, options, native_choice);
+    const auto found = std::find_if(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == selected;
+        });
+    NVF_ERROR(found != options.end(), "RD5.warp exceeds preflighted 3D plans");
+    min_warp_size = std::stoll(selected.substr(1));
+  }
 
   // Initialization
   int64_t target_blocks = 1;

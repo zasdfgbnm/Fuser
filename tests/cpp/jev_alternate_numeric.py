@@ -470,6 +470,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_ragged: bool = False,
                            require_inner_iter_unroll: bool = False,
                            require_inner_warp_target: bool = False,
+                           require_inner3d_warp_target: bool = False,
                            require_inner_width: bool = False,
                            require_inner_targets: bool = False,
                            require_inner3d_warp: bool = False,
@@ -747,6 +748,28 @@ def check_alternate_report(report: dict[str, Any],
                     *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
+    elif require_inner3d_warp_target:
+        if (site != "RD5.warp" or event["native"] != "m8" or
+                alternate != "m4" or
+                set(event["candidates"]) != {
+                    f"m{warp}" for warp in range(1, 17)}):
+            raise ValueError("3D warp fixture lacks its complete logical menu")
+        fields = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "reduction.inner3d_warp_target.v1")
+        if any(fields.get(key) != value for key, value in {
+                "reduction_numel": "512", "iteration_numel": "32",
+                "inner_numel": "128", "n_tensor_inputs": "1",
+                "max_dtype_bits": "32", "vector_width": "4",
+                "sm_count": "128", "warp_size": "32"}.items()):
+            raise ValueError(f"3D warp fixture escaped the proved shape: {fields}")
+        for dependent_site in ("RD4", "RD5.iter_unroll", "RD5.width"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == dependent_site]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"3D warp changed {dependent_site}: {rows}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
     elif require_inner_warp_target:
         if (site != "RD3.warp" or event["native"] != "m8" or
                 alternate != "m16" or
@@ -1226,6 +1249,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-targets", action="store_true")
     parser.add_argument("--require-inner-iter-unroll", action="store_true")
     parser.add_argument("--require-inner-warp-target", action="store_true")
+    parser.add_argument("--require-inner3d-warp-target", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
@@ -1339,6 +1363,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner_targets=args.require_inner_targets,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
             require_inner_warp_target=args.require_inner_warp_target,
+            require_inner3d_warp_target=args.require_inner3d_warp_target,
             require_inner_width=args.require_inner_width,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
