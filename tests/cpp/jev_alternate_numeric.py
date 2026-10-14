@@ -701,7 +701,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_inner_width: bool = False,
                            require_iop3_storage: bool = False,
                            require_transpose_tile: bool = False,
-                           require_pointwise_1d_cta: bool = False) -> dict[str, Any]:
+                           require_pointwise_1d_cta: bool = False,
+                           require_resize_reorder: bool = False) -> dict[str, Any]:
     if len(events) != 1 or not events[0]["forced"]:
         raise ValueError(f"expected exactly one eligible {site} override; got {events}")
     event = events[0]
@@ -721,7 +722,21 @@ def check_alternate_report(report: dict[str, Any],
                 "request_sha256": event["request_sha256"]}
     if intended not in issues:
         raise ValueError(f"missing intended winner mismatch: {issues}")
-    if require_transpose_tile:
+    if require_resize_reorder:
+        if (site != "RS1.reorder" or event["native"] != "keep" or
+                alternate != "skip" or
+                event["candidates"] != ["skip", "keep"] or
+                event["state"] != "resize.reorder.v1\ninput_elements=0:2240\n"):
+            raise ValueError("resize fixture lacks its nontrivial legal reorder menu")
+        for unchanged in ("RS1.width", "RS1.cta"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == unchanged]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"reorder changed unrelated {unchanged}: {rows}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected resize reorder comparison issues: {issues}")
+    elif require_transpose_tile:
         if (site != "TR2.tile" or event["native"] != "tile32" or
                 alternate != "tile16" or
                 set(event["candidates"]) != {"tile32", "tile16"}):
@@ -2106,6 +2121,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-iop3-storage", action="store_true")
     parser.add_argument("--require-transpose-tile", action="store_true")
     parser.add_argument("--require-pointwise-1d-cta", action="store_true")
+    parser.add_argument("--require-resize-reorder", action="store_true")
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -2233,7 +2249,8 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_inner_width=args.require_iop3_inner_width,
             require_iop3_storage=args.require_iop3_storage,
             require_transpose_tile=args.require_transpose_tile,
-            require_pointwise_1d_cta=args.require_pointwise_1d_cta)
+            require_pointwise_1d_cta=args.require_pointwise_1d_cta,
+            require_resize_reorder=args.require_resize_reorder)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)
