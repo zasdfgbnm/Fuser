@@ -687,6 +687,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner3d_grid_wave: bool = False,
                            require_inner_width: bool = False,
                            require_inner_batch_cap: bool = False,
+                           require_inner_cta_seed: bool = False,
                            require_inner_targets: bool = False,
                            require_inner_storage: bool = False,
                            require_inner3d_warp: bool = False,
@@ -1575,6 +1576,7 @@ def check_alternate_report(report: dict[str, Any],
         expected = [intended]
         for nested_site, side in (("IP5.width", "record"),
                                   ("IP5.targets", "record"),
+                                  ("IP5.cta_seed", "record"),
                                   ("IP5.batch", "record"),
                                   ("IP8.cta", "remote")):
             rows = [row for row in report["multiplicity"]
@@ -1594,6 +1596,48 @@ def check_alternate_report(report: dict[str, Any],
                     raise ValueError("shared CTA ignored the selected storage plan")
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected storage-dependent decisions: {issues}")
+    elif require_inner_cta_seed:
+        from jev_shim import parse_inner_reg_cta_seed_state
+
+        if (site != "IP5.cta_seed" or event["native"] != "t128" or
+                alternate != "t512" or
+                not {"t128", "t512"} <= set(event["candidates"])):
+            raise ValueError("2D register fixture lacks its proved CTA seeds")
+        seed_state = parse_inner_reg_cta_seed_state(event["state"])
+        by_seed = {plan.seed: plan for plan in seed_state.plans}
+        if (seed_state.iteration_numel != 256 or
+                seed_state.parallel_after_vectorize != 2048 or
+                seed_state.selected_register_overhead != 16 or
+                seed_state.selected_target_warps_per_sm != 28 or
+                not by_seed[128].valid or not by_seed[512].valid or
+                (by_seed[128].batch, by_seed[128].physical_x) != (8, 256) or
+                (by_seed[512].batch, by_seed[512].physical_x) != (4, 512)):
+            raise ValueError("selected seed did not change the checked batch/CTA")
+        for upstream in ("IP5.width", "IP5.targets"):
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"seed changed upstream {upstream}: {rows}")
+        before, after, pair = paired_state_rows(report, "IP5.batch")
+        old_lines = before["request"]["state"].splitlines()
+        new_lines = after["request"]["state"].splitlines()
+        old_fields = dict(line.split("=", 1) for line in old_lines[1:]
+                          if line.count("=") == 1 and
+                          not line.startswith("plan="))
+        new_fields = dict(line.split("=", 1) for line in new_lines[1:]
+                          if line.count("=") == 1 and
+                          not line.startswith("plan="))
+        if (old_lines[0] != "inner_persistent.reg_batch.v3" or
+                new_lines[0] != "inner_persistent.reg_batch.v4" or
+                old_fields["min_threads_per_block"] != "128" or
+                new_fields["min_threads_per_block"] != "512" or
+                new_fields["native_min_threads_per_block"] != "128" or
+                before["record"] != {"b8": 1} or
+                after["remote"] != {"b4": 1}):
+            raise ValueError("dependent register batch ignored selected CTA seed")
+        if sorted(issues, key=str) != sorted([intended, *pair], key=str):
+            raise ValueError(f"unexpected CTA-seed dependencies: {issues}")
     elif require_inner_batch_cap:
         if (site != "IP5.batch" or alternate != "b12" or
                 event["native"] == alternate):
@@ -1622,6 +1666,8 @@ def check_alternate_report(report: dict[str, Any],
             ("winner_mismatch", "IP5.width"),
             ("record_only_state", "IP5.targets"),
             ("remote_only_state", "IP5.targets"),
+            ("record_only_state", "IP5.cta_seed"),
+            ("remote_only_state", "IP5.cta_seed"),
             ("record_only_state", "IP5.batch"),
             ("remote_only_state", "IP5.batch"),
         ))
@@ -1629,6 +1675,7 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError(f"unexpected dependent inner-width issues: {issues}")
         for nested_site, native_parallel, selected_parallel in (
                 ("IP5.targets", 256, 1024),
+                ("IP5.cta_seed", 256, 1024),
                 ("IP5.batch", 256, 1024)):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == nested_site]
@@ -1682,11 +1729,21 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("inner target fixture lacks its expected four-policy menu")
         expected_issues = sorted((
             ("winner_mismatch", "IP5.targets"),
+            ("record_only_state", "IP5.cta_seed"),
+            ("remote_only_state", "IP5.cta_seed"),
             ("record_only_state", "IP5.batch"),
             ("remote_only_state", "IP5.batch"),
         ))
         if sorted((issue["kind"], issue["site"]) for issue in issues) != expected_issues:
             raise ValueError(f"unexpected inner target comparison issues: {issues}")
+        seed_record, seed_remote, _ = paired_state_rows(report, "IP5.cta_seed")
+        from jev_shim import parse_inner_reg_cta_seed_state
+        for row, overhead, warps in ((seed_record, 16, 28),
+                                     (seed_remote, 32, 16)):
+            state = parse_inner_reg_cta_seed_state(row["request"]["state"])
+            if (state.selected_register_overhead != overhead or
+                    state.selected_target_warps_per_sm != warps):
+                raise ValueError("CTA seed omitted selected register target")
         nested = [row for row in report["multiplicity"]
                   if row["site"] == "IP5.batch"]
         if len(nested) != 2:
@@ -2161,6 +2218,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner3d-grid-wave", action="store_true")
     parser.add_argument("--require-inner-width", action="store_true")
     parser.add_argument("--require-inner-batch-cap", action="store_true")
+    parser.add_argument("--require-inner-cta-seed", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -2292,6 +2350,7 @@ def main(argv: list[str] | None = None) -> int:
             require_inner3d_grid_wave=args.require_inner3d_grid_wave,
             require_inner_width=args.require_inner_width,
             require_inner_batch_cap=args.require_inner_batch_cap,
+            require_inner_cta_seed=args.require_inner_cta_seed,
             require_inner3d_warp=args.require_inner3d_warp,
             require_inner3d_occupancy=args.require_inner3d_occupancy,
             require_inner3d_width=args.require_inner3d_width,

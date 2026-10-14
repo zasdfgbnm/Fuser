@@ -1587,6 +1587,17 @@ if(BUILD_TEST)
       --require-inner-batch-cap)
   set_tests_properties(jev_alternate_numeric_inner_register_batch_cap PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_register_cta_seed
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.cta_seed --alternate t512
+      --gtest Gpu1Test.JevAlternateInnerRegisterCTASeed_CUDA
+      --case-key jev_alternate_numeric_inner_register_cta_seed
+      --require-inner-cta-seed)
+  set_tests_properties(jev_alternate_numeric_inner_register_cta_seed PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_storage
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

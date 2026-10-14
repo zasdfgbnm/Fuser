@@ -7679,6 +7679,55 @@ TEST_F(Gpu1Test, JevAlternateInnerRegisterBatchCap_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// The 128-thread minimum is an empirical seed. A proved 512-thread seed
+// reduces the register-backed batch from eight to four for this RMS case.
+TEST_F(Gpu1Test, JevAlternateInnerRegisterCTASeed_CUDA) {
+  constexpr int64_t norm_size = 8192;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  const std::vector<int64_t> norm_shape{norm_size};
+  auto result = rms_norm(
+      input, norm_shape, nullptr, IrBuilder::create<Val>(eps));
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.invstd);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, norm_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_EQ(rparams->unroll_factor_inner_reduction, 4);
+  const int64_t physical_x = ceilDiv(
+      norm_size / rparams->unroll_factor_inner_reduction,
+      rparams->batches_per_block_inner_reduction);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    ASSERT_EQ(rparams->batches_per_block_inner_reduction, 4);
+    ASSERT_EQ(physical_x, 512);
+  } else {
+    ASSERT_EQ(rparams->batches_per_block_inner_reduction, 8);
+    ASSERT_EQ(physical_x, 256);
+  }
+
+  auto squared = at::pow(aten_input.to(at::kDouble), 2);
+  auto invstd = at::pow(squared.mean(-1, true) + eps, -0.5);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {aten_input.to(at::kDouble) * invstd, invstd},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Both persistent storage modes fit on SM89 for this RMS normalization. A
 // forced shared plan must execute and match the same ATen numerical reference.
 TEST_F(Gpu1Test, JevAlternateInnerStorage_CUDA) {

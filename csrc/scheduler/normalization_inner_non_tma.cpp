@@ -382,7 +382,8 @@ void innerPersistentHeuristic2DPlan(
     int64_t register_overhead,
     int64_t target_warps_per_sm,
     bool enable_batch_choice,
-    Inner2DPolicyResources* policy_resources = nullptr) {
+    Inner2DPolicyResources* policy_resources = nullptr,
+    int64_t min_threads_override = 0) {
   bool is_high_bandwidth_flops_ratio =
       scheduler_utils::isHighBandwidthFlopsRatio();
   // Currently, we only considered the influence of exp op which is used in
@@ -411,8 +412,11 @@ void innerPersistentHeuristic2DPlan(
   // warps and improves performance.
   bool can_use_all_sms =
       properties.total_iteration_numel >= device_multiprocessor_count;
-  const int64_t min_threads_per_block =
+  const int64_t native_min_threads_per_block =
       can_use_all_sms ? 4l * threads_per_warp : max_threads_in_block;
+  const int64_t min_threads_per_block = min_threads_override > 0
+      ? min_threads_override
+      : native_min_threads_per_block;
 
   // set the min persistent buffer size to avoid requesting
   // a block size larger than device limit
@@ -544,7 +548,21 @@ void innerPersistentHeuristic2DPlan(
       const int64_t grid_x_limit = scheduler_utils::x_grid_limit;
       const int64_t grid_y_limit = std::min<int64_t>(
           scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]);
-      return candidate.is_pad_bdimx == should_pad && threads > 0 &&
+      const int64_t physical_x =
+          ceilDiv(parallel_after_vectorize, candidate.persistent_batch_size);
+      const int64_t physical_padded_x =
+          ceilDiv(physical_x, threads_per_warp) * threads_per_warp;
+      const int64_t actual_x =
+          candidate.is_pad_bdimx ? physical_padded_x : physical_x;
+      const int64_t actual_threads = actual_x * candidate.bdimy;
+      const bool alternate_seed = min_threads_override > 0 &&
+          min_threads_override != native_min_threads_per_block;
+      return (!alternate_seed ||
+              (actual_x > 0 && actual_x <= dev_prop->maxThreadsDim[0] &&
+               actual_threads > 0 && actual_threads <= max_threads_in_block &&
+               candidate.register_per_thread <=
+                   dev_prop->regsPerBlock / actual_threads)) &&
+          candidate.is_pad_bdimx == should_pad && threads > 0 &&
           threads <= max_threads_in_block &&
           candidate.bdimx <= dev_prop->maxThreadsDim[0] &&
           candidate.bdimy <= dev_prop->maxThreadsDim[1] &&
@@ -640,9 +658,14 @@ void innerPersistentHeuristic2DPlan(
         const bool expanded =
             candidate_heuristics.back().persistent_batch_size >
             native_batch_max;
+        const bool selected_seed =
+            min_threads_per_block != native_min_threads_per_block;
         std::string state = std::string(
-                                expanded ? "inner_persistent.reg_batch.v3\n"
-                                         : "inner_persistent.reg_batch.v2\n") +
+                                selected_seed
+                                    ? "inner_persistent.reg_batch.v4\n"
+                                    : expanded
+                                    ? "inner_persistent.reg_batch.v3\n"
+                                    : "inner_persistent.reg_batch.v2\n") +
             "parallel_after_vectorize=" +
             std::to_string(parallel_after_vectorize) +
             "\ntotal_iteration_numel=" +
@@ -668,8 +691,12 @@ void innerPersistentHeuristic2DPlan(
             std::to_string(batches_per_block_inner_reduction_min) +
             "\nbatch_max=" +
             std::to_string(candidate_heuristics.back().persistent_batch_size);
-        if (expanded) {
+        if (expanded || selected_seed) {
           state += "\nnative_batch_max=" + std::to_string(native_batch_max);
+        }
+        if (selected_seed) {
+          state += "\nnative_min_threads_per_block=" +
+              std::to_string(native_min_threads_per_block);
         }
         std::vector<scheduler::jev::ChoiceOption> options;
         options.reserve(candidate_heuristics.size());
@@ -923,6 +950,171 @@ PersistentKernelProperties chooseInner2DVectorWidth(
   return chosen;
 }
 
+// The 128-thread versus device-maximum seed is an empirical occupancy target.
+// Keep the register, CTA and grid checks in the native planner and offer only
+// seeds for which that planner produces a complete physical schedule.
+int64_t chooseInner2DCTASeed(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t overhead,
+    int64_t warps) {
+  const auto mode = scheduler::jev::mode();
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const int64_t warp = device->warpSize;
+  const int64_t max_threads = device->maxThreadsPerBlock;
+  const int64_t first_seed = 4 * warp;
+  const int64_t native_seed =
+      properties.total_iteration_numel >= device->multiProcessorCount
+      ? first_seed
+      : max_threads;
+  if (mode == scheduler::jev::Mode::Off) {
+    return native_seed;
+  }
+
+  const int64_t parallel =
+      properties.inner_most_dimension_numel / properties.vectorize_factor;
+  const int64_t buffer_bits =
+      properties.max_persistent_buffer_size_bit /
+      properties.total_reduction_numel * properties.vectorize_factor;
+  struct SeedPlan {
+    int64_t seed;
+    int64_t batch_min = 0;
+    int64_t batch_max = 0;
+    int64_t batch = 0;
+    int64_t physical_x = 0;
+    int64_t physical_y = 0;
+    int64_t register_cap = 0;
+    int64_t grid_x = 0;
+    bool valid = false;
+  };
+  std::vector<SeedPlan> plans;
+  std::vector<scheduler::jev::ChoiceOption> options;
+  if (first_seed > 0 && first_seed <= max_threads && parallel > 0 &&
+      buffer_bits > 0 && properties.total_iteration_numel > 0) {
+    for (int64_t seed = first_seed;; seed = std::min(seed * 2, max_threads)) {
+      SeedPlan plan{seed};
+      try {
+        ReductionParams preview(base);
+        Inner2DPolicyResources resources;
+        innerPersistentHeuristic2DPlan(
+            properties, &preview, overhead, warps, false, &resources, seed);
+        plan.batch_min = resources.batch_min;
+        plan.batch_max = resources.batch_max;
+        plan.batch = preview.batches_per_block_inner_reduction;
+        plan.physical_y = preview.lparams.bdimy() ==
+                LaunchParams::UNINITIALIZED_VAL
+            ? 1
+            : preview.lparams.bdimy();
+        plan.register_cap = preview.cparams.maxrregcount;
+        if (resources.supported_menu && plan.batch > 0) {
+          const int64_t x = ceilDiv(parallel, plan.batch);
+          plan.physical_x = preview.pad_inner_reduction_to_warp
+              ? ceilDiv(x, warp) * warp
+              : x;
+          plan.grid_x =
+              ceilDiv(properties.total_iteration_numel, plan.physical_y);
+          const int64_t threads = plan.physical_x * plan.physical_y;
+          plan.valid = plan.batch >= plan.batch_min &&
+              plan.batch <= plan.batch_max && plan.physical_x > 0 &&
+              plan.physical_x <= device->maxThreadsDim[0] &&
+              plan.physical_y > 0 &&
+              plan.physical_y <= device->maxThreadsDim[1] && threads > 0 &&
+              threads <= max_threads && plan.register_cap > 0 &&
+              plan.register_cap <= 255 &&
+              plan.register_cap <= device->regsPerBlock / threads &&
+              plan.grid_x > 0 &&
+              (plan.grid_x <= device->maxGridSize[0] ||
+               (scheduler_utils::x_grid_limit <= device->maxGridSize[0] &&
+                ceilDiv(plan.grid_x, scheduler_utils::x_grid_limit) <=
+                    std::min<int64_t>(
+                        scheduler_utils::y_grid_limit,
+                        device->maxGridSize[1]));
+        }
+      } catch (const std::exception&) {
+        // A failed alternate preflight never becomes an API option.
+      }
+      if (!plan.valid) {
+        plan = SeedPlan{seed};
+      }
+      plans.push_back(plan);
+      if (plan.valid) {
+        options.push_back({
+            "t" + std::to_string(seed),
+            "Minimum CTA target " + std::to_string(seed) +
+                "; checked batch " + std::to_string(plan.batch) +
+                ", physical CTA " + std::to_string(plan.physical_x) + "x" +
+                std::to_string(plan.physical_y)});
+      }
+      if (seed == max_threads) {
+        break;
+      }
+    }
+  }
+  const bool native_valid = std::any_of(
+      plans.begin(), plans.end(), [&](const SeedPlan& plan) {
+        return plan.seed == native_seed && plan.valid;
+      });
+  NVF_ERROR(
+      native_valid || mode == scheduler::jev::Mode::Record,
+      "Native 2D register CTA seed lacks a proved physical schedule");
+  if (!native_valid) {
+    scheduler::jev::recordCoverageSkip(
+        "IP5.cta_seed", "Native CTA seed lacks a complete physical plan");
+    return native_seed;
+  }
+
+  std::string state =
+      "inner_persistent.reg_cta_seed.v1\niteration_numel=" +
+      std::to_string(properties.total_iteration_numel) +
+      "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+      "\nwarp_size=" + std::to_string(warp) +
+      "\nmax_threads_per_block=" + std::to_string(max_threads) +
+      "\nmax_threads_x=" + std::to_string(device->maxThreadsDim[0]) +
+      "\nmax_threads_y=" + std::to_string(device->maxThreadsDim[1]) +
+      "\nregisters_per_block=" + std::to_string(device->regsPerBlock) +
+      "\nmax_grid_x=" + std::to_string(device->maxGridSize[0]) +
+      "\nmax_grid_y=" + std::to_string(device->maxGridSize[1]) +
+      "\nparallel_after_vectorize=" + std::to_string(parallel) +
+      "\nbuffer_bits_per_batch=" + std::to_string(buffer_bits) +
+      "\nhigh_bandwidth_flops_ratio=" +
+      std::to_string(scheduler_utils::isHighBandwidthFlopsRatio()) +
+      "\npersistent_buffer_bits=" +
+      std::to_string(properties.max_persistent_buffer_size_bit) +
+      "\nmax_multi_reduction_factor=" +
+      std::to_string(std::min(
+          scheduler_utils::safeDiv(
+              scheduler_utils::register_file_size_bit,
+              properties.max_persistent_buffer_size_bit),
+          ceilDiv(
+              properties.total_iteration_numel,
+              device->multiProcessorCount))) +
+      "\nselected_register_overhead=" + std::to_string(overhead) +
+      "\nselected_target_warps_per_sm=" + std::to_string(warps);
+  for (const auto& plan : plans) {
+    state += "\nseed=" + std::to_string(plan.seed) + ":" +
+        std::to_string(plan.valid) + ":" +
+        std::to_string(plan.batch_min) + ":" +
+        std::to_string(plan.batch_max) + ":" +
+        std::to_string(plan.batch) + ":" +
+        std::to_string(plan.physical_x) + ":" +
+        std::to_string(plan.physical_y) + ":" +
+        std::to_string(plan.register_cap) + ":" +
+        std::to_string(plan.grid_x);
+  }
+  NVF_ERROR(state.size() <= 16 * 1024, "2D register CTA seed request too large");
+  const std::string selected = scheduler::jev::chooseDecision(
+      "IP5.cta_seed", state, options,
+      mode == scheduler::jev::Mode::Record
+          ? "t" + std::to_string(native_seed)
+          : "");
+  const auto chosen = std::find_if(
+      plans.begin(), plans.end(), [&](const SeedPlan& plan) {
+        return plan.valid && selected == "t" + std::to_string(plan.seed);
+      });
+  NVF_ERROR(chosen != plans.end(), "Unknown 2D register CTA seed");
+  return chosen->seed;
+}
+
 void innerPersistentHeuristic2D(
     const PersistentKernelProperties& properties,
     ReductionParams* rparams) {
@@ -956,6 +1148,8 @@ void innerPersistentHeuristic2D(
         "Native inner persistent policy has no proved batch menu");
     scheduler::jev::recordCoverageSkip(
         "IP5.targets", "Native 2D register policy lacks a proved batch menu");
+    scheduler::jev::recordCoverageSkip(
+        "IP5.cta_seed", "Native 2D register policy lacks a proved batch menu");
     innerPersistentHeuristic2DPlan(
         properties, rparams, native_overhead, native_warps, true);
     return;
@@ -1037,8 +1231,11 @@ void innerPersistentHeuristic2D(
         return policy.id() == selected;
       });
   NVF_ERROR(policy_it != policies.end(), "Unknown 2D register policy");
+  const int64_t selected_seed = chooseInner2DCTASeed(
+      properties, *rparams, policy_it->overhead, policy_it->warps);
   innerPersistentHeuristic2DPlan(
-      properties, rparams, policy_it->overhead, policy_it->warps, true);
+      properties, rparams, policy_it->overhead, policy_it->warps, true,
+      nullptr, selected_seed);
 }
 
 // This heuristic is only tuned for cross entropy loss since it is the only
