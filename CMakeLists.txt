@@ -1327,6 +1327,17 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_outer_grid_base)
   set_tests_properties(jev_alternate_numeric_outer_grid_base PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_grid_unswitch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP2.unswitch
+      --alternate u4
+      --gtest Gpu3Test.TemplateFunctionTypeMismatch
+      --case-key jev_alternate_numeric_outer_grid_unswitch)
+  set_tests_properties(jev_alternate_numeric_outer_grid_unswitch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_targets
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

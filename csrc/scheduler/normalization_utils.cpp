@@ -620,6 +620,102 @@ std::optional<GridTailPlan> chooseGridTailAdjustment(
   return *choice_it;
 }
 
+// Unswitching changes only the serial persistent-buffer split in
+// scheduleReductionTV. The batch, BIDy extent, CTA, and persistent storage
+// estimate have already been fixed by the grid plan. Smaller positive factors
+// are legal even when the batch is not divisible: the existing factor-four
+// path already relies on a predicated remainder. Never offer a factor larger
+// than the native one, so an alternate cannot increase static unswitch size.
+int64_t chooseGridUnswitchFactor(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit,
+    int64_t native_factor) {
+  const auto& base = plan.launch;
+  const auto& tail = plan.tail;
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Off ||
+      dev_prop->major < 8 || tail.buffer_size < 2 ||
+      native_factor < 2 || native_factor > tail.buffer_size) {
+    return native_factor;
+  }
+
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), tail.buffer_size);
+  const auto expected_native =
+      getLastBlockWorkRatio(
+          total_reduction_numel, base.bdimy(), tail.buffer_size) < 0.25
+      ? tail.buffer_size
+      : std::min(4l, tail.buffer_size);
+  // The selected OP2 plan may come from the historical native search rather
+  // than its stronger alternate-menu checks. Preserve that native plan if its
+  // final schedule does not satisfy the independent Choice safety bounds.
+  if (native_factor != expected_native || actual_gdimy < 1 ||
+      actual_gdimy >
+          std::min<int64_t>(
+              scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) ||
+      base.bdimx() * base.bdimy() > dev_prop->maxThreadsPerBlock ||
+      !checkIfWithinRegisterSpace(
+          total_reduction_numel,
+          persistent_buffer_size_bit,
+          vectorize_factor,
+          base.bdimy(),
+          actual_gdimy)) {
+    return native_factor;
+  }
+
+  std::vector<int64_t> factors;
+  for (const int64_t factor : {1l, 2l, 4l, 8l}) {
+    if (factor <= native_factor) {
+      factors.push_back(factor);
+    }
+  }
+  if (factors.back() != native_factor) {
+    factors.push_back(native_factor);
+  }
+  if (factors.size() < 2) {
+    return native_factor;
+  }
+
+  std::vector<scheduler::jev::ChoiceOption> options;
+  options.reserve(factors.size());
+  for (const auto factor : factors) {
+    options.push_back({
+        "u" + std::to_string(factor),
+        "Unswitch " + std::to_string(factor) +
+            " reduction elements in each persistent batch"});
+  }
+  const std::string state =
+      "outer_persistent.unswitch.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) + "\npersistent_buffer_bits=" +
+      std::to_string(persistent_buffer_size_bit) + "\nvector_width=" +
+      std::to_string(vectorize_factor) + "\nblock_x=" +
+      std::to_string(base.bdimx()) + "\nblock_y=" +
+      std::to_string(base.bdimy()) + "\ngrid_y=" +
+      std::to_string(actual_gdimy) + "\npersistent_batch=" +
+      std::to_string(tail.buffer_size) + "\nsm_major=" +
+      std::to_string(dev_prop->major) + "\nmax_grid_y=" +
+      std::to_string(dev_prop->maxGridSize[1]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(dev_prop->maxThreadsPerBlock);
+  const auto selected = scheduler::jev::chooseDecision(
+      "OP2.unswitch",
+      state,
+      options,
+      scheduler::jev::mode() == scheduler::jev::Mode::Record
+          ? "u" + std::to_string(native_factor)
+          : "");
+  const auto selected_factor = std::find_if(
+      factors.begin(), factors.end(), [&](int64_t factor) {
+        return "u" + std::to_string(factor) == selected;
+      });
+  NVF_ERROR(
+      selected_factor != factors.end(),
+      "Unknown outer persistent unswitch factor");
+  return *selected_factor;
+}
+
 } // namespace
 
 // Iterate configurations from largest blockDim.x and smallest
@@ -650,7 +746,7 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
       persistent_buffer_size_bit <= max_int / 256;
   std::optional<GridBasePlan> native_base;
 
-  const auto finalize = [](const GridBasePlan& plan) {
+  const auto finalize = [&](const GridBasePlan& plan) {
     const auto& base = plan.launch;
     const auto& tail = plan.tail;
     const auto launch_params = LaunchParams(
@@ -660,9 +756,17 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
         base.bdimx(),
         base.bdimy(),
         LaunchParams::UNINITIALIZED_VAL);
-    const int64_t unswitch_factor = tail.reduce_last_block_work
+    const int64_t native_unswitch_factor = tail.reduce_last_block_work
         ? tail.buffer_size
         : std::min(4l, tail.buffer_size);
+    const int64_t unswitch_factor = offer_base_choice
+        ? chooseGridUnswitchFactor(
+              plan,
+              total_reduction_numel,
+              vectorize_factor,
+              persistent_buffer_size_bit,
+              native_unswitch_factor)
+        : native_unswitch_factor;
     return GridOuterNormalizationParams{
         .launch_params = launch_params,
         .persistent_buffer_factor = tail.buffer_size,

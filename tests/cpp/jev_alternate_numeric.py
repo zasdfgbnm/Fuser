@@ -395,8 +395,41 @@ def check_alternate_report(report: dict[str, Any],
             {"kind": "remote_only_state", "site": "OP2.tail",
              "request_sha256": remote_tail[0]["request_sha256"]},
         ]
+        record_unswitch, remote_unswitch, unswitch_issues = paired_state_rows(
+            report, "OP2.unswitch")
+        for row, base_id, side in (
+                (record_unswitch, event["native"], "record"),
+                (remote_unswitch, alternate, "remote")):
+            base_match = re.fullmatch(r"x([0-9]+)_y([0-9]+)_b([0-9]+)", base_id)
+            if base_match is None:
+                raise ValueError(f"invalid OP2.base Choice ID: {base_id}")
+            block_y = 256 // int(base_match.group(3))
+            fields = state_fields(row, "outer_persistent.unswitch.v1")
+            if (fields.get("block_y") != str(block_y) or
+                    fields.get("persistent_batch") != "32" or
+                    row[side] != {"u32": 1}):
+                raise ValueError(f"dependent unswitch ignored {base_id}: {row}")
+        expected.extend(unswitch_issues)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected decision comparison issues: {issues}")
+    elif site == "OP2.unswitch":
+        if (event["native"] != "u32" or alternate != "u4" or
+                set(event["candidates"]) != {"u1", "u2", "u4", "u8", "u32"}):
+            raise ValueError("outer grid fixture lacks its bounded unswitch menu")
+        fields = state_fields({"site": site, "request": {
+            "state": event["state"]}}, "outer_persistent.unswitch.v1")
+        if any(fields.get(key) != value for key, value in {
+                "reduction_numel": "8192", "block_x": "16",
+                "block_y": "16", "grid_y": "16",
+                "persistent_batch": "32"}.items()):
+            raise ValueError(f"unswitch did not receive the final grid plan: {fields}")
+        for upstream in ("OP2.base", "OP2.tail"):
+            rows = [row for row in report["multiplicity"] if row["site"] == upstream]
+            if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
+                    sum(rows[0]["record"].values()) != 1):
+                raise ValueError(f"upstream {upstream} changed: {rows}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected unswitch comparison issues: {issues}")
     elif require_outer_ragged:
         if (site != "RD9.ragged" or event["native"] != "clean" or
                 alternate != "raw" or
