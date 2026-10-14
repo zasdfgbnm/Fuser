@@ -1327,7 +1327,31 @@ OuterReductionParams getGridOuterReduction(
   // use 8 * SM blocks if the problem size is large, it increased requested
   // waves, helps hiding memory latency, if still use 4 * SM blocks, about 5%
   // regression for compute bound kernels. Not much change for memory bound.
-  const int64_t n_waves = n_elems >= (int64_t)64 * 1024 * 1024 ? 8 : 4;
+  int64_t n_waves = 0;
+  const auto jev_mode = scheduler::jev::mode();
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    n_waves = n_elems >= (int64_t)64 * 1024 * 1024 ? 8 : 4;
+  } else {
+    // RD9 delegates only the empirical wave target. The native algorithm
+    // still turns that target into block, unroll, and grid dimensions.
+    const std::string state =
+        "reduction.outer_waves.v1\nreduction_numel=" +
+        std::to_string(total_reduction_numel) +
+        "\niteration_numel=" + std::to_string(total_iteration_numel);
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"waves4", "Target four waves of SM blocks"},
+        {"waves8", "Target eight waves of SM blocks"}};
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? (n_elems >= (int64_t)64 * 1024 * 1024 ? "waves8" : "waves4")
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD9.waves", state, options, native_choice);
+    NVF_ERROR(
+        selected == "waves4" || selected == "waves8",
+        "RD9 wave target is outside native choices");
+    n_waves = selected == "waves8" ? 8 : 4;
+  }
 
   // if data fits in l2 and we need more parallelization in the iter dim,
   // we can use a smaller warp size. While thread local data fits in l1, and
