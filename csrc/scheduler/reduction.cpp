@@ -344,7 +344,7 @@ bool nativePrefersTma(
 }
 } // namespace
 
-std::unique_ptr<HeuristicParams> ReductionScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> ReductionScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

@@ -57,7 +57,7 @@ class CutlassScheduler : public SchedulerEntry {
 
   //! Compute heuristics for the fusion using nvMatmulHeuristics, if available.
   //! Otherwise a static config is used.
-  std::unique_ptr<HeuristicParams> computeHeuristics(
+  std::unique_ptr<HeuristicParams> computeHeuristicsImpl(
       Fusion* fusion,
       SchedulerRuntimeInfo& runtime_info,
       HeuristicDataCache* data_cache = nullptr) override;

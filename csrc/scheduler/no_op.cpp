@@ -87,7 +87,7 @@ bool NoOpScheduler::canScheduleRunTime(
   return true;
 }
 
-std::unique_ptr<HeuristicParams> NoOpScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> NoOpScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

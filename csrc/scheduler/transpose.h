@@ -100,7 +100,7 @@ class TransposeScheduler : public SchedulerEntry {
       SchedulerRuntimeInfo& runtime_info,
       HeuristicDataCache* data_cache = nullptr) override;
 
-  std::unique_ptr<HeuristicParams> computeHeuristics(
+  std::unique_ptr<HeuristicParams> computeHeuristicsImpl(
       Fusion* fusion,
       SchedulerRuntimeInfo& runtime_info,
       HeuristicDataCache* data_cache) override;

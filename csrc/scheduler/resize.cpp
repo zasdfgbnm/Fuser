@@ -214,7 +214,7 @@ bool ResizeScheduler::canScheduleCompileTime(Fusion* fusion) {
   return true;
 }
 
-std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

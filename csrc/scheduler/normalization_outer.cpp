@@ -897,7 +897,7 @@ bool OuterPersistentKernelScheduler::canScheduleRunTime(
 }
 
 std::unique_ptr<HeuristicParams> OuterPersistentKernelScheduler::
-    computeHeuristics(
+    computeHeuristicsImpl(
         Fusion* fusion,
         SchedulerRuntimeInfo& runtime_info,
         HeuristicDataCache* data_cache) {

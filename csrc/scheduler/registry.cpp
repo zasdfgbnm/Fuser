@@ -15,6 +15,7 @@
 #include "scheduler/greedy.h"
 #include "scheduler/heuristic.h"
 #include "scheduler/matmul_utils.h"
+#include "scheduler/native_outcome.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/resize.h"
 #include "scheduler/runtime_info.h"
@@ -129,6 +130,54 @@ bool checkCanSchedule(Fusion* fusion, SchedulerType scheduler_type) {
 }
 
 } // namespace
+
+std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    HeuristicDataCache* data_cache) {
+  auto params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
+  if (params != nullptr && scheduler::native_diagnostic::enabled()) {
+    // All serialization, including a potentially throwing toString(), is
+    // isolated from the native scheduler result.
+    try {
+      using scheduler::native_diagnostic::Outcome;
+      Outcome outcome;
+      outcome.scheduler_type = nvfuser::toString(params->scheduler_type);
+      outcome.tag = params->tag;
+      outcome.heuristic_text = params->toString();
+      const auto& launch = params->lparams;
+      outcome.launch = {
+          launch.getRawVal(ParallelType::BIDx),
+          launch.getRawVal(ParallelType::BIDy),
+          launch.getRawVal(ParallelType::BIDz),
+          launch.getRawVal(ParallelType::TIDx),
+          launch.getRawVal(ParallelType::TIDy),
+          launch.getRawVal(ParallelType::TIDz),
+          launch.smem()};
+      const auto& compile = params->cparams;
+      if (compile.index_type.has_value()) {
+        outcome.compile.index_type = static_cast<int64_t>(*compile.index_type);
+      }
+      outcome.compile.maxrregcount = compile.maxrregcount;
+      outcome.compile.enable_magic_zero = compile.enable_magic_zero;
+      outcome.compile.enable_ptxas_verbose = compile.enable_ptxas_verbose;
+      if (compile.device.has_value()) {
+        outcome.compile.device = compile.device->str();
+      }
+      outcome.compile.include_paths = compile.include_paths;
+      outcome.compile.block_x = compile.bdimx;
+      outcome.compile.block_y = compile.bdimy;
+      outcome.compile.block_z = compile.bdimz;
+      outcome.compile.compute_block_x = compile.compute_bdimx;
+      outcome.compile.compute_block_y = compile.compute_bdimy;
+      outcome.compile.compute_block_z = compile.compute_bdimz;
+      scheduler::native_diagnostic::recordOutcome(outcome);
+    } catch (...) {
+      // Observability is never a condition for a successful native schedule.
+    }
+  }
+  return params;
+}
 
 // Dispatch heuristic type to the right derived class of scheduler entry.
 // Scheduler entries are stateless so it's a lightweight class to dispatch to

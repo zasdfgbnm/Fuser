@@ -113,7 +113,7 @@ void ExprEvalScheduler::schedule(
       });
 }
 
-std::unique_ptr<HeuristicParams> ExprEvalScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> ExprEvalScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

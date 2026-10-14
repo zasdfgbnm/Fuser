@@ -106,7 +106,7 @@ bool CutlassScheduler::canScheduleRunTime(
   return true;
 }
 
-std::unique_ptr<HeuristicParams> CutlassScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> CutlassScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

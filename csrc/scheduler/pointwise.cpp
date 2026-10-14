@@ -531,7 +531,7 @@ void recordFinalPointwisePlan(
 }
 } // namespace
 
-std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

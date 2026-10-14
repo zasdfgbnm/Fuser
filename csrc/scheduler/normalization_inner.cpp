@@ -196,7 +196,7 @@ bool InnerPersistentKernelScheduler::canScheduleRunTime(
 }
 
 std::unique_ptr<HeuristicParams> InnerPersistentKernelScheduler::
-    computeHeuristics(
+    computeHeuristicsImpl(
         Fusion* fusion,
         SchedulerRuntimeInfo& runtime_info,
         HeuristicDataCache* data_cache) {

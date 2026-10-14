@@ -399,7 +399,7 @@ bool TransposeScheduler::canScheduleRunTime(
   return true;
 }
 
-std::unique_ptr<HeuristicParams> TransposeScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> TransposeScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

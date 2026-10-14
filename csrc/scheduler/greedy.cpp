@@ -2066,7 +2066,7 @@ bool GreedyScheduler::canScheduleRunTime(
   return RunTimeChecker::run(fusion, runtime_info);
 }
 
-std::unique_ptr<HeuristicParams> GreedyScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> GreedyScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {
