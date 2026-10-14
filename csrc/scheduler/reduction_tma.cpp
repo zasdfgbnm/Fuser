@@ -39,13 +39,74 @@ std::unique_ptr<TmaInnerReductionParams> getReductionHeuristics(
   int64_t vectorization_factor = 1;
 
   // Benchmarking shows some benefit to 512 block size for has_mufu_computation,
-  // but it's not across the board. Stick to 256 for now.
+  // but it's not across the board. Keep 256 as the native preference.
   int64_t threads_per_block = 256;
+
+  const auto jev_mode = scheduler::jev::mode();
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const int64_t max_threads_per_block = dev_prop->maxThreadsPerBlock;
+    const int64_t max_threads_dim_x = dev_prop->maxThreadsDim[0];
+    const int64_t shared_mem_per_block = dev_prop->sharedMemPerBlockOptin;
+    const int64_t dtype_bytes =
+        props.max_dtype_size_bit_for_vectorization / 8;
+    NVF_ERROR(
+        props.total_reduction_numel > 0 && dtype_bytes > 0 &&
+            max_threads_per_block >= 256 && max_threads_dim_x >= 256,
+        "RD2.cta requires a valid native TMA reduction plan");
+
+    // The TMA input and block-reduction workspace share dynamic memory.
+    // The original 256-thread plan remains available even at the edge of the
+    // legacy eligibility check. Admit alternatives only when a conservative
+    // aligned upper bound fits the device's opt-in shared-memory budget.
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (const int64_t cta : {128, 256, 512}) {
+      if (cta > max_threads_per_block || cta > max_threads_dim_x) {
+        continue;
+      }
+      const int64_t reduction_bytes =
+          props.total_reduction_numel * dtype_bytes;
+      const int64_t workspace_bytes = alignSharedMemoryBytes(cta * dtype_bytes);
+      if (cta != 256 &&
+          alignSharedMemoryBytes(reduction_bytes) + workspace_bytes +
+                  kSharedMemoryAlignmentBytes >
+              shared_mem_per_block) {
+        continue;
+      }
+      options.push_back(
+          {"t" + std::to_string(cta),
+           "TIDx reduction CTA " + std::to_string(cta) + " threads"});
+    }
+    std::string state = "reduction.tma_inner_cta.v1\n";
+    state += "reduction_numel=" +
+        std::to_string(props.total_reduction_numel) + '\n';
+    state += "max_dtype_bits=" +
+        std::to_string(props.max_dtype_size_bit_for_vectorization) + '\n';
+    state += "smem_per_block_bytes=" +
+        std::to_string(shared_mem_per_block) + '\n';
+    state += "max_threads_per_block=" +
+        std::to_string(max_threads_per_block) + '\n';
+    state += "max_threads_dim_x=" +
+        std::to_string(max_threads_dim_x) + '\n';
+    state += "warp_size=" + std::to_string(dev_prop->warpSize) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "t256"
+        : std::string();
+    const auto selected = scheduler::jev::chooseDecision(
+        "RD2.cta", state, options, native_choice);
+    bool matched = false;
+    for (const auto& option : options) {
+      if (selected == option.id) {
+        threads_per_block = std::stoll(selected.substr(1));
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "RD2.cta response exceeds hard CTA bounds");
+  }
 
   const int64_t max_threads_per_sm = dev_prop->maxThreadsPerMultiProcessor;
   const int64_t target_threads_per_sm = max_threads_per_sm / 2;
 
-  const auto jev_mode = scheduler::jev::mode();
   int64_t target_vect_unroll = 0;
   if (jev_mode != scheduler::jev::Mode::Remote) {
     target_vect_unroll = reduction_scheduler_utils::getVectUnroll(
@@ -58,7 +119,7 @@ std::unique_ptr<TmaInnerReductionParams> getReductionHeuristics(
 
   // TMA uses a serial innermost axis, so the entire preferred vector/unroll
   // product becomes an unroll factor. Its structural maximum is the number of
-  // reduction elements that one of the fixed 256 threads can own. Larger
+  // reduction elements that one of the selected threads can own. Larger
   // factors add only predicated, empty unroll lanes.
   int64_t unroll_factor = jev_mode == scheduler::jev::Mode::Remote
       ? 0
@@ -90,10 +151,20 @@ std::unique_ptr<TmaInnerReductionParams> getReductionHeuristics(
               at::cuda::current_device()) == cudaSuccess,
           "RD2.unroll could not read CUDA memory clock");
     }
-    std::string state = "reduction.tma_inner_unroll.v1\n";
+    std::string state = jev_mode == scheduler::jev::Mode::Record
+        ? "reduction.tma_inner_unroll.v1\n"
+        : "reduction.tma_inner_unroll.v2\n";
     state += "reduction_numel=" +
         std::to_string(props.total_reduction_numel) + '\n';
     state += "threads_per_block=" + std::to_string(threads_per_block) + '\n';
+    if (jev_mode == scheduler::jev::Mode::Remote) {
+      state += "max_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) + '\n';
+      state += "max_threads_dim_x=" +
+          std::to_string(dev_prop->maxThreadsDim[0]) + '\n';
+      state += "smem_per_block_bytes=" +
+          std::to_string(dev_prop->sharedMemPerBlockOptin) + '\n';
+    }
     state += "layout_max=" + std::to_string(props.vectorize_factor) + '\n';
     state += "max_dtype_bits=" +
         std::to_string(props.max_dtype_size_bit_for_vectorization) + '\n';
