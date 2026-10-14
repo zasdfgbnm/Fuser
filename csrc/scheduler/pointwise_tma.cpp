@@ -13,6 +13,7 @@
 #include "exceptions.h"
 #include "ir/utils.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/pointwise_utils.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -96,6 +97,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     HeuristicDataCache* data_cache,
     const pointwise_utils::FusionRuntimeProperties& prop) {
   constexpr int64_t threads_per_warp = 32;
+  const auto jev_mode = scheduler::jev::mode();
 
   auto params = std::make_unique<PointwiseParams>();
   params->tag = "Pointwise TMA heuristics";
@@ -259,19 +261,105 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // Don't limit vectorization factor by number of IO tensors or wave count
   // since some of inputs are TMA-loaded which uses shared memory instead of
   // registers.
-  params->vectorization_factor = vectorize_helper::getVectorizationFactor(
-      runtime_info,
-      prop.largest_out,
-      data_cache,
-      bp_info.break_point,
-      /*max_vectorization_size_in_bit=*/128,
-      prop.min_dtype_size_bit_for_vectorization,
-      prop.max_dtype_size_bit_for_vectorization,
-      /*n_vectorizable_tensors=*/-1,
-      /*n_waves=*/-1,
-      /*logical_reorder=*/
-      pointwise_utils::getLogicalReorderMap(
-          prop.largest_out, prop.has_reshapes, data_cache));
+  const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
+      prop.largest_out, prop.has_reshapes, data_cache);
+  int64_t vectorization_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Keep the original analysis in off and record modes. TMA disables both
+    // optional soft caps, so its native preference is the layout limit.
+    vectorization_factor = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        /*max_vectorization_size_in_bit=*/128,
+        prop.min_dtype_size_bit_for_vectorization,
+        prop.max_dtype_size_bit_for_vectorization,
+        /*n_vectorizable_tensors=*/-1,
+        /*n_waves=*/-1,
+        logical_reorder_map);
+  }
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Layout and alignment analysis is a correctness bound. It does not
+    // calculate the native preference in remote mode.
+    const int64_t layout_max = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        /*max_vectorization_size_in_bit=*/128,
+        /*min_dtype_size_bit=*/-1,
+        /*max_dtype_size_bit=*/-1,
+        /*n_vectorizable_tensors=*/-1,
+        /*n_waves=*/-1,
+        logical_reorder_map);
+    const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+    const int64_t byte_min = min_dtype_bits < 8
+        ? scheduler_utils::safeDiv(8L, min_dtype_bits)
+        : 1;
+
+    // The PointWise wrapper caps block quantization at four and rejects
+    // sub-byte quantization below width two. Apply those same hard bounds to
+    // this menu so a remote choice cannot newly reject a schedulable fusion.
+    bool has_block_quantization = false;
+    bool requires_quant_width_two = false;
+    for (auto* op : ir_utils::getOpsOfType<BlockQuantizationOp>(fusion)) {
+      has_block_quantization = true;
+      requires_quant_width_two |= dataTypeSizeBit(
+          op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
+    }
+    for (auto* op :
+         ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion)) {
+      has_block_quantization = true;
+      requires_quant_width_two |= dataTypeSizeBit(
+          op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
+    }
+    const int64_t hard_max =
+        has_block_quantization ? std::min<int64_t>(layout_max, 4) : layout_max;
+    const int64_t hard_min =
+        std::max<int64_t>(byte_min, requires_quant_width_two ? 2 : 1);
+    NVF_ERROR(
+        layout_max >= 1 && layout_max <= 128 &&
+            scheduler_utils::lastPow2(layout_max) == layout_max &&
+            scheduler_utils::lastPow2(byte_min) == byte_min,
+        "PW4.width layout and byte bounds must be powers of two in 1..128");
+
+    std::vector<scheduler::jev::ChoiceOption> options;
+    const int64_t first_width = std::min(hard_min, hard_max);
+    for (int64_t width = first_width; width <= hard_max; width *= 2) {
+      options.push_back(
+          {"w" + std::to_string(width),
+           "Vectorize " + std::to_string(width) + " element(s) per thread"});
+    }
+    // If the layout limit is below a native minimum, the existing source
+    // returns that limit and canScheduleRunTime decides whether to reject it.
+    std::string state = "pointwise.tma_width.v1\n";
+    state += "layout_max=" + std::to_string(layout_max) + '\n';
+    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+    state += "max_dtype_bits=" +
+        std::to_string(prop.max_dtype_size_bit_for_vectorization) + '\n';
+    state += "n_vectorizable_tensors=" +
+        std::to_string(prop.vectorizable_inputs_outputs.size()) + '\n';
+    state += "has_block_quantization=" +
+        std::to_string(has_block_quantization) + '\n';
+    state += "requires_quant_width_two=" +
+        std::to_string(requires_quant_width_two) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "w" + std::to_string(std::min(vectorization_factor, hard_max))
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "PW4.width", state, options, native_choice);
+    bool matched = false;
+    for (int64_t width = first_width; width <= hard_max; width *= 2) {
+      if (selected == "w" + std::to_string(width)) {
+        vectorization_factor = width;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW4.width response is outside native hard bounds");
+  }
+  params->vectorization_factor = vectorization_factor;
 
   // TMA store
   params->use_tma_store = false;
