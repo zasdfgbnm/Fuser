@@ -546,6 +546,18 @@ def check_outer_ragged_dependency(report: dict[str, Any],
     return ragged_issues
 
 
+def clean_outer_grid_waves(raw_grid: int, output_grid: int, sms: int) -> int:
+    """Replay RD9's native ragged-wave contraction for a selected raw grid."""
+    blocks = raw_grid * output_grid
+    if blocks < sms * 16 and blocks % sms != 0 and blocks > sms:
+        waves = max(blocks // sms, 1)
+        cleaned = max(waves * sms // output_grid, 1)
+        if ((raw_grid - cleaned) * 4 <= raw_grid and
+                cleaned * output_grid % sms > blocks % sms):
+            return cleaned
+    return raw_grid
+
+
 def check_outer_grid_plan(record: dict[str, Any], remote: dict[str, Any],
                           record_stride: dict[str, Any],
                           remote_stride: dict[str, Any]) -> None:
@@ -794,7 +806,9 @@ def check_alternate_report(report: dict[str, Any],
                                 (remote_ragged, "remote", "4")):
             state = state_fields(row, "reduction.outer_ragged.v1")
             if (state.get("base_grdim") != base or
-                    row[side] != {"clean": 1}):
+                    row[side] != {"clean": 1} or
+                    set(row["request"]["questions"]["RD9.ragged"]
+                        ["criteria"]) != {"clean", "raw"}):
                 raise ValueError(f"ragged plan ignored selected baseline: {row}")
         ragged_before = state_fields(record_ragged, "reduction.outer_ragged.v1")
         ragged_after = state_fields(remote_ragged, "reduction.outer_ragged.v1")
@@ -803,14 +817,22 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in ragged_after.items()
                  if key != "base_grdim"}):
             raise ValueError("grid baseline changed unrelated ragged measurements")
+        record_clean = clean_outer_grid_waves(
+            int(ragged_before["base_grdim"]),
+            int(ragged_before["gidim"]), int(ragged_before["sm_count"]))
+        remote_clean = clean_outer_grid_waves(
+            int(ragged_after["base_grdim"]),
+            int(ragged_after["gidim"]), int(ragged_after["sm_count"]))
+        if (record_clean, remote_clean) != (7, 3):
+            raise ValueError("baseline fixture changed ragged-wave contraction")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
         stride_before = outer_stride_fields(record_stride)
         stride_after = outer_stride_fields(remote_stride)
         if (stride_before.get("base_grdim") != "8" or
                 stride_after.get("base_grdim") != "4" or
-                record_stride["record"] != {"g7": 1} or
-                remote_stride["remote"] != {"g4": 1} or
+                record_stride["record"] != {f"g{record_clean}": 1} or
+                remote_stride["remote"] != {f"g{remote_clean}": 1} or
                 {key: value for key, value in stride_before.items()
                  if key != "base_grdim"} !=
                 {key: value for key, value in stride_after.items()
@@ -821,8 +843,8 @@ def check_alternate_report(report: dict[str, Any],
         plan_after = state_fields(remote_plan, "reduction.outer_plan.v1")
         if (record_plan["record"] != {"grid": 1} or
                 remote_plan["remote"] != {"grid": 1} or
-                plan_before.get("grid_grdim") != "7" or
-                plan_after.get("grid_grdim") != "4" or
+                plan_before.get("grid_grdim") != str(record_clean) or
+                plan_after.get("grid_grdim") != str(remote_clean) or
                 {key: value for key, value in plan_before.items()
                  if key != "grid_grdim"} !=
                 {key: value for key, value in plan_after.items()
