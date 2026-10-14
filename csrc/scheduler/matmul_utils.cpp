@@ -266,7 +266,9 @@ bool fillDefaultAmpereHeuristic(
 //    different tiles.
 void fillOptimalHopperTileSizes(
     MatmulParams* mparams,
-    const ProblemShape& problem_shape) {
+    const ProblemShape& problem_shape,
+    const mma_utils::TensorRolesMap& tensor_roles,
+    const size_t num_problems) {
   const int64_t m = problem_shape[(size_t)MatmulDimRole::M];
   const int64_t n = problem_shape[(size_t)MatmulDimRole::N];
   const int64_t k = problem_shape[(size_t)MatmulDimRole::K];
@@ -289,6 +291,26 @@ void fillOptimalHopperTileSizes(
       at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int64_t smem_bytes =
       at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+  // The original three-stage floor is a pipeline preference. A one- or
+  // two-stage tile can still be scheduled, as long as both operands and the
+  // optional Float epilogue fit. Bound the expanded menu to a single matmul
+  // with two-byte operands and no extra epilogue input; the existing per-stage
+  // estimate then matches the operand allocation.
+  const auto& as = tensor_roles.at(MatmulTensorRole::OPERAND_A);
+  const auto& bs = tensor_roles.at(MatmulTensorRole::OPERAND_B);
+  const auto& outs = tensor_roles.at(MatmulTensorRole::OUTPUT);
+  const auto epilogue_input_it =
+      tensor_roles.find(MatmulTensorRole::EPILOGUE_INPUT);
+  const size_t epilogue_input_count =
+      epilogue_input_it == tensor_roles.end() ? 0
+                                              : epilogue_input_it->second.size();
+  const int64_t a_dtype_bytes = dataTypeSizeByte(as.front()->dtype());
+  const int64_t b_dtype_bytes = dataTypeSizeByte(bs.front()->dtype());
+  const int64_t output_dtype_bytes = dataTypeSizeByte(outs.front()->dtype());
+  const bool offer_low_stage_tiles =
+      jev_tile_enabled && num_problems == 1 && as.size() == 1 &&
+      bs.size() == 1 && outs.size() == 1 && epilogue_input_count == 0 &&
+      a_dtype_bytes == 2 && b_dtype_bytes == 2 && output_dtype_bytes == 2;
 
   // Compute how many total bytes need to be computed, summed over all tiles in
   // the output
@@ -317,6 +339,7 @@ void fillOptimalHopperTileSizes(
       /*cta=*/{64, 64, 64}, /*warp=*/{64, 64, 64}, /*instr=*/{64, 64, 16}};
   int64_t best_bytes_tx = std::numeric_limits<int64_t>::max();
   int64_t best_stages = std::numeric_limits<int64_t>::max();
+  bool has_native_config = false;
   std::vector<TileConfig> legal_configs;
 
   // If two sizes result in the same number of total byte, prefer the larger CTA
@@ -337,8 +360,7 @@ void fillOptimalHopperTileSizes(
         const int64_t epilogue_bytes = cta_m * cta_n * 2;
         // operands plus outputs plus mbarriers
         const int64_t bytes_per_stage = (cta_m + cta_n) * cta_k * 2 + 8 * 2;
-        // Don't consider cases where we would need fewer than 3 load stages due
-        // to smem constraint
+        // Preserve the native preference for at least three load stages.
         int64_t min_stages = 3L;
 
         // There might be fewer than min_stages stages needed to compute the
@@ -350,7 +372,14 @@ void fillOptimalHopperTileSizes(
         const int64_t stages_per_sm = stages_per_tile * tiles_per_sm;
         min_stages = std::max(1L, std::min(min_stages, stages_per_sm));
 
-        if (bytes_per_stage * min_stages + epilogue_bytes > smem_bytes) {
+        const bool native_valid =
+            bytes_per_stage * min_stages + epilogue_bytes <= smem_bytes;
+        // Reserve room for the Float MMA accumulator even if the downstream
+        // epilogue analysis elects to omit or reuse its shared-memory buffer.
+        const bool low_stage_valid =
+            offer_low_stage_tiles && !native_valid &&
+            bytes_per_stage + cta_m * cta_n * 4 <= smem_bytes;
+        if (!native_valid && !low_stage_valid) {
           continue;
         }
 
@@ -363,10 +392,11 @@ void fillOptimalHopperTileSizes(
             .warp = {64L, instr_n, cta_k},
             .instr = {64L, instr_n, 16L},
         };
+        has_native_config |= native_valid;
         if (jev_tile_enabled) {
           legal_configs.push_back(cfg);
         }
-        if (!score_native) {
+        if (!score_native || !native_valid) {
           continue;
         }
         const int64_t bytes_tx = bytes_transferred(cfg.cta);
@@ -397,6 +427,10 @@ void fillOptimalHopperTileSizes(
   }
 
   if (jev_tile_enabled) {
+    // The no-native-candidate case keeps the original fallback/error behavior.
+    if (!has_native_config) {
+      legal_configs.clear();
+    }
     if (legal_configs.empty()) {
       if (jev_mode == scheduler::jev::Mode::Record) {
         scheduler::jev::recordCoverageSkip(
@@ -426,11 +460,19 @@ void fillOptimalHopperTileSizes(
                 std::to_string(cfg.instr.k)});
       }
       const std::string state =
-          "matmul.hopper_tile.v1\nm_extent=" + std::to_string(m) +
+          "matmul.hopper_tile.v2\nm_extent=" + std::to_string(m) +
           "\nn_extent=" + std::to_string(n) +
           "\nk_extent=" + std::to_string(k) +
           "\nsm_count=" + std::to_string(num_sms) +
-          "\nsmem_per_block_bytes=" + std::to_string(smem_bytes);
+          "\nsmem_per_block_bytes=" + std::to_string(smem_bytes) +
+          "\nnum_problems=" + std::to_string(num_problems) +
+          "\na_tensor_count=" + std::to_string(as.size()) +
+          "\nb_tensor_count=" + std::to_string(bs.size()) +
+          "\noutput_tensor_count=" + std::to_string(outs.size()) +
+          "\nepilogue_input_count=" + std::to_string(epilogue_input_count) +
+          "\na_dtype_bytes=" + std::to_string(a_dtype_bytes) +
+          "\nb_dtype_bytes=" + std::to_string(b_dtype_bytes) +
+          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes);
       const auto native_it = std::find_if(
           legal_configs.begin(), legal_configs.end(), [&](const TileConfig& cfg) {
             return cfg.cta.m == best_config.cta.m &&
@@ -545,7 +587,8 @@ bool fillDefaultHopperHeuristic(
   mparams->tiling_strategy =
       MatmulParams::TilingStrategy::DistributeTilesAcrossSMs;
 
-  fillOptimalHopperTileSizes(mparams, problem_shape);
+  fillOptimalHopperTileSizes(
+      mparams, problem_shape, tensor_roles, num_problems);
 
   maximizeHopperOperandStages(mparams, tensor_roles, num_problems);
 
