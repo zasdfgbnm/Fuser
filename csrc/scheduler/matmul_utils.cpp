@@ -477,15 +477,25 @@ bool fillDefaultHopperHeuristic(
   const GemmTile& cta_tile = mparams->tile_sizes.cta_tile;
   int64_t Mtiles = ceilDiv(problem_shape[(size_t)MatmulDimRole::M], cta_tile.m);
   int64_t Ntiles = ceilDiv(problem_shape[(size_t)MatmulDimRole::N], cta_tile.n);
+  const auto jev_mode = scheduler::jev::mode();
+  const bool jev_raster_enabled =
+      jev_mode != scheduler::jev::Mode::Off &&
+      !matmul_heuristic_plugin::hasPlugin() &&
+      mparams->tiling_strategy ==
+          MatmulParams::TilingStrategy::DistributeTilesAcrossSMs;
+  const bool compute_native_raster =
+      jev_mode != scheduler::jev::Mode::Remote || !jev_raster_enabled;
 
   // When we choose the rasterization direction, that becomes the fast
   // dimension. However, when we swizzle, we pull groups of a fixed size from
   // the _other_ dimension to create a new inner dimension. We find the swizzle
   // factor that is largest and has the least quantization when we divide that
   // other dimension by the swizzle factor.
-  mparams->cta_order = Mtiles <= Ntiles
-      ? MatmulParams::TileRasterizationOrder::ColumnMajor
-      : MatmulParams::TileRasterizationOrder::RowMajor;
+  if (compute_native_raster) {
+    mparams->cta_order = Mtiles <= Ntiles
+        ? MatmulParams::TileRasterizationOrder::ColumnMajor
+        : MatmulParams::TileRasterizationOrder::RowMajor;
+  }
 
   // TODO: swizzle is computed at the level of CGA so we first set CGA size
   // then set swizzle factor.
@@ -519,36 +529,39 @@ bool fillDefaultHopperHeuristic(
     mparams->cluster_dims = largest_cga_cfg;
   }
 
-  // This is the size of the non-fast dimension before swizzling
-  int64_t swizzled_tiles =
-      mparams->cta_order == MatmulParams::TileRasterizationOrder::RowMajor
-      ? Mtiles
-      : Ntiles;
+  if (compute_native_raster) {
+    // Keep the original search in off/record modes and when a plugin owns the
+    // resulting parameters. The remote default path does not use its result.
+    int64_t swizzled_tiles =
+        mparams->cta_order == MatmulParams::TileRasterizationOrder::RowMajor
+        ? Mtiles
+        : Ntiles;
 
-  // We swizzle the tiles as much as possible up to 16 tiles. Like choosing
-  // the rasterization order, this is used to increase L2 locality. We start at
-  // swizzled_tiles-1 because if we set the swizzle factor equal to the size of
-  // the non-swizzled dimension that is equivalent to simply switching
-  // cta_order. The largest possible divisor of an integer i is i/2, so we
-  // start our search there (or 16, whichever is smaller).
-  int grid_traversal_factor = std::max(1L, std::min(swizzled_tiles / 2L, 16L));
-  while (grid_traversal_factor > 1 &&
-         swizzled_tiles % grid_traversal_factor != 0) {
-    // Decrease the swizzle factor if it would result in nondivisible splits,
-    // since this would unnecessarily increase the grid size.
-    grid_traversal_factor--;
+    // We swizzle the tiles as much as possible up to 16 tiles. Like choosing
+    // the rasterization order, this is used to increase L2 locality. We start
+    // at swizzled_tiles-1 because if we set the swizzle factor equal to the
+    // size of the non-swizzled dimension that is equivalent to simply
+    // switching cta_order. The largest possible divisor of an integer i is
+    // i/2, so we start our search there (or 16, whichever is smaller).
+    int grid_traversal_factor =
+        std::max(1L, std::min(swizzled_tiles / 2L, 16L));
+    while (grid_traversal_factor > 1 &&
+           swizzled_tiles % grid_traversal_factor != 0) {
+      // Decrease the swizzle factor if it would result in nondivisible splits,
+      // since this would unnecessarily increase the grid size.
+      grid_traversal_factor--;
+    }
+    // TODO: Use only 1D grid traversal factor for now
+    grid_traversal_factor = 1;
+    mparams->grid_traversal_factor = {grid_traversal_factor, 1};
+  } else {
+    mparams->grid_traversal_factor = {1, 1};
   }
-  // TODO: Use only 1D grid traversal factor for now
-  grid_traversal_factor = 1;
-  mparams->grid_traversal_factor = {grid_traversal_factor, 1};
 
   // The plugin owns its own raster and cluster plan. On the default Hopper
   // path, both orders traverse the same finalized CGA tiles; the native
   // cluster divisibility and the forced 1x1 swizzle remain fixed.
-  if (scheduler::jev::mode() != scheduler::jev::Mode::Off &&
-      !matmul_heuristic_plugin::hasPlugin() &&
-      mparams->tiling_strategy ==
-          MatmulParams::TilingStrategy::DistributeTilesAcrossSMs) {
+  if (jev_raster_enabled) {
     NVF_ERROR(
         mparams->cluster_dims.m > 0 && mparams->cluster_dims.n > 0 &&
             Mtiles % mparams->cluster_dims.m == 0 &&
@@ -576,7 +589,7 @@ bool fillDefaultHopperHeuristic(
         "MM3.raster",
         state,
         options,
-        scheduler::jev::mode() == scheduler::jev::Mode::Record
+        jev_mode == scheduler::jev::Mode::Record
             ? (Mtiles <= Ntiles ? "column" : "row")
             : "");
     NVF_ERROR(
