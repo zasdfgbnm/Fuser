@@ -7,7 +7,10 @@
 // clang-format on
 #include <ATen/cuda/CUDAContext.h>
 
+#include <optional>
+
 #include "options.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -292,37 +295,187 @@ void getHeuristics(
         getHeuristicsGivenVectThreads(vect_factor, threads_per_block));
   }
 
-  // Sort the heuristics based on the register usage and occupancy.
-  std::stable_sort(
-      iop_candidates.begin(),
-      iop_candidates.end(),
-      [](const InnerOuterParams& a, const InnerOuterParams& b) {
-        // If a thread can use more registers than required, there is a high
-        // chance that it can avoid register spilling and compiler can optimize
-        // for better instruction level parallelism.
-        int64_t extra_regs_a =
-            a.available_register_per_thread - a.required_register_per_thread;
-        int64_t extra_regs_b =
-            b.available_register_per_thread - b.required_register_per_thread;
-        if (extra_regs_a > 0 && extra_regs_b < 0) {
-          return true;
-        } else if (extra_regs_a < 0 && extra_regs_b > 0) {
-          return false;
-        }
-        // High occupancy provides better threads level parallelism.
-        // 25% is sufficient since ILP is high due to persistent batch sizes
-        // which is equivalent to unrolling inner dim.
-        if (a.warps_per_sm != b.warps_per_sm &&
-            (a.warps_per_sm < 16 || b.warps_per_sm < 16)) {
-          return a.warps_per_sm > b.warps_per_sm;
-        }
-        // Tie breaker, smaller threads_per_block to reduce communication
-        // overhead
-        return a.threads_per_block < b.threads_per_block;
-      });
+  const auto jev_mode = scheduler::jev::mode();
+  // Preserve the original stable ordering in off/record mode. Remote mode
+  // receives unranked plans and never computes the native winner.
+  std::vector<InnerOuterParams> native_ranked;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    native_ranked = iop_candidates;
+    std::stable_sort(
+        native_ranked.begin(),
+        native_ranked.end(),
+        [](const InnerOuterParams& a, const InnerOuterParams& b) {
+          // Register headroom lowers spilling and leaves more room for ILP.
+          int64_t extra_regs_a =
+              a.available_register_per_thread - a.required_register_per_thread;
+          int64_t extra_regs_b =
+              b.available_register_per_thread - b.required_register_per_thread;
+          if (extra_regs_a > 0 && extra_regs_b < 0) {
+            return true;
+          } else if (extra_regs_a < 0 && extra_regs_b > 0) {
+            return false;
+          }
+          // Below 16 warps per SM, occupancy outranks communication cost.
+          if (a.warps_per_sm != b.warps_per_sm &&
+              (a.warps_per_sm < 16 || b.warps_per_sm < 16)) {
+            return a.warps_per_sm > b.warps_per_sm;
+          }
+          return a.threads_per_block < b.threads_per_block;
+        });
+  }
 
-  // Pick the best heuristic
-  auto iop = iop_candidates.front();
+  InnerOuterParams iop;
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    iop = native_ranked.front();
+  } else {
+    struct OfferedPlan {
+      InnerOuterParams params;
+      int64_t final_bdimx;
+      int64_t final_bdimy;
+      int64_t final_gdimy;
+    };
+    std::vector<OfferedPlan> plans;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    bool all_candidates_safe = true;
+    const int64_t smem_limit_bit =
+        (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
+    const auto make_offered_plan = [&](const InnerOuterParams& candidate)
+        -> std::optional<OfferedPlan> {
+      if (candidate.inner_vect < 1 || candidate.inner_batch < 1 ||
+          candidate.threads_per_block < 1 ||
+          candidate.threads_per_block > dev_prop->maxThreadsPerBlock ||
+          candidate.bdimx < 1 || candidate.bdimy < 1 ||
+          candidate.bdimx > dev_prop->maxThreadsPerBlock ||
+          candidate.bdimy > dev_prop->maxThreadsPerBlock ||
+          candidate.bdimx * candidate.bdimy != candidate.threads_per_block ||
+          candidate.gdimy < 1 ||
+          candidate.gdimy > dev_prop->maxGridSize[1] ||
+          candidate.tmp_gmem_write_vect < 1 ||
+          candidate.tmp_gmem_write_vect > candidate.inner_vect ||
+          candidate.vectorization_factor_outer < 1 ||
+          candidate.vectorization_factor_outer >
+              candidate.tmp_gmem_write_vect ||
+          candidate.warps_per_sm < 1 ||
+          candidate.required_register_per_thread < 1 ||
+          candidate.required_register_per_thread >
+              scheduler_utils::max_registers_per_thread ||
+          candidate.available_register_per_thread < 1 ||
+          candidate.available_register_per_thread >
+              scheduler_utils::max_registers_per_thread ||
+          smem_buffer_size_bit < 0 || smem_overhead_bit < 0 ||
+          smem_overhead_bit > smem_limit_bit ||
+          smem_buffer_size_bit > smem_limit_bit - smem_overhead_bit) {
+        return std::nullopt;
+      }
+      int64_t final_bdimx = candidate.bdimx;
+      int64_t final_bdimy = candidate.bdimy;
+      int64_t final_gdimy = candidate.gdimy;
+      if (inner_dim_numel <= 1024) {
+        final_bdimx = ceilDiv(
+            inner_dim_numel, candidate.inner_vect * candidate.inner_batch);
+        final_bdimy = 1;
+        final_gdimy = getGdimy(
+            candidate.inner_vect, final_bdimx, candidate.inner_batch);
+      } else {
+        const int64_t bdimz = ceilDiv(
+            ceilDiv(
+                ceilDiv(inner_dim_numel / candidate.inner_vect, final_bdimx),
+                final_bdimy),
+            candidate.inner_batch);
+        if (bdimz != 1) {
+          return std::nullopt;
+        }
+      }
+      if (final_bdimx < 1 || final_bdimy < 1 ||
+          final_bdimx * final_bdimy > dev_prop->maxThreadsPerBlock ||
+          final_gdimy < 1 || final_gdimy > dev_prop->maxGridSize[1]) {
+        return std::nullopt;
+      }
+      return OfferedPlan{candidate, final_bdimx, final_bdimy, final_gdimy};
+    };
+
+    // The rows retain native search order, not native rank. Candidate metrics
+    // are measurements; the service independently applies the rank rule.
+    std::string state =
+        "inner_outer_multi_wave.cta.v1\ninner_dim=" +
+        std::to_string(inner_dim_numel) + "\nouter_dim=" +
+        std::to_string(outer_dim_numel) + "\nvector_width=" +
+        std::to_string(vect_factor) + "\nregs_buffer_bits=" +
+        std::to_string(regs_buffer_size_bit) + "\ntmp_dtype_bits=" +
+        std::to_string(tmp_gmem_dtype_size_bit) + "\nwarp_size=" +
+        std::to_string(dev_prop->warpSize) + "\nsm_count=" +
+        std::to_string(device_multiprocessor_count) +
+        "\nmax_threads_per_block=" +
+        std::to_string(dev_prop->maxThreadsPerBlock) + "\nmax_grid_y=" +
+        std::to_string(dev_prop->maxGridSize[1]) +
+        "\nsmem_total_bits=" +
+        std::to_string(smem_buffer_size_bit + smem_overhead_bit) +
+        "\nsmem_limit_bits=" + std::to_string(smem_limit_bit);
+    for (const auto& candidate : iop_candidates) {
+      const auto plan = make_offered_plan(candidate);
+      if (!plan) {
+        all_candidates_safe = false;
+        continue;
+      }
+      const std::string id = "t" + std::to_string(candidate.threads_per_block);
+      plans.push_back(*plan);
+      options.push_back({
+          id,
+          "Use CTA " + std::to_string(plan->final_bdimx) + "x" +
+              std::to_string(plan->final_bdimy) + ", grid Y " +
+              std::to_string(plan->final_gdimy) + ", inner batch " +
+              std::to_string(candidate.inner_batch) + ", inner vector " +
+              std::to_string(candidate.inner_vect)});
+      state += "\nplan=" +
+          std::to_string(candidate.threads_per_block) + ":" +
+          std::to_string(candidate.inner_vect) + ":" +
+          std::to_string(candidate.inner_batch) + ":" +
+          std::to_string(candidate.bdimx) + ":" +
+          std::to_string(candidate.bdimy) + ":" +
+          std::to_string(candidate.gdimy) + ":" +
+          std::to_string(candidate.tmp_gmem_write_vect) + ":" +
+          std::to_string(candidate.vectorization_factor_outer) + ":" +
+          std::to_string(candidate.warps_per_sm) + ":" +
+          std::to_string(candidate.required_register_per_thread) + ":" +
+          std::to_string(candidate.available_register_per_thread) + ":" +
+          std::to_string(plan->final_bdimx) + ":" +
+          std::to_string(plan->final_bdimy) + ":" +
+          std::to_string(plan->final_gdimy);
+    }
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "t" + std::to_string(native_ranked.front().threads_per_block)
+        : "";
+    size_t request_size_bound = state.size();
+    for (const auto& option : options) {
+      request_size_bound += option.id.size() + option.description.size() + 32;
+    }
+    // GCC 14 stable_sort uses one stable merge of insertion-sorted halves for
+    // this small domain. The local service replays that exact comparison order.
+    const bool within_protocol_bounds =
+        all_candidates_safe && !options.empty() && options.size() <= 7 &&
+        request_size_bound < 48 * 1024;
+    const bool native_offered =
+        jev_mode != scheduler::jev::Mode::Record ||
+        std::any_of(options.begin(), options.end(), [&](const auto& option) {
+          return option.id == native_choice;
+        });
+    if (!within_protocol_bounds || !native_offered) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 CTA plans cannot be offered safely within Jev bounds");
+      iop = native_ranked.front();
+    } else {
+      const auto selected = scheduler::jev::chooseDecision(
+          "IOP3.cta", state, options, native_choice);
+      const auto it = std::find_if(
+          options.begin(),
+          options.end(),
+          [&](const auto& option) { return option.id == selected; });
+      NVF_ERROR(it != options.end(), "Unknown IOP3 CTA plan");
+      iop = plans.at(std::distance(options.begin(), it)).params;
+    }
+  }
 
   // Special case, when inner_dim_numel <= 1024, bdimx is usually small
   // after divide by inner_vect and inner_batch. In this case, bdimy is used to
