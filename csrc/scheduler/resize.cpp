@@ -241,6 +241,35 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
     params->largest_input = -1;
   }
 
+  const auto jev_mode = scheduler::jev::mode();
+  std::string input_elements;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Preserve original fusion-input indices: scalar inputs have no layout.
+    for (size_t input_index = 0; input_index < fusion->inputs().size();
+         ++input_index) {
+      auto* input = fusion->inputs().at(input_index);
+      if (!input->isA<TensorView>()) {
+        continue;
+      }
+      int64_t num_elms = 1;
+      for (auto* logical_id : input->as<TensorView>()->getLogicalDomain()) {
+        auto extent = runtime_info.expressionEvaluator().evaluate(
+            logical_id->extent());
+        NVF_ERROR(extent.hasValue(), "Error inferring extent of: ",
+                  logical_id->toString());
+        num_elms *= extent.as<int64_t>();
+      }
+      if (!input_elements.empty()) {
+        input_elements += ',';
+      }
+      input_elements +=
+          std::to_string(input_index) + ':' + std::to_string(num_elms);
+    }
+    if (input_elements.empty()) {
+      input_elements = "-";
+    }
+  }
+
   auto ref_tv_entry =
       HeuristicDataCacheEntry<HeuristicCompileTime::ReferenceTensors>(
           data_cache, [fusion]() {
@@ -263,40 +292,13 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
       (int64_t)ref_tv->getLogicalDomain().size() - 1);
   params->vectorization_factor = layout_max;
 
-  if (scheduler::jev::mode() != scheduler::jev::Mode::Off) {
+  if (jev_mode != scheduler::jev::Mode::Off) {
     NVF_ERROR(
         layout_max >= 1 && layout_max <= 128,
         "RS1.width layout limit must be in 1..128");
 
     // Workload measurements are sent as text with the hard width bound. No
-    // separate native winner is transmitted. Preserve original fusion-input
-    // indices, since scalar inputs do not have layouts to vectorize.
-    std::string input_elements;
-    for (size_t input_index = 0; input_index < fusion->inputs().size();
-         ++input_index) {
-      auto* input = fusion->inputs().at(input_index);
-      if (!input->isA<TensorView>()) {
-        continue;
-      }
-      auto* input_tv = input->as<TensorView>();
-      int64_t num_elms = 1;
-      for (auto* logical_id : input_tv->getLogicalDomain()) {
-        auto extent = runtime_info.expressionEvaluator().evaluate(
-            logical_id->extent());
-        NVF_ERROR(extent.hasValue(), "Error inferring extent of: ",
-                  logical_id->toString());
-        num_elms *= extent.as<int64_t>();
-      }
-      if (!input_elements.empty()) {
-        input_elements += ',';
-      }
-      input_elements +=
-          std::to_string(input_index) + ':' + std::to_string(num_elms);
-    }
-    if (input_elements.empty()) {
-      input_elements = "-";
-    }
-
+    // separate native winner is transmitted.
     std::vector<scheduler::jev::ChoiceOption> options;
     for (int64_t width = 1; width <= layout_max; ++width) {
       if (layout_max % width != 0) {
@@ -311,7 +313,7 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
         "\ninput_elements=" + input_elements +
         "\nmax_output_elements=" + std::to_string(max_num_elms) + '\n';
     const std::string native_choice =
-        scheduler::jev::mode() == scheduler::jev::Mode::Record
+        jev_mode == scheduler::jev::Mode::Record
         ? "w" + std::to_string(layout_max)
         : std::string();
     const std::string selected = scheduler::jev::chooseDecision(
@@ -328,6 +330,33 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
       }
     }
     NVF_ERROR(matched, "RS1.width response is outside native hard bounds");
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // The target remains the first largest TensorView input selected above.
+    // Reordering only changes the outer loop-axis order in schedule(), so
+    // skipping it leaves the reference and innermost vectorized axis intact.
+    std::vector<scheduler::jev::ChoiceOption> options{
+        {"skip", "Keep the reference tensor's outer loop-axis order"}};
+    if (largest_input != nullptr) {
+      options.push_back(
+          {"keep", "Reorder outer loop axes like the largest input"});
+    }
+    const std::string state =
+        "resize.reorder.v1\ninput_elements=" + input_elements + '\n';
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? (largest_input == nullptr ? "skip" : "keep")
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "RS1.reorder", state, options, native_choice);
+    if (selected == "skip") {
+      params->largest_input = -1;
+    } else {
+      NVF_ERROR(
+          selected == "keep" && largest_input != nullptr,
+          "RS1.reorder response is outside native hard bounds");
+    }
   }
 
   return params;
