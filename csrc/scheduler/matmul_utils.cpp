@@ -108,10 +108,9 @@ inline std::optional<MmaMacro> getMmaOp(
   return macro_encode;
 }
 
-//! Find the number of circular buffer stages for shared memory operands, so
-//! that the entire pipeline is filled given problem and heuristics.
-void limitCircularBufferingSmemOperands(
-    MatmulParams* mparams,
+//! Count the useful operand stages before applying a stage-count preference.
+int64_t circularBufferWorkStages(
+    const MatmulParams* mparams,
     const ProblemShape& problem_shape) {
   // The axes of the mma tensorviews are permuted to [B, M, N, K],
   // so K / cta_tile_k is the circular buffer axis for both operands.
@@ -136,9 +135,17 @@ void limitCircularBufferingSmemOperands(
     // in rare cases
     num_tiles_per_cta = ceilDiv(tiles_m * tiles_n, num_sms);
   }
+  return k_stages_per_tile * num_tiles_per_cta;
+}
+
+//! Find the number of circular buffer stages for shared memory operands, so
+//! that the entire pipeline is filled given problem and heuristics.
+void limitCircularBufferingSmemOperands(
+    MatmulParams* mparams,
+    const ProblemShape& problem_shape) {
   int64_t stages = std::min(
       (int64_t)mparams->circular_buffer_options.smem_circular_buffer_stage,
-      k_stages_per_tile * num_tiles_per_cta);
+      circularBufferWorkStages(mparams, problem_shape));
 
   // Limit to 8 stages, even though in some cases we could use more. This is
   // needed because mbarrier initialization has a penalty and we do not expect
@@ -1326,9 +1333,87 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
         mparams.get(), tensor_roles, /*num_problems=*/(size_t)patterns.size());
   }
 
-  // Ensure that entire pipeline is filled for shared memory operands given
-  // problem and heuristics.
-  limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+  // Resource capacity is computed above. K-loop work and the existing
+  // eight-stage ceiling bound the default Hopper Choice menu. The server
+  // independently reconstructs the native maximum from raw measurements;
+  // changing the stage count is followed by the unchanged specialization and
+  // epilogue analysis below.
+  const auto jev_mode = scheduler::jev::mode();
+  const bool jev_stages_enabled =
+      jev_mode != scheduler::jev::Mode::Off &&
+      isHopper(mparams->mma_macro) &&
+      !matmul_heuristic_plugin::hasPlugin() &&
+      mparams->tiling_strategy ==
+          MatmulParams::TilingStrategy::DistributeTilesAcrossSMs &&
+      mparams->circular_buffering_strategy ==
+          MatmulParams::CircularBufferingStrategy::WarpSpecialized;
+  if (jev_stages_enabled) {
+    const int64_t resource_stages =
+        mparams->circular_buffer_options.smem_circular_buffer_stage;
+    const int64_t work_stages =
+        circularBufferWorkStages(mparams.get(), problem_shape);
+    const int64_t hard_max_stages =
+        std::min({resource_stages, work_stages, 8L});
+    if (hard_max_stages < 1) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "MM2.stages", "no positive resource- and work-bounded stage");
+        limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+      } else {
+        NVF_ERROR(false, "MM2.stages has no valid stage candidate");
+      }
+    } else {
+      int64_t output_dtype_bytes = 0;
+      for (TensorView* out : tensor_roles.at(MatmulTensorRole::OUTPUT)) {
+        output_dtype_bytes += dataTypeSizeByte(out->dtype());
+      }
+      const auto* device = at::cuda::getCurrentDeviceProperties();
+      const GemmTile& cta_tile = mparams->tile_sizes.cta_tile;
+      const std::string state =
+          "matmul.hopper_stages.v1\nm_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::M]) +
+          "\nn_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::N]) +
+          "\nk_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::K]) +
+          "\ncta_m=" + std::to_string(cta_tile.m) +
+          "\ncta_n=" + std::to_string(cta_tile.n) +
+          "\ncta_k=" + std::to_string(cta_tile.k) +
+          "\nsplitk_factor=" + std::to_string(mparams->splitk_factor) +
+          "\nnum_problems=" + std::to_string(patterns.size()) +
+          "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(device->sharedMemPerBlockOptin) +
+          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes);
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t stages = 1; stages <= hard_max_stages; ++stages) {
+        options.push_back({
+            "s" + std::to_string(stages),
+            "Use " + std::to_string(stages) +
+                " operand shared-memory stage(s)"});
+      }
+      std::string native_choice;
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+        native_choice = "s" + std::to_string(
+            mparams->circular_buffer_options.smem_circular_buffer_stage);
+      }
+      const std::string selected = scheduler::jev::chooseDecision(
+          "MM2.stages", state, options, native_choice);
+      const auto selected_it = std::find_if(
+          options.begin(), options.end(), [&](const auto& option) {
+            return option.id == selected;
+          });
+      NVF_ERROR(
+          selected_it != options.end(),
+          "MM2.stages response is outside native resource and work bounds");
+      mparams->circular_buffer_options.smem_circular_buffer_stage =
+          std::stoi(selected.substr(1));
+    }
+  } else {
+    // The heuristic plugin owns its parameters, including stage count.
+    limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+  }
 
   mparams->circular_buffer_options.circular_buffer_smem_write =
       mparams->circular_buffer_options.smem_circular_buffer_stage > 1;
