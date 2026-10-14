@@ -49,7 +49,8 @@ void getHeuristics(
     const int64_t hp_threads_per_block_min,
     const int64_t hp_threads_per_block_max,
     const bool project_to_input,
-    const PrimDataType index_type) {
+    const PrimDataType index_type,
+    const bool enable_jev_choice) {
   rparams->project_persistent_buffers = project_to_input;
   rparams->cparams.index_type = index_type;
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
@@ -295,7 +296,11 @@ void getHeuristics(
         getHeuristicsGivenVectThreads(vect_factor, threads_per_block));
   }
 
-  const auto jev_mode = scheduler::jev::mode();
+  // IOP1 constructs a native preview of this complete plan before choosing
+  // between modes. A preview must not request or log an IOP3 choice that might
+  // never be executed.
+  const auto jev_mode = enable_jev_choice ? scheduler::jev::mode()
+                                          : scheduler::jev::Mode::Off;
   // Preserve the original stable ordering in off/record mode. Remote mode
   // receives unranked plans and never computes the native winner.
   std::vector<InnerOuterParams> native_ranked;
@@ -558,7 +563,7 @@ void getHeuristics(
     rparams->tag = "InnerOuter Register Persistent Heuristic.\n";
   }
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (enable_jev_choice && isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << "\n===== Combined InnerOuter Reduction Stats ========\n"
             << "outer_dim_numel: " << outer_dim_numel << "\n"
             << "inner_dim_numel: " << inner_dim_numel << "\n"

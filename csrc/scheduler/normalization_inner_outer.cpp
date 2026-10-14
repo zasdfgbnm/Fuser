@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 // clang-format on
+#include <exception>
+#include <optional>
 #include <ranges>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -12,6 +14,7 @@
 #include "instrumentation.h"
 #include "options.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_inner_outer_multi_wave.h"
 #include "scheduler/normalization_inner_outer_tma_ws.h"
 #include "scheduler/normalization_inner_outer_utils.h"
@@ -23,11 +26,8 @@
 namespace nvfuser {
 namespace {
 
-// Prioritize warp specialized approach if possible
-bool preferWarpSpecialized(
-    Fusion* fusion,
-    int64_t total_iteration_numel,
-    int64_t n_inner_reduction_tvs) {
+// Architecture and TMA shape requirements are hard eligibility checks.
+bool canTryWarpSpecialized(Fusion* fusion) {
   // False, for pre-Blackwell GPUs
   if (at::cuda::getCurrentDeviceProperties()->major < 10) {
     return false;
@@ -46,6 +46,17 @@ bool preferWarpSpecialized(
     return false;
   }
 
+  return true;
+}
+
+// Prioritize warp specialized approach if possible.
+bool preferWarpSpecialized(
+    Fusion* fusion,
+    int64_t total_iteration_numel,
+    int64_t n_inner_reduction_tvs) {
+  if (!canTryWarpSpecialized(fusion)) {
+    return false;
+  }
   // False, when iteration dimension is too small.
   // (1) Benefit from amortizing weight tensor loading overhead is minimal.
   // (2) Can't create deep circular buffering.
@@ -62,6 +73,117 @@ bool preferWarpSpecialized(
   // Try to use warp specialized, but if the heuristic fails, fall back to
   // multi-wave
   return true;
+}
+
+struct WarpSpecializedPlanMeasurements {
+  int64_t compute_bdimx;
+  int64_t computation_groups;
+  int64_t stages;
+  int64_t total_threads;
+  int64_t available_registers_per_thread;
+};
+
+// Check the finalized WS plan, including its first stage. The constructor
+// checks resource usage when growing a plan but can start at one stage even
+// when that first-stage estimate is too large.
+std::optional<WarpSpecializedPlanMeasurements> hardValidWarpSpecializedPlan(
+    const ReductionParams& params,
+    const inner_outer_utils::PersistentBufferStorageParams& buffers,
+    int64_t inner_dim_numel,
+    int64_t computation_dtype_size_bit,
+    int64_t vector_width) {
+  const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto& launch = params.lparams;
+  const auto& circular = params.circular_buffer_options;
+  if (!buffers.has_enough_regs_and_smem || !buffers.project_to_input ||
+      !std::holds_alternative<WarpSpecialized>(circular.type) ||
+      circular.stage < 2 || inner_dim_numel < 1 || vector_width < 1 ||
+      inner_dim_numel % vector_width != 0 ||
+      launch.nThreads() > dev_prop->maxThreadsPerBlock ||
+      launch.bdimx() > dev_prop->maxThreadsDim[0] ||
+      launch.bdimy() > dev_prop->maxThreadsDim[1] ||
+      launch.gdimy() > dev_prop->maxGridSize[1]) {
+    return std::nullopt;
+  }
+  const auto& ws = std::get<WarpSpecialized>(circular.type);
+  if (ws.on != ParallelType::TIDx && ws.on != ParallelType::TIDy) {
+    return std::nullopt;
+  }
+  const int64_t bdimx = ws.on == ParallelType::TIDx
+      ? launch.bdimx() - kWarpSpecializationPaddedThreads
+      : launch.bdimx();
+  const int64_t groups = params.computation_warp_groups;
+  const int64_t compute_threads = bdimx * groups;
+  const int64_t total_threads =
+      compute_threads + kWarpSpecializationPaddedThreads;
+  if (bdimx < 128 || bdimx % 128 != 0 || groups < 1 ||
+      compute_threads < 1 || total_threads != launch.nThreads() ||
+      buffers.circular_buffered_smem_size_bit < 0 ||
+      buffers.non_circular_buffered_smem_size_bit < 0 ||
+      buffers.regs_buffer_size_bit < 0) {
+    return std::nullopt;
+  }
+
+  const int64_t unroll = params.unroll_factor_iter_dom;
+  const auto smem_bits =
+      static_cast<__int128>(buffers.circular_buffered_smem_size_bit) *
+          unroll * circular.stage +
+      (params.is_non_circular_buffer_gmem_to_regs
+           ? 0
+           : buffers.non_circular_buffered_smem_size_bit) +
+      alignSharedMemoryBits(64 * circular.stage) +
+      alignSharedMemoryBits(
+          unroll * bdimx * groups * computation_dtype_size_bit);
+  if (unroll < 1 || smem_bits >
+          static_cast<__int128>(dev_prop->sharedMemPerBlockOptin) * 8) {
+    return std::nullopt;
+  }
+
+  const int64_t after_vectorize = inner_dim_numel / vector_width;
+  const int64_t batch = ceilDiv(after_vectorize, bdimx);
+  auto buffer_registers = [&](int64_t logical_bits) {
+    const int64_t bits_per_element = logical_bits / inner_dim_numel;
+    return bits_per_element * batch * vector_width /
+        scheduler_utils::bits_per_register;
+  };
+  const int64_t available = getRegPerThreadGivenThreadsPerSM(total_threads);
+  const auto [_, compute_branch_registers] =
+      scheduler_utils::getRegisterSharing(
+          available, compute_threads, kWarpSpecializationPaddedThreads);
+  const auto required_registers =
+      static_cast<__int128>(112) +
+      (params.is_circular_buffer_regs_cached
+           ? buffer_registers(buffers.circular_buffered_smem_size_bit) * unroll
+           : 0) +
+      (params.is_non_circular_buffer_gmem_to_regs
+           ? buffer_registers(buffers.non_circular_buffered_smem_size_bit)
+           : 0) +
+      buffer_registers(buffers.regs_buffer_size_bit);
+  if (required_registers > compute_branch_registers) {
+    return std::nullopt;
+  }
+  return WarpSpecializedPlanMeasurements{
+      bdimx, groups, circular.stage, total_threads, available};
+}
+
+bool hardValidMultiWavePlan(
+    const ReductionParams& params,
+    const inner_outer_utils::PersistentBufferStorageParams& buffers) {
+  const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto& launch = params.lparams;
+  const auto smem_bits =
+      static_cast<__int128>(buffers.smem_buffer_size_bit) +
+      buffers.smem_overhead_bit;
+  return buffers.has_enough_regs_and_smem &&
+      buffers.smem_buffer_size_bit >= 0 && buffers.smem_overhead_bit >= 0 &&
+      smem_bits <= static_cast<__int128>(dev_prop->sharedMemPerBlockOptin) * 8 &&
+      launch.nThreads() <= dev_prop->maxThreadsPerBlock &&
+      launch.bdimx() <= dev_prop->maxThreadsDim[0] &&
+      launch.bdimy() <= dev_prop->maxThreadsDim[1] &&
+      launch.gdimy() <= dev_prop->maxGridSize[1] &&
+      params.cparams.maxrregcount > 0 &&
+      params.cparams.maxrregcount <=
+          scheduler_utils::max_registers_per_thread;
 }
 
 std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
@@ -155,9 +277,76 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
     return std::make_unique<ReductionParams>(
         InnerOuterPersistentKernelScheduler::schedulerType());
   };
-  if (user_enforced_warp_specialization ||
-      preferWarpSpecialized(
-          fusion, properties.total_iteration_numel, n_inner_reduction_tvs)) {
+  std::optional<inner_outer_utils::PersistentBufferStorageParams>
+      multiwave_buffer_params;
+  auto multiwaveBuffers = [&]()
+      -> const inner_outer_utils::PersistentBufferStorageParams& {
+    if (!multiwave_buffer_params) {
+      multiwave_buffer_params.emplace(
+          inner_outer_utils::getPersistentBufferStorageParams(
+              fusion,
+              runtime_info,
+              data_cache,
+              reduction_tvs,
+              vectorize_factor,
+              threads_per_block_min,
+              threads_per_block_max,
+              /*is_warp_specialized=*/false));
+    }
+    return *multiwave_buffer_params;
+  };
+  auto makeMultiWave = [&](const auto& buffers, bool enable_jev_choice) {
+    auto params = makeRParams();
+    params->smem_persistent_buffers = buffers.smem_persistent_buffers;
+    inner_outer_multi_wave::getHeuristics(
+        params.get(),
+        properties.total_iteration_numel,
+        properties.total_reduction_numel,
+        buffers.regs_buffer_size_bit,
+        buffers.smem_buffer_size_bit,
+        buffers.smem_overhead_bit,
+        max_outer_reduction_dtype_size_bit,
+        vectorize_factor,
+        threads_per_block_min,
+        threads_per_block_max,
+        buffers.project_to_input,
+        runtime_info.getIndexType(),
+        enable_jev_choice);
+    return params;
+  };
+  auto makeWarpSpecialized =
+      [&](const auto& buffers,
+          bool enable_debug_dump,
+          bool enable_jev_choice) {
+    auto params = makeRParams();
+    params->smem_persistent_buffers = buffers.smem_persistent_buffers;
+    inner_outer_tma_warp_specialized::getHeuristics(
+        params.get(),
+        properties.total_iteration_numel,
+        properties.total_reduction_numel,
+        buffers.regs_buffer_size_bit,
+        buffers.circular_buffered_smem_size_bit,
+        buffers.non_circular_buffered_smem_size_bit,
+        max_outer_reduction_dtype_size_bit,
+        vectorize_factor,
+        threads_per_block_min,
+        threads_per_block_max,
+        buffers.project_to_input,
+        runtime_info.getIndexType(),
+        enable_debug_dump,
+        enable_jev_choice);
+    return params;
+  };
+
+  const auto jev_mode = scheduler::jev::mode();
+  const bool attempt_ws = user_enforced_warp_specialization ||
+      (jev_mode == scheduler::jev::Mode::Off
+           ? preferWarpSpecialized(
+                 fusion,
+                 properties.total_iteration_numel,
+                 n_inner_reduction_tvs)
+           : canTryWarpSpecialized(fusion));
+  if (attempt_ws) {
     auto buffer_params = inner_outer_utils::getPersistentBufferStorageParams(
         fusion,
         runtime_info,
@@ -183,62 +372,128 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
                         buffer, runtime_info, persistent_buffer_info);
                 return buffer_size_regs_bit % 128 == 0;
               })) {
-        auto rparams = makeRParams();
-        rparams->smem_persistent_buffers =
-            buffer_params.smem_persistent_buffers;
+        const bool execute_ws_now =
+            jev_mode == scheduler::jev::Mode::Off ||
+            user_enforced_warp_specialization;
+        auto rparams = makeWarpSpecialized(
+            buffer_params, execute_ws_now, execute_ws_now);
 
-        inner_outer_tma_warp_specialized::getHeuristics(
-            rparams.get(),
-            properties.total_iteration_numel,
-            properties.total_reduction_numel,
-            buffer_params.regs_buffer_size_bit,
-            buffer_params.circular_buffered_smem_size_bit,
-            buffer_params.non_circular_buffered_smem_size_bit,
-            max_outer_reduction_dtype_size_bit,
-            vectorize_factor,
-            threads_per_block_min,
-            threads_per_block_max,
-            buffer_params.project_to_input,
-            runtime_info.getIndexType());
-
-        // If warp specialized is enabled, or the heuristic is successful,
-        // return
-        if (user_enforced_warp_specialization ||
-            rparams->is_good_ws_heuristic) {
+        // A user override is an explicit instruction, not a model choice.
+        if (user_enforced_warp_specialization) {
           return rparams;
+        }
+        if (jev_mode == scheduler::jev::Mode::Off) {
+          if (rparams->is_good_ws_heuristic) {
+            return rparams;
+          }
+        } else {
+          const bool native_ws =
+              jev_mode == scheduler::jev::Mode::Record &&
+              preferWarpSpecialized(
+                  fusion,
+                  properties.total_iteration_numel,
+                  n_inner_reduction_tvs) &&
+              rparams->is_good_ws_heuristic;
+          const auto ws_measurements = hardValidWarpSpecializedPlan(
+              *rparams,
+              buffer_params,
+              properties.total_reduction_numel,
+              max_outer_reduction_dtype_size_bit,
+              vectorize_factor);
+          if (!ws_measurements) {
+            if (native_ws) {
+              scheduler::jev::recordCoverageSkip(
+                  "IOP1.mode", "native WS plan fails conservative hard bounds");
+              return makeWarpSpecialized(
+                  buffer_params, /*debug=*/true, /*choice=*/true);
+            }
+            NVF_ERROR(
+                jev_mode != scheduler::jev::Mode::Remote,
+                "No hard-valid IOP1 warp-specialized alternative");
+          } else {
+            // Build a complete native multiwave preview. Its constructor does
+            // not touch Fusion; disable only its nested IOP3 Choice and debug
+            // output. Once IOP1 chooses multiwave, run it normally so IOP3 is
+            // logged only for the executed branch.
+            const auto& multiwave_buffers = multiwaveBuffers();
+            bool multiwave_valid = false;
+            if (multiwave_buffers.has_enough_regs_and_smem) {
+              try {
+                auto preview = makeMultiWave(
+                    multiwave_buffers, /*enable_jev_choice=*/false);
+                multiwave_valid =
+                    hardValidMultiWavePlan(*preview, multiwave_buffers);
+              } catch (const std::exception&) {
+                // An unconstructible plan is never offered to the model.
+              }
+            }
+            if (!multiwave_valid) {
+              if (jev_mode == scheduler::jev::Mode::Record) {
+                scheduler::jev::recordCoverageSkip(
+                    "IOP1.mode", "multiwave preflight fails hard bounds");
+                if (native_ws) {
+                  return makeWarpSpecialized(
+                      buffer_params, /*debug=*/true, /*choice=*/true);
+                }
+              }
+              NVF_ERROR(false, "No hard-valid IOP1 multiwave alternative");
+            }
+
+            const auto& ws = *ws_measurements;
+            const std::string state =
+                "inner_outer.mode.v1\niteration_numel=" +
+                std::to_string(properties.total_iteration_numel) +
+                "\ninner_reduction_tvs=" +
+                std::to_string(n_inner_reduction_tvs) + "\nsm_count=" +
+                std::to_string(
+                    at::cuda::getCurrentDeviceProperties()->multiProcessorCount) +
+                "\ninner_dim_numel=" +
+                std::to_string(properties.total_reduction_numel) +
+                "\nvector_width=" + std::to_string(vectorize_factor) +
+                "\nws_bdimx=" + std::to_string(ws.compute_bdimx) +
+                "\nws_computation_groups=" +
+                std::to_string(ws.computation_groups) + "\nws_stages=" +
+                std::to_string(ws.stages) + "\nws_total_threads=" +
+                std::to_string(ws.total_threads) +
+                "\nws_available_registers_per_thread=" +
+                std::to_string(ws.available_registers_per_thread) +
+                "\nws_non_circular_gmem_to_regs=" +
+                std::to_string(rparams->is_non_circular_buffer_gmem_to_regs) +
+                "\nws_non_circular_buffer_bits=" +
+                std::to_string(
+                    buffer_params.non_circular_buffered_smem_size_bit) +
+                "\nws_register_buffer_bits=" +
+                std::to_string(buffer_params.regs_buffer_size_bit);
+            const std::vector<scheduler::jev::ChoiceOption> options = {
+                {"multiwave", "Use the complete multiwave persistent plan"},
+                {"ws", "Use the complete TMA warp-specialized persistent plan"}};
+            const std::string selected = scheduler::jev::chooseDecision(
+                "IOP1.mode",
+                state,
+                options,
+                jev_mode == scheduler::jev::Mode::Record
+                    ? (native_ws ? "ws" : "multiwave")
+                    : "");
+            if (selected == "ws") {
+              auto selected_ws = makeWarpSpecialized(
+                  buffer_params, /*debug=*/true, /*choice=*/true);
+              if (jev_mode == scheduler::jev::Mode::Remote &&
+                  !selected_ws->is_good_ws_heuristic) {
+                selected_ws->tag =
+                    "TMA Warp Specialized Persistent Heuristic "
+                    "(IOP1 Choice selected despite native quality estimate).\n";
+              }
+              return selected_ws;
+            }
+            return makeMultiWave(multiwave_buffers, /*enable_jev_choice=*/true);
+          }
         }
       }
     }
   }
 
   // Fallback to multi-wave
-  auto buffer_params = inner_outer_utils::getPersistentBufferStorageParams(
-      fusion,
-      runtime_info,
-      data_cache,
-      reduction_tvs,
-      vectorize_factor,
-      threads_per_block_min,
-      threads_per_block_max,
-      /*is_warp_specialized=*/false);
-  auto rparams = makeRParams();
-  rparams->smem_persistent_buffers = buffer_params.smem_persistent_buffers;
-
-  inner_outer_multi_wave::getHeuristics(
-      rparams.get(),
-      properties.total_iteration_numel,
-      properties.total_reduction_numel,
-      buffer_params.regs_buffer_size_bit,
-      buffer_params.smem_buffer_size_bit,
-      buffer_params.smem_overhead_bit,
-      max_outer_reduction_dtype_size_bit,
-      vectorize_factor,
-      threads_per_block_min,
-      threads_per_block_max,
-      buffer_params.project_to_input,
-      runtime_info.getIndexType());
-
-  return rparams;
+  return makeMultiWave(multiwaveBuffers(), /*enable_jev_choice=*/true);
 }
 
 } // namespace
