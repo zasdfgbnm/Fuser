@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "fusion.h"
+#include "scheduler/bounded_snapshot_stream.h"
 #include "scheduler/runtime_info.h"
 
 // A passive, deterministic description of the inputs visible at the entry to
@@ -25,6 +26,7 @@ namespace nvfuser::scheduler::compute_invocation_input {
 
 enum class UnavailableReason {
   None,
+  NotCaptured,
   NullFusion,
   TooManyInputs,
   FusionTextTooLarge,
@@ -39,6 +41,7 @@ enum class UnavailableReason {
 inline const char* reasonName(UnavailableReason reason) noexcept {
   switch (reason) {
     case UnavailableReason::None: return "none";
+    case UnavailableReason::NotCaptured: return "not_captured";
     case UnavailableReason::NullFusion: return "null_fusion";
     case UnavailableReason::TooManyInputs: return "too_many_inputs";
     case UnavailableReason::FusionTextTooLarge: return "fusion_text_too_large";
@@ -55,10 +58,10 @@ inline const char* reasonName(UnavailableReason reason) noexcept {
 
 struct Snapshot {
   std::string text;
-  UnavailableReason reason = UnavailableReason::None;
+  UnavailableReason reason = UnavailableReason::NotCaptured;
 
   bool available() const noexcept {
-    return reason == UnavailableReason::None;
+    return reason == UnavailableReason::None && !text.empty();
   }
 };
 
@@ -109,27 +112,32 @@ inline Snapshot capture(Fusion* fusion, SchedulerRuntimeInfo& runtime_info)
       return {{}, UnavailableReason::TooManyInputs};
     }
 
-    std::ostringstream fusion_stream;
+    BoundedSnapshotBuffer fusion_buffer(kMaxTextBytes);
+    std::ostream fusion_stream(&fusion_buffer);
     fusion_stream.imbue(std::locale::classic());
     fusion->print(fusion_stream, false);
+    if (fusion_buffer.truncated()) {
+      return {{}, UnavailableReason::FusionTextTooLarge};
+    }
     if (!fusion_stream.good()) {
       return {{}, UnavailableReason::FormattingFailed};
     }
-    const std::string fusion_text = fusion_stream.str();
-    if (fusion_text.size() > kMaxTextBytes) {
-      return {{}, UnavailableReason::FusionTextTooLarge};
-    }
+    const std::string_view fusion_text = fusion_buffer.view();
     if (containsPointerLikeValue(fusion_text)) {
       return {{}, UnavailableReason::FusionTextContainsPointerLikeValue};
     }
 
-    std::ostringstream out;
+    BoundedSnapshotBuffer snapshot_buffer(kMaxTextBytes);
+    std::ostream out(&snapshot_buffer);
     out.imbue(std::locale::classic());
     out << "nvfuser.compute_invocation_input.v1\nfusion ";
     appendSized(out, fusion_text);
     out << "\nindex_type "
         << static_cast<int64_t>(runtime_info.getIndexType()) << "\ninputs "
         << fusion->inputs().size();
+    if (snapshot_buffer.truncated()) {
+      return {{}, UnavailableReason::SnapshotTooLarge};
+    }
 
     size_t index = 0;
     for (Val* input : fusion->inputs()) {
@@ -191,19 +199,19 @@ inline Snapshot capture(Fusion* fusion, SchedulerRuntimeInfo& runtime_info)
         }
       }
       if (!out.good()) {
+        if (snapshot_buffer.truncated()) {
+          return {{}, UnavailableReason::SnapshotTooLarge};
+        }
         return {{}, UnavailableReason::FormattingFailed};
       }
-      if (out.tellp() > static_cast<std::streampos>(kMaxTextBytes)) {
-        return {{}, UnavailableReason::SnapshotTooLarge};
-      }
+    }
+    if (snapshot_buffer.truncated()) {
+      return {{}, UnavailableReason::SnapshotTooLarge};
     }
     if (!out.good()) {
       return {{}, UnavailableReason::FormattingFailed};
     }
-    std::string text = out.str();
-    if (text.size() > kMaxTextBytes) {
-      return {{}, UnavailableReason::SnapshotTooLarge};
-    }
+    std::string text = std::move(snapshot_buffer).take();
     return {std::move(text), UnavailableReason::None};
   } catch (...) {
     return {{}, UnavailableReason::FormattingFailed};

@@ -1112,6 +1112,14 @@ if(BUILD_TEST)
   set_property(TARGET test_jev_client_standalone PROPERTY CXX_STANDARD ${NVFUSER_CPP_STANDARD})
   list(APPEND TEST_BINARIES test_jev_client_standalone)
 
+  add_executable(test_bounded_snapshot_stream_standalone
+    ${NVFUSER_ROOT}/tests/cpp/test_bounded_snapshot_stream_standalone.cpp)
+  target_include_directories(test_bounded_snapshot_stream_standalone PRIVATE
+    ${NVFUSER_SRCS_DIR})
+  set_property(TARGET test_bounded_snapshot_stream_standalone PROPERTY
+    CXX_STANDARD ${NVFUSER_CPP_STANDARD})
+  list(APPEND TEST_BINARIES test_bounded_snapshot_stream_standalone)
+
   # These run an existing scheduler GTest and compare kernel output with a
   # numerical reference. They are a focused smoke suite, not the full nvFuser
   # test inventory. A resource lock keeps GPU work serial even with ctest -j.
