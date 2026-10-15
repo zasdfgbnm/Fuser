@@ -547,7 +547,11 @@ uint64_t ComputeHeuristicsScope::nextEventIndex() noexcept {
 
 void ComputeHeuristicsScope::write(
     std::string_view kind,
-    std::string_view scheduler_type) noexcept {
+    std::string_view scheduler_type,
+    std::string_view site,
+    std::string_view selected,
+    std::string_view reason,
+    std::string_view selection_source) noexcept {
   try {
     native_diagnostic::Object row;
     row.add("schema", kComputeInvocationSchema);
@@ -569,10 +573,39 @@ void ComputeHeuristicsScope::write(
       }
     } else if (kind == "final") {
       row.add("scheduler_type", scheduler_type);
+    } else if (kind == "no_choice") {
+      row.add("site", site);
+      row.add("selected", selected);
+      row.add("reason", reason);
+      row.add("selection_source", selection_source);
     }
     native_diagnostic::appendLine(row.str());
   } catch (...) {
     // A missing row is detected by the strict offline trace reader.
+  }
+}
+
+void ComputeHeuristicsScope::recordNoChoice(
+    std::string_view site,
+    std::string_view selected,
+    std::string_view reason,
+    std::string_view selection_source) noexcept {
+  if (!observing() || site.empty() || selected.empty() || reason.empty() ||
+      selection_source.empty()) {
+    return;
+  }
+  ++event_index_;
+  write("no_choice", {}, site, selected, reason, selection_source);
+}
+
+void recordNoChoiceDecision(
+    std::string_view site,
+    std::string_view selected,
+    std::string_view reason,
+    std::string_view selection_source) noexcept {
+  if (active_compute_scope != nullptr) {
+    active_compute_scope->recordNoChoice(
+        site, selected, reason, selection_source);
   }
 }
 

@@ -115,8 +115,18 @@ int main() {
     require(!scope.recording(), "off mode enabled Pointwise diagnostics");
     scope.complete("ordinary", "{}", "{}", "{}");
   }
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope("off input", {});
+    require(!scope.observing(), "off mode enabled compute observation");
+    nvfuser::scheduler::jev::recordNoChoiceDecision(
+        "RD5.work_split", "unroll_first", "equal_work_factors",
+        "native_unroll_first_branch");
+    scope.complete("Reduction");
+  }
   require(chooseDecision("PW2", state, options, "bp0") == "bp0", "off mode changed choice");
-  require(readFile(path).empty(), "off mode wrote a record");
+  require(readFile(path).empty() &&
+              readFile(std::string(path) + ".outcome.jsonl").empty(),
+          "off mode wrote a record");
 
   ::setenv("NVFUSER_JEV_MODE", "record", 1);
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Record,
@@ -237,6 +247,36 @@ int main() {
                   std::string::npos &&
               compute_choices.find("outer input") == std::string::npos,
           "generic compute IDs or snapshot isolation changed the Choice log");
+  // A structural no-choice event occupies the same compute sequence but only
+  // the outcome stream. It must not become a Choice or HTTP request.
+  const std::string decisions_before_no_choice = readFile(path);
+  std::string no_choice_id;
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope("no-choice input", {});
+    no_choice_id = scope.invocationId();
+    nvfuser::scheduler::jev::recordNoChoiceDecision(
+        "RD3.remainder_x", "x128", "single_cta_width", "native_remainder_scan");
+    nvfuser::scheduler::jev::recordNoChoiceDecision(
+        "RD3.remainder_u", "u1", "single_cta_width", "native_remainder_scan");
+    scope.complete("Reduction");
+  }
+  const std::string no_choice_trace = readFile(compute_path);
+  require(readFile(path) == decisions_before_no_choice &&
+              no_choice_trace.find("\"kind\":\"no_choice\",\"mode\":\"record\"") !=
+                  std::string::npos &&
+              no_choice_trace.find(
+                  "\"compute_invocation_id\":\"" + no_choice_id +
+                  "\",\"compute_event_index\":1,\"site\":\"RD3.remainder_x\",\"selected\":\"x128\",\"reason\":\"single_cta_width\",\"selection_source\":\"native_remainder_scan\"") !=
+                  std::string::npos &&
+              no_choice_trace.find(
+                  "\"compute_invocation_id\":\"" + no_choice_id +
+                  "\",\"compute_event_index\":2,\"site\":\"RD3.remainder_u\",\"selected\":\"u1\"") !=
+                  std::string::npos &&
+              no_choice_trace.find(
+                  "\"compute_invocation_id\":\"" + no_choice_id +
+                  "\",\"compute_event_index\":3,\"scheduler_type\":\"Reduction\"") !=
+                  std::string::npos,
+          "deterministic Record events changed Choice or compute sequencing");
   ::unsetenv("NVFUSER_JEV_CASE_KEY");
   const std::string before_link = readFile(path);
 
@@ -319,6 +359,30 @@ int main() {
                   "\",\"compute_event_index\":2,\"scheduler_type\":\"PointWise\"") !=
                   std::string::npos,
           "remote Choice and compute outcome cannot join");
+  const std::string remote_decisions_before_no_choice = readFile(path);
+  std::string remote_no_choice_id;
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "remote no-choice input", {});
+    remote_no_choice_id = scope.invocationId();
+    nvfuser::scheduler::jev::recordNoChoiceDecision(
+        "RD3.remainder_x", "x64", "single_cta_width", "remote_remainder_seed");
+    scope.complete("Reduction");
+  }
+  const std::string remote_no_choice_trace = readFile(compute_path);
+  require(readFile(path) == remote_decisions_before_no_choice &&
+              remote_no_choice_trace.find(
+                  "\"kind\":\"no_choice\",\"mode\":\"remote\"") !=
+                  std::string::npos &&
+              remote_no_choice_trace.find(
+                  "\"compute_invocation_id\":\"" + remote_no_choice_id +
+                  "\",\"compute_event_index\":1,\"site\":\"RD3.remainder_x\",\"selected\":\"x64\",\"reason\":\"single_cta_width\",\"selection_source\":\"remote_remainder_seed\"") !=
+                  std::string::npos &&
+              remote_no_choice_trace.find(
+                  "\"compute_invocation_id\":\"" + remote_no_choice_id +
+                  "\",\"compute_event_index\":2,\"scheduler_type\":\"Reduction\"") !=
+                  std::string::npos,
+          "deterministic Remote event changed Choice or compute sequencing");
   {
     FakeServer server(answer("bp2"));
     ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);

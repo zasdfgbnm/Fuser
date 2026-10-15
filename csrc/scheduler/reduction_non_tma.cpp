@@ -643,7 +643,9 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // remove quantization effect. e.g. at 20736, vect = 8, bdimx = 512, unroll =
   // 5, then iteration = 1.01, the 2nd iteration only has 1% effective threads.
   // Check all possible bdimx and unroll, choose the one with smallest remainder
-  if (getInnerRemainder() > 1) {
+  const bool remainder_scan_needed = getInnerRemainder() > 1;
+  std::string_view remainder_no_choice_reason;
+  if (remainder_scan_needed) {
     const int64_t seed_bdimx = bdimx;
     if (jev_mode != scheduler::jev::Mode::Remote) {
       int64_t after_vect_bdimx = ceilDiv(after_vect, bdimx);
@@ -726,7 +728,39 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
             bdimx >= 1 && bdimx <= target_threads_per_block &&
                 inner_unroll >= 1 && inner_unroll <= target_inner_unroll,
             "RD3 remainder plan exceeds native CTA or reduction bounds");
+      } else {
+        remainder_no_choice_reason = "single_cta_width";
       }
+    } else if (jev_mode != scheduler::jev::Mode::Off) {
+      remainder_no_choice_reason = target_inner_unroll < 2
+          ? "inner_unroll_target_below_two"
+          : "cta_target_below_four_warps";
+    }
+  } else if (jev_mode != scheduler::jev::Mode::Off) {
+    remainder_no_choice_reason = "reduction_covered_before_remainder_scan";
+  }
+  if (jev_mode != scheduler::jev::Mode::Off &&
+      !remainder_no_choice_reason.empty()) {
+    // Record has the native scan result; Remote has only its actual seed when
+    // no menu was offered. Keep those origins distinct in the outcome log.
+    const std::string_view selection_source = !remainder_scan_needed
+        ? "initial_remainder_plan"
+        : (jev_mode == scheduler::jev::Mode::Record
+               ? "native_remainder_scan"
+               : "remote_remainder_seed");
+    try {
+      scheduler::jev::recordNoChoiceDecision(
+          "RD3.remainder_x",
+          "x" + std::to_string(bdimx),
+          remainder_no_choice_reason,
+          selection_source);
+      scheduler::jev::recordNoChoiceDecision(
+          "RD3.remainder_u",
+          "u" + std::to_string(inner_unroll),
+          remainder_no_choice_reason,
+          selection_source);
+    } catch (...) {
+      // Passive outcome observation cannot change scheduling.
     }
   }
 
@@ -1375,6 +1409,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   // produce distinct physical x dimensions. The ordinary native loop above
   // stays exact in Off and Record modes.
   bool iteration_first = false;
+  std::string_view work_split_no_choice_reason;
   if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
       target_unroll != target_iterations && min_warp_size >= 1 &&
       min_warp_size <= 16) {
@@ -1433,7 +1468,25 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         std::swap(target_unroll, target_iterations);
         iteration_first = true;
       }
+    } else {
+      work_split_no_choice_reason = !native_safe
+          ? "native_plan_not_preflighted"
+          : (!alternate_safe ? "alternate_plan_not_preflighted"
+                             : "same_physical_grid_x");
     }
+  } else if (jev_mode_warp != scheduler::jev::Mode::Off) {
+    work_split_no_choice_reason = !bounded_warp_input
+        ? "outside_bounded_warp_domain"
+        : (target_unroll == target_iterations
+               ? "equal_work_factors"
+               : "logical_warp_outside_preflight_range");
+  }
+  if (!work_split_no_choice_reason.empty()) {
+    scheduler::jev::recordNoChoiceDecision(
+        "RD5.work_split",
+        "unroll_first",
+        work_split_no_choice_reason,
+        "native_unroll_first_branch");
   }
 
   // The wave cap couples the block count and the per-CTA SM thread budget.

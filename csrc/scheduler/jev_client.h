@@ -44,10 +44,12 @@ void recordCoverageSkip(
     std::string_view case_key = {});
 
 // A passive span around one computeHeuristics call in Record/Remote mode.
-// Begin/final rows go to the separate native outcome JSONL; Choice and
-// coverage rows carry the same compute_invocation_id and an increasing
-// compute_event_index. The entry snapshot is owned by the caller and must
-// outlive this scope. An exception leaves the invocation without a final row.
+// Begin/final/no_choice rows go to the separate native outcome JSONL; Choice
+// and coverage rows carry the same compute_invocation_id and an increasing
+// compute_event_index. A no_choice row records the actual selected value when
+// a structural gate leaves no model menu; it is never a Choice or HTTP event.
+// The entry snapshot is owned by the caller and must outlive this scope. An
+// exception leaves the invocation without a final row.
 bool computeTraceEnabled() noexcept;
 class ComputeHeuristicsScope final {
  public:
@@ -61,10 +63,21 @@ class ComputeHeuristicsScope final {
   bool observing() const noexcept;
   std::string_view invocationId() const noexcept;
   uint64_t nextEventIndex() noexcept;
+  void recordNoChoice(
+      std::string_view site,
+      std::string_view selected,
+      std::string_view reason,
+      std::string_view selection_source) noexcept;
   void complete(std::string_view scheduler_type) noexcept;
 
  private:
-  void write(std::string_view kind, std::string_view scheduler_type = {}) noexcept;
+  void write(
+      std::string_view kind,
+      std::string_view scheduler_type = {},
+      std::string_view site = {},
+      std::string_view selected = {},
+      std::string_view reason = {},
+      std::string_view selection_source = {}) noexcept;
 
   ComputeHeuristicsScope* previous_ = nullptr;
   std::string_view input_snapshot_;
@@ -76,6 +89,14 @@ class ComputeHeuristicsScope final {
   bool active_ = false;
   bool completed_ = false;
 };
+
+// Passive observation inside the active computeHeuristics scope. Diagnostics
+// may be absent on write failure but can never affect a schedule or API call.
+void recordNoChoiceDecision(
+    std::string_view site,
+    std::string_view selected,
+    std::string_view reason,
+    std::string_view selection_source) noexcept;
 
 // Pointwise Record uses a separate outcome JSONL so the existing Choice-only
 // decision log and its record/remote comparator keep their wire contract.
