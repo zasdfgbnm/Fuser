@@ -13,6 +13,7 @@
 #include <ir/utils.h>
 #include <ops/all_ops.h>
 #include <runtime/executor.h>
+#include <runtime/fusion_kernel_runtime.h>
 #include <scheduler/all_schedulers.h>
 
 #include <benchmark/benchmark.h>
@@ -79,6 +80,32 @@ static void NvFuserScheduler_RMSNorm(
   at::Tensor weight = at::randn({input_shape[1]}, options);
 
   KernelArgumentHolder args({input, weight});
+
+  // c24 must exercise one automatic InnerPersistent plan and produce the
+  // weighted RMSNorm result before any timed iterations are collected.
+  if (dtype == DataType::Float && input_shape[0] == 128 &&
+      input_shape[1] == 8192) {
+    auto outputs = executor_cache->runFusionWithInputs(args);
+    auto* runtime = executor_cache->getMostRecentKernelRuntime();
+    NVF_ERROR(runtime != nullptr && !runtime->isSegmented());
+    const auto& heuristics = runtime->schedulerHeuristics()->heuristicsList();
+    NVF_ERROR(heuristics.size() == 1 && heuristics.front() != nullptr);
+    NVF_ERROR(
+        heuristics.front()->scheduler_type == SchedulerType::InnerPersistent,
+        "Expected one InnerPersistent scheduler for c24 RMSNorm");
+    NVF_ERROR(outputs.size() == 1);
+
+    auto x = input.to(at::kDouble);
+    auto w = weight.to(at::kDouble);
+    auto mean_square = at::pow(x, 2).mean(std::vector<int64_t>{1}, true);
+    auto reference =
+        (x * at::pow(mean_square + 1e-6, -0.5) * w).to(at::kFloat);
+    NVF_ERROR(
+        at::allclose(
+            outputs[0].as<at::Tensor>(), reference, 1e-4, 1e-5, false),
+        "c24 RMSNorm output differs from the double-precision ATen "
+        "reference");
+  }
 
   runBenchmarkIterations(benchmark_state, executor_cache, args);
 
