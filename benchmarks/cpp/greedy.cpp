@@ -110,7 +110,7 @@ void runGreedyScanAdd(
   NVF_ERROR(outputs.size() == 1, "Expected one Scan+Add output");
   auto reference = input.cumsum(-1) + 1.0;
   NVF_ERROR(
-      at::equal(outputs.front().as<at::Tensor>(), reference),
+      at::equal(outputs[0].as<at::Tensor>(), reference),
       "Greedy Scan+Add differs from ATen");
   assertSingleGreedySchedule(executor_cache, "Greedy ScanAdd");
 
@@ -146,9 +146,9 @@ void runGreedyArgsortAdd(
 
   auto outputs = executor_cache->runFusionWithInputs(args);
   NVF_ERROR(outputs.size() == 1, "Expected one Argsort+Add output");
-  auto reference = input.argsort(-1) + 1;
+  auto reference = input.argsort(-1, false) + 1;
   NVF_ERROR(
-      at::equal(outputs.front().as<at::Tensor>(), reference),
+      at::equal(outputs[0].as<at::Tensor>(), reference),
       "Greedy Argsort+Add differs from ATen");
   assertSingleGreedySchedule(executor_cache, "Greedy ArgsortAdd");
 
@@ -190,7 +190,7 @@ void runGreedyScatterPermutation(
   // independently of an ATen Scatter implementation.
   auto reference = at::remainder((positions - 19) * 941, kColumns);
   NVF_ERROR(
-      at::equal(outputs.front().as<at::Tensor>(), reference),
+      at::equal(outputs[0].as<at::Tensor>(), reference),
       "Greedy Scatter permutation differs from the inverse permutation");
   assertSingleGreedySchedule(executor_cache, "Greedy ScatterPermutation");
 
