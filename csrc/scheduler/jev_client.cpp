@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include <scheduler/jev_client.h>
 
+#include <scheduler/native_diagnostic_jsonl.h>
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -20,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <map>
 #include <mutex>
@@ -38,6 +41,11 @@ constexpr size_t kMaxHeaders = 8 * 1024;
 constexpr auto kTimeout = std::chrono::milliseconds(2000);
 constexpr std::string_view kPointwiseOutcomeSchema =
     "nvfuser.jev.pointwise.outcome.v1";
+constexpr std::string_view kComputeInvocationSchema =
+    "nvfuser.jev.compute_invocation.v1";
+
+thread_local ComputeHeuristicsScope* active_compute_scope = nullptr;
+std::atomic<uint64_t> next_compute_invocation{0};
 
 struct ActiveInvocation {
   std::string id;
@@ -482,6 +490,114 @@ std::string jsonQuote(std::string_view value) {
   return quote(value);
 }
 
+bool computeTraceEnabled() noexcept {
+  try {
+    const std::string_view configured = native_diagnostic::logMode();
+    if ((configured != "record" && configured != "remote") ||
+        !native_diagnostic::enabled()) {
+      return false;
+    }
+    const std::string decision_path = env("NVFUSER_JEV_LOG");
+    return !decision_path.empty() &&
+        native_diagnostic::logPath() != decision_path;
+  } catch (...) {
+    return false;
+  }
+}
+
+ComputeHeuristicsScope::ComputeHeuristicsScope(
+    std::string_view input_snapshot,
+    std::string_view input_snapshot_unavailable_reason) noexcept
+    : previous_(active_compute_scope),
+      input_snapshot_(input_snapshot),
+      input_snapshot_unavailable_reason_(input_snapshot_unavailable_reason) {
+  // A disabled nested call still shadows its parent invocation.
+  active_compute_scope = this;
+  if (!computeTraceEnabled()) return;
+  try {
+    mode_ = native_diagnostic::logMode();
+    case_key_ = env("NVFUSER_JEV_CASE_KEY");
+    invocation_id_ = std::to_string(::getpid()) + "-compute-" +
+        std::to_string(
+            next_compute_invocation.fetch_add(1, std::memory_order_relaxed) +
+            1);
+    active_ = true;
+    write("begin");
+  } catch (...) {
+    // Observation cannot change the native scheduler or its exceptions.
+    active_ = false;
+  }
+}
+
+ComputeHeuristicsScope::~ComputeHeuristicsScope() noexcept {
+  if (active_compute_scope == this) active_compute_scope = previous_;
+}
+
+bool ComputeHeuristicsScope::observing() const noexcept {
+  return active_compute_scope == this && active_ && !completed_;
+}
+
+std::string_view ComputeHeuristicsScope::invocationId() const noexcept {
+  return observing() ? std::string_view(invocation_id_) : std::string_view{};
+}
+
+uint64_t ComputeHeuristicsScope::nextEventIndex() noexcept {
+  return observing() ? ++event_index_ : 0;
+}
+
+void ComputeHeuristicsScope::write(
+    std::string_view kind,
+    std::string_view scheduler_type) noexcept {
+  try {
+    native_diagnostic::Object row;
+    row.add("schema", kComputeInvocationSchema);
+    row.add("kind", kind);
+    row.add("mode", mode_);
+    row.add("case_key", case_key_);
+    row.add("compute_invocation_id", invocation_id_);
+    row.addRaw("compute_event_index", std::to_string(event_index_));
+    if (kind == "begin") {
+      if (input_snapshot_unavailable_reason_.empty() &&
+          !input_snapshot_.empty()) {
+        row.add("input_snapshot", input_snapshot_);
+      } else {
+        row.add(
+            "input_snapshot_unavailable_reason",
+            input_snapshot_unavailable_reason_.empty()
+                ? std::string_view("not_captured")
+                : input_snapshot_unavailable_reason_);
+      }
+    } else if (kind == "final") {
+      row.add("scheduler_type", scheduler_type);
+    }
+    native_diagnostic::appendLine(row.str());
+  } catch (...) {
+    // A missing row is detected by the strict offline trace reader.
+  }
+}
+
+void ComputeHeuristicsScope::complete(std::string_view scheduler_type) noexcept {
+  if (!observing() || std::uncaught_exceptions() != 0) return;
+  ++event_index_;
+  completed_ = true;
+  write("final", scheduler_type);
+}
+
+namespace {
+struct ComputeEvent {
+  std::string_view invocation_id;
+  uint64_t index = 0;
+};
+
+ComputeEvent nextComputeEvent() noexcept {
+  if (active_compute_scope == nullptr || !active_compute_scope->observing())
+    return {};
+  return {
+      active_compute_scope->invocationId(),
+      active_compute_scope->nextEventIndex()};
+}
+} // namespace
+
 PointwiseRecordScope::PointwiseRecordScope() {
   if (mode() != Mode::Record) return;
   if (env("NVFUSER_JEV_LOG").empty())
@@ -600,10 +716,17 @@ std::string chooseDecision(
   const auto event_index = active_invocation.id.empty()
       ? uint64_t{0}
       : ++active_invocation.event_index;
+  const auto compute_event = nextComputeEvent();
   appendLog("{\"site\":" + quote(site) + ",\"case_key\":" + quote(log_case_key) +
       (active_invocation.id.empty() ? std::string()
                                     : ",\"invocation_id\":" + quote(active_invocation.id) +
                                           ",\"event_index\":" + std::to_string(event_index)) +
+      (compute_event.invocation_id.empty()
+           ? std::string()
+           : ",\"compute_invocation_id\":" +
+                 quote(compute_event.invocation_id) +
+                 ",\"compute_event_index\":" +
+                 std::to_string(compute_event.index)) +
       ",\"state\":" + quote(state) + ",\"candidates\":" + candidates +
       ",\"request\":" + request +
       ",\"selected\":" + quote(selected) + ",\"mode\":" +
@@ -624,8 +747,15 @@ void recordCoverageSkip(
       ? (active_invocation.id.empty() ? env("NVFUSER_JEV_CASE_KEY")
                                       : active_invocation.case_key)
       : std::string(case_key);
+  const auto compute_event = nextComputeEvent();
   appendLog("{\"kind\":\"coverage_skip\",\"site\":" + quote(site) +
       ",\"case_key\":" + quote(log_case_key) +
+      (compute_event.invocation_id.empty()
+           ? std::string()
+           : ",\"compute_invocation_id\":" +
+                 quote(compute_event.invocation_id) +
+                 ",\"compute_event_index\":" +
+                 std::to_string(compute_event.index)) +
       ",\"mode\":\"record\",\"reason\":" + quote(reason) + '}');
   if (!active_invocation.id.empty()) {
     const auto event_index = ++active_invocation.event_index;

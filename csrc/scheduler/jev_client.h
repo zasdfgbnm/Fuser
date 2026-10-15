@@ -43,6 +43,40 @@ void recordCoverageSkip(
     std::string_view reason,
     std::string_view case_key = {});
 
+// A passive span around one computeHeuristics call in Record/Remote mode.
+// Begin/final rows go to the separate native outcome JSONL; Choice and
+// coverage rows carry the same compute_invocation_id and an increasing
+// compute_event_index. The entry snapshot is owned by the caller and must
+// outlive this scope. An exception leaves the invocation without a final row.
+bool computeTraceEnabled() noexcept;
+class ComputeHeuristicsScope final {
+ public:
+  ComputeHeuristicsScope(
+      std::string_view input_snapshot,
+      std::string_view input_snapshot_unavailable_reason) noexcept;
+  ~ComputeHeuristicsScope() noexcept;
+  ComputeHeuristicsScope(const ComputeHeuristicsScope&) = delete;
+  ComputeHeuristicsScope& operator=(const ComputeHeuristicsScope&) = delete;
+
+  bool observing() const noexcept;
+  std::string_view invocationId() const noexcept;
+  uint64_t nextEventIndex() noexcept;
+  void complete(std::string_view scheduler_type) noexcept;
+
+ private:
+  void write(std::string_view kind, std::string_view scheduler_type = {}) noexcept;
+
+  ComputeHeuristicsScope* previous_ = nullptr;
+  std::string_view input_snapshot_;
+  std::string_view input_snapshot_unavailable_reason_;
+  std::string invocation_id_;
+  std::string case_key_;
+  std::string mode_;
+  uint64_t event_index_ = 0;
+  bool active_ = false;
+  bool completed_ = false;
+};
+
 // Pointwise Record uses a separate outcome JSONL so the existing Choice-only
 // decision log and its record/remote comparator keep their wire contract.
 // NVFUSER_JEV_POINTWISE_OUTCOME_LOG overrides the default

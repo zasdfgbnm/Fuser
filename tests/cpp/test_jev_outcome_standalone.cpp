@@ -50,6 +50,7 @@ int main() {
   assert(::setenv(diag::kDecisionLogEnvironment, decision_path, 1) == 0);
   assert(::setenv(diag::kModeEnvironment, "record", 1) == 0);
   assert(::setenv("NVFUSER_JEV_CASE_KEY", "case-1", 1) == 0);
+  outcome.compute_invocation_id = "compute-test";
   diag::recordOutcome(outcome);
   assert(::setenv(diag::kModeEnvironment, "remote", 1) == 0);
   diag::recordOutcome(outcome);
@@ -63,6 +64,8 @@ int main() {
   assert(data.find("\"mode\":\"record\"") != std::string::npos);
   assert(data.find("\"mode\":\"remote\"") != std::string::npos);
   assert(data.find("\"case_key\":\"case-1\"") != std::string::npos);
+  assert(data.find("\"compute_invocation_id\":\"compute-test\"") !=
+         std::string::npos);
   assert(data.find("\"scheduler_type\":\"Reduction\"") != std::string::npos);
   assert(data.find("\"tag\":\"modified\\nplan\"") != std::string::npos);
   assert(data.find("\"heuristic_text\":\"complete \\\"reduction\\\" plan\"") != std::string::npos);

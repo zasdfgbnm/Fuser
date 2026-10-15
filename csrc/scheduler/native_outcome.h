@@ -14,6 +14,7 @@
 namespace nvfuser::scheduler::native_diagnostic {
 
 struct Outcome {
+  std::string compute_invocation_id;
   std::string scheduler_type;
   std::string tag;
   std::string heuristic_text;
@@ -106,6 +107,9 @@ inline void recordOutcome(const Outcome& outcome) noexcept {
         "invocation_id",
         std::to_string(::getpid()) + "-outcome-" +
             std::to_string(sequence));
+    if (!outcome.compute_invocation_id.empty()) {
+      row.add("compute_invocation_id", outcome.compute_invocation_id);
+    }
     row.add("scheduler_type", outcome.scheduler_type);
     row.add("tag", outcome.tag);
     row.add("heuristic_text", outcome.heuristic_text);

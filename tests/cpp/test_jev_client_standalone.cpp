@@ -185,6 +185,58 @@ int main() {
   require(readFile(path).find("\"kind\":\"coverage_skip\",\"site\":\"PW4.tile\"") !=
               std::string::npos,
           "Choice-only log coverage contract changed");
+
+  // The generic compute span uses a different ID/index from Pointwise's
+  // existing Record span. A nested failed call must restore its parent.
+  const std::string compute_path = std::string(path) + ".outcome.jsonl";
+  std::string outer_id;
+  std::string nested_id;
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope outer("outer input", {});
+    require(outer.observing(), "generic compute span was not enabled");
+    outer_id = outer.invocationId();
+    require(chooseDecision("PW2", state, options, "bp0") == "bp0",
+            "generic span changed Record selection");
+    try {
+      nvfuser::scheduler::jev::ComputeHeuristicsScope nested("inner input", {});
+      nested_id = nested.invocationId();
+      nvfuser::scheduler::jev::recordCoverageSkip("RD5", "nested coverage");
+      throw std::runtime_error("aborted nested compute");
+    } catch (const std::runtime_error&) {
+    }
+    require(chooseDecision("PW2", state, options, "bp1") == "bp1",
+            "nested span changed parent Record selection");
+    outer.complete("PointWise");
+  }
+  const std::string compute_trace = readFile(compute_path);
+  const std::string compute_choices = readFile(path);
+  require(!outer_id.empty() && !nested_id.empty() && outer_id != nested_id,
+          "generic compute invocation IDs were not unique");
+  require(compute_trace.find("\"compute_invocation_id\":\"" + outer_id +
+                                 "\",\"compute_event_index\":0,\"input_snapshot\":\"outer input\"") !=
+              std::string::npos &&
+              compute_trace.find("\"compute_invocation_id\":\"" + outer_id +
+                                     "\",\"compute_event_index\":3,\"scheduler_type\":\"PointWise\"") !=
+                  std::string::npos,
+          "generic compute begin/final or event indexes are incomplete");
+  require(compute_trace.find("\"compute_invocation_id\":\"" + nested_id +
+                                 "\",\"compute_event_index\":0,\"input_snapshot\":\"inner input\"") !=
+              std::string::npos &&
+              compute_trace.find("\"compute_invocation_id\":\"" + nested_id +
+                                     "\",\"compute_event_index\":2,\"scheduler_type\"") ==
+                  std::string::npos,
+          "failed nested compute acquired a final row");
+  require(compute_choices.find("\"compute_invocation_id\":\"" + outer_id +
+                                  "\",\"compute_event_index\":1") !=
+              std::string::npos &&
+              compute_choices.find("\"compute_invocation_id\":\"" + outer_id +
+                                      "\",\"compute_event_index\":2") !=
+                  std::string::npos &&
+              compute_choices.find("\"compute_invocation_id\":\"" + nested_id +
+                                      "\",\"compute_event_index\":1") !=
+                  std::string::npos &&
+              compute_choices.find("outer input") == std::string::npos,
+          "generic compute IDs or snapshot isolation changed the Choice log");
   ::unsetenv("NVFUSER_JEV_CASE_KEY");
   const std::string before_link = readFile(path);
 
@@ -234,21 +286,39 @@ int main() {
     require(readFile(outcome_path) == outcome,
             "remote mode changed the Pointwise Record outcome log");
   }
+  std::string remote_compute_id;
   {
     FakeServer server(answer("bp\\u0031"));
     ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope compute_scope(
+        "private remote snapshot", {});
+    remote_compute_id = compute_scope.invocationId();
     require(chooseDecision("PW2", state, options, {}, "case-2") == "bp1",
             "remote Unicode-escaped choice was not decoded");
+    compute_scope.complete("PointWise");
     require(server.request().find("POST /v1/systemone HTTP/1.0") == 0, "wrong endpoint");
     require(server.request().find("\"questions\":{\"PW2\"") != std::string::npos,
             "missing Choice question");
     require(server.request().find("native") == std::string::npos, "native winner leaked");
     require(server.request().find("winner") == std::string::npos, "winner leaked");
+    require(server.request().find("private remote snapshot") == std::string::npos &&
+                server.request().find("compute_invocation_id") ==
+                    std::string::npos,
+            "diagnostic compute fields leaked into the HTTP request");
   }
   const std::string log = readFile(path);
   require(log.find("\"selected\":\"bp1\",\"mode\":\"remote\"") != std::string::npos,
           "remote choice not logged");
   require(log.find("\"roundtrip_us\":") != std::string::npos, "missing latency");
+  require(!remote_compute_id.empty() &&
+              log.find("\"compute_invocation_id\":\"" + remote_compute_id +
+                           "\",\"compute_event_index\":1") !=
+                  std::string::npos &&
+              readFile(compute_path).find(
+                  "\"compute_invocation_id\":\"" + remote_compute_id +
+                  "\",\"compute_event_index\":2,\"scheduler_type\":\"PointWise\"") !=
+                  std::string::npos,
+          "remote Choice and compute outcome cannot join");
   {
     FakeServer server(answer("bp2"));
     ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
@@ -273,4 +343,5 @@ int main() {
   }
   ::unlink(path);
   ::unlink(outcome_path.c_str());
+  ::unlink(compute_path.c_str());
 }

@@ -11,9 +11,11 @@
 
 #include "instrumentation.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/compute_invocation_input.h"
 #include "scheduler/debug_utils.h"
 #include "scheduler/greedy.h"
 #include "scheduler/heuristic.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/matmul_utils.h"
 #include "scheduler/native_outcome.h"
 #include "scheduler/native_plan_fields.h"
@@ -136,6 +138,20 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {
+  scheduler::compute_invocation_input::Snapshot input_snapshot;
+  const bool trace_enabled = scheduler::jev::computeTraceEnabled();
+  if (trace_enabled) {
+    input_snapshot =
+        scheduler::compute_invocation_input::capture(fusion, runtime_info);
+  }
+  scheduler::jev::ComputeHeuristicsScope compute_scope(
+      input_snapshot.text,
+      !trace_enabled
+          ? "not_captured"
+          : (input_snapshot.available()
+                 ? std::string_view{}
+                 : scheduler::compute_invocation_input::reasonName(
+                       input_snapshot.reason)));
   auto params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
   if (params != nullptr && scheduler::native_diagnostic::enabled()) {
     // All serialization, including a potentially throwing toString(), is
@@ -143,6 +159,8 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
     try {
       using scheduler::native_diagnostic::Outcome;
       Outcome outcome;
+      outcome.compute_invocation_id =
+          std::string(compute_scope.invocationId());
       outcome.scheduler_type = nvfuser::toString(params->scheduler_type);
       outcome.tag = params->tag;
       outcome.heuristic_text = params->toString();
@@ -179,6 +197,18 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
       scheduler::native_diagnostic::recordOutcome(outcome);
     } catch (...) {
       // Observability is never a condition for a successful native schedule.
+    }
+  }
+  if (compute_scope.observing()) {
+    try {
+      std::string scheduler_type = params == nullptr ? "null" : "unavailable";
+      if (params != nullptr) {
+        scheduler_type = nvfuser::toString(params->scheduler_type);
+      }
+      compute_scope.complete(scheduler_type);
+    } catch (...) {
+      // Even scheduler-name formatting must not affect a successful return.
+      compute_scope.complete("unavailable");
     }
   }
   return params;
