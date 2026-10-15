@@ -327,8 +327,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
             (int64_t)max_vectorize_factor)
       : selected_vect_factor;
   const int64_t four_warps = 4 * threads_per_warp;
-  // Preserve the native quotient, including values larger than the reduction
-  // extent, in off/record mode. Only remote mode uses the model's target.
+  // Off preserves the native quotient, including values larger than the
+  // reduction extent. Record uses it to identify the native menu choice.
   int64_t target_inner_unroll = jev_mode == scheduler::jev::Mode::Remote
       ? 0
       : target_vect_unroll / vect_factor;
@@ -409,9 +409,9 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
           selected_range != ranges.end(),
           "RD3.unroll response is outside reduction bounds");
       if (selected_range->low == selected_range->high) {
-        if (jev_mode == scheduler::jev::Mode::Remote) {
-          target_inner_unroll = selected_range->low;
-        }
+        // Both decision modes must use the selected, bounded singleton for
+        // subsequent CTA and warp choices.
+        target_inner_unroll = selected_range->low;
         break;
       }
       range_low = selected_range->low;
