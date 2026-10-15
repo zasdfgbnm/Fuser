@@ -78,8 +78,8 @@ NVFUSER_BENCHMARK_DEFINE(
     runReduction3D,
     DataType::Float);
 
-// Reuse three shapes from the SM89 3D reduction numeric tests. They exercise
-// distinct native warp/CTA, work-split, and grid-wave choices.
+// Reuse shapes from the SM89 3D reduction numeric tests. They exercise
+// distinct native warp/CTA, work-split, grid-wave, and outer-unroll choices.
 NVFUSER_BENCHMARK_RUN(NvFuserScheduler_Reduction3D_fp32)
     ->Args({4, 32, 128})
     ->Unit(benchmark::kMicrosecond)
@@ -92,5 +92,15 @@ NVFUSER_BENCHMARK_RUN(NvFuserScheduler_Reduction3D_fp32)
 
 NVFUSER_BENCHMARK_RUN(NvFuserScheduler_Reduction3D_fp32)
     ->Args({256, 65, 4})
+    ->Unit(benchmark::kMicrosecond)
+    ->UseManualTime();
+
+NVFUSER_BENCHMARK_RUN(NvFuserScheduler_Reduction3D_fp32)
+    ->Args({2, 65, 8192})
+    ->Unit(benchmark::kMicrosecond)
+    ->UseManualTime();
+
+NVFUSER_BENCHMARK_RUN(NvFuserScheduler_Reduction3D_fp32)
+    ->Args({8, 32, 3})
     ->Unit(benchmark::kMicrosecond)
     ->UseManualTime();
