@@ -1506,10 +1506,11 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       dev_prop->maxThreadsPerBlock <= 2048;
   if (jev_mode_warp != scheduler::jev::Mode::Off) {
     if (!bounded_wave_domain) {
-      if (jev_mode_warp == scheduler::jev::Mode::Record) {
-        scheduler::jev::recordCoverageSkip(
-            "RD5.waves", "outside bounded 3D wave domain");
-      }
+      scheduler::jev::recordNoChoiceDecision(
+          "RD5.waves",
+          "waves4",
+          "outside bounded 3D wave domain",
+          "native_four_wave_cap");
     } else {
       std::vector<scheduler::jev::ChoiceOption> options;
       for (int64_t waves : {2, 4, 8}) {
@@ -1544,10 +1545,11 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           NVF_ERROR(false, "RD5.waves lacks a complete native plan");
         }
       } else if (options.size() == 1) {
-        if (jev_mode_warp == scheduler::jev::Mode::Record) {
-          scheduler::jev::recordCoverageSkip(
-              "RD5.waves", "only one hard-valid wave cap");
-        }
+        scheduler::jev::recordNoChoiceDecision(
+            "RD5.waves",
+            "waves4",
+            "only one hard-valid wave cap",
+            "native_four_wave_cap");
       } else {
         const std::string state =
             std::string(iteration_first ? "reduction.inner3d_waves.v2\n"

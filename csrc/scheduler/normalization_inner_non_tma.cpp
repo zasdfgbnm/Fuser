@@ -2496,10 +2496,11 @@ std::unique_ptr<ReductionParams> chooseInner3DCtaFloor(
     }
   }
   if (options.size() == 1) {
-    if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
-      scheduler::jev::recordCoverageSkip(
-          "IP6.cta_floor", "no distinct, resource-valid 3D CTA floor");
-    }
+    scheduler::jev::recordNoChoiceDecision(
+        "IP6.cta_floor",
+        "floor" + std::to_string(native_floor),
+        "no distinct, resource-valid 3D CTA floor",
+        "native_cta_floor");
     return std::move(plans.front().params);
   }
 
@@ -2899,10 +2900,11 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
   } catch (const std::exception&) {
     // Failure to materialize an optional plan cannot displace the proved
     // native plan. In particular, never send an unproved singleton remotely.
-    if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
-      scheduler::jev::recordCoverageSkip(
-          "IP6.work_split", "alternate 3D work split failed planning");
-    }
+    scheduler::jev::recordNoChoiceDecision(
+        "IP6.work_split",
+        "unroll_first",
+        "alternate 3D work split failed planning",
+        "native_unroll_first_branch");
     return chooseInner3DOuterUnroll(
         properties,
         base,
@@ -2952,10 +2954,11 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
           alternate_resources,
           device);
   if (!alternate_valid) {
-    if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
-      scheduler::jev::recordCoverageSkip(
-          "IP6.work_split", "no distinct, resource-valid 3D work split");
-    }
+    scheduler::jev::recordNoChoiceDecision(
+        "IP6.work_split",
+        "unroll_first",
+        "no distinct, resource-valid 3D work split",
+        "native_unroll_first_branch");
     return chooseInner3DOuterUnroll(
         properties,
         base,
@@ -3413,10 +3416,11 @@ std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
           rparams->unroll_factor_inner_reduction > 0 && !has_tma &&
           !isOptionDisabled(DisableOption::MagicZero);
       if (!eligible) {
-        if (jev_mode == scheduler::jev::Mode::Record) {
-          scheduler::jev::recordCoverageSkip(
-              "IP5.magic_zero", "No proved register-backed magic-zero pair");
-        }
+        scheduler::jev::recordNoChoiceDecision(
+            "IP5.magic_zero",
+            rparams->cparams.enable_magic_zero ? "on" : "off",
+            "No proved register-backed magic-zero pair",
+            "native_magic_zero_policy");
       } else {
         // Send the same primitive device facts used by the original
         // bandwidth/flops heuristic. Sending its boolean result here would
