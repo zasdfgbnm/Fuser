@@ -1839,6 +1839,7 @@ if(BUILD_NVFUSER_BENCHMARK)
     ${NVFUSER_ROOT}/benchmarks/cpp/main.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/many_pointwise_ops.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/matmul.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/outer_persistent_2welford_jev.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/reduction.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/reduction_2d_odd_jev.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/reduction_3d_jev.cpp
