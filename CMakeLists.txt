@@ -1830,6 +1830,7 @@ if(BUILD_NVFUSER_BENCHMARK)
     ${NVFUSER_ROOT}/benchmarks/cpp/heuristic_cache.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/heuristic_lookup.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/indexselect.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/inner_persistent_3d_jev.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/instance_norm.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/layer_norm.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/layer_norm_backward.cpp
