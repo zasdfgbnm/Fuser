@@ -50,7 +50,9 @@ void runReduction3D(
   auto outputs = executor_cache->runFusionWithInputs(args);
   auto* runtime = executor_cache->getMostRecentKernelRuntime();
   NVF_ERROR(runtime != nullptr && !runtime->isSegmented());
-  auto* params = runtime->schedulerHeuristics()->singleKernelHeuristics();
+  const auto& heuristics = runtime->schedulerHeuristics()->heuristicsList();
+  NVF_ERROR(heuristics.size() == 1 && heuristics.front() != nullptr);
+  auto* params = heuristics.front().get();
   NVF_ERROR(
       params != nullptr && params->scheduler_type == SchedulerType::Reduction,
       "Expected one Reduction scheduler");

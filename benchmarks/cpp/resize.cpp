@@ -42,8 +42,12 @@ void runResizePaddedTranspose(
   // Compile and check the same Resize path used by the timed iterations.
   auto outputs = executor_cache->runFusionWithInputs(args);
   auto* runtime = executor_cache->getMostRecentKernelRuntime();
-  NVF_CHECK(!runtime->isSegmented(), "Resize benchmark was segmented");
-  auto* params = runtime->schedulerHeuristics()->singleKernelHeuristics();
+  NVF_CHECK(runtime != nullptr && !runtime->isSegmented(),
+            "Resize benchmark was segmented or has no runtime");
+  const auto& heuristics = runtime->schedulerHeuristics()->heuristicsList();
+  NVF_CHECK(heuristics.size() == 1 && heuristics.front() != nullptr,
+            "Resize benchmark expected one scheduler heuristic");
+  auto* params = heuristics.front().get();
   NVF_CHECK(
       params != nullptr && params->scheduler_type == SchedulerType::Resize,
       "Resize benchmark used an unexpected scheduler");
