@@ -1141,6 +1141,16 @@ if(BUILD_TEST)
   add_test(NAME jev_numeric_inner_outer_persistent
     COMMAND $<TARGET_FILE:test_nvfuser>
       --gtest_filter=CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv)
+  # Exact registry shapes that previously aborted while forming OP3.cta.
+  add_test(NAME jev_numeric_op3_instance_norm_half
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA)
+  add_test(NAME jev_numeric_op3_instance_norm_float
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.JevInstanceNormNhwcFloatCta_CUDA)
+  add_test(NAME jev_numeric_op3_softmax_dropout_outer_half
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.JevSoftmaxDropoutOuterHalfCta_CUDA)
   set_tests_properties(
     jev_numeric_pointwise jev_numeric_reduction jev_numeric_transpose
     jev_numeric_inner_persistent jev_numeric_outer_persistent
@@ -1148,6 +1158,14 @@ if(BUILD_TEST)
     PROPERTIES
       RESOURCE_LOCK nvfuser_gpu
       # A misspelled GTest filter exits successfully after running zero tests.
+      FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
+  set_tests_properties(
+    jev_numeric_op3_instance_norm_half
+    jev_numeric_op3_instance_norm_float
+    jev_numeric_op3_softmax_dropout_outer_half
+    PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu
+      ENVIRONMENT "NVFUSER_JEV_MODE=off"
       FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
 
   # TMA parameter analysis runs on any CUDA device; no Hopper kernel executes.
@@ -1256,6 +1274,12 @@ if(BUILD_TEST)
     "Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA" "IP")
   add_jev_remote_numeric_test(outer_persistent
     "Gpu3Test.TemplateFunctionTypeMismatch" "OP")
+  add_jev_remote_numeric_test(op_instance_norm_half
+    "Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA" "OP" "OP3.cta")
+  add_jev_remote_numeric_test(op_instance_norm_float
+    "Gpu3Test.JevInstanceNormNhwcFloatCta_CUDA" "OP" "OP3.cta")
+  add_jev_remote_numeric_test(op_softmax_dropout_outer_half
+    "Gpu3Test.JevSoftmaxDropoutOuterHalfCta_CUDA" "OP" "OP3.cta")
   add_jev_remote_numeric_test(inner_outer_persistent
     "CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv" "IOP")
   add_test(NAME jev_remote_numeric_inner_outer_singleton_width

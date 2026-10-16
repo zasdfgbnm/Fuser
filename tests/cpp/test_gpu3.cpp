@@ -7246,6 +7246,151 @@ TEST_F(Gpu3Test, FusionInstanceNormNHWC_CUDA) {
   testValidate(fusion, cg_outputs, {t0, t1, t2}, {t4}, __LINE__, __FILE__);
 }
 
+// These shapes reproduce the two InstanceNormNHWC registry cases that reached
+// OP3.cta with a native seven-batch block plan. Keep the benchmark's casts,
+// reduction axes, epsilon, and automatic scheduler selection intact.
+static void expectJevOuterPersistentSchedule(FusionExecutorCache& executor_cache) {
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_NE(runtime, nullptr);
+  auto* heuristics = runtime->schedulerHeuristics();
+  ASSERT_NE(heuristics, nullptr);
+  const auto& plans = heuristics->heuristicsList();
+  ASSERT_TRUE(std::any_of(
+      plans.begin(), plans.end(), [](const auto& plan) {
+        return plan->scheduler_type == SchedulerType::OuterPersistent;
+      })) << "Exact benchmark fixture did not select OuterPersistent";
+}
+
+static void runJevInstanceNormNhwcCtaNumeric(
+    DataType dtype,
+    int64_t channels) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+
+  auto input = makeContigTensor(4, dtype);
+  auto weight = makeContigTensor(1, dtype);
+  auto bias = makeContigTensor(1, dtype);
+  fusion->addInput(input);
+  fusion->addInput(weight);
+  fusion->addInput(bias);
+  if (dtype == DataType::Half) {
+    input = castOp(DataType::Float, input);
+    weight = castOp(DataType::Float, weight);
+    bias = castOp(DataType::Float, bias);
+  }
+
+  auto var_mean = variance_mean(input, {1, 2}, 0, true);
+  auto normalized = div(
+      sub(input, var_mean.mean),
+      sqrt(add(var_mean.var, IrBuilder::create<Val>(1e-5f))));
+  auto output = add(mul(normalized, weight), bias);
+  if (dtype == DataType::Half) {
+    output = castOp(DataType::Half, output);
+  }
+  fusion->addOutput(output);
+
+  at::manual_seed(0);
+  auto options = at::TensorOptions()
+                     .dtype(data_type_to_aten(dtype))
+                     .device(at::kCUDA, 0);
+  auto x = at::randn({32, 7, 7, channels}, options);
+  auto w = at::randn({channels}, options);
+  auto b = at::randn({channels}, options);
+  KernelArgumentHolder inputs = {x, w, b};
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto outputs = executor_cache.runFusionWithInputs(inputs);
+  expectJevOuterPersistentSchedule(executor_cache);
+
+  // The fusion explicitly casts fp16 inputs to fp32 before variance and
+  // normalization. ATen must do the same or the reference checks a different
+  // computation.
+  auto x32 = x.to(at::kFloat);
+  auto stats = at::var_mean(x32, {1, 2}, 0, true);
+  auto reference =
+      ((x32 - std::get<1>(stats)) / at::sqrt(std::get<0>(stats) + 1e-5f)) *
+          w.to(at::kFloat) +
+      b.to(at::kFloat);
+  testValidate(
+      executor_cache.fusion(),
+      outputs,
+      inputs,
+      {reference.to(data_type_to_aten(dtype))},
+      __LINE__,
+      __FILE__);
+}
+
+TEST_F(Gpu3Test, JevInstanceNormNhwcHalfCta_CUDA) {
+  runJevInstanceNormNhwcCtaNumeric(DataType::Half, 64);
+}
+
+TEST_F(Gpu3Test, JevInstanceNormNhwcFloatCta_CUDA) {
+  runJevInstanceNormNhwcCtaNumeric(DataType::Float, 32);
+}
+
+// The third OP3.cta failure was the exact outer-axis fp16 SoftmaxDropout
+// registry fixture. The random mask is an output, so validate the dropped
+// values against that mask rather than assuming the ATen RNG draws match.
+TEST_F(Gpu3Test, JevSoftmaxDropoutOuterHalfCta_CUDA) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+
+  auto scores = makeContigTensor(4, DataType::Half);
+  auto attention_mask = makeContigTensor(4, DataType::Half);
+  auto* divisor = IrBuilder::create<Val>(DataType::Double);
+  fusion->addInput(scores);
+  fusion->addInput(attention_mask);
+  fusion->addInput(divisor);
+
+  auto scores32 = castOp(DataType::Float, scores);
+  auto mask32 = castOp(DataType::Float, attention_mask);
+  auto logits = add(div(scores32, divisor), mask32);
+  auto probs = softmax(logits, 1);
+  constexpr float kKeepProbability = 0.9f;
+  auto dropout_result = dropout(
+      probs,
+      IrBuilder::create<Val>(kKeepProbability),
+      IrBuilder::create<Val>(1.0f / kKeepProbability));
+  fusion->addOutput(castOp(DataType::Half, logits));
+  fusion->addOutput(castOp(DataType::Half, probs));
+  fusion->addOutput(castOp(DataType::Half, dropout_result.output));
+  fusion->addOutput(dropout_result.mask);
+
+  at::manual_seed(0);
+  auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  auto x = at::randn({256, 12, 100, 8}, options);
+  auto mask = at::randn({256, 12, 100, 8}, options);
+  const double divisor_value = std::sqrt(64.0);
+  KernelArgumentHolder inputs = {x, mask, divisor_value};
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto outputs = executor_cache.runFusionWithInputs(inputs);
+  expectJevOuterPersistentSchedule(executor_cache);
+  ASSERT_EQ(outputs.size(), 4);
+
+  const auto& emitted_mask = outputs[3].as<at::Tensor>();
+  ASSERT_EQ(emitted_mask.scalar_type(), at::kBool);
+  ASSERT_EQ(emitted_mask.sizes().vec(), x.sizes().vec());
+  EXPECT_NEAR(
+      emitted_mask.to(at::kFloat).mean().item<float>(),
+      kKeepProbability,
+      0.01);
+
+  auto reference_logits = x.to(at::kFloat) / divisor_value + mask.to(at::kFloat);
+  auto reference_probs = at::_softmax(reference_logits, 1, false);
+  auto reference_dropout =
+      reference_probs * emitted_mask.to(at::kFloat) *
+      (1.0f / kKeepProbability);
+  testValidate(
+      executor_cache.fusion(),
+      outputs,
+      inputs,
+      {reference_logits.to(at::kHalf),
+       reference_probs.to(at::kHalf),
+       reference_dropout.to(at::kHalf),
+       emitted_mask},
+      __LINE__,
+      __FILE__);
+}
+
 TEST_F(Gpu3Test, VectorizeBackToBackReductions) {
   auto fusion = std::make_unique<Fusion>();
   FusionGuard fg(fusion.get());
