@@ -320,21 +320,22 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
           batch,
           ceilDiv(total_iteration_numel, x * iter_unroll)});
     };
-    for (int64_t y = y_min; y <= native->bdimy; y += y_step) {
+    for (int64_t y = y_min; y < native->bdimy; y += y_step) {
       // The native search visits the initial split, then only exact divisors
-      // on this stride. Its last candidate may be the nondivisible y_max.
+      // on this stride. Retain its earlier splits as alternate plans.
       if (y == y_min || after_unroll % y == 0) {
         append(y);
       }
     }
-    if (candidates.empty() ||
-        candidates.back().bdimy != native->bdimy) {
-      append(native->bdimy);
-    }
+    // Eight serial batches are a performance target, not a hard constraint.
+    // The initial native split can be below it (e.g. 49 / 7 = 7), so keep
+    // the already-validated native plan without the alternate-plan filter.
+    candidates.push_back(*native);
     NVF_ERROR(
         !candidates.empty() && candidates.back().bdimx == native->bdimx &&
             candidates.back().bdimy == native->bdimy &&
-            candidates.back().batches_per_block == native->batches_per_block,
+            candidates.back().batches_per_block == native->batches_per_block &&
+            candidates.back().gdimx == native->gdimx,
         "Outer persistent CTA candidates lost the native block plan");
     return candidates;
   };
