@@ -1772,14 +1772,15 @@ if(BUILD_TEST)
   set_tests_properties(jev_alternate_numeric_outer_batch_menu PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
   # Force the earlier legal CTA split for the exact seven-batch native case.
-  # The generic alternate verifier requires one changed OP3.cta winner while
-  # the GTest checks the selected kernel against the fp32 ATen reference.
+  # The GTest computes this same plan twice; require both Choice responses to
+  # select the alternate and check the generated output against fp32 ATen.
   add_test(NAME jev_alternate_numeric_op3_instance_norm_half
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
       --binary "$<TARGET_FILE:test_nvfuser>"
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
       --site OP3.cta --alternate x32_y4_b13
+      --expected-site-calls 2
       --gtest Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA
       --case-key jev_alternate_numeric_op3_instance_norm_half
       --require-sm89)

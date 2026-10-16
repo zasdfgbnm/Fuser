@@ -736,6 +736,7 @@ def check_outer_unroll_dependency(
 def check_alternate_report(report: dict[str, Any],
                            events: list[dict[str, Any]], *, site: str,
                            alternate: str, case_key: str,
+                           expected_site_calls: int = 1,
                            require_grid: bool = False,
                            require_outer_width: bool = False,
                            require_outer_cta: bool = False,
@@ -774,8 +775,11 @@ def check_alternate_report(report: dict[str, Any],
                            require_transpose_tile: bool = False,
                            require_pointwise_1d_cta: bool = False,
                            require_resize_reorder: bool = False) -> dict[str, Any]:
-    if len(events) != 1 or not events[0]["forced"]:
-        raise ValueError(f"expected exactly one eligible {site} override; got {events}")
+    if (len(events) != expected_site_calls or
+            not all(event["forced"] and event == events[0] for event in events)):
+        raise ValueError(
+            f"expected {expected_site_calls} identical eligible {site} "
+            f"overrides; got {events}")
     event = events[0]
     target = [entry for entry in report["multiplicity"]
               if entry["site"] == site]
@@ -783,8 +787,10 @@ def check_alternate_report(report: dict[str, Any],
         raise ValueError(f"expected exactly one shared {site} request, got {len(target)}")
     entry = target[0]
     if (entry["request_sha256"] != event["request_sha256"] or
-            entry["record"] != {event["native"]: 1} or
-            entry["remote"] != {alternate: 1}):
+            entry["record"] != {event["native"]: expected_site_calls} or
+            entry["remote"] != {alternate: expected_site_calls} or
+            any(report["site_coverage"][site][key] != expected_site_calls
+                for key in ("record_events", "remote_events", "server_events"))):
         raise ValueError(f"{site} record/remote requests or winners differ: {entry}")
     issues = [{"kind": problem["kind"], "site": problem.get("site"),
                "request_sha256": problem.get("request_sha256")}
@@ -2375,6 +2381,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alternate", default=ALTERNATE)
     parser.add_argument("--gtest", default=GTEST)
     parser.add_argument("--case-key", default=CASE_KEY)
+    parser.add_argument("--expected-site-calls", type=int, choices=(1, 2),
+                        default=1)
     parser.add_argument("--require-grid", action="store_true")
     parser.add_argument("--require-outer-width", action="store_true")
     parser.add_argument("--require-outer-cta", action="store_true")
@@ -2520,6 +2528,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = check_alternate_report(
             report, override.events, site=args.site,
             alternate=args.alternate, case_key=args.case_key,
+            expected_site_calls=args.expected_site_calls,
             require_grid=args.require_grid,
             require_outer_width=args.require_outer_width,
             require_outer_cta=args.require_outer_cta,
