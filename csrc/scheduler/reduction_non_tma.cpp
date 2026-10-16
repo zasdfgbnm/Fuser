@@ -1606,6 +1606,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   // finite envelope respects the Choice API's 255-option limit. In
   // particular, preflight covers physical CTA size, all later output-unroll
   // choices, grid extents, and the unsupported 3D-to-2D fallback.
+  bool cta_choice_emitted = false;
+  std::string_view cta_no_choice_reason = "cta_menu_outside_bounded_domain";
   if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
       min_warp_size >= 1 && min_warp_size <= 16 &&
       target_threads_in_block >= min_warp_size &&
@@ -1641,10 +1643,11 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
            "Target " + std::to_string(candidate) +
                " threads in the completed 3D CTA plan"});
     }
-    if (options.size() > 1 &&
-        std::any_of(options.begin(), options.end(), [&](const auto& option) {
+    const bool native_target_preflighted = std::any_of(
+        options.begin(), options.end(), [&](const auto& option) {
           return option.id == "t" + std::to_string(native_target);
-        })) {
+        });
+    if (options.size() > 1 && native_target_preflighted) {
       const std::string state =
           std::string(target_waves == 4
                           ? (iteration_first
@@ -1671,6 +1674,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
                ? ""
                : "\ntarget_waves=" + std::to_string(target_waves)) +
           "\nhard_valid_targets=" + hard_valid_targets;
+      cta_choice_emitted = true;
       const auto selected = scheduler::jev::chooseDecision(
           "RD5.cta", state, options,
           jev_mode_warp == scheduler::jev::Mode::Record
@@ -1682,6 +1686,10 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           });
       NVF_ERROR(found != options.end(), "RD5.cta exceeds preflighted 3D plans");
       target_threads_in_block = std::stoll(selected.substr(1));
+    } else {
+      cta_no_choice_reason = options.size() <= 1
+          ? "fewer_than_two_hard_valid_cta_targets"
+          : "native_cta_target_not_preflighted";
     }
   }
 
@@ -2314,6 +2322,27 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       rparams->unroll_factor_inner_reduction = selected_width;
       rparams->unroll_factor_top_of_vectorization =
           fixed_inner_factor / selected_width;
+    }
+  }
+
+  // Observe unoffered native targets at the successful 3D return, after the
+  // fallback and alternative-plan branches have been resolved. This does not
+  // offer a Choice or alter any scheduling parameter.
+  if (rparams->schedule_3d && jev_mode != scheduler::jev::Mode::Off) {
+    if (!offer_warp) {
+      scheduler::jev::recordNoChoiceDecision(
+          "RD5.warp",
+          "m" + std::to_string(min_warp_size),
+          bounded_warp_input ? "complete_3d_plan_preflight_excluded"
+                             : "outside_bounded_warp_domain",
+          "final_3d_native_target");
+    }
+    if (!cta_choice_emitted) {
+      scheduler::jev::recordNoChoiceDecision(
+          "RD5.cta",
+          "t" + std::to_string(target_threads_in_block),
+          cta_no_choice_reason,
+          "final_3d_native_target");
     }
   }
 
