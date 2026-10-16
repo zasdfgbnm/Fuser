@@ -1771,6 +1771,22 @@ if(BUILD_TEST)
       --require-outer-batch-menu)
   set_tests_properties(jev_alternate_numeric_outer_batch_menu PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  # Force the earlier legal CTA split for the exact seven-batch native case.
+  # The generic alternate verifier requires one changed OP3.cta winner while
+  # the GTest checks the selected kernel against the fp32 ATen reference.
+  add_test(NAME jev_alternate_numeric_op3_instance_norm_half
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.cta --alternate x32_y4_b13
+      --gtest Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA
+      --case-key jev_alternate_numeric_op3_instance_norm_half
+      --require-sm89)
+  set_tests_properties(jev_alternate_numeric_op3_instance_norm_half PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu
+    SKIP_RETURN_CODE 77
+    FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
   add_test(NAME jev_alternate_numeric_outer_redu_unroll
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
