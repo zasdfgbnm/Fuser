@@ -405,9 +405,8 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
 
   int64_t max_unroll_factor = 0;
   if (jev_mode != scheduler::jev::Mode::Remote) {
-    // Keep the original numeric cap in off/record modes. The vectorization
-    // helper applies maxVectorizationWidth to it, so its effective cap may be
-    // smaller than the raw value when the latter has an odd factor.
+    // Keep the original numeric cap in off mode. Record uses it to identify
+    // the native Choice; the selected effective cap is applied below.
     max_unroll_factor = ceilDiv(
         // Available unrolling based on size of data type
         kSixteen / max_io_dtype_size,
@@ -475,22 +474,23 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
         : "";
     const auto selected = scheduler::jev::chooseDecision(
         "TR2.unroll", state, options, native_choice);
-    if (jev_mode == scheduler::jev::Mode::Remote) {
-      bool found = false;
-      if (hard_cap == 0 && selected == "u0") {
-        max_unroll_factor = 0;
-        found = true;
-      } else {
-        for (int64_t factor = 1; factor <= hard_cap; factor *= 2) {
-          if (selected == "u" + std::to_string(factor)) {
-            max_unroll_factor = factor;
-            found = true;
-            break;
-          }
+    // The helper uses maxVectorizationWidth, so Record's selected power of two
+    // is the same effective cap as the native raw value. Apply the selected cap
+    // in both modes to keep equivalent downstream width requests identical.
+    bool found = false;
+    if (hard_cap == 0 && selected == "u0") {
+      max_unroll_factor = 0;
+      found = true;
+    } else {
+      for (int64_t factor = 1; factor <= hard_cap; factor *= 2) {
+        if (selected == "u" + std::to_string(factor)) {
+          max_unroll_factor = factor;
+          found = true;
+          break;
         }
       }
-      NVF_ERROR(found, "TR2.unroll response is outside native hard bounds");
     }
+    NVF_ERROR(found, "TR2.unroll response is outside native hard bounds");
   }
 
   // Note: [Computing Vectorization Width for Transpose]
