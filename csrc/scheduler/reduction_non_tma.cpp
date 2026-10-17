@@ -1861,10 +1861,11 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
             "RD5.outer_unroll", "native outer unroll lacks bounded 3D proof");
       }
     } else if (options.size() == 1) {
-      if (jev_mode_warp == scheduler::jev::Mode::Record) {
-        scheduler::jev::recordCoverageSkip(
-            "RD5.outer_unroll", "only native outer unroll has a 3D proof");
-      }
+      scheduler::jev::recordNoChoiceDecision(
+          "RD5.outer_unroll",
+          "u" + std::to_string(native_factor),
+          "only native outer unroll has a 3D proof",
+          "native_outer_unroll");
     } else if (options.size() > 1) {
       const std::string state =
           "reduction.inner3d_outer_unroll.v1\nreduction_numel=" +

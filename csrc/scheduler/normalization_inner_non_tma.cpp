@@ -1063,10 +1063,11 @@ int64_t chooseInner2DCTASeed(
   // IP5.batch menus and per-batch CTA/register plans. Only a single hard-valid
   // seed is proved to lack a model decision.
   if (valid_count == 1) {
-    if (mode == scheduler::jev::Mode::Record) {
-      scheduler::jev::recordCoverageSkip(
-          "IP5.cta_seed", "Only one hard-valid CTA seed");
-    }
+    scheduler::jev::recordNoChoiceDecision(
+        "IP5.cta_seed",
+        "t" + std::to_string(native_seed),
+        "Only one hard-valid CTA seed",
+        "native_cta_seed");
     return native_seed;
   }
   std::vector<scheduler::jev::ChoiceOption> options;

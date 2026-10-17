@@ -28,6 +28,9 @@ GTEST_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\Z")
 CASE_KEY = re.compile(r"jev_remote_numeric_[a-z_]+\Z")
 SITE_PREFIX = re.compile(r"(?:PW|RD|RS|TR|IP|OP|IOP)\Z")
 REQUIRED_SITE = re.compile(r"[A-Z]{2,3}[0-9]+(?:\.[a-z][a-z0-9_]*)?\Z")
+NO_CHOICE_EXPECTATION = re.compile(
+    r"(?P<site>[A-Z]{2,3}[0-9]+(?:\.[a-z][a-z0-9_]*)?)="
+    r"(?P<selected>[a-z][a-z0-9_]*)\Z")
 PASSED = re.compile(r"^\[\s+PASSED\s+\]\s+(\d+) tests?\.$", re.M)
 RUNNING = re.compile(r"^\[==========\] Running (\d+) tests? from", re.M)
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -117,8 +120,7 @@ def run_numeric(
 
 
 def check_parity(report: dict[str, Any], case_key: str, prefix: str,
-                 required_site: str | None = None,
-                 expected_record_skip: str | None = None) -> None:
+                 required_site: str | None = None) -> None:
     if not report["ok"]:
         kinds = sorted({issue["kind"] for issue in report["issues"]})
         raise ValueError(f"record/remote/server decision parity failed: {kinds}")
@@ -151,13 +153,56 @@ def check_parity(report: dict[str, Any], case_key: str, prefix: str,
             sites[required_site]["status"] != "covered" or
             sites[required_site]["server_events"] == 0):
         raise ValueError(f"required Choice {required_site} was not covered")
-    if expected_record_skip is not None:
-        site = sites.get(expected_record_skip, {})
-        if (site.get("record_skipped") != 1 or
-                any(site.get(key, 0) != 0 for key in
-                    ("record_events", "remote_events", "server_events"))):
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.is_file() or path.stat().st_size > MAX_ARTIFACT_BYTES:
+        raise ValueError(f"missing or oversized JSONL artifact: {path}")
+    rows = []
+    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"{path}:{line_number} is not an object")
+        rows.append(row)
+    return rows
+
+
+def check_no_choice(
+    record: dict[str, Any], remote: dict[str, Any], server_log: Path,
+    report: dict[str, Any], case_key: str, site: str, selected: str,
+) -> dict[str, Any]:
+    # A structural singleton is a completed computeHeuristics outcome. It
+    # must appear in both native outcome streams and nowhere on the Choice
+    # wire, while the other sites still exercise the API through check_parity.
+    site_coverage = report["site_coverage"].get(site, {})
+    if any(site_coverage.get(key, 0) for key in
+           ("record_events", "remote_events", "server_events", "record_skipped")):
+        raise ValueError(f"{site} unexpectedly appeared on the Choice wire: {site_coverage}")
+    evidence = {}
+    for mode, run in (("record", record), ("remote", remote)):
+        decision_log = Path(run["decision_log"])
+        if any(row.get("site") == site for row in read_jsonl(decision_log)):
+            raise ValueError(f"{mode} wrote a Choice or coverage skip at {site}")
+        outcome_log = Path(str(decision_log) + ".outcome.jsonl")
+        matching = [row for row in read_jsonl(outcome_log)
+                    if row.get("site") == site]
+        if len(matching) != 1 or any(
+            row.get("schema") != "nvfuser.jev.compute_invocation.v1" or
+            row.get("kind") != "no_choice" or
+            row.get("mode") != mode or
+            row.get("case_key") != case_key or
+            row.get("selected") != selected or
+            not row.get("reason") or not row.get("selection_source")
+            for row in matching
+        ):
             raise ValueError(
-                f"expected one record-only singleton skip for {expected_record_skip}: {site}")
+                f"expected exactly one {mode} no_choice at {site}={selected}: {matching}")
+        evidence[mode] = {"outcome_log": str(outcome_log),
+                          "outcome_sha256": file_hash(outcome_log),
+                          "no_choice": matching[0]}
+    if any(row.get("site") == site for row in read_jsonl(server_log)):
+        raise ValueError(f"API server received a singleton Choice at {site}")
+    return evidence
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -167,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--case-key", required=True)
     parser.add_argument("--site-prefix", required=True)
     parser.add_argument("--required-site")
-    parser.add_argument("--expect-record-skip")
+    parser.add_argument("--expect-no-choice", metavar="SITE=SELECTED")
     parser.add_argument("--analysis-only", action="store_true")
     parser.add_argument("--artifacts-root", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -182,11 +227,13 @@ def main(argv: list[str] | None = None) -> int:
             REQUIRED_SITE.fullmatch(args.required_site) is None or
             not args.required_site.startswith(args.site_prefix)):
         parser.error("invalid required Choice site")
-    if args.expect_record_skip is not None and (
-            REQUIRED_SITE.fullmatch(args.expect_record_skip) is None or
-            not args.expect_record_skip.startswith(args.site_prefix) or
-            args.expect_record_skip == args.required_site):
-        parser.error("invalid expected record-only skip site")
+    no_choice_match = (NO_CHOICE_EXPECTATION.fullmatch(args.expect_no_choice)
+                       if args.expect_no_choice is not None else None)
+    if args.expect_no_choice is not None and (
+            no_choice_match is None or
+            not no_choice_match["site"].startswith(args.site_prefix) or
+            no_choice_match["site"] == args.required_site):
+        parser.error("invalid no-choice site or selected ID")
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
     if not args.artifacts_root.is_absolute():
@@ -201,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
         "case_key": args.case_key, "gtests": names,
         "required_site_prefix": args.site_prefix,
         "required_site": args.required_site,
-        "expected_record_skip": args.expect_record_skip,
+        "expected_no_choice": args.expect_no_choice,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "binary": str(args.binary), "binary_sha256": file_hash(args.binary),
         "loader": str(loader), "loader_sha256": file_hash(loader),
@@ -261,7 +308,11 @@ def main(argv: list[str] | None = None) -> int:
         manifest["decision_parity"] = str(report_path)
         manifest["decision_parity_sha256"] = file_hash(report_path)
         check_parity(report, args.case_key, args.site_prefix,
-                     args.required_site, args.expect_record_skip)
+                     args.required_site)
+        if no_choice_match is not None:
+            manifest["no_choice_evidence"] = check_no_choice(
+                record, remote, server_log, report, args.case_key,
+                no_choice_match["site"], no_choice_match["selected"])
         manifest["status"] = ("analysis_and_decision_parity_pass" if args.analysis_only
                               else "numeric_and_decision_parity_pass")
         write_manifest(manifest_path, manifest)

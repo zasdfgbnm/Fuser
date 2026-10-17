@@ -502,11 +502,11 @@ void getHeuristics(
     } else if (vectorization_factor_outer == max_tmp_gmem_vect_factor) {
       // The reader already requires the maximum safe store width. There is no
       // performance alternative, so keep the locally determined native width.
-      if (jev_mode == scheduler::jev::Mode::Record) {
-        scheduler::jev::recordCoverageSkip(
-            "IOP2.tmp_write_width",
-            "reader already requires the maximum temporary write width");
-      }
+      scheduler::jev::recordNoChoiceDecision(
+          "IOP2.tmp_write_width",
+          "w" + std::to_string(tmp_gmem_write_vect),
+          "reader already requires the maximum temporary write width",
+          "native_temporary_write_width");
     } else {
       std::vector<scheduler::jev::ChoiceOption> write_options;
       for (int64_t width = vectorization_factor_outer;

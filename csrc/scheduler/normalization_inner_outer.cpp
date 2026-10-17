@@ -602,10 +602,11 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
     }
     if (options.size() == 1) {
       // A proved native singleton has no performance choice to send remotely.
-      if (jev_mode == scheduler::jev::Mode::Record) {
-        scheduler::jev::recordCoverageSkip(
-            "IOP3.inner_width", "only the native width is hard-valid");
-      }
+      scheduler::jev::recordNoChoiceDecision(
+          "IOP3.inner_width",
+          native_id,
+          "only the native width is hard-valid",
+          "native_inner_width");
       return chooseMultiWaveStorage(
           native_buffers, vectorize_factor, enable_jev_choice);
     }

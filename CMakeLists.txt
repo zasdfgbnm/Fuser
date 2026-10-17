@@ -1293,7 +1293,7 @@ if(BUILD_TEST)
       --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
       --case-key jev_remote_numeric_inner_outer_singleton_width
       --site-prefix IOP
-      --expect-record-skip IOP3.inner_width)
+      --expect-no-choice IOP3.inner_width=w1)
   set_tests_properties(jev_remote_numeric_inner_outer_singleton_width
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_outer_min_batch

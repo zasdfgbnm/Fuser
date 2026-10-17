@@ -231,10 +231,11 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
       }
     } else if (selected_n_stages == 2) {
       // The only positive distance below two stages is the native one.
-      if (jev_mode == scheduler::jev::Mode::Record) {
-        scheduler::jev::recordCoverageSkip(
-            "IP3.prefetch", "two stages have one positive prefetch distance");
-      }
+      scheduler::jev::recordNoChoiceDecision(
+          "IP3.prefetch",
+          "p1",
+          "two stages have one positive prefetch distance",
+          "native_two_stage_prefetch");
     } else if (selected_n_stages > 256) {
       // chooseDecision accepts at most 255 options. Keep the native distance
       // instead of hiding any other positive distance from the model.
