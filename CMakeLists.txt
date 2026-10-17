@@ -1930,6 +1930,9 @@ if(BUILD_NVFUSER_BENCHMARK)
   target_include_directories(nvfuser_bench SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/benchmark/include
     ${CMAKE_SOURCE_DIR}/third_party/googletest/googletest/include
+    # Keep compiler CUDA headers ahead of transitive CUDA/Torch headers.
+    ${CMAKE_SOURCE_DIR}/third_party/googletest/googletest
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
   )
   target_include_directories(nvfuser_bench PUBLIC ${NVFUSER_ROOT})
   target_link_libraries(nvfuser_bench PRIVATE
