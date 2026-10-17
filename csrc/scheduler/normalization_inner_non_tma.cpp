@@ -2158,6 +2158,57 @@ bool isNativeValidInner3DAlternative(
           std::min<int64_t>(scheduler_utils::x_grid_limit, device.maxGridSize[0]);
 }
 
+// A failed *conservative* menu preflight does not invalidate the original
+// scheduler plan. Record its actual native selections on both traced modes,
+// then leave that plan unchanged without asking the API about unproved plans.
+void recordInner3DNativeOnlyTail(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& native,
+    const cudaDeviceProp& device,
+    std::string_view reason) {
+  constexpr std::string_view source = "native_3d_preflight_fallback";
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.work_split", "unroll_first", reason, source);
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.outer_unroll",
+      "u" + std::to_string(native.unroll_factor_outer_reduction),
+      reason,
+      source);
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.reg_overhead",
+      properties.has_exp_op ? "r32" : "r16",
+      reason,
+      source);
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.cta_floor",
+      "floor" + std::to_string(4 * device.warpSize),
+      reason,
+      source);
+}
+
+void recordInner3DNativeOnlyDecisions(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& native,
+    const cudaDeviceProp& device,
+    std::string_view reason) {
+  constexpr std::string_view source = "native_3d_preflight_fallback";
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.width",
+      "w" + std::to_string(properties.vectorize_factor),
+      reason,
+      source);
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.waves", "waves4", reason, source);
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.occupancy", "occ28", reason, source);
+  scheduler::jev::recordNoChoiceDecision(
+      "IP6.warp",
+      "warp" + std::to_string(getInner3DNativeWarpTarget(properties, device)),
+      reason,
+      source);
+  recordInner3DNativeOnlyTail(properties, native, device, reason);
+}
+
 PersistentKernelProperties chooseInner3DVectorWidth(
     const PersistentKernelProperties& properties,
     const ReductionParams& base,
@@ -2173,11 +2224,11 @@ PersistentKernelProperties chooseInner3DVectorWidth(
   const int64_t layout_max = properties.vectorize_factor;
   if (layout_max <= 0 || (layout_max & (layout_max - 1)) != 0 ||
       properties.inner_most_dimension_numel % layout_max != 0) {
-    NVF_ERROR(
-        scheduler::jev::mode() != scheduler::jev::Mode::Remote,
-        "Cannot prove a safe inner 3D vector-width menu");
-    scheduler::jev::recordCoverageSkip(
-        "IP6.width", "native vector width is not a divisible power of two");
+    scheduler::jev::recordNoChoiceDecision(
+        "IP6.width",
+        "w" + std::to_string(layout_max),
+        "native vector width is not a divisible power of two",
+        "native_vector_width");
     return properties;
   }
 
@@ -2393,11 +2444,11 @@ std::unique_ptr<ReductionParams> chooseInner3DCtaFloor(
   const int64_t native_floor = 4 * device.warpSize;
   if (!isNativeValidInner3DAlternative(
           properties, *native, *native, native_resources, device)) {
-    NVF_ERROR(
-        scheduler::jev::mode() != scheduler::jev::Mode::Remote,
-        "Cannot prove the native inner 3D CTA floor plan");
-    scheduler::jev::recordCoverageSkip(
-        "IP6.cta_floor", "native 3D CTA floor failed complete resource preflight");
+    scheduler::jev::recordNoChoiceDecision(
+        "IP6.cta_floor",
+        "floor" + std::to_string(native_floor),
+        "native 3D CTA floor failed complete resource preflight",
+        "native_3d_preflight_fallback");
     return native;
   }
 
@@ -2465,11 +2516,11 @@ std::unique_ptr<ReductionParams> chooseInner3DCtaFloor(
           unroll_first,
           floor);
     } catch (const std::exception&) {
-      NVF_ERROR(
-          scheduler::jev::mode() != scheduler::jev::Mode::Remote,
-          "Cannot materialize all inner 3D CTA floor candidates");
-      scheduler::jev::recordCoverageSkip(
-          "IP6.cta_floor", "alternate 3D CTA floor failed planning");
+      scheduler::jev::recordNoChoiceDecision(
+          "IP6.cta_floor",
+          "floor" + std::to_string(native_floor),
+          "alternate 3D CTA floor failed planning",
+          "native_cta_floor");
       return std::move(plans.front().params);
     }
     const std::string measurements = complete_plan(*params, resources);
@@ -2868,21 +2919,12 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
   // orders must finish the complete register-backed 3D plan before selection.
   if (!isNativeValidInner3DAlternative(
           properties, *native, *native, native_resources, device)) {
-    NVF_ERROR(
-        scheduler::jev::mode() != scheduler::jev::Mode::Remote,
-        "Cannot prove the native inner 3D work-split plan");
-    scheduler::jev::recordCoverageSkip(
-        "IP6.work_split", "native 3D plan failed complete resource preflight");
-    return chooseInner3DOuterUnroll(
+    recordInner3DNativeOnlyTail(
         properties,
-        base,
-        wave_cap,
-        warp_target,
-        occupancy_target,
-        std::move(native),
-        native_resources,
+        *native,
         device,
-        true);
+        "native 3D plan failed complete resource preflight");
+    return native;
   }
 
   auto alternate = std::make_unique<ReductionParams>(base);
@@ -3150,6 +3192,32 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
   }
 
   const auto device = at::cuda::getCurrentDeviceProperties();
+  auto native_preview = std::make_unique<ReductionParams>(base);
+  Inner3DPlanResources native_resources;
+  innerPersistentHeuristic3DPlan(
+      properties, 4, native_preview.get(), &native_resources);
+  // The original plan may run successfully even when the stricter Choice
+  // validator rejects its estimated register footprint. If the native anchor
+  // is not admitted, no alternate can be proved against it. Keep the exact
+  // Off-mode result and make the native-only path explicit in both traces.
+  const int64_t layout_max = properties.vectorize_factor;
+  const bool layout_valid =
+      layout_max > 0 && (layout_max & (layout_max - 1)) == 0 &&
+      properties.inner_most_dimension_numel % layout_max == 0;
+  if (!layout_valid || !isNativeValidInner3DAlternative(
+                           properties,
+                           *native_preview,
+                           *native_preview,
+                           native_resources,
+                           *device)) {
+    recordInner3DNativeOnlyDecisions(
+        properties,
+        *native_preview,
+        *device,
+        layout_valid ? "native 3D plan failed complete resource preflight"
+                     : "native vector width is not a divisible power of two");
+    return native_preview;
+  }
   const auto selected_properties =
       chooseInner3DVectorWidth(properties, base, *device);
   struct Plan {

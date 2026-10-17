@@ -1975,6 +1975,19 @@ if(BUILD_NVFUSER_BENCHMARK)
   endif()
 endif()
 
+if(BUILD_TEST AND BUILD_NVFUSER_BENCHMARK)
+  # The native batch-norm 3D plan can run even when the stricter Choice-menu
+  # resource check rejects its register estimate. Both traced modes must keep
+  # that exact native plan without contacting the API.
+  add_test(NAME jev_ip6_native_preflight_fallback
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_ip6_native_fallback.py"
+      --binary "$<TARGET_FILE:nvfuser_bench>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_ip6_native_fallback")
+  set_tests_properties(jev_ip6_native_preflight_fallback PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+endif()
+
 # --- generate runtime files
 # nvfuser runtime files
 set(NVFUSER_RUNTIME_FILES)
