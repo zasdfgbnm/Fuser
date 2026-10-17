@@ -7261,6 +7261,44 @@ static void expectJevOuterPersistentSchedule(FusionExecutorCache& executor_cache
       })) << "Exact benchmark fixture did not select OuterPersistent";
 }
 
+// Reproduce transpose benchmark ordinal 11833 with the default optimization
+// passes and automatic scheduler selection. Both inputs and the graph match
+// the fp16 Inner 3D 12 Axis Args(64, 160) registration.
+TEST_F(Gpu3Test, JevTransposeFp16Inner3D12Ordinal11833_CUDA) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+  auto x_tv = makeContigTensor(3, DataType::Half);
+  auto y_tv = makeContigTensor(3, DataType::Half);
+  fusion->addInput(x_tv);
+  fusion->addInput(y_tv);
+  fusion->addOutput(relu(add(transpose(x_tv, 1, 2), y_tv)));
+
+  at::manual_seed(0);
+  auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  auto x = at::randn({32, 64, 160}, options);
+  auto y = at::randn({32, 160, 64}, options);
+  KernelArgumentHolder inputs = {x, y};
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto outputs = executor_cache.runFusionWithInputs(inputs);
+
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_NE(runtime, nullptr);
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_NE(runtime->schedulerHeuristics(), nullptr);
+  const auto& plans = runtime->schedulerHeuristics()->heuristicsList();
+  ASSERT_EQ(plans.size(), 1);
+  ASSERT_EQ(plans.at(0)->scheduler_type, SchedulerType::Transpose);
+
+  auto reference = at::relu(x.transpose(1, 2) + y);
+  testValidate(
+      executor_cache.fusion(),
+      outputs,
+      inputs,
+      {reference},
+      __LINE__,
+      __FILE__);
+}
+
 static void runJevInstanceNormNhwcCtaNumeric(
     DataType dtype,
     int64_t channels) {

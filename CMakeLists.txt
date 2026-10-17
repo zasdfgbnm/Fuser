@@ -1131,7 +1131,7 @@ if(BUILD_TEST)
       --gtest_filter=Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA)
   add_test(NAME jev_numeric_transpose
     COMMAND $<TARGET_FILE:test_nvfuser>
-      --gtest_filter=TransposeTest.FusionScheduleTransposeSmall)
+      --gtest_filter=TransposeTest.FusionScheduleTransposeSmall:Gpu3Test.JevTransposeFp16Inner3D12Ordinal11833_CUDA)
   add_test(NAME jev_numeric_inner_persistent
     COMMAND $<TARGET_FILE:test_nvfuser>
       --gtest_filter=Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA)
@@ -1167,6 +1167,9 @@ if(BUILD_TEST)
       RESOURCE_LOCK nvfuser_gpu
       ENVIRONMENT "NVFUSER_JEV_MODE=off"
       FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
+  set_tests_properties(jev_numeric_transpose PROPERTIES
+    ENVIRONMENT "NVFUSER_JEV_MODE=off"
+    FAIL_REGULAR_EXPRESSION "Running [01] tests?|\\[  PASSED  \\] [01] tests?\\.")
 
   # TMA parameter analysis runs on any CUDA device; no Hopper kernel executes.
   add_test(NAME jev_pointwise_tma_analysis
@@ -1238,7 +1241,7 @@ if(BUILD_TEST)
   add_jev_remote_numeric_test(reduction
     "Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA" "RD")
   add_jev_remote_numeric_test(transpose
-    "TransposeTest.FusionScheduleTransposeSmall" "TR")
+    "TransposeTest.FusionScheduleTransposeSmall:Gpu3Test.JevTransposeFp16Inner3D12Ordinal11833_CUDA" "TR")
   add_test(NAME jev_alternate_numeric_transpose_cta
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
