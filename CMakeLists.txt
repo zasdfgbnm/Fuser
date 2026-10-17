@@ -1989,6 +1989,17 @@ if(BUILD_TEST AND BUILD_NVFUSER_BENCHMARK)
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_ip6_native_fallback")
   set_tests_properties(ip6_native_preflight_fallback PROPERTIES
     RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+
+  # The native inner 2D plan also remains valid when its Choice-menu proof
+  # rejects the two large softmax shapes. Keep this outside the Jev 80-test
+  # denominator and check its fallback independently.
+  add_test(NAME ip5_native_preflight_fallback
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_ip5_native_fallback.py"
+      --binary "$<TARGET_FILE:nvfuser_bench>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_ip5_native_fallback")
+  set_tests_properties(ip5_native_preflight_fallback PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
 endif()
 
 # --- generate runtime files
