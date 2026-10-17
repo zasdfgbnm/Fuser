@@ -835,12 +835,11 @@ PersistentKernelProperties chooseInner2DVectorWidth(
       properties.total_reduction_numel == properties.inner_most_dimension_numel &&
       properties.inner_most_dimension_numel % max_width == 0 &&
       properties.max_persistent_buffer_size_bit > 0;
-  NVF_ERROR(
-      valid_max || jev_mode == scheduler::jev::Mode::Record,
-      "Inner persistent width has no proved layout maximum");
   if (!valid_max) {
-    scheduler::jev::recordCoverageSkip(
-        "IP5.width", "No proved 2D register vectorization maximum");
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP5.width", "No proved 2D register vectorization maximum");
+    }
     return properties;
   }
 
@@ -861,24 +860,24 @@ PersistentKernelProperties chooseInner2DVectorWidth(
       native_warps,
       false,
       &native_resources);
-  NVF_ERROR(
-      native_resources.supported_menu ||
-          jev_mode == scheduler::jev::Mode::Record,
-      "Native inner persistent width lacks a proved batch menu");
   if (!native_resources.supported_menu) {
-    scheduler::jev::recordCoverageSkip(
-        "IP5.width", "Native width has no proved 2D register plan");
+    // A failed Choice-menu proof does not invalidate the native scheduler.
+    // Remote cannot emit a Record-only coverage marker, but must still leave
+    // the width unchanged and let the native-only 2D path complete.
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP5.width", "Native width has no proved 2D register plan");
+    }
     return properties;
   }
   const bool native_axis_fits = native_resources.batch_max > 0 &&
       native_resources.batch_max <=
           std::numeric_limits<int64_t>::max() / max_width;
-  NVF_ERROR(
-      native_axis_fits || jev_mode == scheduler::jev::Mode::Record,
-      "Native 2D register vector extent exceeds arithmetic bounds");
   if (!native_axis_fits) {
-    scheduler::jev::recordCoverageSkip(
-        "IP5.width", "Native vector extent exceeds arithmetic bounds");
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP5.width", "Native vector extent exceeds arithmetic bounds");
+    }
     return properties;
   }
 
@@ -1166,15 +1165,21 @@ void innerPersistentHeuristic2D(
       false,
       &native_resources);
   if (!native_resources.supported_menu) {
-    NVF_ERROR(
-        jev_mode == scheduler::jev::Mode::Record,
-        "Native inner persistent policy has no proved batch menu");
-    scheduler::jev::recordCoverageSkip(
-        "IP5.targets", "Native 2D register policy lacks a proved batch menu");
-    scheduler::jev::recordCoverageSkip(
-        "IP5.cta_seed", "Native 2D register policy lacks a proved batch menu");
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP5.targets", "Native 2D register policy lacks a proved batch menu");
+      scheduler::jev::recordCoverageSkip(
+          "IP5.cta_seed", "Native 2D register policy lacks a proved batch menu");
+    }
+    // The validator is deliberately stricter than the original heuristic.
+    // An unproved menu has no API option, so Remote executes the same native
+    // planner as Off. Record retains its existing coverage-skip trace.
     innerPersistentHeuristic2DPlan(
-        properties, rparams, native_overhead, native_warps, true);
+        properties,
+        rparams,
+        native_overhead,
+        native_warps,
+        jev_mode == scheduler::jev::Mode::Record);
     return;
   }
 
