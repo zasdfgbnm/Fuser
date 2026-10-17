@@ -4,8 +4,9 @@
 
 Off, Record, and Remote must finish with the same typed scheduler plan. Remote
 has no API server, so an accidental Choice fails. Record keeps the coverage
-skips which identify the unproved candidate menu. The caller owns this numeric
-workload and its processes; this script sends no signals or timeouts.
+skips which identify the unproved candidate menu. Each mode also checks the
+same shape against ATen. The caller owns this numeric workload and its
+processes; this script sends no signals or timeouts.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ COVERAGE = (
     ("IP5.targets", "Native 2D register policy lacks a proved batch menu"),
     ("IP5.cta_seed", "Native 2D register policy lacks a proved batch menu"),
 )
+GTEST_NAMES = {
+    160: "Gpu1Test.JevIP5NativeFallbackSoftmax160_CUDA",
+    320: "Gpu1Test.JevIP5NativeFallbackSoftmax320_CUDA",
+}
 
 
 def case_name(iteration: int) -> str:
@@ -64,6 +69,58 @@ def device_profile(libraries: str) -> tuple[int, int, int]:
 
 def read_rows(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def check_numeric_output(output: str, name: str) -> None:
+    running = re.findall(r"^\[=+\] Running (\d+) tests? from", output, re.M)
+    passed = re.findall(r"^\[\s+PASSED\s+\]\s+(\d+) tests?\.", output, re.M)
+    run_names = re.findall(r"^\[\s+RUN\s+\]\s+(\S+)\s*$", output, re.M)
+    ok_names = re.findall(r"^\[\s+OK\s+\]\s+(\S+)", output, re.M)
+    failed_or_skipped = re.search(r"^\[\s+(?:FAILED|SKIPPED)\s+\]", output, re.M)
+    if (running != ["1"] or passed != ["1"] or
+            run_names != [name] or ok_names != [name] or failed_or_skipped):
+        raise AssertionError(f"numeric GTest did not pass exactly {name}")
+
+
+def run_numeric(mode: str, ordinal: int, iteration: int, binary: Path,
+                loader: Path, libraries: str, root: Path) -> set[str]:
+    name = GTEST_NAMES[iteration]
+    key = f"{ordinal}:{case_name(iteration)}"
+    prefix = f"{ordinal}-{mode}.numeric"
+    stdout = root / f"{prefix}.stdout.txt"
+    stderr = root / f"{prefix}.stderr.txt"
+    decision_log = root / f"{prefix}.decisions.jsonl"
+    outcome_log = root / f"{prefix}.outcomes.jsonl"
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("NVFUSER_") and not key.startswith("LD_")}
+    env.update({"NVFUSER_JEV_MODE": mode,
+                "NVFUSER_JEV_OUTCOME_LOG": str(outcome_log),
+                "NVFUSER_JEV_CASE_KEY": key})
+    if mode != "off":
+        decision_log.touch(exist_ok=False)
+        env["NVFUSER_JEV_LOG"] = str(decision_log)
+        env["NVFUSER_JEV_PORT"] = "1"
+    argv = [str(loader), "--library-path", str(binary.parent) + ":" + libraries,
+            str(binary), "--gtest_color=no", "--gtest_filter=" + name]
+    with stdout.open("x") as out, stderr.open("x") as err:
+        result = subprocess.run(argv, env=env, stdout=out, stderr=err,
+                                check=False)
+    if result.returncode != 0:
+        raise AssertionError(f"{prefix} exited {result.returncode}; see {stderr}")
+    check_numeric_output(stdout.read_text(errors="replace"), name)
+    if mode == "remote" and decision_log.stat().st_size:
+        raise AssertionError(f"{prefix} logged an unproved IP5 Choice")
+    finals = [row for row in read_rows(outcome_log)
+              if row.get("schema") == "nvfuser.native_outcome.v2" and
+              row.get("kind") == "final" and row.get("case_key") == key]
+    if not finals or any(row.get("scheduler_type") != "inner_persistent"
+                         for row in finals):
+        raise AssertionError(f"{prefix} lacks completed inner-persistent plans")
+    plans = {json.dumps({field: row[field] for field in PLAN_FIELDS},
+                        sort_keys=True, separators=(",", ":")) for row in finals}
+    if len(plans) != 1:
+        raise AssertionError(f"{prefix} produced multiple typed plans")
+    return plans
 
 
 def run_mode(mode: str, ordinal: int, iteration: int, binary: Path,
@@ -164,6 +221,9 @@ def main() -> None:
     parser.add_argument("--artifacts-root", type=Path, required=True)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
+    test_binary = binary.with_name("test_nvfuser").resolve(strict=True)
+    if not test_binary.is_file():
+        raise ValueError("test_nvfuser is not a sibling of nvfuser_bench")
     loader = Path(os.environ["JEV_NUMERIC_LOADER"]).resolve(strict=True)
     libraries = os.environ["JEV_NUMERIC_LIBRARY_PATH"]
     if any(not Path(path).is_absolute() or not Path(path).is_dir()
@@ -185,8 +245,16 @@ def main() -> None:
         counts = {mode: check_traced_mode(mode, ordinal, iteration,
                                           results[mode][1], results[mode][2])
                   for mode in ("record", "remote")}
+        for mode in ("off", "record", "remote"):
+            numeric_plan = run_numeric(mode, ordinal, iteration, test_binary,
+                                       loader, libraries, root)
+            if numeric_plan != results[mode][0]:
+                raise AssertionError(f"{mode} numeric plan differs from benchmark"
+                                     f" for ordinal {ordinal}")
         summary.append({"ordinal": ordinal, "iteration": iteration,
-                        "typed_plan_equal": True, "compute_invocations": counts})
+                        "typed_plan_equal": True, "compute_invocations": counts,
+                        "numeric_reference_passed": ["off", "record", "remote"],
+                        "numeric_plan_equal": True})
     print(json.dumps({"cases": summary, "artifacts": str(root)}, sort_keys=True))
 
 

@@ -7503,6 +7503,41 @@ TEST_F(Gpu1Test, FusionMagicSchedulerSoftmax_CUDA) {
   }
 }
 
+// These are the exact two benchmark shapes whose native IP5 plan is retained
+// when its Jev candidate menu cannot be proved. Compare the result with ATen
+// as well as checking the typed plan in jev_ip5_native_fallback.py.
+static void runJevIP5NativeFallbackSoftmax(int64_t batch) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+  auto input = makeContigTensor(2, DataType::Float);
+  fusion->addInput(input);
+  fusion->addOutput(softmax(input, 1));
+
+  at::manual_seed(0);
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({batch, 32768}, options);
+  auto aten_output = at::_softmax(aten_input.to(at::kDouble), 1, false);
+  KernelArgumentHolder args({aten_input});
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto cg_outputs = executor_cache.runFusionWithInputs(args);
+  testValidate(
+      executor_cache.fusion(),
+      cg_outputs,
+      args,
+      {aten_output},
+      __LINE__,
+      __FILE__);
+}
+
+TEST_F(Gpu1Test, JevIP5NativeFallbackSoftmax160_CUDA) {
+  runJevIP5NativeFallbackSoftmax(160);
+}
+
+TEST_F(Gpu1Test, JevIP5NativeFallbackSoftmax320_CUDA) {
+  runJevIP5NativeFallbackSoftmax(320);
+}
+
 TEST_F(Gpu1Test, FusionTestMaskSoftmax_CUDA) {
   // This test is testing the usage of all padding tokens
   // with softmax like Bert might might use in a full padding
@@ -8067,6 +8102,67 @@ TEST_F(Gpu1Test, FusionMagicSchedulerBatchNormalization_CUDA) {
       __LINE__,
       __FILE__,
       "");
+}
+
+// Match the ordinal 44 benchmark graph and inputs, then check its output
+// against ATen after the native IP6 fallback has run.
+TEST_F(Gpu1Test, JevIP6NativeFallbackBatchNorm_CUDA) {
+  constexpr float kMomentum = 0.1f;
+  constexpr float kEps = 1e-5f;
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+  auto input = makeContigTensor(4, DataType::Float);
+  auto weight = makeContigTensor(1, DataType::Float);
+  auto bias = makeContigTensor(1, DataType::Float);
+  auto running_mean = makeContigTensor(1, DataType::Float);
+  auto running_var = makeContigTensor(1, DataType::Float);
+  fusion->addInput(input);
+  fusion->addInput(weight);
+  fusion->addInput(bias);
+  fusion->addInput(running_mean);
+  fusion->addInput(running_var);
+  auto result = batch_norm(
+      input,
+      weight,
+      bias,
+      running_mean,
+      running_var,
+      true,
+      IrBuilder::create<Val>(kMomentum),
+      IrBuilder::create<Val>(kEps));
+  fusion->addOutput(result.output);
+
+  at::manual_seed(0);
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor at_x = at::randn({8, 32, 64, 64}, options);
+  at::Tensor at_weight = at::ones({32}, options);
+  at::Tensor at_bias = at::zeros({32}, options);
+  at::Tensor at_run_mean = at::zeros({32}, options);
+  at::Tensor at_run_var = at::ones({32}, options);
+  auto ref_mean = at_run_mean.clone();
+  auto ref_var = at_run_var.clone();
+  auto aten_outputs = at::native_batch_norm(
+      at_x,
+      c10::optional<at::Tensor>(at_weight),
+      c10::optional<at::Tensor>(at_bias),
+      c10::optional<at::Tensor>(ref_mean),
+      c10::optional<at::Tensor>(ref_var),
+      true,
+      kMomentum,
+      kEps);
+
+  KernelArgumentHolder args = {
+      at_x, at_weight, at_bias, at_run_mean, at_run_var};
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto cg_outputs = executor_cache.runFusionWithInputs(args);
+  testValidate(
+      executor_cache.fusion(),
+      cg_outputs,
+      args,
+      {std::get<0>(aten_outputs)},
+      __LINE__,
+      __FILE__);
 }
 
 TEST_F(Gpu1Test, FusionMagicSchedulerInstanceNormalization_CUDA) {
