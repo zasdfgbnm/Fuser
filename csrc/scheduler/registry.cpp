@@ -140,13 +140,16 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
     HeuristicDataCache* data_cache) {
   scheduler::compute_invocation_input::Snapshot input_snapshot;
   const bool trace_enabled = scheduler::jev::computeTraceEnabled();
-  if (trace_enabled) {
+  const bool semantic_enabled =
+      scheduler::jev::mode() != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticProtocolEnabled();
+  if (trace_enabled || semantic_enabled) {
     input_snapshot =
         scheduler::compute_invocation_input::capture(fusion, runtime_info);
   }
   scheduler::jev::ComputeHeuristicsScope compute_scope(
       input_snapshot.text,
-      !trace_enabled
+      !trace_enabled && !semantic_enabled
           ? "not_captured"
           : (input_snapshot.available()
                  ? std::string_view{}

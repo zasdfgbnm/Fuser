@@ -421,20 +421,132 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     // Current nvFuser returns layout_max if the byte floor exceeds it; the
     // singleton preserves that existing behavior until the source TODO is
     // resolved. In the normal case all options satisfy both hard constraints.
-    std::string state = "pointwise.width.v1\n";
-    state += "layout_max=" + std::to_string(layout_max) + '\n';
-    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
-    state += "max_dtype_bits=" +
-        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
-    state += "n_vectorizable_tensors=" +
-        std::to_string(vectorizable_inputs_outputs.size()) + '\n';
-    state += "n_elems=" + std::to_string(n_elems) + '\n';
-    state += "sm_count=" + std::to_string(device_multiprocessor_count) + '\n';
+    const bool semantic = scheduler::jev::semanticProtocolEnabled();
+    std::string state;
+    if (semantic) {
+      // This is the entire state visible to a stateless System One model.
+      // The entry snapshot is never shortened to fit the HTTP limit. The
+      // client rejects a request exceeding 64 KiB in either active mode.
+      const auto snapshot = scheduler::jev::computeInvocationInputSnapshot();
+      NVF_ERROR(
+          !snapshot.empty(),
+          "PW3.width semantic request has no complete computeHeuristics "
+          "snapshot: ",
+          scheduler::jev::computeInvocationInputUnavailableReason());
+      const auto* device = at::cuda::getCurrentDeviceProperties();
+      const int64_t right_elems = bp_info.break_point > 0
+          ? bp_info.right_elem_count
+          : n_elems;
+      NVF_ERROR(
+          n_elems > 0 && right_elems > 0 && n_elems % right_elems == 0,
+          "PW3.width semantic request needs a valid partial schedule");
+      const auto ceil_quotient = [](int64_t numerator, int64_t denominator) {
+        return numerator / denominator + (numerator % denominator != 0);
+      };
+      state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
+      state += ",\"objective\":\"Minimize expected runtime of this "
+          "fusion by choosing a legal per-thread vector width; balance "
+          "memory instruction count, register pressure, and available "
+          "parallelism.\"";
+      state += ",\"workload\":{\"fusion_and_runtime\":" +
+          scheduler::jev::jsonQuote(snapshot) +
+          ",\"snapshot_format\":\"nvfuser.compute_invocation_input.v1\"";
+      state += ",\"hardware\":{\"sm_count\":" +
+          std::to_string(device_multiprocessor_count) +
+          ",\"device_name\":" + scheduler::jev::jsonQuote(device->name) +
+          ",\"compute_capability_major\":" +
+          std::to_string(device->major) +
+          ",\"compute_capability_minor\":" +
+          std::to_string(device->minor) +
+          ",\"warp_size\":" + std::to_string(device->warpSize) +
+          ",\"max_threads_per_block\":" +
+          std::to_string(device->maxThreadsPerBlock) +
+          ",\"max_threads_per_sm\":" +
+          std::to_string(device->maxThreadsPerMultiProcessor) +
+          ",\"registers_per_sm\":" +
+          std::to_string(device->regsPerMultiprocessor) +
+          ",\"shared_memory_per_sm_bytes\":" +
+          std::to_string(device->sharedMemPerMultiprocessor) +
+          ",\"max_grid_x\":" + std::to_string(device->maxGridSize[0]) +
+          "}}";
+      state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
+      state += ",\"breakpoint_analysis_requested\":" +
+          std::string(analyze_2d_break_point ? "true" : "false");
+      state += ",\"break_point\":" + std::to_string(bp_info.break_point) +
+          ",\"flip_grid_binding\":" +
+          std::string(bp_info.flip_grid_binding ? "true" : "false") +
+          ",\"right_elems\":" + std::to_string(right_elems) +
+          ",\"outer_broadcast_dominated\":" +
+          std::string(bp_info.is_outer_broadcast_dominated ? "true" : "false") +
+          ",\"cta_and_grid\":\"pending subsequent scheduling decisions\"}";
+      state += ",\"decision\":{\"kind\":\"vector_width\"";
+      state += ",\"n_elems\":" + std::to_string(n_elems) +
+          ",\"layout_max\":" + std::to_string(layout_max) +
+          ",\"min_dtype_bits\":" + std::to_string(min_dtype_bits) +
+          ",\"max_dtype_bits\":" +
+          std::to_string(max_dtype_size_bit_for_vectorization) +
+          ",\"n_vectorizable_tensors\":" +
+          std::to_string(vectorizable_inputs_outputs.size()) +
+          ",\"byte_floor_exceeds_layout\":" +
+          std::string(byte_min > layout_max ? "true" : "false") +
+          ",\"candidates\":[";
+      bool first_candidate = true;
+      for (int64_t width = first_width; width <= layout_max; width *= 2) {
+        const int64_t total_vectors = ceil_quotient(n_elems, width);
+        const int64_t right_vectors = ceil_quotient(right_elems, width);
+        if (!first_candidate) state += ',';
+        first_candidate = false;
+        state += "{\"id\":\"w" + std::to_string(width) +
+            "\",\"width\":" + std::to_string(width) +
+            ",\"total_vector_iterations\":" +
+            std::to_string(total_vectors) +
+            ",\"right_vector_iterations\":" +
+            std::to_string(right_vectors) +
+            ",\"block_x_if_128\":128";
+        if (bp_info.break_point == 0) {
+          // Coverage CTA estimate used by the later 1D CTA preflight.
+          // The unroll heuristic has its own (floor-divided) block estimate.
+          state += ",\"coverage_ctas_if_128\":" +
+              std::to_string(ceil_quotient(total_vectors, kThreadX));
+        } else {
+          // The subsequent PW3.launch Choice may use another CTA width.
+          state += ",\"grid_left_if_128\":" +
+              std::to_string(n_elems / right_elems) +
+              ",\"grid_right_if_128\":" +
+              std::to_string(ceil_quotient(right_elems, width * kThreadX));
+        }
+        state += '}';
+      }
+      state += "]}}";
+    } else {
+      state = "pointwise.width.v1\n";
+      state += "layout_max=" + std::to_string(layout_max) + '\n';
+      state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+      state += "max_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+      state += "n_vectorizable_tensors=" +
+          std::to_string(vectorizable_inputs_outputs.size()) + '\n';
+      state += "n_elems=" + std::to_string(n_elems) + '\n';
+      state += "sm_count=" + std::to_string(device_multiprocessor_count) + '\n';
+    }
     const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
         ? "w" + std::to_string(vectorization_factor)
         : std::string();
-    const std::string selected = scheduler::jev::chooseDecision(
-        "PW3.width", state, options, native_choice);
+    const std::string selected = semantic
+        ? scheduler::jev::chooseSemanticDecision(
+              "PW3.width",
+              state,
+              "Choose the legal vector width for this ordinary PointWise "
+              "fusion. The state gives the fusion, runtime tensors, current "
+              "breakpoint, hardware, hard layout limit, and each width's "
+              "work and hypothetical 128-thread coverage/grid estimate. "
+              "A later decision chooses CTA and unroll, so do not treat "
+              "that preview as the final launch grid. "
+              "Favor expected kernel speed; return one listed width.",
+              options,
+              native_choice)
+        : scheduler::jev::chooseDecision(
+              "PW3.width", state, options, native_choice);
     bool matched = false;
     for (int64_t width = first_width; width <= layout_max; width *= 2) {
       if (selected == "w" + std::to_string(width)) {

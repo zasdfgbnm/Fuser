@@ -359,6 +359,69 @@ int main() {
                   "\",\"compute_event_index\":2,\"scheduler_type\":\"PointWise\"") !=
                   std::string::npos,
           "remote Choice and compute outcome cannot join");
+  // Semantic-v2 sends the same model-visible object in Record and Remote.
+  // A real Jev response may resolve jev-latest to a versioned model name.
+  ::setenv("NVFUSER_JEV_PROTOCOL", "semantic-v2", 1);
+  const std::string semantic_state =
+      "{\"workload\":{\"fusion_and_runtime\":\"full snapshot\"},"
+      "\"decision\":{\"kind\":\"vector_width\"}}";
+  const std::vector<ChoiceOption> width_options{
+      {"w1", "one element per thread"}, {"w2", "two elements per thread"}};
+  ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  const std::string before_semantic_record = readFile(path);
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope("full snapshot", {});
+    require(nvfuser::scheduler::jev::computeInvocationInputSnapshot() ==
+                "full snapshot",
+            "semantic scope lost entry snapshot");
+    require(nvfuser::scheduler::jev::chooseSemanticDecision(
+                "PW3.width", semantic_state, "Choose vector width for this fusion",
+                width_options, "w2") == "w2",
+            "semantic Record changed native choice");
+  }
+  require(nvfuser::scheduler::jev::computeInvocationInputSnapshot().empty() &&
+              nvfuser::scheduler::jev::computeInvocationInputUnavailableReason() ==
+                  "no_compute_scope",
+          "semantic snapshot escaped its compute scope");
+  const std::string semantic_record = readFile(path).substr(before_semantic_record.size());
+  require(semantic_record.find("\"state\":{") != std::string::npos &&
+              semantic_record.find("\"native_choice\"") == std::string::npos,
+          "semantic Record did not preserve a winner-free object state");
+  {
+    const std::string before_overflow = readFile(path);
+    const std::string oversized = "{\"payload\":\"" +
+        std::string(70 * 1024, 'x') + "\"}";
+    bool rejected = false;
+    try {
+      (void)nvfuser::scheduler::jev::chooseSemanticDecision(
+          "PW3.width", oversized, "Choose width", width_options, "w2");
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    require(rejected && readFile(path) == before_overflow,
+            "oversized semantic state was shortened or logged");
+  }
+  ::setenv("NVFUSER_JEV_MODE", "remote", 1);
+  {
+    FakeServer server(
+        "{\"model\":\"jev-1.13.0\",\"answers\":{\"PW3.width\":{"
+        "\"type\":\"choice\",\"choice\":\"w2\",\"confidence\":1.0,"
+        "\"probabilities\":{\"w1\":0.0,\"w2\":1.0}}},"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}");
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    require(nvfuser::scheduler::jev::chooseSemanticDecision(
+                "PW3.width", semantic_state, "Choose vector width for this fusion",
+                width_options) == "w2",
+            "versioned real-Jev model response was rejected");
+    const auto body_start = server.request().find("\r\n\r\n");
+    require(body_start != std::string::npos, "semantic HTTP body missing");
+    const auto body = server.request().substr(body_start + 4);
+    require(semantic_record.find("\"request\":" + body) != std::string::npos &&
+                body.find("full snapshot") != std::string::npos &&
+                body.find("native_choice") == std::string::npos,
+            "Record and Remote sent different semantic requests");
+  }
+  ::unsetenv("NVFUSER_JEV_PROTOCOL");
   const std::string remote_decisions_before_no_choice = readFile(path);
   std::string remote_no_choice_id;
   {

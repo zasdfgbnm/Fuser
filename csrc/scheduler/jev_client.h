@@ -14,6 +14,13 @@ Mode mode();
 // Reuse the client's JSON string escaping for local diagnostic snapshots.
 std::string jsonQuote(std::string_view value);
 
+// Opt in with NVFUSER_JEV_PROTOCOL=semantic-v2. The default preserves the
+// historical text-state experiment. A semantic request is one complete,
+// model-visible JSON state object; callers must not send a truncated snapshot.
+bool semanticProtocolEnabled();
+std::string_view computeInvocationInputSnapshot() noexcept;
+std::string_view computeInvocationInputUnavailableReason() noexcept;
+
 // The identifier is the wire-format Choice key. Descriptions provide the
 // model with context; neither field contains the native decision.
 struct ChoiceOption {
@@ -35,6 +42,13 @@ std::string chooseDecision(
     const std::vector<ChoiceOption>& options,
     std::string_view native_choice = {},
     std::string_view case_key = {});
+
+std::string chooseSemanticDecision(
+    std::string_view site,
+    std::string_view state_json,
+    std::string_view instructions,
+    const std::vector<ChoiceOption>& options,
+    std::string_view native_choice = {});
 
 // Record why a native plan could not be represented by a conservative Choice
 // menu. This is a coverage event, not a decision; it preserves native params.
@@ -62,6 +76,8 @@ class ComputeHeuristicsScope final {
 
   bool observing() const noexcept;
   std::string_view invocationId() const noexcept;
+  std::string_view inputSnapshot() const noexcept;
+  std::string_view inputSnapshotUnavailableReason() const noexcept;
   uint64_t nextEventIndex() noexcept;
   void recordNoChoice(
       std::string_view site,

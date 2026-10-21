@@ -439,9 +439,16 @@ void appendPointwiseOutcome(std::string_view line) {
 std::string selectedFromResponse(
     std::string_view response,
     std::string_view site,
-    const std::vector<ChoiceOption>& options) {
+    const std::vector<ChoiceOption>& options,
+    bool semantic) {
   Json root = JsonReader(response).parse();
-  if (root.at("model").asString() != "nvfuser-analysis-v1") fail("unexpected local model");
+  const auto response_model = root.at("model").asString();
+  const bool known_semantic_model = response_model == "nvfuser-analysis-v1" ||
+      response_model == "jev-latest" || response_model.starts_with("jev-");
+  if (semantic ? !known_semantic_model
+               : response_model != "nvfuser-analysis-v1") {
+    fail("unexpected response model");
+  }
   const Json& answers = root.at("answers");
   if (answers.kind != Json::Kind::Object || answers.object.size() != 1)
     fail("expected exactly one Choice answer");
@@ -488,6 +495,13 @@ Mode mode() {
 
 std::string jsonQuote(std::string_view value) {
   return quote(value);
+}
+
+bool semanticProtocolEnabled() {
+  const std::string configured = env("NVFUSER_JEV_PROTOCOL");
+  if (configured.empty() || configured == "text-v1") return false;
+  if (configured == "semantic-v2") return true;
+  fail("NVFUSER_JEV_PROTOCOL must be text-v1 or semantic-v2");
 }
 
 bool computeTraceEnabled() noexcept {
@@ -539,6 +553,27 @@ bool ComputeHeuristicsScope::observing() const noexcept {
 
 std::string_view ComputeHeuristicsScope::invocationId() const noexcept {
   return observing() ? std::string_view(invocation_id_) : std::string_view{};
+}
+
+std::string_view ComputeHeuristicsScope::inputSnapshot() const noexcept {
+  return active_compute_scope == this ? input_snapshot_ : std::string_view{};
+}
+
+std::string_view ComputeHeuristicsScope::inputSnapshotUnavailableReason()
+    const noexcept {
+  return active_compute_scope == this ? input_snapshot_unavailable_reason_
+                                      : std::string_view("no_compute_scope");
+}
+
+std::string_view computeInvocationInputSnapshot() noexcept {
+  return active_compute_scope == nullptr ? std::string_view{}
+                                         : active_compute_scope->inputSnapshot();
+}
+
+std::string_view computeInvocationInputUnavailableReason() noexcept {
+  return active_compute_scope == nullptr
+      ? std::string_view("no_compute_scope")
+      : active_compute_scope->inputSnapshotUnavailableReason();
 }
 
 uint64_t ComputeHeuristicsScope::nextEventIndex() noexcept {
@@ -693,12 +728,14 @@ void PointwiseRecordScope::complete(
   active_invocation.completed = true;
 }
 
-std::string chooseDecision(
+std::string chooseDecisionImpl(
     std::string_view site,
     std::string_view state,
     const std::vector<ChoiceOption>& options,
     std::string_view native_choice,
-    std::string_view case_key) {
+    std::string_view case_key,
+    bool semantic,
+    std::string_view instructions) {
   const Mode current_mode = mode();
   if (current_mode == Mode::Off) {
     if (native_choice.empty()) fail("native choice is required in off mode");
@@ -716,6 +753,8 @@ std::string chooseDecision(
     fail("native choice is not an allowed candidate");
   if (!active_invocation.id.empty() && active_invocation.completed)
     fail("Pointwise Choice followed a final Record outcome");
+  if (semantic && JsonReader(state).parse().kind != Json::Kind::Object)
+    fail("semantic state must be a JSON object");
   const std::string log_case_key = case_key.empty()
       ? (active_invocation.id.empty() ? env("NVFUSER_JEV_CASE_KEY")
                                       : active_invocation.case_key)
@@ -724,21 +763,26 @@ std::string chooseDecision(
   // Keep the exact model-visible question in both local logs. In record mode
   // this is the request that the remote mode would have sent, without the
   // native winner; comparing it catches mismatched option descriptions too.
-  std::string request = "{\"model\":\"jev-latest\",\"state\":" + quote(state) +
+  std::string request = "{\"model\":\"jev-latest\",\"state\":" +
+      (semantic ? std::string(state) : quote(state)) +
       ",\"questions\":{" + quote(site) + ":{\"type\":\"choice\",\"instructions\":" +
-      quote("Choose nvFuser scheduler decision " + std::string(site)) + ",\"criteria\":{";
+      quote(semantic ? instructions
+                     : "Choose nvFuser scheduler decision " + std::string(site)) +
+      ",\"criteria\":{";
   for (size_t i = 0; i < options.size(); ++i) {
     if (i != 0) request += ',';
     request += quote(options[i].id) + ':' + quote(options[i].description);
   }
   request += "}}}}";
+  if (semantic && request.size() > kMaxRequest)
+    fail("complete semantic request exceeds 64 KiB; no snapshot was truncated");
   std::string selected(native_choice);
   int64_t roundtrip_us = 0;
   if (current_mode == Mode::Remote) {
     const auto begin = Clock::now();
     const std::string response = post(request);
     roundtrip_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count();
-    selected = selectedFromResponse(response, site, options);
+    selected = selectedFromResponse(response, site, options, semantic);
   }
   std::string candidates = "[";
   for (size_t i = 0; i < options.size(); ++i) {
@@ -760,12 +804,35 @@ std::string chooseDecision(
                  quote(compute_event.invocation_id) +
                  ",\"compute_event_index\":" +
                  std::to_string(compute_event.index)) +
-      ",\"state\":" + quote(state) + ",\"candidates\":" + candidates +
+      ",\"state\":" + (semantic ? std::string(state) : quote(state)) +
+      ",\"candidates\":" + candidates +
       ",\"request\":" + request +
       ",\"selected\":" + quote(selected) + ",\"mode\":" +
       quote(current_mode == Mode::Record ? "record" : "remote") +
       ",\"roundtrip_us\":" + std::to_string(roundtrip_us) + '}');
   return selected;
+}
+
+std::string chooseDecision(
+    std::string_view site,
+    std::string_view state,
+    const std::vector<ChoiceOption>& options,
+    std::string_view native_choice,
+    std::string_view case_key) {
+  return chooseDecisionImpl(
+      site, state, options, native_choice, case_key, false, {});
+}
+
+std::string chooseSemanticDecision(
+    std::string_view site,
+    std::string_view state_json,
+    std::string_view instructions,
+    const std::vector<ChoiceOption>& options,
+    std::string_view native_choice) {
+  if (!semanticProtocolEnabled() || instructions.empty())
+    fail("semantic Choice requires semantic-v2 and instructions");
+  return chooseDecisionImpl(
+      site, state_json, options, native_choice, {}, true, instructions);
 }
 
 void recordCoverageSkip(
