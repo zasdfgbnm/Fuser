@@ -8,6 +8,8 @@
 
 #include "scheduler/pointwise.h"
 
+#include <algorithm>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
@@ -550,6 +552,32 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
   }
   const auto& prop = prop_opt.value();
 
+  // A block-quantized schedule has downstream width and grid-Y correctness
+  // requirements. canScheduleRunTime calls computeHeuristics separately from
+  // the plan later used for code generation. Keep every PointWise preference
+  // native in both calls so a variable stateless model cannot change the
+  // result between the eligibility check and the final schedule.
+  auto block_quantization_ops =
+      HeuristicDataCacheEntry<HeuristicCompileTime::BlockQuantizationOps>(
+          data_cache,
+          [fusion]() {
+            auto ops = std::make_unique<std::vector<Expr*>>();
+            auto block_ops =
+                ir_utils::getOpsOfType<BlockQuantizationOp>(fusion);
+            ops->insert(ops->end(), block_ops.begin(), block_ops.end());
+            auto grouped_ops =
+                ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion);
+            ops->insert(ops->end(), grouped_ops.begin(), grouped_ops.end());
+            return ops;
+          })
+          .get();
+  const bool block_quantization = !block_quantization_ops.empty();
+  const auto configured_jev_mode = scheduler::jev::mode();
+  std::optional<scheduler::jev::ScopedNativeDecisions> native_decisions;
+  if (block_quantization && configured_jev_mode != scheduler::jev::Mode::Off) {
+    native_decisions.emplace();
+  }
+
   const bool use_tma =
       mayUseTma(fusion, prop) && isOptionEnabled(EnableOption::TmaPointwise);
   const auto jev_mode = scheduler::jev::mode();
@@ -568,10 +596,9 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
     auto ordinary_params = pointwise::non_tma::getPointwiseHeuristics(
         fusion, runtime_info, data_cache, prop);
     if (ordinary_params != nullptr) {
-      const std::string state =
-          "pointwise.tma_preference.v1\nn_elems=" +
-          std::to_string(prop.n_elems) + "\nsm_count=" +
-          std::to_string(prop.device_multiprocessor_count) +
+      const std::string state = "pointwise.tma_preference.v1\nn_elems=" +
+          std::to_string(prop.n_elems) +
+          "\nsm_count=" + std::to_string(prop.device_multiprocessor_count) +
           "\nmin_dtype_bits=" +
           std::to_string(prop.min_dtype_size_bit_for_vectorization) +
           "\nmax_dtype_bits=" +
@@ -582,8 +609,8 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
       // The original policy prefers every materialized TMA pointwise plan.
       const std::string native_choice =
           jev_mode == scheduler::jev::Mode::Record ? "tma" : "";
-      const auto selected = scheduler::jev::chooseDecision(
-          "PW1", state, options, native_choice);
+      const auto selected =
+          scheduler::jev::chooseDecision("PW1", state, options, native_choice);
       NVF_ERROR(
           selected == "tma" || selected == "ordinary",
           "PW1 must select a complete native pointwise plan");
@@ -594,34 +621,41 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
   }
   NVF_ERROR(pparams != nullptr);
 
-  // cap vectorization when block quantization op is encountered, since there's
-  // a validation during device_lower
-  auto has_block_quantization_ops =
-      HeuristicDataCacheEntry<HeuristicCompileTime::BlockQuantizationOps>(
-          data_cache,
-          [fusion]() {
-            auto ops = std::make_unique<std::vector<Expr*>>();
-            // Get BlockQuantizationOp operations
-            auto block_quant_ops =
-                ir_utils::getOpsOfType<BlockQuantizationOp>(fusion);
-            ops->insert(
-                ops->end(), block_quant_ops.begin(), block_quant_ops.end());
-            // Get GroupedBlockQuantizationOp operations
-            auto grouped_ops =
-                ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion);
-            ops->insert(ops->end(), grouped_ops.begin(), grouped_ops.end());
-            return ops;
-          })
-          .get();
-  if (!has_block_quantization_ops.empty()) {
+  // Keep the original final clamp and runtime eligibility check.
+  if (block_quantization) {
     // FIXME: this needs to be done per input dtype. I'm capping it as 4 for
     // simplicity for now.
     pparams->as<PointwiseParams>()->vectorization_factor = std::min<int64_t>(
         4, pparams->as<PointwiseParams>()->vectorization_factor);
   }
 
-  recordFinalPointwisePlan(
-      record_scope, *pparams->as<PointwiseParams>(), true);
+  native_decisions.reset();
+  if (block_quantization &&
+      configured_jev_mode == scheduler::jev::Mode::Record) {
+    const auto* pointwise = pparams->as<PointwiseParams>();
+    const auto skip = [](std::string_view site) {
+      scheduler::jev::recordCoverageSkip(
+          site, "block_quantization_native_plan");
+    };
+    if (pointwise->use_tma_load) {
+      skip("PW1");
+      skip("PW4.domain_inner");
+      skip("PW4.tile_inner");
+      skip("PW4.tile_outer");
+      skip("PW4.width");
+      skip("PW4.breakpoint");
+    } else {
+      skip("PW2.entry");
+      if (pointwise->break_point > 0) {
+        skip("PW2");
+      }
+      skip("PW3.width");
+      skip(pointwise->break_point > 0 ? "PW3.launch" : "PW3.cta_1d");
+      skip("PW3.unroll");
+    }
+  }
+
+  recordFinalPointwisePlan(record_scope, *pparams->as<PointwiseParams>(), true);
   return pparams;
 }
 
@@ -634,6 +668,30 @@ void PointWiseScheduler::schedule(
       pparams != nullptr,
       "Incorrect parameters sent to PointWiseScheduler::schedule",
       params);
+  bool has_block_quantization = false;
+  bool subbyte_quantized_output = false;
+  for (auto* op : ir_utils::getOpsOfType<BlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    subbyte_quantized_output |=
+        dataTypeSizeBit(op->quantizedOutput()->getDataType()) % 8 != 0;
+  }
+  for (auto* op : ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    subbyte_quantized_output |=
+        dataTypeSizeBit(op->quantizedOutput()->getDataType()) % 8 != 0;
+  }
+  if (has_block_quantization) {
+    // This checks the parameters actually being applied, independently of the
+    // earlier canScheduleRunTime call and of any model or cache state.
+    NVF_ERROR(
+        pparams->vectorization_factor >= 1 &&
+            pparams->vectorization_factor <= 4 &&
+            (!subbyte_quantized_output || pparams->vectorization_factor >= 2) &&
+            !pparams->split_grid_y_dim && pparams->unroll_factor_inner == 1 &&
+            pparams->unroll_factor_outer == 1,
+        "Block quantization PointWise schedule violates native width, "
+        "unroll, or grid-Y requirements");
+  }
   if (pparams->use_tma_load) {
     pointwise::tma::schedulePointwise(fusion, pparams);
   } else {

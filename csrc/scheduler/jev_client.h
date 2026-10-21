@@ -11,6 +11,20 @@ namespace nvfuser::scheduler::jev {
 enum class Mode { Off, Record, Remote };
 Mode mode();
 
+// Force native choices within one scheduler's correctness-sensitive plan.
+// The override is thread-local and nestable; the configured mode is restored
+// when the scope ends, so surrounding Record diagnostics remain active.
+class ScopedNativeDecisions final {
+ public:
+  ScopedNativeDecisions() noexcept;
+  ~ScopedNativeDecisions() noexcept;
+  ScopedNativeDecisions(const ScopedNativeDecisions&) = delete;
+  ScopedNativeDecisions& operator=(const ScopedNativeDecisions&) = delete;
+
+ private:
+  bool previous_ = false;
+};
+
 // Reuse the client's JSON string escaping for local diagnostic snapshots.
 std::string jsonQuote(std::string_view value);
 

@@ -123,33 +123,83 @@ int main() {
         "native_unroll_first_branch");
     scope.complete("Reduction");
   }
-  require(chooseDecision("PW2", state, options, "bp0") == "bp0", "off mode changed choice");
-  require(readFile(path).empty() &&
-              readFile(std::string(path) + ".outcome.jsonl").empty(),
-          "off mode wrote a record");
+  require(
+      chooseDecision("PW2", state, options, "bp0") == "bp0",
+      "off mode changed choice");
+  require(
+      readFile(path).empty() &&
+          readFile(std::string(path) + ".outcome.jsonl").empty(),
+      "off mode wrote a record");
 
   ::setenv("NVFUSER_JEV_MODE", "record", 1);
-  require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Record,
-          "mode() did not report record");
-  require(chooseDecision("PW2", state, options, "bp0", "case-1") == "bp0", "record changed choice");
-  require(readFile(path).find("\"case_key\":\"case-1\"") != std::string::npos,
-          "record lacks case key");
-  require(readFile(path).find("\"request\":{\"model\":\"jev-latest\"") != std::string::npos,
-          "record lacks the model-visible request");
-  require(readFile(path).find("\"instructions\":\"Choose nvFuser scheduler decision PW2\"") != std::string::npos,
-          "record lacks Choice instructions");
-  require(readFile(path).find("\"criteria\":{\"bp0\":\"one dimensional\",\"bp1\":\"split\"}") != std::string::npos,
-          "record lacks candidate descriptions");
+  require(
+      nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Record,
+      "mode() did not report record");
+  const std::string before_native_scope = readFile(path);
+  {
+    nvfuser::scheduler::jev::ScopedNativeDecisions native_scope;
+    require(
+        nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Off,
+        "native scope did not force off mode");
+    {
+      nvfuser::scheduler::jev::ScopedNativeDecisions nested_scope;
+      require(
+          chooseDecision("PW2", state, options, "bp1") == "bp1",
+          "nested native scope changed the native choice");
+    }
+    require(
+        nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Off,
+        "nested native scope restored configured mode too early");
+  }
+  require(
+      nvfuser::scheduler::jev::mode() ==
+              nvfuser::scheduler::jev::Mode::Record &&
+          readFile(path) == before_native_scope,
+      "native scope did not restore Record without a Choice log");
+  try {
+    nvfuser::scheduler::jev::ScopedNativeDecisions native_scope;
+    throw std::runtime_error("test exception");
+  } catch (const std::runtime_error&) {
+    require(
+        nvfuser::scheduler::jev::mode() ==
+            nvfuser::scheduler::jev::Mode::Record,
+        "exception did not restore the configured mode");
+  }
+  require(
+      chooseDecision("PW2", state, options, "bp0", "case-1") == "bp0",
+      "record changed choice");
+  require(
+      readFile(path).find("\"case_key\":\"case-1\"") != std::string::npos,
+      "record lacks case key");
+  require(
+      readFile(path).find("\"request\":{\"model\":\"jev-latest\"") !=
+          std::string::npos,
+      "record lacks the model-visible request");
+  require(
+      readFile(path).find(
+          "\"instructions\":\"Choose nvFuser scheduler decision PW2\"") !=
+          std::string::npos,
+      "record lacks Choice instructions");
+  require(
+      readFile(path).find(
+          "\"criteria\":{\"bp0\":\"one dimensional\",\"bp1\":\"split\"}") !=
+          std::string::npos,
+      "record lacks candidate descriptions");
   nvfuser::scheduler::jev::recordCoverageSkip(
-      "PW4.tile", "native tile exceeds conservative shared-memory bound", "case-skip");
-  require(readFile(path).find("\"kind\":\"coverage_skip\",\"site\":\"PW4.tile\"") !=
+      "PW4.tile",
+      "native tile exceeds conservative shared-memory bound",
+      "case-skip");
+  require(
+      readFile(path).find("\"kind\":\"coverage_skip\",\"site\":\"PW4.tile\"") !=
               std::string::npos &&
-              readFile(path).find("\"reason\":\"native tile exceeds conservative shared-memory bound\"") !=
-                  std::string::npos,
-          "record coverage skip lacks a reason");
+          readFile(path).find(
+              "\"reason\":\"native tile exceeds conservative shared-memory "
+              "bound\"") != std::string::npos,
+      "record coverage skip lacks a reason");
   const std::string first_record = readFile(path);
-  require(chooseDecision("PW2", state, options, "bp1", "case-1b") == "bp1",
-          "second record changed choice");
+  require(
+      chooseDecision("PW2", state, options, "bp1", "case-1b") == "bp1",
+      "second record changed choice");
   const std::string appended = readFile(path);
   require(appended.starts_with(first_record) &&
               appended.find("\"case_key\":\"case-1b\"") != std::string::npos &&
@@ -319,6 +369,14 @@ int main() {
   ::setenv("NVFUSER_JEV_MODE", "remote", 1);
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,
           "mode() did not report remote");
+  {
+    nvfuser::scheduler::jev::ScopedNativeDecisions native_scope;
+    require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Off &&
+                chooseDecision("PW2", state, options, "bp0") == "bp0",
+            "Remote native scope did not bypass the server");
+  }
+  require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,
+          "Remote native scope did not restore the configured mode");
   {
     nvfuser::scheduler::jev::PointwiseRecordScope scope;
     require(!scope.recording(), "remote mode enabled Pointwise Record diagnostics");

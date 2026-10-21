@@ -128,7 +128,8 @@ BlockGridConfig getBlockGridConfig(
     const FusionRuntimeProperties& prop,
     const BreakPointInfo& bp_info,
     int64_t max_vect_factor,
-    int64_t kThreadX);
+    int64_t kThreadX,
+    bool block_quantization);
 
 // Structure to hold results from common pointwise scheduling setup
 struct CommonScheduleInfo {

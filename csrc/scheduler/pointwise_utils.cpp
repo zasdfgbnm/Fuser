@@ -9,6 +9,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
 #include <string_view>
 
 #include "ir/printer.h"
@@ -29,8 +30,8 @@ std::string semanticPointwiseWorkload(
       !snapshot.empty(),
       "PointWise semantic request has no complete computeHeuristics snapshot: ",
       scheduler::jev::computeInvocationInputUnavailableReason());
-  std::string workload = "{\"fusion_and_runtime\":" +
-      scheduler::jev::jsonQuote(snapshot) +
+  std::string workload =
+      "{\"fusion_and_runtime\":" + scheduler::jev::jsonQuote(snapshot) +
       ",\"snapshot_format\":\"nvfuser.compute_invocation_input.v1\"";
   workload += ",\"hardware\":{\"sm_count\":" + std::to_string(sm_count) +
       ",\"device_name\":" + scheduler::jev::jsonQuote(device->name) +
@@ -38,15 +39,15 @@ std::string semanticPointwiseWorkload(
       ",\"compute_capability_minor\":" + std::to_string(device->minor) +
       ",\"warp_size\":" + std::to_string(device->warpSize) +
       ",\"max_threads_per_block\":" +
-      std::to_string(device->maxThreadsPerBlock) +
-      ",\"max_threads_per_sm\":" +
+      std::to_string(device->maxThreadsPerBlock) + ",\"max_threads_per_sm\":" +
       std::to_string(device->maxThreadsPerMultiProcessor) +
-      ",\"registers_per_sm\":" +
-      std::to_string(device->regsPerMultiprocessor) +
+      ",\"max_threads_x\":" + std::to_string(device->maxThreadsDim[0]) +
+      ",\"max_threads_y\":" + std::to_string(device->maxThreadsDim[1]) +
+      ",\"registers_per_sm\":" + std::to_string(device->regsPerMultiprocessor) +
       ",\"shared_memory_per_sm_bytes\":" +
       std::to_string(device->sharedMemPerMultiprocessor) +
       ",\"max_grid_x\":" + std::to_string(device->maxGridSize[0]) +
-      "}}";
+      ",\"max_grid_y\":" + std::to_string(device->maxGridSize[1]) + "}}";
   return workload;
 }
 
@@ -346,7 +347,8 @@ BreakPointInfo getBreakPoint(
     append_vector("lhs_bit_multiples", lhs);
     append_vector("rhs_bit_multiples", rhs);
     request.state += "dtype_sum_bits=" + std::to_string(dtype_sum_bit) + '\n';
-    request.state += "max_vectorization=" + std::to_string(max_vect_factor) + '\n';
+    request.state +=
+        "max_vectorization=" + std::to_string(max_vect_factor) + '\n';
     request.state += "warp_size=" +
         std::to_string(at::cuda::getCurrentDeviceProperties()->warpSize) + '\n';
     request.state += "l2_cache_bytes=" +
@@ -365,14 +367,14 @@ BreakPointInfo getBreakPoint(
       plan.right_elem_count = right_count;
       plan.is_outer_broadcast_dominated = lhs[i] < rhs[i];
       const std::string prefix = "bp" + std::to_string(i);
-      request.options.push_back({
-          prefix + "_normal",
-          "Split at axis " + std::to_string(i) + ", normal BID binding"});
+      request.options.push_back(
+          {prefix + "_normal",
+           "Split at axis " + std::to_string(i) + ", normal BID binding"});
       request.plans.push_back(plan);
       plan.flip_grid_binding = true;
-      request.options.push_back({
-          prefix + "_flip",
-          "Split at axis " + std::to_string(i) + ", flipped BID binding"});
+      request.options.push_back(
+          {prefix + "_flip",
+           "Split at axis " + std::to_string(i) + ", flipped BID binding"});
       request.plans.push_back(plan);
     }
     return request;
@@ -511,7 +513,8 @@ BlockGridConfig getBlockGridConfig(
     const FusionRuntimeProperties& prop,
     const BreakPointInfo& bp_info,
     int64_t max_vect_factor,
-    int64_t kThreadX) {
+    int64_t kThreadX,
+    bool block_quantization) {
   BlockGridConfig result;
 
   // Copy break point information
@@ -534,142 +537,183 @@ BlockGridConfig getBlockGridConfig(
 
     int64_t cur_left_elem_count = n_elems / result.right_elem_count;
 
-    // Preserve the native preference in off and record modes. Remote mode
-    // derives it from raw extents and hardware data in the local model.
+    // Keep the native launch available for block quantization and for a
+    // conservative fallback if its preliminary resource proof fails. It is
+    // never sent to the model as a preference.
     int64_t after_vect = ceilDiv(result.right_elem_count, max_vect_factor);
     const auto jev_mode = scheduler::jev::mode();
-    if (jev_mode != scheduler::jev::Mode::Remote) {
-      result.bdimx = std::min(after_vect, threads_per_warp);
-      while (result.bdimx * 2 <= kThreadX &&
-             result.bdimx * 2 <= after_vect &&
-             after_vect % (result.bdimx * 2) == 0) {
-        result.bdimx *= 2;
-      }
+    result.bdimx = std::min(after_vect, threads_per_warp);
+    while (result.bdimx * 2 <= kThreadX && result.bdimx * 2 <= after_vect &&
+           after_vect % (result.bdimx * 2) == 0) {
+      result.bdimx *= 2;
     }
-    if (jev_mode != scheduler::jev::Mode::Off) {
+    if (jev_mode != scheduler::jev::Mode::Off && !block_quantization) {
       NVF_ERROR(
           n_elems > 0 && result.right_elem_count > 0 && max_vect_factor > 0 &&
               threads_per_warp > 0 && threads_per_warp <= kThreadX &&
-              kThreadX == 128 &&
-              result.right_elem_count <= n_elems &&
+              kThreadX == 128 && result.right_elem_count <= n_elems &&
               n_elems % result.right_elem_count == 0,
           "PW3.launch requires valid two-dimensional extents and CTA bounds");
 
-      // The schedule splits both axes by symbolic thread dimensions and
-      // predicates tails. Any positive TIDx dimension up to the CTA cap is
-      // structurally valid, including overprovisioned or non-power-of-two
-      // dimensions. TIDy=floor(kThreadX/TIDx) keeps the CTA within that cap.
-      // Offer the full set so its upper bound never reveals the native winner.
+      // Symbolic splits and predicated tails permit irregular TIDx values.
+      // Filter the structural domain against the physical CTA and the
+      // preliminary grid before offering a model any alternatives. Later
+      // unroll can only shrink the grid; if this filter excludes the native
+      // plan, retain the original native path instead of making an incomplete
+      // pre-unroll proof into a rejection.
       std::vector<scheduler::jev::ChoiceOption> options;
       options.reserve(kThreadX);
       for (int64_t candidate = 1; candidate <= kThreadX; ++candidate) {
+        const int64_t threads_y = kThreadX / candidate;
+        const int64_t physical_threads = candidate * threads_y;
+        const int64_t grid_left = ceilDiv(cur_left_elem_count, threads_y);
+        const int64_t grid_right = ceilDiv(after_vect, candidate);
+        const int64_t grid_x =
+            result.flip_grid_binding ? grid_left : grid_right;
+        const int64_t grid_y =
+            result.flip_grid_binding ? grid_right : grid_left;
+        if (candidate > device->maxThreadsDim[0] ||
+            threads_y > device->maxThreadsDim[1] ||
+            physical_threads > device->maxThreadsPerBlock ||
+            physical_threads > device->maxThreadsPerMultiProcessor ||
+            grid_x > device->maxGridSize[0] ||
+            std::min<int64_t>(grid_y, 65535) > device->maxGridSize[1]) {
+          continue;
+        }
         options.push_back(
             {"x" + std::to_string(candidate),
              "Use " + std::to_string(candidate) + " TIDx threads"});
       }
       const bool semantic = scheduler::jev::semanticProtocolEnabled();
-      std::string state;
-      if (semantic) {
-        state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
-        state += ",\"objective\":\"Minimize expected runtime by choosing "
-            "a legal 2D CTA thread split for this fusion; balance right-axis "
-            "vector work, left-axis grid coverage, CTA occupancy, and idle or "
-            "tail lanes.\"";
-        state += ",\"workload\":" + semanticPointwiseWorkload(
-            prop.device_multiprocessor_count, device);
-        state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
-        state += ",\"breakpoint_analysis_requested\":true,\"break_point\":" +
-            std::to_string(result.break_point) +
-            ",\"flip_grid_binding\":" +
-            std::string(result.flip_grid_binding ? "true" : "false") +
-            ",\"left_elems\":" + std::to_string(cur_left_elem_count) +
-            ",\"right_elems\":" + std::to_string(result.right_elem_count) +
-            ",\"outer_broadcast_dominated\":" +
-            std::string(result.is_outer_broadcast_dominated ? "true" : "false") +
-            ",\"vector_width\":" + std::to_string(max_vect_factor) +
-            ",\"vector_width_already_selected\":true,\"unroll\":\"pending\","
-            "\"grid_splitting\":\"pending\",\"grid_x_axis\":\"" +
-            std::string(result.flip_grid_binding ? "left" : "right") +
-            "\",\"grid_y_axis\":\"" +
-            std::string(result.flip_grid_binding ? "right" : "left") + "\"}";
-        state += ",\"decision\":{\"kind\":\"cta_split_2d\"";
-        state += ",\"n_elems\":" + std::to_string(n_elems) +
-            ",\"cta_threads_cap\":" + std::to_string(kThreadX) +
-            ",\"grid_y_split_threshold\":65535" +
-            ",\"candidates\":[";
-        for (int64_t candidate = 1; candidate <= kThreadX; ++candidate) {
-          const int64_t threads_y = kThreadX / candidate;
-          const int64_t grid_left = ceilDiv(cur_left_elem_count, threads_y);
-          const int64_t grid_right = ceilDiv(after_vect, candidate);
-          const int64_t idle_right =
-              (candidate - after_vect % candidate) % candidate;
-          const int64_t idle_left =
-              (threads_y - cur_left_elem_count % threads_y) % threads_y;
-          const int64_t tail_elements =
-              (max_vect_factor - result.right_elem_count % max_vect_factor) %
-              max_vect_factor;
-          if (candidate != 1) state += ',';
-          state += "{\"id\":\"x" + std::to_string(candidate) +
-              "\",\"threads_x\":" + std::to_string(candidate) +
-              ",\"threads_y\":" + std::to_string(threads_y) +
-              ",\"actual_cta_threads\":" +
-              std::to_string(candidate * threads_y) +
-              ",\"right_vector_iterations\":" +
-              std::to_string(after_vect) +
-              ",\"preliminary_grid_left\":" +
-              std::to_string(grid_left) +
-              ",\"preliminary_grid_right\":" +
-              std::to_string(grid_right) +
-              ",\"preliminary_grid_x\":" +
-              std::to_string(result.flip_grid_binding ? grid_left : grid_right) +
-              ",\"preliminary_grid_y\":" +
-              std::to_string(result.flip_grid_binding ? grid_right : grid_left) +
-              ",\"preliminary_grid_y_exceeds_split_threshold\":" +
-              std::string((result.flip_grid_binding ? grid_right : grid_left) >
-                      65535
-                      ? "true"
-                      : "false") +
-              ",\"idle_right_vector_lanes_last_cta\":" +
-              std::to_string(idle_right) +
-              ",\"idle_left_rows_last_cta\":" +
-              std::to_string(idle_left) +
-              ",\"right_tail_elements_last_vector\":" +
-              std::to_string(tail_elements) + '}';
+      const bool native_in_menu =
+          std::any_of(options.begin(), options.end(), [&](const auto& option) {
+            return option.id == "x" + std::to_string(result.bdimx);
+          });
+      // The legacy text-v1 server has no device-axis fields for a partial
+      // menu. Keep it active only when its original full menu is hard-safe.
+      const char* skip_reason = options.empty() ? "empty_hard_cta_menu"
+          : !native_in_menu                     ? "native_2d_cta_preflight"
+          : !semantic && options.size() != static_cast<size_t>(kThreadX)
+          ? "text_v1_requires_full_hard_cta_menu"
+          : nullptr;
+      if (skip_reason != nullptr) {
+        if (jev_mode == scheduler::jev::Mode::Record) {
+          scheduler::jev::recordCoverageSkip("PW3.launch", skip_reason);
         }
-        state += "]}}";
       } else {
-        state = "pointwise.launch.v1\n";
-        state += "n_elems=" + std::to_string(n_elems) + '\n';
-        state += "right_elems=" + std::to_string(result.right_elem_count) + '\n';
-        state += "vector_width=" + std::to_string(max_vect_factor) + '\n';
-        state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
-        state += "cta_threads=" + std::to_string(kThreadX) + '\n';
-      }
-      const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
-          ? "x" + std::to_string(result.bdimx)
-          : std::string();
-      const auto selected = semantic
-          ? scheduler::jev::chooseSemanticDecision(
-                "PW3.launch", state,
-                "Choose the legal 2D CTA thread split for this fusion. "
-                "The breakpoint, grid binding, and vector width are already "
-                "selected. Compare every candidate's CTA threads, "
-                "preliminary grid coverage, grid X/Y binding and the 65535 "
-                "grid Y split threshold, vector work, and idle or tail "
-                "lanes. Later unroll and grid splitting can change the "
-                "launch; return one listed split for expected runtime.",
-                options, native_choice)
-          : scheduler::jev::chooseDecision(
-                "PW3.launch", state, options, native_choice);
-      bool matched = false;
-      for (const auto& option : options) {
-        if (selected == option.id) {
-          result.bdimx = std::stoll(option.id.substr(1));
-          matched = true;
-          break;
+        std::string state;
+        if (semantic) {
+          state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
+          state +=
+              ",\"objective\":\"Minimize expected runtime by choosing "
+              "a legal 2D CTA thread split for this fusion; balance right-axis "
+              "vector work, left-axis grid coverage, CTA occupancy, and idle "
+              "or "
+              "tail lanes.\"";
+          state += ",\"workload\":" +
+              semanticPointwiseWorkload(
+                       prop.device_multiprocessor_count, device);
+          state +=
+              ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
+          state += ",\"breakpoint_analysis_requested\":true,\"break_point\":" +
+              std::to_string(result.break_point) + ",\"flip_grid_binding\":" +
+              std::string(result.flip_grid_binding ? "true" : "false") +
+              ",\"left_elems\":" + std::to_string(cur_left_elem_count) +
+              ",\"right_elems\":" + std::to_string(result.right_elem_count) +
+              ",\"outer_broadcast_dominated\":" +
+              std::string(
+                       result.is_outer_broadcast_dominated ? "true" : "false") +
+              ",\"vector_width\":" + std::to_string(max_vect_factor) +
+              ",\"vector_width_already_selected\":true,\"unroll\":\"pending\","
+              "\"grid_splitting\":\"pending\",\"grid_x_axis\":\"" +
+              std::string(result.flip_grid_binding ? "left" : "right") +
+              "\",\"grid_y_axis\":\"" +
+              std::string(result.flip_grid_binding ? "right" : "left") + "\"}";
+          state += ",\"decision\":{\"kind\":\"cta_split_2d\"";
+          state += ",\"n_elems\":" + std::to_string(n_elems) +
+              ",\"cta_threads_cap\":" + std::to_string(kThreadX) +
+              ",\"grid_y_split_threshold\":65535" + ",\"candidates\":[";
+          for (size_t i = 0; i < options.size(); ++i) {
+            const int64_t candidate = std::stoll(options[i].id.substr(1));
+            const int64_t threads_y = kThreadX / candidate;
+            const int64_t grid_left = ceilDiv(cur_left_elem_count, threads_y);
+            const int64_t grid_right = ceilDiv(after_vect, candidate);
+            const int64_t idle_right =
+                (candidate - after_vect % candidate) % candidate;
+            const int64_t idle_left =
+                (threads_y - cur_left_elem_count % threads_y) % threads_y;
+            const int64_t tail_elements =
+                (max_vect_factor - result.right_elem_count % max_vect_factor) %
+                max_vect_factor;
+            if (i != 0)
+              state += ',';
+            state +=
+                "{\"id\":\"x" + std::to_string(candidate) +
+                "\",\"threads_x\":" + std::to_string(candidate) +
+                ",\"threads_y\":" + std::to_string(threads_y) +
+                ",\"actual_cta_threads\":" +
+                std::to_string(candidate * threads_y) +
+                ",\"right_vector_iterations\":" + std::to_string(after_vect) +
+                ",\"preliminary_grid_left\":" + std::to_string(grid_left) +
+                ",\"preliminary_grid_right\":" + std::to_string(grid_right) +
+                ",\"preliminary_grid_x\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_left : grid_right) +
+                ",\"preliminary_grid_y\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_right : grid_left) +
+                ",\"preliminary_grid_y_exceeds_split_threshold\":" +
+                std::string(
+                    (result.flip_grid_binding ? grid_right : grid_left) > 65535
+                        ? "true"
+                        : "false") +
+                ",\"idle_right_vector_lanes_last_cta\":" +
+                std::to_string(idle_right) +
+                ",\"idle_left_rows_last_cta\":" + std::to_string(idle_left) +
+                ",\"right_tail_elements_last_vector\":" +
+                std::to_string(tail_elements) + '}';
+          }
+          state += "]}}";
+        } else {
+          state = "pointwise.launch.v1\n";
+          state += "n_elems=" + std::to_string(n_elems) + '\n';
+          state +=
+              "right_elems=" + std::to_string(result.right_elem_count) + '\n';
+          state += "vector_width=" + std::to_string(max_vect_factor) + '\n';
+          state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
+          state += "cta_threads=" + std::to_string(kThreadX) + '\n';
         }
+        const std::string native_choice =
+            jev_mode == scheduler::jev::Mode::Record
+            ? "x" + std::to_string(result.bdimx)
+            : std::string();
+        const auto selected = semantic
+            ? scheduler::jev::chooseSemanticDecision(
+                  "PW3.launch",
+                  state,
+                  "Choose the legal 2D CTA thread split for this fusion. "
+                  "The breakpoint, grid binding, and vector width are already "
+                  "selected. Compare every candidate's CTA threads, "
+                  "preliminary grid coverage, grid X/Y binding and the 65535 "
+                  "grid Y split threshold, vector work, and idle or tail "
+                  "lanes. Later unroll and grid splitting can change the "
+                  "launch; return one listed split for expected runtime.",
+                  options,
+                  native_choice)
+            : scheduler::jev::chooseDecision(
+                  "PW3.launch", state, options, native_choice);
+        bool matched = false;
+        for (const auto& option : options) {
+          if (selected == option.id) {
+            result.bdimx = std::stoll(option.id.substr(1));
+            matched = true;
+            break;
+          }
+        }
+        NVF_ERROR(matched, "PW3.launch response is outside hard CTA bounds");
       }
-      NVF_ERROR(matched, "PW3.launch response is outside hard CTA bounds");
+    } else if (jev_mode == scheduler::jev::Mode::Record && block_quantization) {
+      scheduler::jev::recordCoverageSkip("PW3.launch", "block_quantization");
     }
     result.bdimy = kThreadX / result.bdimx;
     result.gdim_left = ceilDiv(cur_left_elem_count, result.bdimy);

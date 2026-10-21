@@ -45,6 +45,7 @@ constexpr std::string_view kComputeInvocationSchema =
     "nvfuser.jev.compute_invocation.v1";
 
 thread_local ComputeHeuristicsScope* active_compute_scope = nullptr;
+thread_local bool native_decisions_forced = false;
 std::atomic<uint64_t> next_compute_invocation{0};
 
 struct ActiveInvocation {
@@ -486,11 +487,25 @@ std::string selectedFromResponse(
 } // namespace
 
 Mode mode() {
+  if (native_decisions_forced)
+    return Mode::Off;
   const std::string configured = env("NVFUSER_JEV_MODE");
-  if (configured.empty() || configured == "off") return Mode::Off;
-  if (configured == "record") return Mode::Record;
-  if (configured == "remote") return Mode::Remote;
+  if (configured.empty() || configured == "off")
+    return Mode::Off;
+  if (configured == "record")
+    return Mode::Record;
+  if (configured == "remote")
+    return Mode::Remote;
   fail("NVFUSER_JEV_MODE must be off, record, or remote");
+}
+
+ScopedNativeDecisions::ScopedNativeDecisions() noexcept
+    : previous_(native_decisions_forced) {
+  native_decisions_forced = true;
+}
+
+ScopedNativeDecisions::~ScopedNativeDecisions() noexcept {
+  native_decisions_forced = previous_;
 }
 
 std::string jsonQuote(std::string_view value) {
@@ -499,8 +514,10 @@ std::string jsonQuote(std::string_view value) {
 
 bool semanticProtocolEnabled() {
   const std::string configured = env("NVFUSER_JEV_PROTOCOL");
-  if (configured.empty() || configured == "text-v1") return false;
-  if (configured == "semantic-v2") return true;
+  if (configured.empty() || configured == "text-v1")
+    return false;
+  if (configured == "semantic-v2")
+    return true;
   fail("NVFUSER_JEV_PROTOCOL must be text-v1 or semantic-v2");
 }
 
