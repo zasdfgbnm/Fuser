@@ -6,8 +6,10 @@
  */
 // clang-format on
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -25,6 +27,7 @@
 #include "ops/all_ops.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -921,6 +924,24 @@ TEST_F(CombinedSchedulerTest, InnerOuterNoOuterBroadcastTv) {
   NVF_CHECK(
       !persistent_params->project_persistent_buffers,
       "Shouldn't project persistent buffers to inputs!");
+  ASSERT_NE(cg_results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      cg_results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      persistent_params->cparams.maxrregcount);
+  EXPECT_EQ(
+      cg_results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      persistent_params->cparams.maxrregcount);
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      case_key != nullptr &&
+      std::string_view(case_key) ==
+          "jev_alternate_numeric_inner_outer_min_batch") {
+    EXPECT_EQ(
+        persistent_params->cparams.maxrregcount,
+        scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 128 : 255);
+  }
 
   auto t1 = t0.sum({1});
   auto t2 = t1.unsqueeze(-1);
@@ -935,6 +956,47 @@ TEST_F(CombinedSchedulerTest, InnerOuterNoOuterBroadcastTv) {
       __FILE__,
       "",
       persistent_params->lparams);
+}
+
+// An odd inner extent has a hard maximum vector width of one. The native
+// multiwave plan is the only IOP3.inner_width candidate and still has to run
+// in remote mode, with downstream choices delegated as usual.
+TEST_F(CombinedSchedulerTest, InnerOuterSingletonVectorWidth) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  constexpr int64_t dim0 = 1024, dim1 = 1987;
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = sum(tv0, {1});
+  auto tv2 = broadcast(tv1, {false, true});
+  auto tv3 = add(tv2, tv0);
+  auto tv4 = sum(tv0, {0});
+  fusion.addOutput(tv3);
+  fusion.addOutput(tv4);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor input = at::randn({dim0, dim1}, options);
+  auto result =
+      scheduleAndRun(&fusion, SchedulerType::InnerOuterPersistent, {input});
+  const auto* params = result.heuristic_params->as<ReductionParams>();
+  NVF_CHECK(
+      params->unroll_factor_inner_reduction == 1,
+      "Odd inner extent must have a singleton vector width");
+
+  auto inner_sum = input.sum({1});
+  auto expected_pointwise = input + inner_sum.unsqueeze(-1);
+  auto expected_outer_sum = input.sum({0});
+  testValidate(
+      &fusion,
+      result.outputs,
+      {input},
+      {expected_pointwise, expected_outer_sum},
+      __LINE__,
+      __FILE__,
+      "",
+      params->lparams);
 }
 
 // Reproduce error found in:

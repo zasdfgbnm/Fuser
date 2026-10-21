@@ -8,12 +8,19 @@
 
 #include "scheduler/pointwise.h"
 
+#include <algorithm>
+#include <optional>
 #include <ranges>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 
 #include "instrumentation.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
 #include "scheduler/pointwise_utils.h"
@@ -418,13 +425,120 @@ bool mayUseTma(
   }
   return true;
 }
+
+// These snapshots describe the returned plan, after the block-quantization
+// cap. Candidate Choice rows alone cannot distinguish a discarded ordinary
+// plan from the TMA plan actually returned by computeHeuristics.
+class PointwiseRecordObject {
+ public:
+  void add(std::string_view key, std::string_view value) {
+    addRaw(key, scheduler::jev::jsonQuote(value));
+  }
+
+  void add(std::string_view key, const char* value) {
+    add(key, std::string_view(value));
+  }
+
+  void add(std::string_view key, int64_t value) {
+    addRaw(key, std::to_string(value));
+  }
+
+  void add(std::string_view key, bool value) {
+    addRaw(key, value ? "true" : "false");
+  }
+
+  void addRaw(std::string_view key, std::string_view value) {
+    if (body_.size() != 1) body_ += ',';
+    body_ += scheduler::jev::jsonQuote(key) + ':' + std::string(value);
+  }
+
+  std::string str() const {
+    return body_ + '}';
+  }
+
+ private:
+  std::string body_ = "{";
+};
+
+void recordFinalPointwisePlan(
+    scheduler::jev::PointwiseRecordScope& scope,
+    const PointwiseParams& params,
+    bool has_runtime_properties) {
+  if (!scope.recording()) return;
+
+  PointwiseRecordObject final_params;
+  final_params.add("scheduler_type", "PointWise");
+  final_params.add("tag", params.tag);
+  final_params.add("break_point", params.break_point);
+  final_params.add("split_block", params.split_block);
+  final_params.add("symbolic_1d_cta", params.symbolic_1d_cta);
+  final_params.add("split_grid_y_dim", params.split_grid_y_dim);
+  final_params.add("flip_grid_binding", params.flip_grid_binding);
+  final_params.add("vectorization_factor", params.vectorization_factor);
+  final_params.add("vectorize_casts", params.vectorize_casts);
+  final_params.add("unroll_factor_outer", params.unroll_factor_outer);
+  final_params.add("unroll_factor_inner", params.unroll_factor_inner);
+  final_params.add("use_tma_load", params.use_tma_load);
+  final_params.add("use_tma_store", params.use_tma_store);
+  final_params.add("tma_domain_inner", params.tma_domain_inner);
+  final_params.add("tma_tile_outer", params.tma_tile_outer);
+  final_params.add("tma_tile_inner", params.tma_tile_inner);
+
+  PointwiseRecordObject launch;
+  launch.add("grid_x_raw", params.lparams.getRawVal(ParallelType::BIDx));
+  launch.add("grid_y_raw", params.lparams.getRawVal(ParallelType::BIDy));
+  launch.add("grid_z_raw", params.lparams.getRawVal(ParallelType::BIDz));
+  launch.add("block_x_raw", params.lparams.getRawVal(ParallelType::TIDx));
+  launch.add("block_y_raw", params.lparams.getRawVal(ParallelType::TIDy));
+  launch.add("block_z_raw", params.lparams.getRawVal(ParallelType::TIDz));
+  launch.add("dynamic_smem_bytes", params.lparams.smem());
+
+  PointwiseRecordObject compile;
+  const auto add_optional_number = [&](std::string_view key, const auto& value) {
+    if (value.has_value()) {
+      compile.add(key, static_cast<int64_t>(*value));
+    } else {
+      compile.addRaw(key, "null");
+    }
+  };
+  add_optional_number("index_type", params.cparams.index_type);
+  compile.add("maxrregcount", params.cparams.maxrregcount);
+  compile.add("enable_magic_zero", params.cparams.enable_magic_zero);
+  compile.add("enable_ptxas_verbose", params.cparams.enable_ptxas_verbose);
+  if (params.cparams.device.has_value()) {
+    compile.add("device", params.cparams.device->str());
+  } else {
+    compile.addRaw("device", "null");
+  }
+  std::string include_paths = "[";
+  for (size_t i = 0; i < params.cparams.include_paths.size(); ++i) {
+    if (i != 0) include_paths += ',';
+    include_paths += scheduler::jev::jsonQuote(params.cparams.include_paths[i]);
+  }
+  include_paths += ']';
+  compile.addRaw("include_paths", include_paths);
+  add_optional_number("block_x", params.cparams.bdimx);
+  add_optional_number("block_y", params.cparams.bdimy);
+  add_optional_number("block_z", params.cparams.bdimz);
+  add_optional_number("compute_block_x", params.cparams.compute_bdimx);
+  add_optional_number("compute_block_y", params.cparams.compute_bdimy);
+  add_optional_number("compute_block_z", params.cparams.compute_bdimz);
+
+  scope.complete(
+      !has_runtime_properties ? "empty"
+                              : params.use_tma_load ? "tma" : "ordinary",
+      final_params.str(),
+      launch.str(),
+      compile.str());
+}
 } // namespace
 
-std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {
   FUSER_PERF_SCOPE("PointWiseScheduler::computeHeuristics");
+  scheduler::jev::PointwiseRecordScope record_scope;
 
   auto prop_opt = pointwise_utils::getFusionRuntimeProperties(
       fusion, runtime_info, data_cache);
@@ -433,50 +547,147 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristics(
     auto pwise_params = std::make_unique<PointwiseParams>();
     pwise_params->tag = "Pointwise heuristics";
     pwise_params->cparams.index_type = runtime_info.getIndexType();
+    recordFinalPointwisePlan(record_scope, *pwise_params, false);
     return pwise_params;
   }
   const auto& prop = prop_opt.value();
 
-  bool use_tma =
-      mayUseTma(fusion, prop) && isOptionEnabled(EnableOption::TmaPointwise);
-  std::unique_ptr<HeuristicParams> pparams = nullptr;
-  if (use_tma) {
-    pparams = pointwise::tma::getPointwiseHeuristics(
-        fusion, runtime_info, data_cache, prop);
-  }
-  // Fallback to non-TMA scheduler if TMA is not applicable
-  if (pparams == nullptr) {
-    pparams = pointwise::non_tma::getPointwiseHeuristics(
-        fusion, runtime_info, data_cache, prop);
-  }
-  NVF_ERROR(pparams != nullptr);
-
-  // cap vectorization when block quantization op is encountered, since there's
-  // a validation during device_lower
-  auto has_block_quantization_ops =
+  // A block-quantized schedule has downstream width and grid-Y correctness
+  // requirements. canScheduleRunTime calls computeHeuristics separately from
+  // the plan later used for code generation. Keep every PointWise preference
+  // native in both calls so a variable stateless model cannot change the
+  // result between the eligibility check and the final schedule.
+  auto block_quantization_ops =
       HeuristicDataCacheEntry<HeuristicCompileTime::BlockQuantizationOps>(
           data_cache,
           [fusion]() {
             auto ops = std::make_unique<std::vector<Expr*>>();
-            // Get BlockQuantizationOp operations
-            auto block_quant_ops =
+            auto block_ops =
                 ir_utils::getOpsOfType<BlockQuantizationOp>(fusion);
-            ops->insert(
-                ops->end(), block_quant_ops.begin(), block_quant_ops.end());
-            // Get GroupedBlockQuantizationOp operations
+            ops->insert(ops->end(), block_ops.begin(), block_ops.end());
             auto grouped_ops =
                 ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion);
             ops->insert(ops->end(), grouped_ops.begin(), grouped_ops.end());
             return ops;
           })
           .get();
-  if (!has_block_quantization_ops.empty()) {
+  const bool block_quantization = !block_quantization_ops.empty();
+  const auto configured_jev_mode = scheduler::jev::mode();
+  const char* semantic_graph_reason = nullptr;
+  if (configured_jev_mode != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticProtocolEnabled() && !block_quantization) {
+    semantic_graph_reason = pointwise_utils::semanticPointwiseEligibilityReason(
+        fusion, scheduler::jev::computeInvocationInputSnapshot());
+  }
+  std::optional<scheduler::jev::ScopedNativeDecisions> native_decisions;
+  if ((block_quantization || semantic_graph_reason != nullptr) &&
+      configured_jev_mode != scheduler::jev::Mode::Off) {
+    native_decisions.emplace();
+  }
+
+  const bool use_tma =
+      mayUseTma(fusion, prop) && isOptionEnabled(EnableOption::TmaPointwise);
+  const auto jev_mode = scheduler::jev::mode();
+  std::unique_ptr<HeuristicParams> pparams = nullptr;
+  if (use_tma) {
+    pparams = pointwise::tma::getPointwiseHeuristics(
+        fusion, runtime_info, data_cache, prop);
+  }
+  if (pparams == nullptr) {
+    // TMA eligibility and plan construction are native correctness gates.
+    pparams = pointwise::non_tma::getPointwiseHeuristics(
+        fusion, runtime_info, data_cache, prop);
+  } else if (jev_mode != scheduler::jev::Mode::Off) {
+    // Both completed plans must exist before the backend preference can be a
+    // Choice. Off mode keeps the original TMA-first fast path unchanged.
+    auto ordinary_params = pointwise::non_tma::getPointwiseHeuristics(
+        fusion, runtime_info, data_cache, prop);
+    if (ordinary_params != nullptr) {
+      const std::string state = "pointwise.tma_preference.v1\nn_elems=" +
+          std::to_string(prop.n_elems) +
+          "\nsm_count=" + std::to_string(prop.device_multiprocessor_count) +
+          "\nmin_dtype_bits=" +
+          std::to_string(prop.min_dtype_size_bit_for_vectorization) +
+          "\nmax_dtype_bits=" +
+          std::to_string(prop.max_dtype_size_bit_for_vectorization);
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"tma", "Use the complete TMA pointwise plan"},
+          {"ordinary", "Use the complete ordinary pointwise plan"}};
+      // The original policy prefers every materialized TMA pointwise plan.
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record ? "tma" : "";
+      const auto selected =
+          scheduler::jev::chooseDecision("PW1", state, options, native_choice);
+      NVF_ERROR(
+          selected == "tma" || selected == "ordinary",
+          "PW1 must select a complete native pointwise plan");
+      if (selected == "ordinary") {
+        pparams = std::move(ordinary_params);
+      }
+    }
+  }
+  NVF_ERROR(pparams != nullptr);
+
+  // Keep the original final clamp and runtime eligibility check.
+  if (block_quantization) {
     // FIXME: this needs to be done per input dtype. I'm capping it as 4 for
     // simplicity for now.
     pparams->as<PointwiseParams>()->vectorization_factor = std::min<int64_t>(
         4, pparams->as<PointwiseParams>()->vectorization_factor);
   }
 
+  native_decisions.reset();
+  if (semantic_graph_reason != nullptr) {
+    const auto* pointwise = pparams->as<PointwiseParams>();
+    if (pointwise->use_tma_load) {
+      scheduler::jev::recordNoChoiceDecision(
+          "PW1", "tma", semantic_graph_reason, "native");
+    } else {
+      scheduler::jev::recordNoChoiceDecision(
+          "PW3.width",
+          "w" + std::to_string(pointwise->vectorization_factor),
+          semantic_graph_reason,
+          "native");
+      scheduler::jev::recordNoChoiceDecision(
+          pointwise->break_point > 0 ? "PW3.launch" : "PW3.cta_1d",
+          "x" + std::to_string(pointwise->lparams.bdimx()),
+          semantic_graph_reason,
+          "native");
+      scheduler::jev::recordNoChoiceDecision(
+          "PW3.unroll",
+          "u" + std::to_string(
+                    pointwise->unroll_factor_inner *
+                    pointwise->unroll_factor_outer),
+          semantic_graph_reason,
+          "native");
+    }
+  }
+  if (block_quantization &&
+      configured_jev_mode == scheduler::jev::Mode::Record) {
+    const auto* pointwise = pparams->as<PointwiseParams>();
+    const auto skip = [](std::string_view site) {
+      scheduler::jev::recordCoverageSkip(
+          site, "block_quantization_native_plan");
+    };
+    if (pointwise->use_tma_load) {
+      skip("PW1");
+      skip("PW4.domain_inner");
+      skip("PW4.tile_inner");
+      skip("PW4.tile_outer");
+      skip("PW4.width");
+      skip("PW4.breakpoint");
+    } else {
+      skip("PW2.entry");
+      if (pointwise->break_point > 0) {
+        skip("PW2");
+      }
+      skip("PW3.width");
+      skip(pointwise->break_point > 0 ? "PW3.launch" : "PW3.cta_1d");
+      skip("PW3.unroll");
+    }
+  }
+
+  recordFinalPointwisePlan(record_scope, *pparams->as<PointwiseParams>(), true);
   return pparams;
 }
 
@@ -489,6 +700,30 @@ void PointWiseScheduler::schedule(
       pparams != nullptr,
       "Incorrect parameters sent to PointWiseScheduler::schedule",
       params);
+  bool has_block_quantization = false;
+  bool subbyte_quantized_output = false;
+  for (auto* op : ir_utils::getOpsOfType<BlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    subbyte_quantized_output |=
+        dataTypeSizeBit(op->quantizedOutput()->getDataType()) % 8 != 0;
+  }
+  for (auto* op : ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    subbyte_quantized_output |=
+        dataTypeSizeBit(op->quantizedOutput()->getDataType()) % 8 != 0;
+  }
+  if (has_block_quantization) {
+    // This checks the parameters actually being applied, independently of the
+    // earlier canScheduleRunTime call and of any model or cache state.
+    NVF_ERROR(
+        pparams->vectorization_factor >= 1 &&
+            pparams->vectorization_factor <= 4 &&
+            (!subbyte_quantized_output || pparams->vectorization_factor >= 2) &&
+            !pparams->split_grid_y_dim && pparams->unroll_factor_inner == 1 &&
+            pparams->unroll_factor_outer == 1,
+        "Block quantization PointWise schedule violates native width, "
+        "unroll, or grid-Y requirements");
+  }
   if (pparams->use_tma_load) {
     pointwise::tma::schedulePointwise(fusion, pparams);
   } else {

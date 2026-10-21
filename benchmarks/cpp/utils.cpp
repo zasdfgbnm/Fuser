@@ -11,8 +11,10 @@
 
 #include <fusion_profiler.h>
 #include <scheduler/all_schedulers.h>
+#include <scheduler/resize_heuristic.h>
 #include <tests/cpp/utils.h>
 
+#include <cstdlib>
 #include <sstream>
 
 using namespace nvfuser;
@@ -127,6 +129,20 @@ std::string toString(const std::unique_ptr<HeuristicParams>& params) {
   auto tparams = dynamic_cast<const TransposeParams*>(params.get());
   if (tparams) {
     return toString(tparams);
+  }
+  auto resize_params = dynamic_cast<const ResizeParams*>(params.get());
+  if (resize_params) {
+    std::stringstream ss;
+    ss << "Resize / vectorization factor: "
+       << resize_params->vectorization_factor
+       << " / largest input: " << resize_params->largest_input
+       << " / split grid x: " << resize_params->split_grid_x_dim;
+    return ss.str();
+  }
+  // Greedy schedules per tensor. The per-site decision log captures those
+  // batches; keep the benchmark label stable across cache instances.
+  if (params->scheduler_type == SchedulerType::Greedy) {
+    return "Greedy";
   }
   NVF_THROW(
       "Unknown heuristic parameter type. Did you just added a new heuristic "
@@ -255,7 +271,20 @@ int64_t runBenchmarkIterations(
 
 namespace executorCache {
 thread_local ExecutorMap executor_map_;
+thread_local std::string active_batch_case_key_;
 ExecutorMap& getGlobalMap() {
+  if (std::getenv("NVFUSER_JEV_BATCH_MANIFEST") != nullptr) {
+    const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+    NVF_ERROR(
+        case_key != nullptr && case_key[0] != '\0',
+        "batch benchmark executor cache requires a nonempty case key");
+    if (active_batch_case_key_ != case_key) {
+      // A new registration must compute its own heuristics even when another
+      // registration uses the same graph. Reuse the cache within this case.
+      executor_map_.clear();
+      active_batch_case_key_ = case_key;
+    }
+  }
   return executor_map_;
 }
 } // namespace executorCache

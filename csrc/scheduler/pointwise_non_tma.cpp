@@ -8,14 +8,19 @@
 
 #include "scheduler/pointwise_non_tma.h"
 
+#include <algorithm>
+
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 
 #include "debug.h"
 #include "exceptions.h"
 #include "ir/printer.h"
 #include "multidevice/utils.h"
 #include "scheduler/cache_policy_refiner.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
+#include "scheduler/pointwise_unroll_envelope.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/utils.h"
@@ -29,18 +34,30 @@ namespace {
 // Unused at the moment, commenting for clang tidy
 constexpr int64_t kThreadX = 128;
 
-// Get number of vectorizable non-outer broadcast inputs
+std::vector<TensorView*> getUniqueVectorizableInputs(
+    const std::vector<TensorView*>& vectorizable_io_tvs) {
+  std::vector<TensorView*> inputs;
+  for (auto* tv : vectorizable_io_tvs) {
+    if (tv->isFusionInput() &&
+        std::find(inputs.begin(), inputs.end(), tv) == inputs.end()) {
+      inputs.push_back(tv);
+    }
+  }
+  return inputs;
+}
+
+// Classify each unique vectorizable input for the non-outer broadcast cost.
 // vectorizable_inputs: all vectorizable inputs
 // break_point: the break point of the broadcast flags.
 // Used to determine the influence of inputs on unroll factor.
 // outer broadcast inputs are not counted since outer unroll is used
 // and they are only loaded once regardless of the unroll factor due to
 // the re-use across different unrolled iterations.
-int64_t getNumOfNonOuterBcastInputs(
-    std::vector<TensorView*> vectorizable_inputs,
+std::vector<bool> getOuterBcastInputFlags(
+    const std::vector<TensorView*>& vectorizable_inputs,
     int64_t break_point) {
   if (break_point == 0) {
-    return std::max((int64_t)vectorizable_inputs.size(), 1L);
+    return std::vector<bool>(vectorizable_inputs.size(), false);
   }
 
   // Returns true if tv is outer broadcast tv or is used by outer broadcast
@@ -72,12 +89,20 @@ int64_t getNumOfNonOuterBcastInputs(
     }
     return false;
   };
-  int64_t n_non_bcast_inputs = 0;
+  std::vector<bool> flags;
+  flags.reserve(vectorizable_inputs.size());
   for (auto tv : vectorizable_inputs) {
-    if (!isUsedByOuterBcast(tv)) {
-      n_non_bcast_inputs++;
-    }
+    flags.push_back(isUsedByOuterBcast(tv));
   }
+  return flags;
+}
+
+int64_t getNumOfNonOuterBcastInputs(
+    const std::vector<TensorView*>& vectorizable_inputs,
+    int64_t break_point) {
+  const auto flags = getOuterBcastInputFlags(vectorizable_inputs, break_point);
+  const int64_t n_non_bcast_inputs =
+      static_cast<int64_t>(std::count(flags.begin(), flags.end(), false));
   // return 1 if no non-outer broadcast inputs to avoid division by 0
   return std::max(n_non_bcast_inputs, 1L);
 }
@@ -115,11 +140,13 @@ int64_t getEmpiricalUnrollFactor(
 
 // calculate unroll factor based on total blocks to ensure we still
 // have 8 waves after unroll.
-int64_t getElementBasedUnrollFactor(int64_t total_blocks) {
+int64_t getElementBasedUnrollFactor(
+    int64_t total_blocks,
+    int64_t threads_per_block) {
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
   const int64_t target_waves = 8L;
   int64_t max_block_per_sm =
-      (int64_t)dev_prop->maxThreadsPerMultiProcessor / kThreadX;
+      (int64_t)dev_prop->maxThreadsPerMultiProcessor / threads_per_block;
   int64_t n_waves_wo_unroll = ceilDiv(
       total_blocks, max_block_per_sm * (int64_t)dev_prop->multiProcessorCount);
   int64_t n_elems_limited_unroll =
@@ -127,23 +154,8 @@ int64_t getElementBasedUnrollFactor(int64_t total_blocks) {
   return n_elems_limited_unroll;
 }
 
-// returns unroll factor.
-// The unroll factor is calculated based on the following:
-// (1) ensure enough bytes in flight to cover gmem access latency
-// (2) ensure enough threads for thread level parallelism (TLP)
-// (3) when kernel doesn't have enough TLP and split is not divisible, don't
-// unroll.
-int64_t getUnrollFactor(
-    Fusion* fusion,
-    int64_t break_point,
-    int64_t total_blocks,
-    int64_t vectorization_bits,
-    bool divisible_split,
-    std::vector<TensorView*> vectorizable_io_tvs,
-    HeuristicDataCache* data_cache) {
-  // Check if fusion has BlockQuantizationOp(s)
-  // Limit unroll factor for fusions with BlockQuantizationOp(s). The runtime
-  // function which implements quantization assumes no unrolling
+// Block quantization requires a hard unroll factor of one.
+bool hasBlockQuantizationOps(Fusion* fusion, HeuristicDataCache* data_cache) {
   auto block_quantization_ops =
       HeuristicDataCacheEntry<HeuristicCompileTime::BlockQuantizationOps>(
           data_cache,
@@ -162,30 +174,35 @@ int64_t getUnrollFactor(
           })
           .get();
 
-  if (!block_quantization_ops.empty()) {
+  return !block_quantization_ops.empty();
+}
+
+// Balance memory latency, TLP and non-divisible tails.
+int64_t getUnrollFactor(
+    Fusion* fusion,
+    int64_t break_point,
+    int64_t total_blocks,
+    int64_t threads_per_block,
+    int64_t vectorization_bits,
+    bool divisible_split,
+    std::vector<TensorView*> vectorizable_io_tvs,
+    HeuristicDataCache* data_cache) {
+  // The runtime block-quantization function assumes no unrolling.
+  if (hasBlockQuantizationOps(fusion, data_cache)) {
     // Runtime function implementing Block Quantization Op requires unroll
     // factor to be 1
     return 1;
   }
 
-  // only consider vectorizable inputs,
-  // needs to check if it's already in the list to avoid duplication since a tv
-  // may be both input and output, e.g. NVFuserTest.FusionIssue2372_CUDA
-  std::vector<TensorView*> vectorizable_inputs;
-  for (auto* tv : vectorizable_io_tvs) {
-    if (tv->isFusionInput() &&
-        std::find(vectorizable_inputs.begin(), vectorizable_inputs.end(), tv) ==
-            vectorizable_inputs.end()) {
-      vectorizable_inputs.push_back(tv);
-    }
-  }
+  auto vectorizable_inputs = getUniqueVectorizableInputs(vectorizable_io_tvs);
 
   int64_t empirical_unroll = getEmpiricalUnrollFactor(
       fusion, break_point, vectorization_bits, vectorizable_inputs);
 
   // limit unroll factor when n_elems is small to ensure enough
   // blocks for thread level parallelism.
-  int64_t n_elems_limited_unroll = getElementBasedUnrollFactor(total_blocks);
+  int64_t n_elems_limited_unroll =
+      getElementBasedUnrollFactor(total_blocks, threads_per_block);
 
   // Avoid unrolling when the unroll factor is constrained by `n_elems` and the
   // split is not divisible. Why? While unrolling increases instruction-level
@@ -198,6 +215,60 @@ int64_t getUnrollFactor(
   } else {
     return std::min(n_elems_limited_unroll, empirical_unroll);
   }
+}
+
+struct ExpensiveOpCounts {
+  int64_t tanh = 0;
+  int64_t exp = 0;
+  int64_t reciprocal = 0;
+};
+
+ExpensiveOpCounts countExpensiveOps(Fusion* fusion) {
+  ExpensiveOpCounts counts;
+  for (auto* expr : fusion->exprs()) {
+    if (auto* unary = dynamic_cast<UnaryOp*>(expr)) {
+      switch (unary->getUnaryOpType()) {
+        case UnaryOpType::Tanh:
+          ++counts.tanh;
+          break;
+        case UnaryOpType::Exp:
+          ++counts.exp;
+          break;
+        case UnaryOpType::Reciprocal:
+          ++counts.reciprocal;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return counts;
+}
+
+struct FactorRange {
+  int64_t low;
+  int64_t high;
+  std::string id;
+};
+
+std::vector<FactorRange> getUnrollRanges(int64_t low, int64_t high) {
+  NVF_ERROR(low >= 1 && high >= low);
+  constexpr int64_t kMaxChoices = 255;
+  const int64_t span = high - low + 1;
+  const int64_t stride = span / kMaxChoices + (span % kMaxChoices != 0);
+  std::vector<FactorRange> ranges;
+  for (int64_t first = low;;) {
+    const int64_t last = first + std::min(stride - 1, high - first);
+    const std::string id = first == last
+        ? "u" + std::to_string(first)
+        : "r" + std::to_string(first) + "_" + std::to_string(last);
+    ranges.push_back({first, last, id});
+    if (last == high) {
+      break;
+    }
+    first = last + 1;
+  }
+  return ranges;
 }
 
 } // namespace
@@ -220,6 +291,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   int64_t n_elems = prop.n_elems;
   const auto device_multiprocessor_count = prop.device_multiprocessor_count;
   constexpr int64_t max_vectorization_size_in_bit = 128;
+  const bool block_quantization = hasBlockQuantizationOps(fusion, data_cache);
 
   // See pointwise.h to understand what we're doing for this 2D analysis.
   // Ideal break point location
@@ -250,9 +322,35 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // break point.
   int64_t gdim_right = 1;
 
-  // Only calculate break point if there's enough parallelism for 2D scheduling
+  // PW2.entry is the performance choice to search for a 2D break point at all.
+  // Both choices are legal: the default 1D plan requires no view split, while
+  // getBreakPoint keeps the view-disjointness checks for every 2D candidate.
+  const auto jev_mode = scheduler::jev::mode();
+  bool analyze_2d_break_point = false;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    analyze_2d_break_point =
+        n_elems * 2 > device_multiprocessor_count * kThreadX;
+  }
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const std::string state =
+        "pointwise.entry.v1\nn_elems=" + std::to_string(n_elems) +
+        "\nsm_count=" + std::to_string(device_multiprocessor_count);
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"analyze", "Analyze hard-legal two-dimensional break points"},
+        {"default_1d",
+         "Use the one-dimensional default without split analysis"}};
+    std::string native_choice;
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      native_choice = analyze_2d_break_point ? "analyze" : "default_1d";
+    }
+    const auto selected = scheduler::jev::chooseDecision(
+        "PW2.entry", state, options, native_choice);
+    analyze_2d_break_point = selected == "analyze";
+  }
+
+  // Only calculate break point if its performance choice requests analysis.
   pointwise_utils::BreakPointInfo bp_info;
-  if (n_elems * 2 > device_multiprocessor_count * kThreadX) {
+  if (analyze_2d_break_point) {
     bp_info = pointwise_utils::getBreakPoint(
         fusion,
         prop,
@@ -269,29 +367,179 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     bp_info.is_outer_broadcast_dominated = false;
   }
 
-  // Use unified function that handles all constraints internally
-  const int64_t vectorization_factor = vectorize_helper::getVectorizationFactor(
-      runtime_info,
-      prop.largest_out,
-      data_cache,
-      bp_info.break_point,
-      max_vectorization_size_in_bit,
-      prop.min_dtype_size_bit_for_vectorization,
-      prop.max_dtype_size_bit_for_vectorization,
-      /*n_vectorizable_tensors=*/(int64_t)vectorizable_inputs_outputs.size(),
-      // should use the actual wave count, here just to keep consistency with
-      // the old code.
-      // TODO: check how should we limit the vectorization factor based on the
-      // wave count.
-      /*n_waves=*/n_elems > device_multiprocessor_count * kThreadX ? -1 : 1,
-      /*logical_reorder_map=*/
-      pointwise_utils::getLogicalReorderMap(
-          prop.largest_out, prop.has_reshapes, data_cache));
+  const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
+      prop.largest_out, prop.has_reshapes, data_cache);
+  int64_t vectorization_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote || block_quantization) {
+    // Block quantization retains the native width in Remote mode as well:
+    // the final wrapper clamp and runtime eligibility check depend on it.
+    vectorization_factor = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        max_vectorization_size_in_bit,
+        prop.min_dtype_size_bit_for_vectorization,
+        prop.max_dtype_size_bit_for_vectorization,
+        /*n_vectorizable_tensors=*/(int64_t)vectorizable_inputs_outputs.size(),
+        // Keep the source's existing one-wave or disabled-wave approximation.
+        /*n_waves=*/n_elems > device_multiprocessor_count * kThreadX ? -1 : 1,
+        logical_reorder_map);
+  }
+  if (jev_mode != scheduler::jev::Mode::Off && !block_quantization) {
+    // Calling the same layout analysis with optional soft constraints disabled
+    // gives a correctness-derived upper bound, not the native preferred width.
+    const int64_t layout_max = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        max_vectorization_size_in_bit,
+        /*min_dtype_size_bit=*/-1,
+        /*max_dtype_size_bit=*/-1,
+        /*n_vectorizable_tensors=*/-1,
+        /*n_waves=*/-1,
+        logical_reorder_map);
+    const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+    const int64_t byte_min =
+        min_dtype_bits < 8 ? scheduler_utils::safeDiv(8L, min_dtype_bits) : 1;
+    NVF_ERROR(
+        layout_max >= 1 && layout_max <= max_vectorization_size_in_bit &&
+            scheduler_utils::lastPow2(layout_max) == layout_max,
+        "PW3.width layout limit must be a power of two in 1..128");
+    NVF_ERROR(
+        scheduler_utils::lastPow2(byte_min) == byte_min,
+        "PW3.width byte minimum must be a power of two");
+
+    std::vector<scheduler::jev::ChoiceOption> options;
+    const int64_t first_width = std::min(byte_min, layout_max);
+    for (int64_t width = first_width; width <= layout_max; width *= 2) {
+      options.push_back(
+          {"w" + std::to_string(width),
+           "Vectorize " + std::to_string(width) + " element(s) per thread"});
+    }
+    // Current nvFuser returns layout_max if the byte floor exceeds it; the
+    // singleton preserves that existing behavior until the source TODO is
+    // resolved. In the normal case all options satisfy both hard constraints.
+    const bool semantic = scheduler::jev::semanticProtocolEnabled();
+    std::string state;
+    if (semantic) {
+      // The client rejects a complete request exceeding 64 KiB; no snapshot
+      // is shortened to fit the HTTP limit.
+      const auto* device = at::cuda::getCurrentDeviceProperties();
+      const int64_t right_elems =
+          bp_info.break_point > 0 ? bp_info.right_elem_count : n_elems;
+      NVF_ERROR(
+          n_elems > 0 && right_elems > 0 && n_elems % right_elems == 0,
+          "PW3.width semantic request needs a valid partial schedule");
+      const auto ceil_quotient = [](int64_t numerator, int64_t denominator) {
+        return numerator / denominator + (numerator % denominator != 0);
+      };
+      state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
+      state +=
+          ",\"objective\":\"Minimize expected runtime of this "
+          "fusion by choosing a legal per-thread vector width; balance "
+          "memory instruction count, register pressure, and available "
+          "parallelism.\"";
+      state += ",\"workload\":" +
+          pointwise_utils::semanticPointwiseWorkload(
+                   device_multiprocessor_count, device);
+      state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
+      state += ",\"breakpoint_analysis_requested\":" +
+          std::string(analyze_2d_break_point ? "true" : "false");
+      state += ",\"break_point\":" + std::to_string(bp_info.break_point) +
+          ",\"flip_grid_binding\":" +
+          std::string(bp_info.flip_grid_binding ? "true" : "false") +
+          ",\"right_elems\":" + std::to_string(right_elems) +
+          ",\"outer_broadcast_dominated\":" +
+          std::string(bp_info.is_outer_broadcast_dominated ? "true" : "false") +
+          ",\"cta_and_grid\":\"pending subsequent scheduling decisions\"}";
+      state += ",\"decision\":{\"kind\":\"vector_width\"";
+      state += ",\"n_elems\":" + std::to_string(n_elems) +
+          ",\"layout_max\":" + std::to_string(layout_max) +
+          ",\"min_dtype_bits\":" + std::to_string(min_dtype_bits) +
+          ",\"max_dtype_bits\":" +
+          std::to_string(max_dtype_size_bit_for_vectorization) +
+          ",\"n_vectorizable_tensors\":" +
+          std::to_string(vectorizable_inputs_outputs.size()) +
+          ",\"byte_floor_exceeds_layout\":" +
+          std::string(byte_min > layout_max ? "true" : "false") +
+          ",\"candidates\":[";
+      bool first_candidate = true;
+      for (int64_t width = first_width; width <= layout_max; width *= 2) {
+        const int64_t total_vectors = ceil_quotient(n_elems, width);
+        const int64_t right_vectors = ceil_quotient(right_elems, width);
+        if (!first_candidate)
+          state += ',';
+        first_candidate = false;
+        state += "{\"id\":\"w" + std::to_string(width) +
+            "\",\"width\":" + std::to_string(width) +
+            ",\"total_vector_iterations\":" + std::to_string(total_vectors) +
+            ",\"right_vector_iterations\":" + std::to_string(right_vectors) +
+            ",\"block_x_if_128\":128";
+        if (bp_info.break_point == 0) {
+          // Coverage CTA estimate used by the later 1D CTA preflight.
+          // The unroll heuristic has its own (floor-divided) block estimate.
+          state += ",\"coverage_ctas_if_128\":" +
+              std::to_string(ceil_quotient(total_vectors, kThreadX));
+        } else {
+          // The subsequent PW3.launch Choice may use another CTA width.
+          state +=
+              ",\"grid_left_if_128\":" + std::to_string(n_elems / right_elems) +
+              ",\"grid_right_if_128\":" +
+              std::to_string(ceil_quotient(right_elems, width * kThreadX));
+        }
+        state += '}';
+      }
+      state += "]}}";
+    } else {
+      state = "pointwise.width.v1\n";
+      state += "layout_max=" + std::to_string(layout_max) + '\n';
+      state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+      state += "max_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+      state += "n_vectorizable_tensors=" +
+          std::to_string(vectorizable_inputs_outputs.size()) + '\n';
+      state += "n_elems=" + std::to_string(n_elems) + '\n';
+      state += "sm_count=" + std::to_string(device_multiprocessor_count) + '\n';
+    }
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "w" + std::to_string(vectorization_factor)
+        : std::string();
+    const std::string selected = semantic
+        ? scheduler::jev::chooseSemanticDecision(
+              "PW3.width",
+              state,
+              "Choose the legal vector width for this ordinary PointWise "
+              "fusion. The state gives the fusion, runtime tensors, current "
+              "breakpoint, hardware, hard layout limit, and each width's "
+              "work and hypothetical 128-thread coverage/grid estimate. "
+              "A later decision chooses CTA and unroll, so do not treat "
+              "that preview as the final launch grid. "
+              "Favor expected kernel speed; return one listed width.",
+              options,
+              native_choice)
+        : scheduler::jev::chooseDecision(
+              "PW3.width", state, options, native_choice);
+    bool matched = false;
+    for (int64_t width = first_width; width <= layout_max; width *= 2) {
+      if (selected == "w" + std::to_string(width)) {
+        vectorization_factor = width;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW3.width response is outside native hard bounds");
+  } else if (jev_mode == scheduler::jev::Mode::Record && block_quantization) {
+    // The wrapper caps the final width at four and the runtime gate checks
+    // block-quantization constraints on the completed native schedule.
+    scheduler::jev::recordCoverageSkip("PW3.width", "block_quantization");
+  }
   params->vectorization_factor = vectorization_factor;
 
   // Calculate block and grid configuration based on break point
   auto config = pointwise_utils::getBlockGridConfig(
-      prop, bp_info, vectorization_factor, kThreadX);
+      prop, bp_info, vectorization_factor, kThreadX, block_quantization);
 
   // Extract results
   break_point = config.break_point;
@@ -304,21 +552,259 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   bool is_outer_broadcast_dominated = config.is_outer_broadcast_dominated;
   const auto& elem_counts = prop.elem_counts;
 
+  // Each eligible 1D CTA choice defines a complete thread/grid mapping. A
+  // non-native choice uses a symbolic split so different launch dimensions
+  // can reuse the same scheduled kernel. The native 128 path remains literal.
+  if (break_point == 0 && jev_mode != scheduler::jev::Mode::Off) {
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const int64_t warp_size = dev_prop->warpSize;
+    const bool native_cta_valid = warp_size > 0 && kThreadX % warp_size == 0 &&
+        kThreadX <= dev_prop->maxThreadsDim[0] &&
+        kThreadX <= dev_prop->maxThreadsPerBlock &&
+        kThreadX <= dev_prop->maxThreadsPerMultiProcessor &&
+        dev_prop->maxGridSize[0] > 0 &&
+        ceilDiv(ceilDiv(n_elems, vectorization_factor), kThreadX) <=
+            dev_prop->maxGridSize[0];
+    if (!native_cta_valid) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "PW3.cta_1d native CTA fails conservative hard preflight");
+      scheduler::jev::recordCoverageSkip(
+          "PW3.cta_1d", "native_1d_cta_preflight");
+    } else if (block_quantization) {
+      // No alternate CTA is proved for block quantization; retain native.
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip("PW3.cta_1d", "block_quantization");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t candidate = warp_size; candidate <= kThreadX;
+           candidate *= 2) {
+        if (ceilDiv(ceilDiv(n_elems, vectorization_factor), candidate) >
+            dev_prop->maxGridSize[0]) {
+          continue;
+        }
+        options.push_back(
+            {"x" + std::to_string(candidate),
+             "Use " + std::to_string(candidate) + " threads per 1D CTA"});
+      }
+      const bool semantic = scheduler::jev::semanticProtocolEnabled();
+      std::string state;
+      if (semantic) {
+        NVF_ERROR(
+            vectorization_factor > 0 && n_elems > 0 &&
+                device_multiprocessor_count > 0,
+            "PW3.cta_1d semantic request needs a valid partial schedule");
+        state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
+        state +=
+            ",\"objective\":\"Minimize expected runtime by choosing "
+            "a legal 1D CTA thread count for this fusion; balance grid "
+            "coverage, thread occupancy, wave count, and tail waste.\"";
+        state += ",\"workload\":" +
+            pointwise_utils::semanticPointwiseWorkload(
+                     device_multiprocessor_count, dev_prop);
+        state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
+        state += ",\"breakpoint_analysis_requested\":" +
+            std::string(analyze_2d_break_point ? "true" : "false") +
+            ",\"break_point\":0,\"right_elems\":" + std::to_string(n_elems) +
+            ",\"vector_width\":" + std::to_string(vectorization_factor) +
+            ",\"vector_width_already_selected\":true,\"unroll\":\"pending\"}";
+        state += ",\"decision\":{\"kind\":\"cta_threads_1d\"";
+        state += ",\"n_elems\":" + std::to_string(n_elems) +
+            ",\"max_threads_x\":" + std::to_string(dev_prop->maxThreadsDim[0]) +
+            ",\"candidates\":[";
+        const int64_t vector_iterations =
+            ceilDiv(n_elems, vectorization_factor);
+        for (size_t i = 0; i < options.size(); ++i) {
+          const int64_t threads = std::stoll(options[i].id.substr(1));
+          const int64_t grid_x = ceilDiv(vector_iterations, threads);
+          const int64_t blocks_per_sm =
+              dev_prop->maxThreadsPerMultiProcessor / threads;
+          if (i != 0)
+            state += ',';
+          state += "{\"id\":\"x" + std::to_string(threads) +
+              "\",\"threads\":" + std::to_string(threads) +
+              ",\"vector_iterations\":" + std::to_string(vector_iterations) +
+              ",\"grid_x_if_unrolled_one\":" + std::to_string(grid_x) +
+              ",\"floor_divided_unroll_blocks\":" +
+              std::to_string(ceilDiv(n_elems / vectorization_factor, threads)) +
+              ",\"blocks_per_sm_thread_limit\":" +
+              std::to_string(blocks_per_sm) +
+              ",\"thread_limit_waves_if_unrolled_one\":" +
+              std::to_string(ceilDiv(
+                  grid_x, blocks_per_sm * device_multiprocessor_count)) +
+              ",\"tail_elements\":" +
+              std::to_string(n_elems % (vectorization_factor * threads)) +
+              ",\"symbolic_thread_split\":" +
+              std::string(threads == kThreadX ? "false" : "true") + '}';
+        }
+        state += "]}}";
+      } else {
+        state = "pointwise.launch_1d.v1\n";
+        state += "n_elems=" + std::to_string(n_elems) + '\n';
+        state += "vector_width=" + std::to_string(vectorization_factor) + '\n';
+        state += "warp_size=" + std::to_string(warp_size) + '\n';
+        state += "max_threads_x=" + std::to_string(dev_prop->maxThreadsDim[0]) +
+            '\n';
+        state += "max_threads_per_block=" +
+            std::to_string(dev_prop->maxThreadsPerBlock) + '\n';
+        state += "max_threads_per_sm=" +
+            std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
+        state +=
+            "max_grid_x=" + std::to_string(dev_prop->maxGridSize[0]) + '\n';
+      }
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record ? "x128" : "";
+      const auto selected = semantic
+          ? scheduler::jev::chooseSemanticDecision(
+                "PW3.cta_1d",
+                state,
+                "Choose the legal 1D CTA thread count for this fusion. "
+                "The vector width is already selected. Compare the listed "
+                "grid coverage, thread-limit waves and tails; unroll is "
+                "chosen later, so grid and waves are conditional previews. "
+                "Favor expected kernel runtime and return one listed CTA.",
+                options,
+                native_choice)
+          : scheduler::jev::chooseDecision(
+                "PW3.cta_1d", state, options, native_choice);
+      bool matched = false;
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          bdimx = std::stoll(option.id.substr(1));
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "PW3.cta_1d response is outside hard CTA bounds");
+      params->symbolic_1d_cta = bdimx != kThreadX;
+    }
+  }
+
   // get unroll factor:
   int64_t total_blocks = break_point > 0
       ? gdim_left * gdim_right
-      : ceilDiv(n_elems / vectorization_factor, kThreadX);
+      : ceilDiv(n_elems / vectorization_factor, bdimx);
   bool divisible_split = break_point > 0
       ? (right_elem_count % (params->vectorization_factor * bdimx) == 0)
-      : (n_elems % (params->vectorization_factor * kThreadX) == 0);
+      : (n_elems % (params->vectorization_factor * bdimx) == 0);
+  // Both Record and Remote must evaluate the native factor to agree on
+  // whether the bounded model menu is available for this invocation.
   int64_t unroll_factor = getUnrollFactor(
       fusion,
       break_point,
       total_blocks,
+      break_point > 0 ? kThreadX : bdimx,
       params->vectorization_factor * max_dtype_size_bit_for_vectorization,
       divisible_split,
       vectorizable_inputs_outputs,
       data_cache);
+  if (jev_mode != scheduler::jev::Mode::Off && !block_quantization) {
+    // The pointwise split represents any positive factor up to total_blocks,
+    // including non-power-of-two factors and tails. Limit model-selected
+    // factors further to avoid pathological expansion of the generated kernel.
+    const int64_t schedule_max = std::max<int64_t>(1, total_blocks);
+    NVF_ERROR(
+        unroll_factor >= 1 && unroll_factor <= schedule_max,
+        "PW3.unroll native factor exceeds the schedule's hard range");
+    const auto envelope = getPointwiseUnrollEnvelope(
+        total_blocks,
+        fusion->exprs().size(),
+        vectorization_factor,
+        unroll_factor);
+    const int64_t model_max = envelope.model_limit;
+    if (envelope.offer_choice) {
+      const auto inputs =
+          getUniqueVectorizableInputs(vectorizable_inputs_outputs);
+      const auto outer_flags = getOuterBcastInputFlags(inputs, break_point);
+      const auto op_counts = countExpensiveOps(fusion);
+      const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+      int memory_clock_khz = 0;
+      NVF_ERROR(
+          cudaDeviceGetAttribute(
+              &memory_clock_khz,
+              cudaDevAttrMemoryClockRate,
+              at::cuda::current_device()) == cudaSuccess,
+          "PW3.unroll could not read CUDA memory clock");
+      std::string flags = outer_flags.empty() ? "-" : std::string();
+      for (size_t i = 0; i < outer_flags.size(); ++i) {
+        if (i != 0) {
+          flags += ',';
+        }
+        flags += (outer_flags[i] ? '1' : '0');
+      }
+      std::string state_base = "pointwise.unroll.v2\n";
+      state_base += "axis=" +
+          std::string(is_outer_broadcast_dominated ? "outer" : "inner") + '\n';
+      state_base += "break_point=" + std::to_string(break_point) + '\n';
+      state_base += "n_elems=" + std::to_string(n_elems) + '\n';
+      state_base += "right_elems=" + std::to_string(right_elem_count) + '\n';
+      state_base += "bdimx=" + std::to_string(bdimx) + '\n';
+      state_base += "gdim_left=" + std::to_string(gdim_left) + '\n';
+      state_base += "gdim_right=" + std::to_string(gdim_right) + '\n';
+      state_base += "vector_width=" + std::to_string(vectorization_factor) + '\n';
+      state_base +=
+          "expr_count=" + std::to_string(fusion->exprs().size()) + '\n';
+      state_base += "max_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+      state_base += "input_outer_bcast_flags=" + flags + '\n';
+      state_base += "tanh_ops=" + std::to_string(op_counts.tanh) + '\n';
+      state_base += "exp_ops=" + std::to_string(op_counts.exp) + '\n';
+      state_base +=
+          "reciprocal_ops=" + std::to_string(op_counts.reciprocal) + '\n';
+      state_base +=
+          "sm_count=" + std::to_string(dev_prop->multiProcessorCount) + '\n';
+      state_base += "max_threads_per_sm=" +
+          std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
+      state_base +=
+          "memory_bus_bits=" + std::to_string(dev_prop->memoryBusWidth) + '\n';
+      state_base += "memory_clock_khz=" + std::to_string(memory_clock_khz) + '\n';
+      state_base += "block_quantization=" +
+          std::to_string(static_cast<int>(block_quantization)) + '\n';
+
+      int64_t range_low = 1;
+      int64_t range_high = model_max;
+      for (;;) {
+        const auto ranges = getUnrollRanges(range_low, range_high);
+        std::vector<scheduler::jev::ChoiceOption> options;
+        options.reserve(ranges.size());
+        std::string native_choice;
+        for (const auto& range : ranges) {
+          options.push_back(
+              {range.id,
+               "Unroll factor in [" + std::to_string(range.low) + ", " +
+                   std::to_string(range.high) + "]"});
+          if (jev_mode == scheduler::jev::Mode::Record &&
+              range.low <= unroll_factor && unroll_factor <= range.high) {
+            native_choice = range.id;
+          }
+        }
+        const std::string state = state_base +
+            "range_low=" + std::to_string(range_low) + '\n' +
+            "range_high=" + std::to_string(range_high) + '\n';
+        const auto selected = scheduler::jev::chooseDecision(
+            "PW3.unroll", state, options, native_choice);
+        const auto selected_range = std::find_if(
+            ranges.begin(), ranges.end(), [&](const FactorRange& range) {
+              return range.id == selected;
+            });
+        NVF_ERROR(
+            selected_range != ranges.end(),
+            "PW3.unroll response is outside the bounded model menu");
+        if (selected_range->low == selected_range->high) {
+          unroll_factor = selected_range->low;
+          break;
+        }
+        range_low = selected_range->low;
+        range_high = selected_range->high;
+      }
+    }
+  } else if (jev_mode == scheduler::jev::Mode::Record && block_quantization) {
+    scheduler::jev::recordCoverageSkip("PW3.unroll", "block_quantization");
+  }
+  NVF_ERROR(
+      !block_quantization || unroll_factor == 1,
+      "PW3.unroll violated the block-quantization guard");
 
   if (is_outer_broadcast_dominated) {
     params->unroll_factor_outer = unroll_factor;
@@ -341,6 +827,42 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   if ((flip_grid_binding && gdim_right > 65535) ||
       (!flip_grid_binding && gdim_left > 65535)) {
     params->split_grid_y_dim = true;
+  }
+
+  if (jev_mode == scheduler::jev::Mode::Remote) {
+    // PW2 may choose a different breakpoint or grid binding before PW3 sees
+    // the width and CTA. Validate the completed launch as well as the PW3
+    // menu: an empty PW3 menu can fall back to the native CTA while the PW2
+    // grid-X choice is still outside the device limit.
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    NVF_ERROR(
+        bdimx > 0 && bdimy > 0 && vectorization_factor > 0 &&
+            params->unroll_factor_inner > 0 && params->unroll_factor_outer > 0,
+        "Remote PointWise launch has nonpositive geometry");
+    const int64_t physical_grid_x = break_point > 0
+        ? (flip_grid_binding ? gdim_left : gdim_right)
+        : ceilDiv(
+              ceilDiv(ceilDiv(n_elems, vectorization_factor), bdimx),
+              params->unroll_factor_inner);
+    const int64_t logical_grid_y =
+        break_point > 0 ? (flip_grid_binding ? gdim_right : gdim_left) : 1;
+    const int64_t physical_grid_y = std::min<int64_t>(logical_grid_y, 65535);
+    NVF_ERROR(
+        bdimx <= device->maxThreadsDim[0] &&
+            bdimy <= device->maxThreadsDim[1] &&
+            bdimx * bdimy <= device->maxThreadsPerBlock &&
+            bdimx * bdimy <= device->maxThreadsPerMultiProcessor &&
+            physical_grid_x > 0 && physical_grid_x <= device->maxGridSize[0] &&
+            physical_grid_y > 0 && physical_grid_y <= device->maxGridSize[1],
+        "Remote PointWise plan exceeds physical CTA or grid limits: block=(",
+        bdimx,
+        ",",
+        bdimy,
+        "), grid=(",
+        physical_grid_x,
+        ",",
+        physical_grid_y,
+        ")");
   }
 
   if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
@@ -560,7 +1082,11 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams* pparams) {
       // Unswitch
       reference_tv->split(0, 1);
       // Threads
-      reference_tv->split(0, kThreadX);
+      if (pparams->symbolic_1d_cta) {
+        reference_tv->split(0, NamedScalar::getParallelDim(ParallelType::TIDx));
+      } else {
+        reference_tv->split(0, kThreadX);
+      }
 
       reference_tv->axis(0)->parallelize(ParallelType::BIDx);
       reference_tv->axis(1)->parallelize(ParallelType::TIDx);
@@ -578,7 +1104,11 @@ void schedulePointwise(Fusion* fusion, const PointwiseParams* pparams) {
         reference_tv->split(0, pparams->vectorization_factor);
       }
       // Threads
-      reference_tv->split(0, kThreadX);
+      if (pparams->symbolic_1d_cta) {
+        reference_tv->split(0, NamedScalar::getParallelDim(ParallelType::TIDx));
+      } else {
+        reference_tv->split(0, kThreadX);
+      }
       // Unroll
       if (pparams->unroll_factor_inner > 1) {
         reference_tv->split(0, pparams->unroll_factor_inner);

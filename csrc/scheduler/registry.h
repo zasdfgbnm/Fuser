@@ -33,10 +33,19 @@ class SchedulerEntry {
       Fusion* fusion,
       const HeuristicParams* params) = 0;
 
-  virtual std::unique_ptr<HeuristicParams> computeHeuristics(
+  // The only public compute entry. It returns the native scheduler's exact
+  // result; an optional diagnostic observes that result without influencing it.
+  NVF_API std::unique_ptr<HeuristicParams> computeHeuristics(
       Fusion* fusion,
       SchedulerRuntimeInfo& runtime_info,
-      HeuristicDataCache* data_cache = nullptr) = 0;
+      HeuristicDataCache* data_cache = nullptr);
+
+  // Implemented by each native scheduler. Keep all calls through the public
+  // entry so direct users and the normal executor receive the same observer.
+  virtual std::unique_ptr<HeuristicParams> computeHeuristicsImpl(
+      Fusion* fusion,
+      SchedulerRuntimeInfo& runtime_info,
+      HeuristicDataCache* data_cache) = 0;
 
   // Compile check that the scheduler maybe able to schedule the fusion
   virtual bool canScheduleCompileTime(Fusion* fusion) = 0;

@@ -12,6 +12,7 @@
 #include <memory>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -27,6 +28,7 @@
 #include "mma_type.h"
 #include "options.h"
 #include "runtime/executor_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/matmul_heuristic.h"
 #include "scheduler/matmul_heuristic_plugin.h"
 #include "scheduler/mma_utils.h"
@@ -106,10 +108,9 @@ inline std::optional<MmaMacro> getMmaOp(
   return macro_encode;
 }
 
-//! Find the number of circular buffer stages for shared memory operands, so
-//! that the entire pipeline is filled given problem and heuristics.
-void limitCircularBufferingSmemOperands(
-    MatmulParams* mparams,
+//! Count the useful operand stages before applying a stage-count preference.
+int64_t circularBufferWorkStages(
+    const MatmulParams* mparams,
     const ProblemShape& problem_shape) {
   // The axes of the mma tensorviews are permuted to [B, M, N, K],
   // so K / cta_tile_k is the circular buffer axis for both operands.
@@ -134,9 +135,17 @@ void limitCircularBufferingSmemOperands(
     // in rare cases
     num_tiles_per_cta = ceilDiv(tiles_m * tiles_n, num_sms);
   }
+  return k_stages_per_tile * num_tiles_per_cta;
+}
+
+//! Find the number of circular buffer stages for shared memory operands, so
+//! that the entire pipeline is filled given problem and heuristics.
+void limitCircularBufferingSmemOperands(
+    MatmulParams* mparams,
+    const ProblemShape& problem_shape) {
   int64_t stages = std::min(
       (int64_t)mparams->circular_buffer_options.smem_circular_buffer_stage,
-      k_stages_per_tile * num_tiles_per_cta);
+      circularBufferWorkStages(mparams, problem_shape));
 
   // Limit to 8 stages, even though in some cases we could use more. This is
   // needed because mbarrier initialization has a penalty and we do not expect
@@ -257,7 +266,9 @@ bool fillDefaultAmpereHeuristic(
 //    different tiles.
 void fillOptimalHopperTileSizes(
     MatmulParams* mparams,
-    const ProblemShape& problem_shape) {
+    const ProblemShape& problem_shape,
+    const mma_utils::TensorRolesMap& tensor_roles,
+    const size_t num_problems) {
   const int64_t m = problem_shape[(size_t)MatmulDimRole::M];
   const int64_t n = problem_shape[(size_t)MatmulDimRole::N];
   const int64_t k = problem_shape[(size_t)MatmulDimRole::K];
@@ -268,8 +279,41 @@ void fillOptimalHopperTileSizes(
     GemmTile instr;
   };
 
+  const auto jev_mode = scheduler::jev::mode();
+  // A plugin may replace the default Hopper plan after this function returns.
+  const bool jev_tile_enabled =
+      jev_mode != scheduler::jev::Mode::Off &&
+      !matmul_heuristic_plugin::hasPlugin();
+  const bool score_native =
+      jev_mode != scheduler::jev::Mode::Remote || !jev_tile_enabled;
+
   const int64_t num_sms =
       at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int64_t smem_bytes =
+      at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+  // The original three-stage floor is a pipeline preference. A one- or
+  // two-stage tile can still be scheduled, as long as both operands and the
+  // optional Float epilogue fit. Bound the expanded menu to a single matmul
+  // with two-byte operands and no extra epilogue input; the existing per-stage
+  // estimate then matches the operand allocation.
+  const auto& as = tensor_roles.at(MatmulTensorRole::OPERAND_A);
+  const auto& bs = tensor_roles.at(MatmulTensorRole::OPERAND_B);
+  const auto& outs = tensor_roles.at(MatmulTensorRole::OUTPUT);
+  NVF_ERROR(
+      !as.empty() && !bs.empty() && !outs.empty(),
+      "MM1 tile search requires nonempty operand and output tensor roles");
+  const auto epilogue_input_it =
+      tensor_roles.find(MatmulTensorRole::EPILOGUE_INPUT);
+  const size_t epilogue_input_count =
+      epilogue_input_it == tensor_roles.end() ? 0
+                                              : epilogue_input_it->second.size();
+  const int64_t a_dtype_bytes = dataTypeSizeByte(as.front()->dtype());
+  const int64_t b_dtype_bytes = dataTypeSizeByte(bs.front()->dtype());
+  const int64_t output_dtype_bytes = dataTypeSizeByte(outs.front()->dtype());
+  const bool offer_low_stage_tiles =
+      jev_tile_enabled && num_problems == 1 && as.size() == 1 &&
+      bs.size() == 1 && outs.size() == 1 && epilogue_input_count == 0 &&
+      a_dtype_bytes == 2 && b_dtype_bytes == 2 && output_dtype_bytes == 2;
 
   // Compute how many total bytes need to be computed, summed over all tiles in
   // the output
@@ -298,6 +342,8 @@ void fillOptimalHopperTileSizes(
       /*cta=*/{64, 64, 64}, /*warp=*/{64, 64, 64}, /*instr=*/{64, 64, 16}};
   int64_t best_bytes_tx = std::numeric_limits<int64_t>::max();
   int64_t best_stages = std::numeric_limits<int64_t>::max();
+  bool has_native_config = false;
+  std::vector<TileConfig> legal_configs;
 
   // If two sizes result in the same number of total byte, prefer the larger CTA
   // K. To do this we iterate backwards here.
@@ -317,10 +363,7 @@ void fillOptimalHopperTileSizes(
         const int64_t epilogue_bytes = cta_m * cta_n * 2;
         // operands plus outputs plus mbarriers
         const int64_t bytes_per_stage = (cta_m + cta_n) * cta_k * 2 + 8 * 2;
-        // Don't consider cases where we would need fewer than 3 load stages due
-        // to smem constraint
-        const int64_t smem_bytes =
-            at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin;
+        // Preserve the native preference for at least three load stages.
         int64_t min_stages = 3L;
 
         // There might be fewer than min_stages stages needed to compute the
@@ -332,7 +375,14 @@ void fillOptimalHopperTileSizes(
         const int64_t stages_per_sm = stages_per_tile * tiles_per_sm;
         min_stages = std::max(1L, std::min(min_stages, stages_per_sm));
 
-        if (bytes_per_stage * min_stages + epilogue_bytes > smem_bytes) {
+        const bool native_valid =
+            bytes_per_stage * min_stages + epilogue_bytes <= smem_bytes;
+        // Reserve room for the Float MMA accumulator even if the downstream
+        // epilogue analysis elects to omit or reuse its shared-memory buffer.
+        const bool low_stage_valid =
+            offer_low_stage_tiles && !native_valid &&
+            bytes_per_stage + cta_m * cta_n * 4 <= smem_bytes;
+        if (!native_valid && !low_stage_valid) {
           continue;
         }
 
@@ -345,6 +395,13 @@ void fillOptimalHopperTileSizes(
             .warp = {64L, instr_n, cta_k},
             .instr = {64L, instr_n, 16L},
         };
+        has_native_config |= native_valid;
+        if (jev_tile_enabled) {
+          legal_configs.push_back(cfg);
+        }
+        if (!score_native || !native_valid) {
+          continue;
+        }
         const int64_t bytes_tx = bytes_transferred(cfg.cta);
         bool new_best = bytes_tx < best_bytes_tx;
         if (bytes_tx == best_bytes_tx) {
@@ -368,6 +425,83 @@ void fillOptimalHopperTileSizes(
           best_config = cfg;
           best_stages = stages_per_sm;
         }
+      }
+    }
+  }
+
+  if (jev_tile_enabled) {
+    // The no-native-candidate case keeps the original fallback/error behavior.
+    if (!has_native_config) {
+      legal_configs.clear();
+    }
+    if (legal_configs.empty()) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "MM1.tile", "no native-valid Hopper tile; preserved legacy fallback");
+      } else {
+        NVF_ERROR(false, "MM1.tile has no native-valid Hopper tile");
+      }
+    } else {
+      const auto choice_id = [](const TileConfig& cfg) {
+        return "m" + std::to_string(cfg.cta.m) + "n" +
+            std::to_string(cfg.cta.n) + "k" + std::to_string(cfg.cta.k) +
+            "w" + std::to_string(cfg.warp.n);
+      };
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(legal_configs.size());
+      for (const TileConfig& cfg : legal_configs) {
+        options.push_back({
+            choice_id(cfg),
+            "CTA " + std::to_string(cfg.cta.m) + "x" +
+                std::to_string(cfg.cta.n) + "x" +
+                std::to_string(cfg.cta.k) + "; warp " +
+                std::to_string(cfg.warp.m) + "x" +
+                std::to_string(cfg.warp.n) + "x" +
+                std::to_string(cfg.warp.k) + "; instruction " +
+                std::to_string(cfg.instr.m) + "x" +
+                std::to_string(cfg.instr.n) + "x" +
+                std::to_string(cfg.instr.k)});
+      }
+      const std::string state =
+          "matmul.hopper_tile.v2\nm_extent=" + std::to_string(m) +
+          "\nn_extent=" + std::to_string(n) +
+          "\nk_extent=" + std::to_string(k) +
+          "\nsm_count=" + std::to_string(num_sms) +
+          "\nsmem_per_block_bytes=" + std::to_string(smem_bytes) +
+          "\nnum_problems=" + std::to_string(num_problems) +
+          "\na_tensor_count=" + std::to_string(as.size()) +
+          "\nb_tensor_count=" + std::to_string(bs.size()) +
+          "\noutput_tensor_count=" + std::to_string(outs.size()) +
+          "\nepilogue_input_count=" + std::to_string(epilogue_input_count) +
+          "\na_dtype_bytes=" + std::to_string(a_dtype_bytes) +
+          "\nb_dtype_bytes=" + std::to_string(b_dtype_bytes) +
+          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes);
+      const auto native_it = std::find_if(
+          legal_configs.begin(), legal_configs.end(), [&](const TileConfig& cfg) {
+            return cfg.cta.m == best_config.cta.m &&
+                cfg.cta.n == best_config.cta.n &&
+                cfg.cta.k == best_config.cta.k &&
+                cfg.warp.n == best_config.warp.n;
+          });
+      if (jev_mode == scheduler::jev::Mode::Record &&
+          native_it == legal_configs.end()) {
+        scheduler::jev::recordCoverageSkip(
+            "MM1.tile", "legacy winner is outside the native-valid tile menu");
+      } else {
+        const std::string selected = scheduler::jev::chooseDecision(
+            "MM1.tile",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? choice_id(*native_it)
+                                                      : "");
+        const auto selected_it = std::find_if(
+            legal_configs.begin(), legal_configs.end(), [&](const TileConfig& cfg) {
+              return choice_id(cfg) == selected;
+            });
+        NVF_ERROR(
+            selected_it != legal_configs.end(),
+            "MM1.tile response is outside the native-valid tile menu");
+        best_config = *selected_it;
       }
     }
   }
@@ -456,7 +590,8 @@ bool fillDefaultHopperHeuristic(
   mparams->tiling_strategy =
       MatmulParams::TilingStrategy::DistributeTilesAcrossSMs;
 
-  fillOptimalHopperTileSizes(mparams, problem_shape);
+  fillOptimalHopperTileSizes(
+      mparams, problem_shape, tensor_roles, num_problems);
 
   maximizeHopperOperandStages(mparams, tensor_roles, num_problems);
 
@@ -476,15 +611,26 @@ bool fillDefaultHopperHeuristic(
   const GemmTile& cta_tile = mparams->tile_sizes.cta_tile;
   int64_t Mtiles = ceilDiv(problem_shape[(size_t)MatmulDimRole::M], cta_tile.m);
   int64_t Ntiles = ceilDiv(problem_shape[(size_t)MatmulDimRole::N], cta_tile.n);
+  const auto jev_mode = scheduler::jev::mode();
+  const bool jev_raster_enabled =
+      jev_mode != scheduler::jev::Mode::Off &&
+      !matmul_heuristic_plugin::hasPlugin() &&
+      mparams->tiling_strategy ==
+          MatmulParams::TilingStrategy::DistributeTilesAcrossSMs;
+  const bool jev_cluster_enabled = jev_raster_enabled;
+  const bool compute_native_raster =
+      jev_mode != scheduler::jev::Mode::Remote || !jev_raster_enabled;
 
   // When we choose the rasterization direction, that becomes the fast
   // dimension. However, when we swizzle, we pull groups of a fixed size from
   // the _other_ dimension to create a new inner dimension. We find the swizzle
   // factor that is largest and has the least quantization when we divide that
   // other dimension by the swizzle factor.
-  mparams->cta_order = Mtiles <= Ntiles
-      ? MatmulParams::TileRasterizationOrder::ColumnMajor
-      : MatmulParams::TileRasterizationOrder::RowMajor;
+  if (compute_native_raster) {
+    mparams->cta_order = Mtiles <= Ntiles
+        ? MatmulParams::TileRasterizationOrder::ColumnMajor
+        : MatmulParams::TileRasterizationOrder::RowMajor;
+  }
 
   // TODO: swizzle is computed at the level of CGA so we first set CGA size
   // then set swizzle factor.
@@ -499,47 +645,144 @@ bool fillDefaultHopperHeuristic(
     // large CGAs because they will leave some SMs idle.
     int64_t largest_cga = -1L;
     MatmulParams::ClusterDims largest_cga_cfg{1, 1};
+    std::vector<MatmulParams::ClusterDims> legal_cgas;
+    const bool compute_native_cluster =
+        jev_mode != scheduler::jev::Mode::Remote || !jev_cluster_enabled;
     // Allow CGAs larger than 2 only for small problems
     const int64_t max_cga_size =
         Mtiles * Ntiles > ((double)num_sms * .75) ? 2L : 4L;
     for (int64_t cm : arange(1L, 9L)) {
       for (int64_t cn : arange(1L, 9L)) {
         int64_t cga_size = cm * cn;
-        if (Mtiles % cm != 0 || Ntiles % cn != 0 || cga_size > max_cga_size) {
+        // The two-CTA ceiling for large grids is a performance rule, not a
+        // hardware restriction. Keep it for the native answer while allowing
+        // the remote choice to consider every shape the default Hopper path
+        // already supports on small grids.
+        if (Mtiles % cm != 0 || Ntiles % cn != 0 ||
+            cga_size > (jev_cluster_enabled ? 4L : max_cga_size)) {
           continue;
         }
-        if (largest_cga == -1L || cga_size > largest_cga) {
+        if (jev_cluster_enabled) {
+          legal_cgas.push_back({cm, cn});
+        }
+        if (compute_native_cluster && cga_size <= max_cga_size &&
+            (largest_cga == -1L || cga_size > largest_cga)) {
           largest_cga = cga_size;
           largest_cga_cfg = {cm, cn};
         }
       }
     }
 
-    mparams->cluster_dims = largest_cga_cfg;
+    if (jev_cluster_enabled) {
+      const auto choice_id = [](const MatmulParams::ClusterDims& dims) {
+        return "m" + std::to_string(dims.m) + "n" + std::to_string(dims.n);
+      };
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(legal_cgas.size());
+      for (const auto& dims : legal_cgas) {
+        options.push_back({
+            choice_id(dims),
+            "CGA " + std::to_string(dims.m) + "x" +
+                std::to_string(dims.n) + " CTA cluster"});
+      }
+      const std::string state =
+          "matmul.hopper_cluster.v1\nm_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::M]) +
+          "\nn_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::N]) +
+          "\ncta_m=" + std::to_string(cta_tile.m) +
+          "\ncta_n=" + std::to_string(cta_tile.n) +
+          "\nsm_count=" + std::to_string(num_sms);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "MM3.cluster",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? choice_id(largest_cga_cfg)
+              : "");
+      const auto selected_it = std::find_if(
+          legal_cgas.begin(), legal_cgas.end(), [&](const auto& dims) {
+            return choice_id(dims) == selected;
+          });
+      NVF_ERROR(
+          selected_it != legal_cgas.end(),
+          "MM3.cluster response is outside divisible native CGA bounds");
+      mparams->cluster_dims = *selected_it;
+    } else {
+      mparams->cluster_dims = largest_cga_cfg;
+    }
   }
 
-  // This is the size of the non-fast dimension before swizzling
-  int64_t swizzled_tiles =
-      mparams->cta_order == MatmulParams::TileRasterizationOrder::RowMajor
-      ? Mtiles
-      : Ntiles;
+  if (compute_native_raster) {
+    // Keep the original search in off/record modes and when a plugin owns the
+    // resulting parameters. The remote default path does not use its result.
+    int64_t swizzled_tiles =
+        mparams->cta_order == MatmulParams::TileRasterizationOrder::RowMajor
+        ? Mtiles
+        : Ntiles;
 
-  // We swizzle the tiles as much as possible up to 16 tiles. Like choosing
-  // the rasterization order, this is used to increase L2 locality. We start at
-  // swizzled_tiles-1 because if we set the swizzle factor equal to the size of
-  // the non-swizzled dimension that is equivalent to simply switching
-  // cta_order. The largest possible divisor of an integer i is i/2, so we
-  // start our search there (or 16, whichever is smaller).
-  int grid_traversal_factor = std::max(1L, std::min(swizzled_tiles / 2L, 16L));
-  while (grid_traversal_factor > 1 &&
-         swizzled_tiles % grid_traversal_factor != 0) {
-    // Decrease the swizzle factor if it would result in nondivisible splits,
-    // since this would unnecessarily increase the grid size.
-    grid_traversal_factor--;
+    // We swizzle the tiles as much as possible up to 16 tiles. Like choosing
+    // the rasterization order, this is used to increase L2 locality. We start
+    // at swizzled_tiles-1 because if we set the swizzle factor equal to the
+    // size of the non-swizzled dimension that is equivalent to simply
+    // switching cta_order. The largest possible divisor of an integer i is
+    // i/2, so we start our search there (or 16, whichever is smaller).
+    int grid_traversal_factor =
+        std::max(1L, std::min(swizzled_tiles / 2L, 16L));
+    while (grid_traversal_factor > 1 &&
+           swizzled_tiles % grid_traversal_factor != 0) {
+      // Decrease the swizzle factor if it would result in nondivisible splits,
+      // since this would unnecessarily increase the grid size.
+      grid_traversal_factor--;
+    }
+    // TODO: Use only 1D grid traversal factor for now
+    grid_traversal_factor = 1;
+    mparams->grid_traversal_factor = {grid_traversal_factor, 1};
+  } else {
+    mparams->grid_traversal_factor = {1, 1};
   }
-  // TODO: Use only 1D grid traversal factor for now
-  grid_traversal_factor = 1;
-  mparams->grid_traversal_factor = {grid_traversal_factor, 1};
+
+  // The plugin owns its own raster and cluster plan. On the default Hopper
+  // path, both orders traverse the same finalized CGA tiles; the native
+  // cluster divisibility and the forced 1x1 swizzle remain fixed.
+  if (jev_raster_enabled) {
+    NVF_ERROR(
+        mparams->cluster_dims.m > 0 && mparams->cluster_dims.n > 0 &&
+            Mtiles % mparams->cluster_dims.m == 0 &&
+            Ntiles % mparams->cluster_dims.n == 0,
+        "MM3 raster plan requires a divisible native cluster");
+    const std::string state =
+        "matmul.hopper_raster.v1\nm_extent=" +
+        std::to_string(problem_shape[(size_t)MatmulDimRole::M]) +
+        "\nn_extent=" + std::to_string(problem_shape[(size_t)MatmulDimRole::N]) +
+        "\ncta_m=" + std::to_string(cta_tile.m) +
+        "\ncta_n=" + std::to_string(cta_tile.n) +
+        "\nsm_count=" + std::to_string(
+            at::cuda::getCurrentDeviceProperties()->multiProcessorCount) +
+        "\ncluster_m=" + std::to_string(mparams->cluster_dims.m) +
+        "\ncluster_n=" + std::to_string(mparams->cluster_dims.n) +
+        "\nswizzle_x=1\nswizzle_y=1";
+    const std::string fixed_plan =
+        "; cluster=" + std::to_string(mparams->cluster_dims.m) + "x" +
+        std::to_string(mparams->cluster_dims.n) + "; swizzle=1x1";
+    const std::vector<scheduler::jev::ChoiceOption> options = {
+        {"column", "column-major raster" + fixed_plan},
+        {"row", "row-major raster" + fixed_plan},
+    };
+    const auto selected = scheduler::jev::chooseDecision(
+        "MM3.raster",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record
+            ? (Mtiles <= Ntiles ? "column" : "row")
+            : "");
+    NVF_ERROR(
+        selected == "column" || selected == "row",
+        "MM3 raster response is outside native plan bounds");
+    mparams->cta_order = selected == "column"
+        ? MatmulParams::TileRasterizationOrder::ColumnMajor
+        : MatmulParams::TileRasterizationOrder::RowMajor;
+  }
 
   return true;
 }
@@ -1186,9 +1429,128 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
         mparams.get(), tensor_roles, /*num_problems=*/(size_t)patterns.size());
   }
 
-  // Ensure that entire pipeline is filled for shared memory operands given
-  // problem and heuristics.
-  limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+  // Resource capacity is computed above. K-loop work bounds the Hopper Choice
+  // menu. The native eight-stage ceiling is a performance preference, but the
+  // existing resource estimate assumes two-byte operands. Only the simple
+  // one-matmul, one-warp-group 64x64x64 two-byte-operand case may offer stages
+  // above eight: its operand SMEM is exactly 16384 bytes per stage (plus two
+  // mbarriers). For the extended menu we also reserve a full float epilogue
+  // tile in addition to the existing output allowance for other semaphores.
+  // The server reconstructs both the bounded menu and the native eight-stage
+  // winner from the raw state. Subsequent specialization and epilogue analysis
+  // still derives the complete plan from the chosen stage.
+  const auto jev_mode = scheduler::jev::mode();
+  const bool jev_stages_enabled =
+      jev_mode != scheduler::jev::Mode::Off &&
+      isHopper(mparams->mma_macro) &&
+      !matmul_heuristic_plugin::hasPlugin() &&
+      mparams->tiling_strategy ==
+          MatmulParams::TilingStrategy::DistributeTilesAcrossSMs &&
+      mparams->circular_buffering_strategy ==
+          MatmulParams::CircularBufferingStrategy::WarpSpecialized;
+  if (jev_stages_enabled) {
+    const int64_t resource_stages =
+        mparams->circular_buffer_options.smem_circular_buffer_stage;
+    const int64_t work_stages =
+        circularBufferWorkStages(mparams.get(), problem_shape);
+    int64_t output_dtype_bytes = 0;
+    for (TensorView* out : tensor_roles.at(MatmulTensorRole::OUTPUT)) {
+      output_dtype_bytes += dataTypeSizeByte(out->dtype());
+    }
+    const auto& operands_a = tensor_roles.at(MatmulTensorRole::OPERAND_A);
+    const auto& operands_b = tensor_roles.at(MatmulTensorRole::OPERAND_B);
+    NVF_ERROR(!operands_a.empty() && !operands_b.empty());
+    const int64_t operand_a_dtype_bytes =
+        dataTypeSizeByte(operands_a.front()->dtype());
+    const int64_t operand_b_dtype_bytes =
+        dataTypeSizeByte(operands_b.front()->dtype());
+    const GemmTile& cta_tile = mparams->tile_sizes.cta_tile;
+    const GemmTile& warp_tile = mparams->tile_sizes.warp_tile;
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    const bool exact_stage_envelope =
+        patterns.size() == 1 && operands_a.size() == 1 &&
+        operands_b.size() == 1 && cta_tile.m == 64 && cta_tile.n == 64 &&
+        cta_tile.k == 64 && warp_tile.m == 64 && warp_tile.n == 64 &&
+        warp_tile.k == 64 && operand_a_dtype_bytes == 2 &&
+        operand_b_dtype_bytes == 2 && output_dtype_bytes == 2 &&
+        device->sharedMemPerBlockOptin <= 227328;
+    int64_t safe_extended_stages = 0;
+    if (exact_stage_envelope) {
+      const int64_t per_stage_bytes =
+          2 * (cta_tile.m + cta_tile.n) * cta_tile.k + 16;
+      const int64_t reserved_bytes =
+          (output_dtype_bytes + 4) * cta_tile.m * cta_tile.n;
+      const int64_t remaining_bytes = std::max<int64_t>(
+          0, device->sharedMemPerBlockOptin - reserved_bytes);
+      safe_extended_stages = remaining_bytes / per_stage_bytes;
+    }
+    const int64_t menu_max_stages =
+        safe_extended_stages > 8
+        ? std::min({resource_stages, work_stages, safe_extended_stages})
+        : std::min({resource_stages, work_stages, 8L});
+    if (menu_max_stages < 1) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "MM2.stages", "no positive resource- and work-bounded stage");
+        limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+      } else {
+        NVF_ERROR(false, "MM2.stages has no valid stage candidate");
+      }
+    } else {
+      const std::string state =
+          "matmul.hopper_stages.v2\nm_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::M]) +
+          "\nn_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::N]) +
+          "\nk_extent=" +
+          std::to_string(problem_shape[(size_t)MatmulDimRole::K]) +
+          "\ncta_m=" + std::to_string(cta_tile.m) +
+          "\ncta_n=" + std::to_string(cta_tile.n) +
+          "\ncta_k=" + std::to_string(cta_tile.k) +
+          "\nsplitk_factor=" + std::to_string(mparams->splitk_factor) +
+          "\nnum_problems=" + std::to_string(patterns.size()) +
+          "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(device->sharedMemPerBlockOptin) +
+          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes) +
+          "\nwarp_m=" + std::to_string(warp_tile.m) +
+          "\nwarp_n=" + std::to_string(warp_tile.n) +
+          "\nwarp_k=" + std::to_string(warp_tile.k) +
+          "\noperand_a_count=" + std::to_string(operands_a.size()) +
+          "\noperand_b_count=" + std::to_string(operands_b.size()) +
+          "\noperand_a_dtype_bytes=" +
+          std::to_string(operand_a_dtype_bytes) +
+          "\noperand_b_dtype_bytes=" +
+          std::to_string(operand_b_dtype_bytes);
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t stages = 1; stages <= menu_max_stages; ++stages) {
+        options.push_back({
+            "s" + std::to_string(stages),
+            "Use " + std::to_string(stages) +
+                " operand shared-memory stage(s)"});
+      }
+      std::string native_choice;
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+        native_choice = "s" + std::to_string(
+            mparams->circular_buffer_options.smem_circular_buffer_stage);
+      }
+      const std::string selected = scheduler::jev::chooseDecision(
+          "MM2.stages", state, options, native_choice);
+      const auto selected_it = std::find_if(
+          options.begin(), options.end(), [&](const auto& option) {
+            return option.id == selected;
+          });
+      NVF_ERROR(
+          selected_it != options.end(),
+          "MM2.stages response is outside native resource and work bounds");
+      mparams->circular_buffer_options.smem_circular_buffer_stage =
+          std::stoi(selected.substr(1));
+    }
+  } else {
+    // The heuristic plugin owns its parameters, including stage count.
+    limitCircularBufferingSmemOperands(mparams.get(), problem_shape);
+  }
 
   mparams->circular_buffer_options.circular_buffer_smem_write =
       mparams->circular_buffer_options.smem_circular_buffer_stage > 1;
@@ -1200,6 +1562,76 @@ std::unique_ptr<MatmulParams> getMatmulHeuristics(
   } else {
     mparams->circular_buffering_strategy =
         MatmulParams::CircularBufferingStrategy::Pipelined;
+  }
+
+  // The default Hopper scheduler circular-buffers both operand caches. Once
+  // MM2.stages has selected their common stage count, prefetch gap is a
+  // performance choice. Keep the schedule's stricter positive prefetch
+  // distance, and leave plugin-owned configurations untouched.
+  if (jev_mode != scheduler::jev::Mode::Off &&
+      isHopper(mparams->mma_macro) &&
+      !matmul_heuristic_plugin::hasPlugin()) {
+    const int stages =
+        mparams->circular_buffer_options.smem_circular_buffer_stage;
+    if (stages < 3) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "MM2.prefetch_gap", "fewer than three operand stages");
+      }
+    } else {
+      const auto a_it = tensor_roles.find(MatmulTensorRole::OPERAND_A);
+      const auto b_it = tensor_roles.find(MatmulTensorRole::OPERAND_B);
+      const bool warp_specialized =
+          mparams->circular_buffering_strategy ==
+          MatmulParams::CircularBufferingStrategy::WarpSpecialized;
+      const bool smem_write =
+          mparams->circular_buffer_options.circular_buffer_smem_write;
+      const bool valid_operand_plan =
+          a_it != tensor_roles.end() && !a_it->second.empty() &&
+          b_it != tensor_roles.end() && !b_it->second.empty() &&
+          mparams->async_gmem_load_operands && smem_write && warp_specialized;
+      if (!valid_operand_plan) {
+        if (jev_mode == scheduler::jev::Mode::Record) {
+          scheduler::jev::recordCoverageSkip(
+              "MM2.prefetch_gap", "operand circular-buffer plan is unproved");
+        } else {
+          NVF_ERROR(false, "MM2.prefetch_gap operand plan is unproved");
+        }
+      } else {
+        const std::string state =
+            "matmul.hopper_prefetch_gap.v1\nstage_count=" +
+            std::to_string(stages) +
+            "\noperand_a_count=" + std::to_string(a_it->second.size()) +
+            "\noperand_b_count=" + std::to_string(b_it->second.size()) +
+            "\nnum_problems=" + std::to_string(patterns.size()) +
+            "\nasync_load=" +
+            std::to_string(mparams->async_gmem_load_operands ? 1 : 0) +
+            "\nwarp_specialized=" +
+            std::to_string(warp_specialized ? 1 : 0) +
+            "\nsmem_write=" + std::to_string(smem_write ? 1 : 0);
+        std::vector<scheduler::jev::ChoiceOption> options;
+        for (int gap = 1; gap <= std::min(stages - 1, 4); ++gap) {
+          options.push_back({
+              "g" + std::to_string(gap),
+              "Prefetch both operands " + std::to_string(stages - gap) +
+                  " stage(s) ahead"});
+        }
+        const std::string selected = scheduler::jev::chooseDecision(
+            "MM2.prefetch_gap",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? "g1" : "");
+        const auto selected_it = std::find_if(
+            options.begin(), options.end(), [&](const auto& option) {
+              return option.id == selected;
+            });
+        NVF_ERROR(
+            selected_it != options.end(),
+            "MM2.prefetch_gap response is outside the checked stage menu");
+        mparams->circular_buffer_options.smem_circular_buffer_prefetch_gap =
+            std::stoi(selected.substr(1));
+      }
+    }
   }
 
   // Disable magic zero for matmul kernels

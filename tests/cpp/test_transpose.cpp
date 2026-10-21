@@ -708,6 +708,27 @@ TEST_F(TransposeTest, FusionScheduleTransposeSmall) {
   testValidate(&fusion, cg_outputs, {input}, __LINE__, __FILE__);
 }
 
+// Both original inner axes are exact multiples of the native 32x32 tile.
+// TR2.tile may select a 16x16 tile while all dependent parameters are rebuilt.
+TEST_F(TransposeTest, FusionScheduleTransposeTileChoice) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = sin(tv0);
+  auto tv2 = transpose(tv1, 0, 1);
+  auto tv3 = cos(tv2);
+  fusion.addOutput(tv3);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor input = at::randn({512, 512}, options);
+  auto outputs =
+      scheduleAndRun(&fusion, SchedulerType::Transpose, {input}, false).outputs;
+  auto reference = input.sin().transpose(0, 1).cos();
+  testValidate(&fusion, outputs, {input}, {reference}, __LINE__, __FILE__);
+}
+
 // x->sin->transpose->cos->y
 TEST_F(TransposeTest, FusionScheduleTransposeSmallInnerSize1) {
   Fusion fusion;

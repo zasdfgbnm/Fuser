@@ -11,10 +11,14 @@
 
 #include "instrumentation.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/compute_invocation_input.h"
 #include "scheduler/debug_utils.h"
 #include "scheduler/greedy.h"
 #include "scheduler/heuristic.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/matmul_utils.h"
+#include "scheduler/native_outcome.h"
+#include "scheduler/native_plan_fields.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/resize.h"
 #include "scheduler/runtime_info.h"
@@ -129,6 +133,89 @@ bool checkCanSchedule(Fusion* fusion, SchedulerType scheduler_type) {
 }
 
 } // namespace
+
+std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    HeuristicDataCache* data_cache) {
+  scheduler::compute_invocation_input::Snapshot input_snapshot;
+  const bool trace_enabled = scheduler::jev::computeTraceEnabled();
+  const bool semantic_enabled =
+      scheduler::jev::mode() != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticProtocolEnabled();
+  if (trace_enabled || semantic_enabled) {
+    input_snapshot =
+        scheduler::compute_invocation_input::capture(fusion, runtime_info);
+  }
+  scheduler::jev::ComputeHeuristicsScope compute_scope(
+      input_snapshot.text,
+      !trace_enabled && !semantic_enabled
+          ? "not_captured"
+          : (input_snapshot.available()
+                 ? std::string_view{}
+                 : scheduler::compute_invocation_input::reasonName(
+                       input_snapshot.reason)));
+  auto params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
+  if (params != nullptr && scheduler::native_diagnostic::enabled()) {
+    // All serialization, including a potentially throwing toString(), is
+    // isolated from the native scheduler result.
+    try {
+      using scheduler::native_diagnostic::Outcome;
+      Outcome outcome;
+      outcome.compute_invocation_id =
+          std::string(compute_scope.invocationId());
+      outcome.scheduler_type = nvfuser::toString(params->scheduler_type);
+      outcome.tag = params->tag;
+      outcome.heuristic_text = params->toString();
+      auto description =
+          scheduler::native_diagnostic::describeSchedulerFields(*params);
+      outcome.params_kind = std::move(description.params_kind);
+      outcome.scheduler_fields_json = std::move(description.fields_json);
+      const auto& launch = params->lparams;
+      outcome.launch = {
+          launch.getRawVal(ParallelType::BIDx),
+          launch.getRawVal(ParallelType::BIDy),
+          launch.getRawVal(ParallelType::BIDz),
+          launch.getRawVal(ParallelType::TIDx),
+          launch.getRawVal(ParallelType::TIDy),
+          launch.getRawVal(ParallelType::TIDz),
+          launch.smem()};
+      const auto& compile = params->cparams;
+      if (compile.index_type.has_value()) {
+        outcome.compile.index_type = static_cast<int64_t>(*compile.index_type);
+      }
+      outcome.compile.maxrregcount = compile.maxrregcount;
+      outcome.compile.enable_magic_zero = compile.enable_magic_zero;
+      outcome.compile.enable_ptxas_verbose = compile.enable_ptxas_verbose;
+      if (compile.device.has_value()) {
+        outcome.compile.device = compile.device->str();
+      }
+      outcome.compile.include_paths = compile.include_paths;
+      outcome.compile.block_x = compile.bdimx;
+      outcome.compile.block_y = compile.bdimy;
+      outcome.compile.block_z = compile.bdimz;
+      outcome.compile.compute_block_x = compile.compute_bdimx;
+      outcome.compile.compute_block_y = compile.compute_bdimy;
+      outcome.compile.compute_block_z = compile.compute_bdimz;
+      scheduler::native_diagnostic::recordOutcome(outcome);
+    } catch (...) {
+      // Observability is never a condition for a successful native schedule.
+    }
+  }
+  if (compute_scope.observing()) {
+    try {
+      std::string scheduler_type = params == nullptr ? "null" : "unavailable";
+      if (params != nullptr) {
+        scheduler_type = nvfuser::toString(params->scheduler_type);
+      }
+      compute_scope.complete(scheduler_type);
+    } catch (...) {
+      // Even scheduler-name formatting must not affect a successful return.
+      compute_scope.complete("unavailable");
+    }
+  }
+  return params;
+}
 
 // Dispatch heuristic type to the right derived class of scheduler entry.
 // Scheduler entries are stateless so it's a lightweight class to dispatch to

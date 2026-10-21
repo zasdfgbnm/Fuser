@@ -7,9 +7,13 @@
 // clang-format on
 #include <ATen/cuda/CUDAContext.h>
 
+#include <string>
+#include <vector>
+
 #include "base.h"
 #include "ops/arith.h"
 #include "options.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_inner_outer_utils.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/runtime_info.h"
@@ -28,7 +32,11 @@ void getHeuristics(
     const int64_t hp_threads_per_block_min,
     const int64_t hp_threads_per_block_max,
     const bool project_to_input,
-    const PrimDataType index_type) {
+    const PrimDataType index_type,
+    const bool enable_debug_dump,
+    const bool enable_jev_choice) {
+  // IOP1 can construct this plan speculatively. Nested IOP2 choices are
+  // enabled only when the WS mode is actually selected.
   rparams->tma_warp_specialized = true;
   rparams->project_persistent_buffers = project_to_input;
   rparams->cparams.index_type = index_type;
@@ -233,14 +241,156 @@ void getHeuristics(
         /*target_stages=*/2, /*target_bdimy=*/1, /*target_iter_unroll=*/1);
   }
 
-  // If sufficient shared memory is available, try increasing the number of
-  // stages. Ensure n_stages is divisible by bdimy so that each computation warp
-  // group operates on a distinct circular buffer stage with its own mbarrier.
-  while (is_enough_smem(iter_unroll, n_stages * 2, bdimx, bdimy)) {
-    n_stages *= 2;
+  // The native joint search above fixes topology, unroll and register-cache
+  // placement. At that fixed plan, either non-circular input path is a
+  // performance choice if both pass the same hard resource checks. In
+  // particular, do not offer a one-stage plan: the native search uses that
+  // outcome to trigger a different topology and load-mode fallback.
+  const auto jev_mode = scheduler::jev::mode();
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool native_direct = is_non_circular_buffer_gmem_to_regs;
+    const bool valid_shape = inner_dim_numel > 0 && vect_factor > 0 &&
+        inner_dim_numel % vect_factor == 0 && outer_dim_numel > 0 &&
+        outer_dim_numel % iter_unroll == 0 && min_bdimx >= 128 &&
+        min_bdimx % 128 == 0 && max_bdimx >= min_bdimx &&
+        max_bdimx <= 1024 && bdimx >= min_bdimx && bdimx <= max_bdimx &&
+        bdimx % 128 == 0 && (bdimy == 1 || bdimy == 2) &&
+        n_stages >= 2 && n_stages % bdimy == 0 &&
+        non_circular_buffered_smem_size_bit > 0 &&
+        circular_buffered_smem_size_bit >= 0 && regs_buffer_size_bit >= 0 &&
+        computation_dtype_size_bit > 0 &&
+        bdimx * bdimy + kWarpSpecializationPaddedThreads <=
+            dev_prop->maxThreadsPerBlock &&
+        (bdimx > 128 ? bdimx + kWarpSpecializationPaddedThreads : bdimx) <=
+            dev_prop->maxThreadsDim[0] &&
+        (bdimx > 128 ? bdimy : bdimy + 1) <=
+            dev_prop->maxThreadsDim[1] &&
+        gdimy <= dev_prop->maxGridSize[1];
+    is_non_circular_buffer_gmem_to_regs = true;
+    const bool direct_valid = valid_shape &&
+        is_enough_regs(iter_unroll, bdimx, bdimy) &&
+        is_enough_smem(iter_unroll, n_stages, bdimx, bdimy);
+    is_non_circular_buffer_gmem_to_regs = false;
+    const bool smem_valid = valid_shape &&
+        is_enough_regs(iter_unroll, bdimx, bdimy) &&
+        is_enough_smem(iter_unroll, n_stages, bdimx, bdimy);
+    is_non_circular_buffer_gmem_to_regs = native_direct;
+    if (direct_valid && smem_valid) {
+      std::string register_budgets;
+      for (int64_t x = min_bdimx; x <= max_bdimx; x += 128) {
+        if (!register_budgets.empty()) {
+          register_budgets += ",";
+        }
+        register_budgets += std::to_string(x + kWarpSpecializationPaddedThreads) +
+            ":" + std::to_string(getRegPerThreadGivenThreadsPerSM(
+                      x + kWarpSpecializationPaddedThreads));
+      }
+      // The two-computation-group probe also needs the 384-thread budget
+      // when the configured maximum leaves only x=128 in the sweep.
+      if (max_bdimx == 128) {
+        register_budgets += ",384:" +
+            std::to_string(getRegPerThreadGivenThreadsPerSM(384));
+      }
+      const std::string state =
+          "inner_outer.tma_ws_load_mode.v1\nouter_dim_numel=" +
+          std::to_string(outer_dim_numel) + "\ninner_dim_numel=" +
+          std::to_string(inner_dim_numel) + "\nvector_width=" +
+          std::to_string(vect_factor) + "\nmin_threads=" +
+          std::to_string(hp_threads_per_block_min) + "\nmax_threads=" +
+          std::to_string(hp_threads_per_block_max) + "\nregister_budgets=" +
+          register_budgets + "\nregister_buffer_bits=" +
+          std::to_string(regs_buffer_size_bit) + "\ncircular_buffer_bits=" +
+          std::to_string(circular_buffered_smem_size_bit) +
+          "\nnon_circular_buffer_bits=" +
+          std::to_string(non_circular_buffered_smem_size_bit) +
+          "\ncomputation_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(dev_prop->sharedMemPerBlockOptin) +
+          "\nmax_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) +
+          "\nmax_threads_dim_x=" +
+          std::to_string(dev_prop->maxThreadsDim[0]) +
+          "\nmax_threads_dim_y=" +
+          std::to_string(dev_prop->maxThreadsDim[1]) + "\nmax_grid_y=" +
+          std::to_string(dev_prop->maxGridSize[1]) + "\nsm_count=" +
+          std::to_string(sm_count);
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"direct", "Load non-circular inputs directly into registers"},
+          {"smem", "Load non-circular inputs through shared memory"}};
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.load_mode",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? (native_direct ? "direct" : "smem")
+              : "");
+      is_non_circular_buffer_gmem_to_regs = selected == "direct";
+    } else if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IOP2.load_mode", "fixed topology lacks two hard-valid load paths");
+    }
   }
-  if (n_stages % bdimy != 0) {
-    n_stages -= (n_stages % bdimy);
+
+  // The topology, register-cache mode, and load mode above are fixed before
+  // choosing the final circular-buffer depth. The initial stage count is also
+  // the lower bound: selecting a smaller count could bypass the load-mode
+  // fallback that update_heuristics uses for a single-stage plan.
+  const int64_t initial_stages = n_stages;
+  if (!enable_jev_choice || jev_mode != scheduler::jev::Mode::Remote) {
+    // The IOP1 preflight also needs the native full-depth plan. On the
+    // executed branch, preserve the native preference in off/record modes.
+    while (is_enough_smem(iter_unroll, n_stages * 2, bdimx, bdimy)) {
+      n_stages *= 2;
+    }
+    // Each computation warp group needs a distinct stage and mbarrier.
+    if (n_stages % bdimy != 0) {
+      n_stages -= (n_stages % bdimy);
+    }
+  }
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool initial_stage_is_legal =
+        initial_stages > 0 && initial_stages % bdimy == 0 &&
+        is_enough_smem(iter_unroll, initial_stages, bdimx, bdimy);
+    if (!initial_stage_is_legal) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP2.stages", "initial warp-specialized stage exceeds hard bounds");
+      } else {
+        NVF_ERROR(false, "No hard-valid inner-outer TMA stage count");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> stage_options;
+      for (int64_t stages = initial_stages;
+           is_enough_smem(iter_unroll, stages, bdimx, bdimy); stages *= 2) {
+        stage_options.push_back({
+            "s" + std::to_string(stages),
+            "Use stage depth " + std::to_string(stages) +
+                " for inner-outer TMA circular buffering"});
+      }
+      const std::string state =
+          "inner_outer.tma_ws_stages.v1\ninitial_stages=" +
+          std::to_string(initial_stages) + "\niter_unroll=" +
+          std::to_string(iter_unroll) + "\nbdimx=" + std::to_string(bdimx) +
+          "\nbdimy=" + std::to_string(bdimy) +
+          "\ncircular_buffer_bits=" +
+          std::to_string(circular_buffered_smem_size_bit) +
+          "\nnon_circular_buffer_bits=" +
+          std::to_string(non_circular_buffered_smem_size_bit) +
+          "\ncomputation_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit) +
+          "\nnon_circular_gmem_to_regs=" +
+          std::to_string(is_non_circular_buffer_gmem_to_regs ? 1 : 0) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(dev_prop->sharedMemPerBlockOptin);
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? "s" + std::to_string(n_stages)
+          : "";
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.stages", state, stage_options, native_choice);
+      n_stages = std::stoll(selected.substr(1));
+    }
   }
 
   int64_t inner_batch = ceilDiv(after_vect, bdimx);
@@ -262,6 +412,126 @@ void getHeuristics(
   const int64_t workload_per_thread = inner_dim_numel >= 4096 ? 4l : 2l;
   int64_t vectorization_factor_outer =
       std::min(workload_per_thread, max_tmp_gmem_vect_factor);
+
+  // The read and write choices only change vectorization of the intermediate
+  // global buffer. The TMA input layout, WS topology, and resource plan stay
+  // fixed. Check that plan again after the preceding choices have completed.
+  const auto has_valid_tmp_width_envelope = [&]() {
+    return inner_dim_numel > 0 && vect_factor > 0 && vect_factor <= 128 &&
+        (vect_factor & (vect_factor - 1)) == 0 &&
+        inner_dim_numel % vect_factor == 0 &&
+        computation_dtype_size_bit >= 8 &&
+        computation_dtype_size_bit <= 128 &&
+        (computation_dtype_size_bit & (computation_dtype_size_bit - 1)) == 0 &&
+        max_tmp_gmem_vect_factor > 0 &&
+        (max_tmp_gmem_vect_factor & (max_tmp_gmem_vect_factor - 1)) == 0 &&
+        vectorization_factor_outer > 0 &&
+        max_tmp_gmem_vect_factor % vectorization_factor_outer == 0 &&
+        outer_dim_numel > 0 && iter_unroll > 0 &&
+        outer_dim_numel % iter_unroll == 0 &&
+        bdimx > 0 && bdimy > 0 && gdimy > 0 && n_stages >= 2 &&
+        n_stages % bdimy == 0 &&
+        bdimx * bdimy + kWarpSpecializationPaddedThreads <=
+            dev_prop->maxThreadsPerBlock &&
+        (bdimx > 128 ? bdimx + kWarpSpecializationPaddedThreads : bdimx) <=
+            dev_prop->maxThreadsDim[0] &&
+        (bdimx > 128 ? bdimy : bdimy + 1) <=
+            dev_prop->maxThreadsDim[1] &&
+        gdimy <= dev_prop->maxGridSize[1] &&
+        is_enough_regs(iter_unroll, bdimx, bdimy) &&
+        is_enough_smem(iter_unroll, n_stages, bdimx, bdimy);
+  };
+
+  // The final outer reduction reads the temporary global buffer in a
+  // different thread layout from the producer. A narrower read vector divides
+  // the producer width and never increases the per-thread vector footprint.
+  // The native 2/4 rule is a performance preference within this envelope.
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool legal_width_envelope = has_valid_tmp_width_envelope();
+    if (!legal_width_envelope) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP2.tmp_read_width", "WS temporary read width lacks hard bounds");
+      } else {
+        NVF_ERROR(false, "No hard-valid IOP2 temporary read width");
+      }
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> read_options;
+      for (int64_t width = 1; width <= vectorization_factor_outer;
+           width *= 2) {
+        read_options.push_back({
+            "w" + std::to_string(width),
+            "Read partial outer reduction from global memory with vector "
+            "width " + std::to_string(width)});
+      }
+      const std::string state =
+          "inner_outer.tma_ws_tmp_read_width.v1\ninner_dim_numel=" +
+          std::to_string(inner_dim_numel) + "\ninner_vector_width=" +
+          std::to_string(vect_factor) + "\ntmp_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.tmp_read_width",
+          state,
+          read_options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "w" + std::to_string(vectorization_factor_outer)
+              : "");
+      vectorization_factor_outer = std::stoll(selected.substr(1));
+    }
+  }
+
+  // The selected reader has a complete fixed layout. A smaller power-of-two
+  // store divides the original inner vector; keep it at least as wide as the
+  // reader, so the existing producer/consumer vector invariant is preserved.
+  // The temporary store remains at most 128 bits, and the TMA input alignment
+  // and WS register/shared-memory plan are unchanged.
+  if (enable_jev_choice && jev_mode != scheduler::jev::Mode::Off) {
+    const bool legal_write_width_envelope =
+        has_valid_tmp_width_envelope() &&
+        tmp_gmem_write_vect == max_tmp_gmem_vect_factor &&
+        tmp_gmem_write_vect <= vect_factor &&
+        tmp_gmem_write_vect % vectorization_factor_outer == 0;
+    if (!legal_write_width_envelope) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IOP2.tmp_write_width",
+            "WS temporary write width lacks hard bounds");
+      } else {
+        NVF_ERROR(false, "No hard-valid IOP2 temporary write width");
+      }
+    } else if (vectorization_factor_outer == max_tmp_gmem_vect_factor) {
+      // The reader already requires the maximum safe store width. There is no
+      // performance alternative, so keep the locally determined native width.
+      scheduler::jev::recordNoChoiceDecision(
+          "IOP2.tmp_write_width",
+          "w" + std::to_string(tmp_gmem_write_vect),
+          "reader already requires the maximum temporary write width",
+          "native_temporary_write_width");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> write_options;
+      for (int64_t width = vectorization_factor_outer;
+           width <= max_tmp_gmem_vect_factor; width *= 2) {
+        write_options.push_back({
+            "w" + std::to_string(width),
+            "Write partial outer reduction to global memory with vector "
+            "width " + std::to_string(width)});
+      }
+      const std::string state =
+          "inner_outer.tma_ws_tmp_write_width.v1\ninner_dim_numel=" +
+          std::to_string(inner_dim_numel) + "\ninner_vector_width=" +
+          std::to_string(vect_factor) + "\nouter_read_width=" +
+          std::to_string(vectorization_factor_outer) + "\ntmp_dtype_bits=" +
+          std::to_string(computation_dtype_size_bit);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP2.tmp_write_width",
+          state,
+          write_options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "w" + std::to_string(tmp_gmem_write_vect)
+              : "");
+      tmp_gmem_write_vect = std::stoll(selected.substr(1));
+    }
+  }
 
   rparams->combined_split_grid_inner_dim =
       vectorization_factor_outer * bdimx * gdimy < inner_dim_numel;
@@ -347,7 +617,8 @@ void getHeuristics(
       : "TMA Warp Specialized Persistent Heuristic Failed, falling back to "
         "multi-wave.\n";
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (enable_debug_dump &&
+      isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << "\n===== Combined InnerOuter Reduction Stats ========\n"
             << "outer_dim_numel: " << outer_dim_numel << "\n"
             << "inner_dim_numel: " << inner_dim_numel << "\n"

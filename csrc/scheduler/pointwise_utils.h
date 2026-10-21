@@ -7,7 +7,11 @@
 // clang-format on
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "compute_at_map.h"
@@ -23,6 +27,20 @@ class SchedulerRuntimeInfo;
 class HeuristicDataCache;
 
 namespace pointwise_utils {
+
+// A null result means Fusion::print's visible loop axes can be bound to the
+// input runtime logical axes for the mock's strict PointWise graph subset.
+// Unsupported or unavailable context must retain the native schedule.
+const char* semanticPointwiseEligibilityReason(
+    Fusion* fusion,
+    std::string_view snapshot);
+
+// Model-visible invocation and device context shared by ordinary PointWise
+// decisions. The caller supplies hardware; the complete fusion/runtime
+// snapshot is captured by the surrounding computeHeuristics scope.
+std::string semanticPointwiseWorkload(
+    int64_t sm_count,
+    const cudaDeviceProp* device);
 
 // Return reference tensor view.
 TensorView* getReferenceTensor(Fusion* fusion);
@@ -78,6 +96,18 @@ struct BreakPointInfo {
   bool is_outer_broadcast_dominated = false;
 };
 
+// Raw measurements and structurally legal split positions for the TMA
+// pointwise Choice. TMA-specific alignment and resource checks remain with
+// the TMA plan builder.
+struct TmaBreakPointSearch {
+  std::string state;
+  std::vector<BreakPointInfo> candidates;
+};
+
+TmaBreakPointSearch getTmaBreakPointSearch(
+    const FusionRuntimeProperties& prop,
+    HeuristicDataCache* data_cache);
+
 // Calculate optimal break point for 2D scheduling
 // Returns just the break point information without thread/grid dimensions
 BreakPointInfo getBreakPoint(
@@ -106,7 +136,8 @@ BlockGridConfig getBlockGridConfig(
     const FusionRuntimeProperties& prop,
     const BreakPointInfo& bp_info,
     int64_t max_vect_factor,
-    int64_t kThreadX);
+    int64_t kThreadX,
+    bool block_quantization);
 
 // Structure to hold results from common pointwise scheduling setup
 struct CommonScheduleInfo {

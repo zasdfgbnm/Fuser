@@ -55,7 +55,7 @@ bool MatmulScheduler::canScheduleRunTime(
   return true;
 }
 
-std::unique_ptr<HeuristicParams> MatmulScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> MatmulScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

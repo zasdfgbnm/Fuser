@@ -7,7 +7,10 @@
 // clang-format on
 #include <ATen/cuda/CUDAContext.h>
 
+#include <optional>
+
 #include "options.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -46,7 +49,8 @@ void getHeuristics(
     const int64_t hp_threads_per_block_min,
     const int64_t hp_threads_per_block_max,
     const bool project_to_input,
-    const PrimDataType index_type) {
+    const PrimDataType index_type,
+    const bool enable_jev_choice) {
   rparams->project_persistent_buffers = project_to_input;
   rparams->cparams.index_type = index_type;
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
@@ -153,12 +157,10 @@ void getHeuristics(
   // outer dimension. The kernel is a cooperative kernel, so the number of
   // blocks should be as large as possible to achieve a high occupancy unless
   // outer dim is too small which may lead large workload for the final outer
-  // reduction. So, gdimy is drvied from the number of blocks per sm and limited
-  // to ensure at least 8 rows per block.
-  // TODO: re-evaluate this 8 rows per block requirement.
-  auto getGdimy = [&](int64_t inner_vect,
-                      int64_t threads_per_block,
-                      int64_t inner_batch) {
+  // reduction. The empirical minimum rows per block bounds the grid.
+  auto getGridCapacity = [&](int64_t inner_vect,
+                             int64_t threads_per_block,
+                             int64_t inner_batch) {
     int64_t reg_per_thread =
         getEstimatedRegisterUsage(inner_vect * inner_batch);
     // Limit threads per SM by register usage and hardware constraints
@@ -167,8 +169,15 @@ void getHeuristics(
         static_cast<int64_t>(dev_prop->maxThreadsPerMultiProcessor));
     int64_t blocks_per_sm =
         getBlocksPerSM(threads_per_sm, threads_per_block, dev_prop->warpSize);
-    int64_t gdimy = blocks_per_sm * device_multiprocessor_count;
-    const int64_t outer_iter_min = 8;
+    return blocks_per_sm * device_multiprocessor_count;
+  };
+  auto getGdimy = [&](int64_t inner_vect,
+                      int64_t threads_per_block,
+                      int64_t inner_batch,
+                      int64_t outer_iter_min) {
+    int64_t gdimy =
+        getGridCapacity(inner_vect, threads_per_block, inner_batch);
+    int64_t blocks_per_sm = gdimy / device_multiprocessor_count;
     const int64_t gdimy_max = scheduler_utils::roundUpToN(
         ceilDiv(outer_dim_numel, outer_iter_min), device_multiprocessor_count);
     while (gdimy > gdimy_max && blocks_per_sm > 1) {
@@ -187,16 +196,13 @@ void getHeuristics(
   // For read from tmp gmem, since the paralelization is changed, a different
   //                         vectorization factor is used to optimize the
   //                         number of reaductions per thread.
-  auto getOuterReductionBufferVectFactor = [&](int64_t inner_vect) {
+  auto getOuterReductionBufferVectFactor = [&](int64_t inner_vect, int64_t outer_read_width) {
     constexpr int64_t max_gmem_vect_access_bits = 128;
     const int64_t max_tmp_gmem_vect_factor = std::min(
         max_gmem_vect_access_bits / (int64_t)tmp_gmem_dtype_size_bit,
         inner_vect);
     int64_t tmp_gmem_write_vect = max_tmp_gmem_vect_factor;
-    const int64_t workload_per_thread = inner_dim_numel >= 4096 ? 4l : 2l;
-    int64_t vectorization_factor_outer =
-        std::min(workload_per_thread, max_tmp_gmem_vect_factor);
-    return std::make_pair(tmp_gmem_write_vect, vectorization_factor_outer);
+    return std::make_pair(tmp_gmem_write_vect, outer_read_width);
   };
 
   // In the outer reduction part of the kernel, inner and outer dims are
@@ -229,7 +235,9 @@ void getHeuristics(
 
   // Get the heuristics given vectorization factor and threads per block
   auto getHeuristicsGivenVectThreads = [&](int64_t vect_factor,
-                                           int64_t threads_per_block) {
+                                           int64_t threads_per_block,
+                                           int64_t outer_read_width,
+                                           int64_t outer_iter_min) {
     InnerOuterParams iop;
     // (1) inner reduction
     // Reduction dim: inner_batch, threads_per_block, vect_factor
@@ -238,13 +246,16 @@ void getHeuristics(
     iop.threads_per_block = threads_per_block;
     iop.inner_batch =
         ceilDiv(inner_dim_numel / iop.inner_vect, iop.threads_per_block);
-    iop.gdimy =
-        getGdimy(iop.inner_vect, iop.threads_per_block, iop.inner_batch);
+    iop.gdimy = getGdimy(
+        iop.inner_vect,
+        iop.threads_per_block,
+        iop.inner_batch,
+        outer_iter_min);
     // (2) outer reduction
     // Iteration dim: gdimy, bdimx, vectorization_factor_outer
     // Reduction dim: bdimy
     std::tie(iop.tmp_gmem_write_vect, iop.vectorization_factor_outer) =
-        getOuterReductionBufferVectFactor(iop.inner_vect);
+        getOuterReductionBufferVectFactor(iop.inner_vect, outer_read_width);
     auto [bdimx, bdimy] = getBdimxBdimy(
         threads_per_block, iop.vectorization_factor_outer, iop.gdimy);
     iop.bdimx = bdimx;
@@ -261,26 +272,372 @@ void getHeuristics(
 
   // Use the maximum vectorization factor
   const int64_t vect_factor = (int64_t)vectorize_factor;
+  const auto jev_mode = enable_jev_choice ? scheduler::jev::mode()
+                                          : scheduler::jev::Mode::Off;
+  const int64_t hard_tmp_width =
+      std::min<int64_t>(128 / (int64_t)tmp_gmem_dtype_size_bit, vect_factor);
+  const int64_t native_outer_read_width =
+      std::min(inner_dim_numel >= 4096 ? 4l : 2l, hard_tmp_width);
 
   // Set a reasonable range for threads per block based on the number of
   // elements in the inner dimension after vectorization.
   // Start from 128 or a smaller number if inner dim is small.
   const int64_t after_vect = inner_dim_numel / vect_factor;
-  const int64_t batch_min = getMinimumBatch();
   int64_t threads_per_block_min = hp_threads_per_block_min;
   threads_per_block_min = std::min(threads_per_block_min, after_vect);
   threads_per_block_min = scheduler_utils::roundUpPow2(threads_per_block_min);
+  const auto max_threads_for_batch = [&](int64_t batch) {
+    return std::min(
+        scheduler_utils::roundUpPow2(std::max(
+            threads_per_block_min, ceilDiv(after_vect, batch))),
+        hp_threads_per_block_max);
+  };
 
-  // star max threads per block from min threads per block
-  int64_t threads_per_block_max = threads_per_block_min;
-  // increase to cover the whole inner dim
-  threads_per_block_max =
-      std::max(threads_per_block_max, ceilDiv(after_vect, batch_min));
-  // round up to power of 2
-  threads_per_block_max = scheduler_utils::roundUpPow2(threads_per_block_max);
-  // don't go beyond the maximum threads per block
-  threads_per_block_max =
-      std::min(threads_per_block_max, hp_threads_per_block_max);
+  struct OfferedPlan {
+    InnerOuterParams params;
+    int64_t final_bdimx;
+    int64_t final_bdimy;
+    int64_t final_gdimy;
+  };
+  const int64_t smem_limit_bit =
+      (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
+  const auto make_offered_plan = [&](const InnerOuterParams& candidate,
+                                     int64_t outer_iter_min)
+      -> std::optional<OfferedPlan> {
+    if (candidate.inner_vect < 1 || candidate.inner_batch < 1 ||
+        candidate.threads_per_block < 1 ||
+        candidate.threads_per_block > dev_prop->maxThreadsPerBlock ||
+        candidate.bdimx < 1 || candidate.bdimy < 1 ||
+        candidate.bdimx > dev_prop->maxThreadsPerBlock ||
+        candidate.bdimy > dev_prop->maxThreadsPerBlock ||
+        candidate.bdimx * candidate.bdimy != candidate.threads_per_block ||
+        candidate.gdimy < 1 ||
+        candidate.gdimy > dev_prop->maxGridSize[1] ||
+        candidate.tmp_gmem_write_vect < 1 ||
+        candidate.tmp_gmem_write_vect > candidate.inner_vect ||
+        candidate.vectorization_factor_outer < 1 ||
+        candidate.vectorization_factor_outer >
+            candidate.tmp_gmem_write_vect ||
+        candidate.warps_per_sm < 1 ||
+        candidate.required_register_per_thread < 1 ||
+        candidate.required_register_per_thread >
+            scheduler_utils::max_registers_per_thread ||
+        candidate.available_register_per_thread < 1 ||
+        candidate.available_register_per_thread >
+            scheduler_utils::max_registers_per_thread ||
+        smem_buffer_size_bit < 0 || smem_overhead_bit < 0 ||
+        smem_overhead_bit > smem_limit_bit ||
+        smem_buffer_size_bit > smem_limit_bit - smem_overhead_bit) {
+      return std::nullopt;
+    }
+    int64_t final_bdimx = candidate.bdimx;
+    int64_t final_bdimy = candidate.bdimy;
+    int64_t final_gdimy = candidate.gdimy;
+    if (inner_dim_numel <= 1024) {
+      final_bdimx = ceilDiv(
+          inner_dim_numel, candidate.inner_vect * candidate.inner_batch);
+      final_bdimy = 1;
+      final_gdimy = getGdimy(
+          candidate.inner_vect,
+          final_bdimx,
+          candidate.inner_batch,
+          outer_iter_min);
+    } else {
+      const int64_t bdimz = ceilDiv(
+          ceilDiv(
+              ceilDiv(inner_dim_numel / candidate.inner_vect, final_bdimx),
+              final_bdimy),
+          candidate.inner_batch);
+      if (bdimz != 1) {
+        return std::nullopt;
+      }
+    }
+    if (final_bdimx < 1 || final_bdimy < 1 ||
+        final_bdimx * final_bdimy > dev_prop->maxThreadsPerBlock ||
+        final_gdimy < 1 || final_gdimy > dev_prop->maxGridSize[1]) {
+      return std::nullopt;
+    }
+    return OfferedPlan{candidate, final_bdimx, final_bdimy, final_gdimy};
+  };
+
+  // The layer-norm workload thresholds in getMinimumBatch are a performance
+  // preference. Offer a different threshold only when every CTA in its full
+  // search passes the same layout, resource, and final launch checks used by
+  // IOP3.cta. The later read-width Choice repeats these checks for each width.
+  int64_t batch_min =
+      jev_mode == scheduler::jev::Mode::Remote ? 1 : getMinimumBatch();
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool valid_batch_bounds =
+        inner_dim_numel > 0 && outer_dim_numel > 0 &&
+        vect_factor >= 1 && vect_factor <= 128 &&
+        (vect_factor & (vect_factor - 1)) == 0 &&
+        inner_dim_numel % vect_factor == 0 &&
+        tmp_gmem_dtype_size_bit >= 8 && tmp_gmem_dtype_size_bit <= 128 &&
+        (tmp_gmem_dtype_size_bit & (tmp_gmem_dtype_size_bit - 1)) == 0 &&
+        native_outer_read_width >= 1 &&
+        (native_outer_read_width & (native_outer_read_width - 1)) == 0 &&
+        threads_per_block_min >= 1 &&
+        threads_per_block_min <= hp_threads_per_block_max &&
+        (threads_per_block_min & (threads_per_block_min - 1)) == 0;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::string state =
+        "inner_outer_multi_wave.minimum_batch.v1\ninner_dim=" +
+        std::to_string(inner_dim_numel) + "\nouter_dim=" +
+        std::to_string(outer_dim_numel) + "\nvector_width=" +
+        std::to_string(vect_factor) + "\nafter_vector=" +
+        std::to_string(after_vect) + "\nmin_threads=" +
+        std::to_string(threads_per_block_min) + "\nthread_cap=" +
+        std::to_string(hp_threads_per_block_max) + "\ntmp_dtype_bits=" +
+        std::to_string(tmp_gmem_dtype_size_bit) +
+        "\nbaseline_read_width=" +
+        std::to_string(native_outer_read_width);
+    if (valid_batch_bounds) {
+      for (int64_t batch = 1; batch <= 4; ++batch) {
+        const int64_t max_threads = max_threads_for_batch(batch);
+        bool full_search_safe = max_threads >= threads_per_block_min;
+        int64_t plan_count = 0;
+        for (int64_t threads = max_threads;
+             full_search_safe && threads >= threads_per_block_min;
+             threads /= 2) {
+          const auto candidate = getHeuristicsGivenVectThreads(
+              vect_factor, threads, native_outer_read_width, 8);
+          if (!make_offered_plan(candidate, 8)) {
+            full_search_safe = false;
+          }
+          ++plan_count;
+        }
+        if (full_search_safe && plan_count >= 1 && plan_count <= 7) {
+          options.push_back({
+              "b" + std::to_string(batch),
+              "Use minimum batch " + std::to_string(batch) +
+                  " with CTA search " + std::to_string(max_threads) +
+                  " down to " + std::to_string(threads_per_block_min)});
+          state += "\nplan=" + std::to_string(batch) + ":" +
+              std::to_string(max_threads) + ":" +
+              std::to_string(plan_count);
+        }
+      }
+    }
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "b" + std::to_string(batch_min)
+        : "";
+    const bool native_offered =
+        jev_mode != scheduler::jev::Mode::Record ||
+        std::any_of(options.begin(), options.end(), [&](const auto& option) {
+          return option.id == native_choice;
+        });
+    if (options.empty() || !native_offered || state.size() >= 48 * 1024) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 minimum batch lacks a complete safe native CTA search");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.min_batch", "native batch lacks a complete safe CTA search");
+    } else {
+      const auto selected = scheduler::jev::chooseDecision(
+          "IOP3.min_batch", state, options,
+          jev_mode == scheduler::jev::Mode::Record ? native_choice : "");
+      const auto it = std::find_if(
+          options.begin(), options.end(),
+          [&](const auto& option) { return option.id == selected; });
+      NVF_ERROR(it != options.end(), "Unknown IOP3 minimum batch");
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        batch_min = std::stoll(selected.substr(1));
+      }
+    }
+  }
+  const int64_t threads_per_block_max = max_threads_for_batch(batch_min);
+
+  // Only offer read widths whose full CTA search space passes the native
+  // layout, register, shared-memory, and final launch-geometry checks.
+  // The threshold below is a performance preference, not a legality bound.
+  int64_t outer_read_width = native_outer_read_width;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool valid_width_bounds =
+        tmp_gmem_dtype_size_bit >= 8 && tmp_gmem_dtype_size_bit <= 128 &&
+        (tmp_gmem_dtype_size_bit & (tmp_gmem_dtype_size_bit - 1)) == 0 &&
+        vect_factor >= 1 && vect_factor <= 128 &&
+        (vect_factor & (vect_factor - 1)) == 0 &&
+        inner_dim_numel > 0 && inner_dim_numel % vect_factor == 0 &&
+        hard_tmp_width >= 1 &&
+        (hard_tmp_width & (hard_tmp_width - 1)) == 0;
+    std::vector<scheduler::jev::ChoiceOption> width_options;
+    if (valid_width_bounds) {
+      for (int64_t width = 1; width <= hard_tmp_width; width *= 2) {
+        bool full_plans_safe = true;
+        int64_t count = 0;
+        for (int64_t threads = threads_per_block_max;
+             threads >= threads_per_block_min; threads /= 2) {
+          const auto candidate =
+              getHeuristicsGivenVectThreads(vect_factor, threads, width, 8);
+          if (!make_offered_plan(candidate, 8)) {
+            full_plans_safe = false;
+          }
+          ++count;
+        }
+        if (full_plans_safe && count >= 1 && count <= 7) {
+          width_options.push_back({
+              "w" + std::to_string(width),
+              "Read partial outer reduction from global memory with vector "
+              "width " + std::to_string(width)});
+        }
+      }
+    }
+    const std::string native_width =
+        "w" + std::to_string(native_outer_read_width);
+    const bool native_offered = std::any_of(
+        width_options.begin(), width_options.end(),
+        [&](const auto& option) { return option.id == native_width; });
+    if (!native_offered) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 temporary read width lacks a complete safe plan");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.tmp_read_width", "no complete safe native width plan");
+    } else {
+      std::string legal_widths;
+      for (const auto& option : width_options) {
+        if (!legal_widths.empty()) {
+          legal_widths += ",";
+        }
+        legal_widths += option.id;
+      }
+      const std::string state =
+          "inner_outer_multi_wave.tmp_read_width.v1\ninner_dim=" +
+          std::to_string(inner_dim_numel) + "\ninner_vector_width=" +
+          std::to_string(vect_factor) + "\ntmp_dtype_bits=" +
+          std::to_string(tmp_gmem_dtype_size_bit) +
+          "\nlegal_widths=" + legal_widths;
+      const auto selected = scheduler::jev::chooseDecision(
+          "IOP3.tmp_read_width", state, width_options,
+          jev_mode == scheduler::jev::Mode::Record ? native_width : "");
+      const auto it = std::find_if(
+          width_options.begin(), width_options.end(),
+          [&](const auto& option) { return option.id == selected; });
+      NVF_ERROR(it != width_options.end(),
+                "IOP3 temporary read width is outside proved bounds");
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        outer_read_width = std::stoll(selected.substr(1));
+      }
+    }
+  }
+
+  // This A100-tuned rows threshold is a performance preference. Offer a small
+  // menu only after the upstream batch and read width are fixed, and only when
+  // every CTA search candidate has a legal complete launch for that threshold.
+  int64_t outer_iter_min = 8;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool valid_rows_bounds =
+        outer_dim_numel > 0 && inner_dim_numel > 0 &&
+        device_multiprocessor_count > 0 &&
+        vect_factor >= 1 && vect_factor <= 128 &&
+        (vect_factor & (vect_factor - 1)) == 0 &&
+        inner_dim_numel % vect_factor == 0 &&
+        threads_per_block_min >= 1 &&
+        threads_per_block_max >= threads_per_block_min &&
+        (threads_per_block_min & (threads_per_block_min - 1)) == 0 &&
+        (threads_per_block_max & (threads_per_block_max - 1)) == 0 &&
+        hp_threads_per_block_max <= dev_prop->maxThreadsPerBlock &&
+        threads_per_block_max <= dev_prop->maxThreadsPerBlock;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::string state =
+        "inner_outer_multi_wave.grid_rows.v1\ninner_dim=" +
+        std::to_string(inner_dim_numel) + "\nouter_dim=" +
+        std::to_string(outer_dim_numel) + "\nvector_width=" +
+        std::to_string(vect_factor) + "\nselected_min_batch=" +
+        std::to_string(batch_min) + "\nselected_outer_read_width=" +
+        std::to_string(outer_read_width) + "\nmin_threads=" +
+        std::to_string(threads_per_block_min) + "\nmax_threads=" +
+        std::to_string(threads_per_block_max) + "\nthread_cap=" +
+        std::to_string(hp_threads_per_block_max) + "\nregs_buffer_bits=" +
+        std::to_string(regs_buffer_size_bit) + "\ntmp_dtype_bits=" +
+        std::to_string(tmp_gmem_dtype_size_bit) + "\nwarp_size=" +
+        std::to_string(dev_prop->warpSize) + "\nsm_count=" +
+        std::to_string(device_multiprocessor_count) +
+        "\nmax_threads_per_block=" +
+        std::to_string(dev_prop->maxThreadsPerBlock) +
+        "\nmax_grid_y=" + std::to_string(dev_prop->maxGridSize[1]) +
+        "\nsmem_total_bits=" +
+        std::to_string(smem_buffer_size_bit + smem_overhead_bit) +
+        "\nsmem_limit_bits=" + std::to_string(smem_limit_bit);
+    if (valid_rows_bounds) {
+      for (int64_t rows : {4l, 8l, 16l}) {
+        bool full_search_safe = true;
+        std::string rows_state;
+        int64_t plan_count = 0;
+        for (int64_t threads = threads_per_block_max;
+             full_search_safe && threads >= threads_per_block_min;
+             threads /= 2) {
+          const auto candidate = getHeuristicsGivenVectThreads(
+              vect_factor, threads, outer_read_width, rows);
+          const auto plan = make_offered_plan(candidate, rows);
+          if (!plan) {
+            full_search_safe = false;
+            break;
+          }
+          const int64_t capacity = getGridCapacity(
+              candidate.inner_vect,
+              candidate.threads_per_block,
+              candidate.inner_batch);
+          const int64_t final_capacity = getGridCapacity(
+              candidate.inner_vect,
+              plan->final_bdimx * plan->final_bdimy,
+              candidate.inner_batch);
+          rows_state += "\nplan=" + std::to_string(rows) + ":" +
+              std::to_string(capacity) + ":" +
+              std::to_string(final_capacity) + ":" +
+              std::to_string(candidate.threads_per_block) + ":" +
+              std::to_string(candidate.inner_vect) + ":" +
+              std::to_string(candidate.inner_batch) + ":" +
+              std::to_string(candidate.bdimx) + ":" +
+              std::to_string(candidate.bdimy) + ":" +
+              std::to_string(candidate.gdimy) + ":" +
+              std::to_string(candidate.tmp_gmem_write_vect) + ":" +
+              std::to_string(candidate.vectorization_factor_outer) + ":" +
+              std::to_string(candidate.warps_per_sm) + ":" +
+              std::to_string(candidate.required_register_per_thread) + ":" +
+              std::to_string(candidate.available_register_per_thread) + ":" +
+              std::to_string(plan->final_bdimx) + ":" +
+              std::to_string(plan->final_bdimy) + ":" +
+              std::to_string(plan->final_gdimy);
+          ++plan_count;
+        }
+        if (full_search_safe && plan_count >= 1 && plan_count <= 7) {
+          options.push_back({
+              "r" + std::to_string(rows),
+              "Require at least " + std::to_string(rows) +
+                  " outer rows per grid-Y block across " +
+                  std::to_string(plan_count) + " complete CTA plans"});
+          state += rows_state;
+        }
+      }
+    }
+    const bool native_offered =
+        std::any_of(options.begin(), options.end(), [](const auto& option) {
+          return option.id == "r8";
+        });
+    if (!native_offered || state.size() >= 48 * 1024) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 rows threshold lacks complete safe CTA plans");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.grid_rows", "native rows lack complete safe CTA plans");
+    } else {
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP3.grid_rows",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "r8" : "");
+      const auto option = std::find_if(
+          options.begin(), options.end(), [&](const auto& candidate) {
+            return candidate.id == selected;
+          });
+      NVF_ERROR(option != options.end(), "IOP3 rows are outside proved plans");
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        outer_iter_min = std::stoll(selected.substr(1));
+      }
+    }
+  }
 
   // Store all the possible heuristics based on different threads per block.
   // Vectorizaton is fixed at the maximum value.
@@ -289,40 +646,129 @@ void getHeuristics(
        threads_per_block >= threads_per_block_min;
        threads_per_block /= 2) {
     iop_candidates.emplace_back(
-        getHeuristicsGivenVectThreads(vect_factor, threads_per_block));
+        getHeuristicsGivenVectThreads(
+            vect_factor, threads_per_block, outer_read_width, outer_iter_min));
   }
 
-  // Sort the heuristics based on the register usage and occupancy.
-  std::stable_sort(
-      iop_candidates.begin(),
-      iop_candidates.end(),
-      [](const InnerOuterParams& a, const InnerOuterParams& b) {
-        // If a thread can use more registers than required, there is a high
-        // chance that it can avoid register spilling and compiler can optimize
-        // for better instruction level parallelism.
-        int64_t extra_regs_a =
-            a.available_register_per_thread - a.required_register_per_thread;
-        int64_t extra_regs_b =
-            b.available_register_per_thread - b.required_register_per_thread;
-        if (extra_regs_a > 0 && extra_regs_b < 0) {
-          return true;
-        } else if (extra_regs_a < 0 && extra_regs_b > 0) {
-          return false;
-        }
-        // High occupancy provides better threads level parallelism.
-        // 25% is sufficient since ILP is high due to persistent batch sizes
-        // which is equivalent to unrolling inner dim.
-        if (a.warps_per_sm != b.warps_per_sm &&
-            (a.warps_per_sm < 16 || b.warps_per_sm < 16)) {
-          return a.warps_per_sm > b.warps_per_sm;
-        }
-        // Tie breaker, smaller threads_per_block to reduce communication
-        // overhead
-        return a.threads_per_block < b.threads_per_block;
-      });
+  // IOP1 previews use Off mode and therefore issue no IOP3 requests.
+  // Preserve the original stable ordering in off/record mode. Remote mode
+  // receives unranked plans and never computes the native winner.
+  std::vector<InnerOuterParams> native_ranked;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    native_ranked = iop_candidates;
+    std::stable_sort(
+        native_ranked.begin(),
+        native_ranked.end(),
+        [](const InnerOuterParams& a, const InnerOuterParams& b) {
+          // Register headroom lowers spilling and leaves more room for ILP.
+          int64_t extra_regs_a =
+              a.available_register_per_thread - a.required_register_per_thread;
+          int64_t extra_regs_b =
+              b.available_register_per_thread - b.required_register_per_thread;
+          if (extra_regs_a > 0 && extra_regs_b < 0) {
+            return true;
+          } else if (extra_regs_a < 0 && extra_regs_b > 0) {
+            return false;
+          }
+          // Below 16 warps per SM, occupancy outranks communication cost.
+          if (a.warps_per_sm != b.warps_per_sm &&
+              (a.warps_per_sm < 16 || b.warps_per_sm < 16)) {
+            return a.warps_per_sm > b.warps_per_sm;
+          }
+          return a.threads_per_block < b.threads_per_block;
+        });
+  }
 
-  // Pick the best heuristic
-  auto iop = iop_candidates.front();
+  InnerOuterParams iop;
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    iop = native_ranked.front();
+  } else {
+    std::vector<OfferedPlan> plans;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    bool all_candidates_safe = true;
+    // The rows retain native search order, not native rank. Candidate metrics
+    // are measurements; the service independently applies the rank rule.
+    std::string state =
+        "inner_outer_multi_wave.cta.v2\ninner_dim=" +
+        std::to_string(inner_dim_numel) + "\nouter_dim=" +
+        std::to_string(outer_dim_numel) + "\nvector_width=" +
+        std::to_string(vect_factor) + "\nregs_buffer_bits=" +
+        std::to_string(regs_buffer_size_bit) + "\ntmp_dtype_bits=" +
+        std::to_string(tmp_gmem_dtype_size_bit) + "\nwarp_size=" +
+        std::to_string(dev_prop->warpSize) + "\nsm_count=" +
+        std::to_string(device_multiprocessor_count) +
+        "\nmax_threads_per_block=" +
+        std::to_string(dev_prop->maxThreadsPerBlock) + "\nmax_grid_y=" +
+        std::to_string(dev_prop->maxGridSize[1]) +
+        "\nsmem_total_bits=" +
+        std::to_string(smem_buffer_size_bit + smem_overhead_bit) +
+        "\nsmem_limit_bits=" + std::to_string(smem_limit_bit) +
+        "\nselected_outer_read_width=" + std::to_string(outer_read_width);
+    for (const auto& candidate : iop_candidates) {
+      const auto plan = make_offered_plan(candidate, outer_iter_min);
+      if (!plan) {
+        all_candidates_safe = false;
+        continue;
+      }
+      const std::string id = "t" + std::to_string(candidate.threads_per_block);
+      plans.push_back(*plan);
+      options.push_back({
+          id,
+          "Use CTA " + std::to_string(plan->final_bdimx) + "x" +
+              std::to_string(plan->final_bdimy) + ", grid Y " +
+              std::to_string(plan->final_gdimy) + ", inner batch " +
+              std::to_string(candidate.inner_batch) + ", inner vector " +
+              std::to_string(candidate.inner_vect)});
+      state += "\nplan=" +
+          std::to_string(candidate.threads_per_block) + ":" +
+          std::to_string(candidate.inner_vect) + ":" +
+          std::to_string(candidate.inner_batch) + ":" +
+          std::to_string(candidate.bdimx) + ":" +
+          std::to_string(candidate.bdimy) + ":" +
+          std::to_string(candidate.gdimy) + ":" +
+          std::to_string(candidate.tmp_gmem_write_vect) + ":" +
+          std::to_string(candidate.vectorization_factor_outer) + ":" +
+          std::to_string(candidate.warps_per_sm) + ":" +
+          std::to_string(candidate.required_register_per_thread) + ":" +
+          std::to_string(candidate.available_register_per_thread) + ":" +
+          std::to_string(plan->final_bdimx) + ":" +
+          std::to_string(plan->final_bdimy) + ":" +
+          std::to_string(plan->final_gdimy);
+    }
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "t" + std::to_string(native_ranked.front().threads_per_block)
+        : "";
+    size_t request_size_bound = state.size();
+    for (const auto& option : options) {
+      request_size_bound += option.id.size() + option.description.size() + 32;
+    }
+    // GCC 14 stable_sort uses one stable merge of insertion-sorted halves for
+    // this small domain. The local service replays that exact comparison order.
+    const bool within_protocol_bounds =
+        all_candidates_safe && !options.empty() && options.size() <= 7 &&
+        request_size_bound < 48 * 1024;
+    const bool native_offered =
+        jev_mode != scheduler::jev::Mode::Record ||
+        std::any_of(options.begin(), options.end(), [&](const auto& option) {
+          return option.id == native_choice;
+        });
+    if (!within_protocol_bounds || !native_offered) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 CTA plans cannot be offered safely within Jev bounds");
+      iop = native_ranked.front();
+    } else {
+      const auto selected = scheduler::jev::chooseDecision(
+          "IOP3.cta", state, options, native_choice);
+      const auto it = std::find_if(
+          options.begin(),
+          options.end(),
+          [&](const auto& option) { return option.id == selected; });
+      NVF_ERROR(it != options.end(), "Unknown IOP3 CTA plan");
+      iop = plans.at(std::distance(options.begin(), it)).params;
+    }
+  }
 
   // Special case, when inner_dim_numel <= 1024, bdimx is usually small
   // after divide by inner_vect and inner_batch. In this case, bdimy is used to
@@ -337,7 +783,8 @@ void getHeuristics(
     iop.bdimx = ceilDiv(inner_dim_numel, iop.inner_vect * iop.inner_batch);
 
     // Step-2, InnerParams, Iteration dim: gdimy, bdimy (in next step)
-    iop.gdimy = getGdimy(iop.inner_vect, iop.bdimx, iop.inner_batch);
+    iop.gdimy = getGdimy(
+        iop.inner_vect, iop.bdimx, iop.inner_batch, outer_iter_min);
 
     // Step-3, OuterParams, Iteration dim: vectorization_factor_outer(reuse),
     // bdimy, gdimy (in previous step).
@@ -375,6 +822,72 @@ void getHeuristics(
   // check all the parameters in InnerOuterParams are set.
   iop.verify();
 
+  // The CTA choice has fixed the inner vector, batch, grid, and outer read
+  // width. A narrower vector store to the partial-result buffer keeps those
+  // dimensions unchanged. Preserve the read-width <= write-width invariant
+  // checked for each IOP3 CTA plan above; smaller power-of-two stores divide
+  // the same aligned inner vector and cannot increase the access size.
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool valid_width_bounds =
+        tmp_gmem_dtype_size_bit >= 8 && tmp_gmem_dtype_size_bit <= 128 &&
+        (tmp_gmem_dtype_size_bit & (tmp_gmem_dtype_size_bit - 1)) == 0 &&
+        iop.inner_vect >= 1 && iop.inner_vect <= 128 &&
+        (iop.inner_vect & (iop.inner_vect - 1)) == 0 &&
+        inner_dim_numel > 0 && inner_dim_numel % iop.inner_vect == 0 &&
+        iop.vectorization_factor_outer >= 1 &&
+        (iop.vectorization_factor_outer &
+         (iop.vectorization_factor_outer - 1)) == 0;
+    const int64_t hard_max = valid_width_bounds
+        ? std::min<int64_t>(
+              128 / (int64_t)tmp_gmem_dtype_size_bit, iop.inner_vect)
+        : 0;
+    const bool native_in_bounds =
+        valid_width_bounds && hard_max >= iop.vectorization_factor_outer &&
+        hard_max == iop.tmp_gmem_write_vect &&
+        hard_max % iop.vectorization_factor_outer == 0;
+    if (!native_in_bounds) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "IOP3 temporary write width lacks proved vector bounds");
+      scheduler::jev::recordCoverageSkip(
+          "IOP3.tmp_write_width",
+          "native temporary write width lacks proved vector bounds");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t width = iop.vectorization_factor_outer; width <= hard_max;
+           width *= 2) {
+        options.push_back(
+            {"w" + std::to_string(width),
+             "Write partial outer reduction to global memory with vector "
+             "width " + std::to_string(width)});
+      }
+      const std::string state =
+          "inner_outer_multi_wave.tmp_write_width.v2\ninner_dim=" +
+          std::to_string(inner_dim_numel) +
+          "\ninner_vector_width=" + std::to_string(iop.inner_vect) +
+          "\nouter_read_width=" +
+          std::to_string(iop.vectorization_factor_outer) +
+          "\ntmp_dtype_bits=" + std::to_string(tmp_gmem_dtype_size_bit);
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IOP3.tmp_write_width",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "w" + std::to_string(iop.tmp_gmem_write_vect)
+              : "");
+      const auto option = std::find_if(
+          options.begin(), options.end(), [&](const auto& candidate) {
+            return candidate.id == selected;
+          });
+      NVF_ERROR(
+          option != options.end(),
+          "IOP3 temporary write width is outside proved bounds");
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        iop.tmp_gmem_write_vect = std::stoll(selected.substr(1));
+      }
+    }
+  }
+
   rparams->persistent_kernel = true;
   rparams->fastest_dim = true;
   rparams->combined_inner_outer = true;
@@ -405,7 +918,7 @@ void getHeuristics(
     rparams->tag = "InnerOuter Register Persistent Heuristic.\n";
   }
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (enable_jev_choice && isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << "\n===== Combined InnerOuter Reduction Stats ========\n"
             << "outer_dim_numel: " << outer_dim_numel << "\n"
             << "inner_dim_numel: " << inner_dim_numel << "\n"

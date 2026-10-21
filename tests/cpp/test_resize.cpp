@@ -16,9 +16,12 @@
 #include "runtime/executor.h"
 #include "runtime/executor_utils.h"
 #include "runtime/fusion_executor_cache.h"
+#include "scheduler/jev_client.h"
+#include "scheduler/resize_heuristic.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/tools/loop_domain_scheduler.h"
 #include "scheduler/tools/resize_utils.h"
+#include "scheduler/utils.h"
 #include "tests/cpp/utils.h"
 #include "tests/cpp/validator.h"
 
@@ -54,6 +57,108 @@ void checkLoopDomainEquivalence(
 } // namespace
 
 using ResizeTest = NVFuserTest;
+
+TEST_F(ResizeTest, JevAlternateCta_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  auto* output = pad(
+      input, {IrBuilder::create<Val>(1L), IrBuilder::create<Val>(2L)});
+  fusion.addOutput(output);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({37, 1001}, options);
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  EXPECT_TRUE(params->cta_threads == 64 || params->cta_threads == 128);
+  EXPECT_FALSE(params->split_grid_x_dim);
+
+  // The selected parameter must reach the actual TIDx split; the reference
+  // checks every padded element for both native and forced API choices.
+  auto tidx = std::ranges::find_if(output->getLoopDomain(), [](IterDomain* id) {
+    return id->getParallelType() == ParallelType::TIDx;
+  });
+  ASSERT_NE(tidx, output->getLoopDomain().end());
+  EXPECT_EQ((*tidx)->extent()->evaluate(), params->cta_threads);
+  const auto launch = result.kernel_executor->lastLaunchParams();
+  EXPECT_EQ(launch.bdimx(), params->cta_threads);
+  EXPECT_EQ(
+      launch.gdimx(),
+      (37 * 1004 + params->vectorization_factor * params->cta_threads - 1) /
+          (params->vectorization_factor * params->cta_threads));
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {1, 2})},
+      __LINE__,
+      __FILE__);
+}
+
+TEST_F(ResizeTest, JevAlternateOuterReorder_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+
+  // The first two logical axes differ from the input's physical outer order.
+  // A native keep must therefore change the loop order, while skip preserves
+  // it. Keep the innermost axis and vectorization constraints identical.
+  const auto native_permutation = scheduler_utils::reorderDomainLike(
+      {output->getLogicalDomain().at(0), output->getLogicalDomain().at(1)},
+      input->getMaybeAllocationDomain());
+  ASSERT_EQ(native_permutation, (std::vector<int64_t>{1, 0}));
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  ASSERT_EQ(tensor.size(0), 5);
+  ASSERT_EQ(tensor.size(1), 7);
+  ASSERT_EQ(tensor.size(2), 64);
+  ASSERT_EQ(tensor.stride(0), 64);
+  ASSERT_EQ(tensor.stride(1), 320);
+  ASSERT_EQ(tensor.stride(2), 1);
+
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  const bool skip = scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  EXPECT_EQ(params->largest_input, skip ? -1 : 0);
+
+  // Inspect the actual reference schedule: TIDx comes from a flattened
+  // three-axis domain, whose first merge retains the chosen outer order.
+  auto tidx = std::ranges::find_if(output->getLoopDomain(), [](IterDomain* id) {
+    return id->getParallelType() == ParallelType::TIDx;
+  });
+  ASSERT_NE(tidx, output->getLoopDomain().end());
+  auto* thread_split = dynamic_cast<Split*>((*tidx)->definition());
+  ASSERT_NE(thread_split, nullptr);
+  auto* last_merge = dynamic_cast<Merge*>(thread_split->in()->definition());
+  ASSERT_NE(last_merge, nullptr);
+  auto* outer_merge = dynamic_cast<Merge*>(last_merge->outer()->definition());
+  ASSERT_NE(outer_merge, nullptr);
+  IdModel id_model(&fusion, /*build_graphs=*/false);
+  const auto& exact = id_model.buildExactGraph();
+  EXPECT_EQ(
+      exact.toGroup(outer_merge->outer()),
+      exact.toGroup(output->getLogicalDomain().at(skip ? 0 : 1)));
+  EXPECT_EQ(
+      exact.toGroup(outer_merge->inner()),
+      exact.toGroup(output->getLogicalDomain().at(skip ? 1 : 0)));
+
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {0, 8})},
+      __LINE__,
+      __FILE__);
+}
 
 using ResizeSchedulerTest = NVFuserFixtureParamTest<bool>;
 

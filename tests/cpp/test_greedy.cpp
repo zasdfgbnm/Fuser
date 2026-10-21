@@ -18,6 +18,7 @@
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/executor.h"
 #include "runtime/executor_utils.h"
+#include "scheduler/jev_client.h"
 #include "tests/cpp/utils.h"
 #include "tests/cpp/validator.h"
 
@@ -798,6 +799,200 @@ TEST_P(GreedySchedulerTestConstraintSize, ArgsortLargeConstrainedIDs) {
           1);
     }
   }
+}
+
+// The local API's alternate-batch CTest forces b4 after independently
+// validating the menu. testValidate compares the result with ATen argsort.
+TEST_F(GreedySchedulerTest, JevAlternateArgsortBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto sorted_indices = argsort(input_tv, -1);
+  // A lone Argsort is evaluated by ExprEval without entering Greedy.
+  fusion.addOutput(add(sorted_indices, fusion.oneVal(DataType::Int)));
+
+  auto input = at::randn(
+      shape, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+}
+
+// Force an exact-divisible alternate batch for a single Scatter. The
+// reference checks that values follow the permutation, not just that the
+// output has the expected shape.
+TEST_F(GreedySchedulerTest, JevAlternateScatterBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  constexpr int64_t size = 2048;
+  auto index_tv = makeContigConcreteTensor({size}, DataType::Int);
+  fusion.addInput(index_tv);
+  auto base_tv = zeros({IrBuilder::create<Val>(size)}, DataType::Int);
+  auto source_tv = arange(
+      fusion.zeroVal(DataType::Int),
+      IrBuilder::create<Val>(size, DataType::Int),
+      DataType::Int);
+  auto out_tv = scatter(base_tv, 0, index_tv, source_tv);
+  fusion.addOutput(out_tv);
+
+  auto index = at::randperm(
+      size, at::TensorOptions().dtype(at::kLong).device(at::kCUDA, 0));
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({index});
+  testValidate(executor_cache.fusion(), outputs, {index}, __LINE__, __FILE__);
+  FusionKernelRuntime* runtime = executor_cache.getMostRecentKernelRuntime();
+  EXPECT_FALSE(runtime->isSegmented());
+  EXPECT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+}
+
+// The local API forces one shared b4 choice for two equal Scan operations.
+// Check the second scan against an independent ATen prefix-sum reference.
+TEST_F(GreedySchedulerTest, JevAlternateMultiScanBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto first = scan(input_tv, -1, BinaryOpType::Add);
+  auto second = scan(first, -1, BinaryOpType::Add);
+  fusion.addOutput(second);
+
+  auto input = at::randint(
+                   0,
+                   2,
+                   shape,
+                   at::TensorOptions().dtype(at::kLong).device(at::kCUDA, 0))
+                   .to(at::kFloat);
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  ASSERT_EQ(outputs.size(), 1);
+  // Every prefix result is an integer below 2^24, hence exactly
+  // representable as Float for an order-independent comparison.
+  EXPECT_TRUE(at::equal(
+      outputs[0].as<at::Tensor>(), input.cumsum(-1).cumsum(-1)));
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+}
+
+// Force one b4 decision for three compatible Scan operations. Publish all
+// intermediate results so each Scan is checked against an ATen prefix sum.
+TEST_F(GreedySchedulerTest, JevAlternateThreeScanBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto first = scan(input_tv, -1, BinaryOpType::Add);
+  auto second = scan(first, -1, BinaryOpType::Add);
+  auto third = scan(second, -1, BinaryOpType::Add);
+  fusion.addOutput(first);
+  fusion.addOutput(second);
+  fusion.addOutput(third);
+
+  auto input = at::zeros(
+      shape, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  input.select(-1, 0).fill_(1.0);
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  ASSERT_EQ(outputs.size(), 3);
+  auto reference = input;
+  for (int64_t i = 0; i < 3; ++i) {
+    reference = reference.cumsum(-1);
+    // One impulse per row keeps even the third prefix below 2^24, so
+    // Float addition remains exact for all three independent checks.
+    EXPECT_TRUE(at::equal(outputs[i].as<at::Tensor>(), reference));
+  }
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+}
+
+// Four compatible Scans reserve four CUB temporary buffers. Force a shared
+// b4 batch and compare every result with an independent ATen prefix sum.
+TEST_F(GreedySchedulerTest, JevAlternateFourScanBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto first = scan(input_tv, -1, BinaryOpType::Add);
+  auto second = scan(first, -1, BinaryOpType::Add);
+  auto third = scan(second, -1, BinaryOpType::Add);
+  auto fourth = scan(third, -1, BinaryOpType::Add);
+  fusion.addOutput(first);
+  fusion.addOutput(second);
+  fusion.addOutput(third);
+  fusion.addOutput(fourth);
+
+  auto input = at::zeros(
+      shape, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  // The final prefix stays below 2^24, so all four integer-valued Float
+  // outputs are exactly representable despite different summation orders.
+  input.select(-1, 1600).fill_(1.0);
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  ASSERT_EQ(outputs.size(), 4);
+  auto reference = input;
+  for (int64_t i = 0; i < 4; ++i) {
+    reference = reference.cumsum(-1);
+    EXPECT_TRUE(at::equal(outputs[i].as<at::Tensor>(), reference));
+  }
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+  auto* scheduled = runtime->executors()
+                        .at(0)
+                        ->as<KernelExecutor>()
+                        ->compiledKernel()
+                        ->kernel();
+  const bool forced_batch =
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  const int64_t expected_threads = forced_batch ? 512 : 1024;
+  const int64_t expected_batch = forced_batch ? 4 : 2;
+  int64_t scan_count = 0;
+  for (auto* tv : scheduled->allTvs()) {
+    if (!tv->isDefinitionType<ScanOp>()) {
+      continue;
+    }
+    ++scan_count;
+    ASSERT_EQ(tv->getLoopDomain().size(), 3);
+    EXPECT_EQ(tv->axis(0)->getParallelType(), ParallelType::BIDx);
+    EXPECT_EQ(tv->axis(1)->getParallelType(), ParallelType::TIDx);
+    EXPECT_EQ(
+        tv->axis(1)->extent()->evaluate().as<int64_t>(), expected_threads);
+    EXPECT_EQ(tv->axis(2)->getParallelType(), ParallelType::Group);
+    EXPECT_EQ(tv->axis(2)->extent()->evaluate().as<int64_t>(), expected_batch);
+  }
+  EXPECT_EQ(scan_count, 4);
 }
 
 TEST_P(GreedySchedulerTestConstraintSize, ScanLargeConstrainedIDs) {

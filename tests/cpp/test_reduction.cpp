@@ -39,6 +39,7 @@
 #include "scheduler/all_schedulers.h"
 #include "scheduler/reduction_outer_tma.h"
 #include "scheduler/reduction_tma.h"
+#include "scheduler/native_plan_fields.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/utils.h"
@@ -76,6 +77,118 @@ void validateNoParallelBroadcastExist(kir::Kernel* kernel) {
 } // namespace
 
 using ReductionTest = NVFuserTest;
+
+TEST(NativeSchedulerFieldsTest, EveryDerivedFamilyAndMissingFieldIsVisible) {
+  using scheduler::native_diagnostic::schedulerFields;
+  PointwiseParams pointwise;
+  auto pointwise_base = schedulerFields(pointwise);
+  auto pointwise_different = pointwise;
+  pointwise_different.vectorize_casts = false;
+  EXPECT_NE(pointwise_base, schedulerFields(pointwise_different));
+  auto check_symbolic = []<typename P>(P baseline) {
+    if constexpr (requires { baseline.symbolic_1d_cta; }) {
+      auto changed = baseline;
+      changed.symbolic_1d_cta = true;
+      EXPECT_NE(schedulerFields(baseline), schedulerFields(changed));
+    }
+  };
+  check_symbolic(pointwise);
+
+  TransposeParams transpose;
+  auto transpose_different = transpose;
+  transpose_different.use_tma_load = true;
+  EXPECT_NE(schedulerFields(transpose), schedulerFields(transpose_different));
+  auto check_cap = []<typename P>(P baseline) {
+    if constexpr (requires { baseline.threads_per_block_cap; }) {
+      auto changed = baseline;
+      changed.threads_per_block_cap = 64;
+      EXPECT_NE(schedulerFields(baseline), schedulerFields(changed));
+    }
+  };
+  check_cap(transpose);
+
+  ReductionParams reduction;
+  const auto reduction_base = schedulerFields(reduction);
+#define CHECK_REDUCTION(field, value) { \
+    auto changed = reduction; changed.field = value; \
+    EXPECT_NE(reduction_base, schedulerFields(changed)) << #field; \
+  }
+  CHECK_REDUCTION(flip_grid, true);
+  CHECK_REDUCTION(unroll_factor_top_of_vectorization, 2);
+  CHECK_REDUCTION(vectorize_casts, false);
+  CHECK_REDUCTION(static_bdimx, true);
+  CHECK_REDUCTION(static_bdimy, true);
+  CHECK_REDUCTION(combined_inner_outer, true);
+  CHECK_REDUCTION(tidx_for_outer_reduction, true);
+  CHECK_REDUCTION(pad_outer_reduction_to_warp, true);
+  CHECK_REDUCTION(combined_split_grid_inner_dim, true);
+  CHECK_REDUCTION(tma_warp_specialized, true);
+  CHECK_REDUCTION(is_good_ws_heuristic, true);
+  CHECK_REDUCTION(is_non_circular_buffer_gmem_to_regs, false);
+  CHECK_REDUCTION(is_circular_buffer_regs_cached, false);
+  CHECK_REDUCTION(computation_warp_groups, 2);
+  CHECK_REDUCTION(vectorization_factor_outer, 2);
+  CHECK_REDUCTION(vectorization_factor_tmp_gmem_write, 2);
+  CHECK_REDUCTION(block_dim_inner_reduction_extra, ParallelType::TIDy);
+  CHECK_REDUCTION(smem_persistent_buffers, std::vector<TensorView*>{nullptr});
+#undef CHECK_REDUCTION
+
+  TmaInnerReductionParams inner_tma;
+  const auto inner_base = schedulerFields(inner_tma);
+  {
+    auto changed = inner_tma;
+    changed.vectorization_factor = 2;
+    EXPECT_NE(inner_base, schedulerFields(changed));
+  }
+  {
+    auto changed = inner_tma;
+    changed.threads_per_block = 128;
+    EXPECT_NE(inner_base, schedulerFields(changed));
+  }
+  {
+    auto changed = inner_tma;
+    changed.unroll_factor = 2;
+    EXPECT_NE(inner_base, schedulerFields(changed));
+  }
+
+  EXPECT_NE(scheduler::native_diagnostic::describeSchedulerFields(ResizeParams{}).params_kind.find("ResizeParams"), std::string::npos);
+  EXPECT_NE(scheduler::native_diagnostic::describeSchedulerFields(TmaOuterReductionParams{}).params_kind.find("TmaOuterReductionParams"), std::string::npos);
+  EXPECT_NE(scheduler::native_diagnostic::describeSchedulerFields(InnerNormTmaParams{}).params_kind.find("InnerNormTmaParams"), std::string::npos);
+  MatmulParams matmul;
+  matmul.supported_vec_size.a = 1;
+  matmul.supported_vec_size.b = 1;
+  matmul.supported_vec_size.epilogue = 1;
+  EXPECT_EQ(scheduler::native_diagnostic::describeSchedulerFields(matmul).params_kind, "MatmulParams");
+  const auto matmul_fields = schedulerFields(matmul);
+  {
+    auto changed = matmul;
+    changed.tag = "descriptive label";
+    EXPECT_EQ(matmul_fields, schedulerFields(changed));
+  }
+  {
+    auto changed = matmul;
+    changed.tile_sizes.warp_tile.m = 32;
+    EXPECT_NE(matmul_fields, schedulerFields(changed));
+  }
+  {
+    auto changed = matmul;
+    changed.circular_buffer_options.smem_circular_buffer_stage = 3;
+    EXPECT_NE(matmul_fields, schedulerFields(changed));
+  }
+  {
+    auto changed = matmul;
+    changed.supported_vec_size.a = 2;
+    EXPECT_NE(matmul_fields, schedulerFields(changed));
+  }
+  EXPECT_NE(scheduler::native_diagnostic::describeSchedulerFields(GreedyParams{}).params_kind.find("GreedyParams"), std::string::npos);
+  EXPECT_NE(scheduler::native_diagnostic::describeSchedulerFields(CutlassParams{}).params_kind.find("CutlassParams"), std::string::npos);
+}
+
+TEST(NativeSchedulerFieldsTest, GreedyEntryOrderIsCanonical) {
+  using scheduler::native_diagnostic::detail::sortedGreedyLines;
+  EXPECT_EQ(sortedGreedyLines("header\nt2 -> B\nt1 -> A\nfooter\n"),
+            sortedGreedyLines("header\nt1 -> A\nt2 -> B\nfooter\n"));
+}
 
 TEST_F(ReductionTest, GridAllreduce1) {
   const int nx = 999;

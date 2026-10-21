@@ -160,7 +160,8 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
     int64_t total_reduction_numel,
     int64_t total_iteration_numel,
     int64_t vectorize_factor,
-    int64_t persistent_buffer_size_bit);
+    int64_t persistent_buffer_size_bit,
+    bool allow_jev_tail_choice = false);
 
 //! check iter type of each domain in inner and outer reduction tvs
 //! inner reduction must be [I,I,...R,R]
@@ -242,11 +243,14 @@ struct PersistentKernelProperties {
     return ss.str();
   }
 };
+// enable_jev_projection is only for final InnerPersistent computeHeuristics
+// on a guaranteed non-TMA path. Other callers retain native analysis.
 PersistentKernelProperties getPersistentKernelProperties(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    SchedulerType heuristic);
+    SchedulerType heuristic,
+    bool enable_jev_projection = false);
 
 // Verify the presence of a reduction TensorView connected to a Fusion input
 void checkReductionTvForScheduling(Fusion* fusion, TensorView* ref_red_tv);
@@ -305,7 +309,23 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
     const std::vector<TensorView*>& reduction_tvs,
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
     const bool can_use_smem_persistent,
-    const bool project_to_inputs);
+    const bool project_to_inputs,
+    // Zero preserves the native max-thread padding estimate. A candidate
+    // supplies its batch and warp-padded TIDx for per-buffer capacity bounds.
+    int64_t candidate_batch = 0,
+    int64_t candidate_padded_threads = 0);
+
+// Pure shared-memory capacity for a particular inner-persistent CTA plan.
+// Unlike getMaxRegOrSharedMemorySizeBitForPersistentBuffer, this cannot let
+// register capacity mask an overfull shared-memory allocation.
+int64_t getMaxSharedMemorySizeBitForPersistentBuffer(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    bool project_to_inputs,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads);
 
 enum class BufferProjectionStrategy {
   // Recompute persistent buffers from inputs, only need to cache inputs in

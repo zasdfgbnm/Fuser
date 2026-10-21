@@ -13,6 +13,7 @@
 #include "debug.h"
 #include "instrumentation.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/runtime_info.h"
@@ -228,22 +229,140 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
   tparams->tag = "Transpose heuristics";
   tparams->cparams.index_type = index_type;
 
-  // Expand inner-most dims to virtual inner-most dims so that the inner-most
-  // dims has at least tile_size elements
-  // See note [Supporting small transpose dimensions]
-  utils::maybeBuildVirtualInnerDims(
-      tparams.get(),
-      device_multiprocessor_count,
-      n_elems,
-      shape_in_ref1,
-      inner_most_pos1_in_ref1,
-      inner_most_pos2_in_ref1);
+  // The one-wave test is a performance preference. Keep the exact native
+  // merge/split constructor and the view guard as hard schedule constraints.
+  const auto jev_mode = scheduler::jev::mode();
+  const bool has_view = !scheduler_utils::getViewTVs(fusion).empty();
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    utils::maybeBuildVirtualInnerDims(
+        tparams.get(),
+        device_multiprocessor_count,
+        n_elems,
+        shape_in_ref1,
+        inner_most_pos1_in_ref1,
+        inner_most_pos2_in_ref1);
+  } else {
+    if (has_view) {
+      // Preserve the pre-existing unsupported combination even when a remote
+      // answer would otherwise request the original axes.
+      auto checked = std::make_unique<TransposeParams>();
+      checked->tile_size1 = tparams->tile_size1;
+      checked->tile_size2 = tparams->tile_size2;
+      utils::maybeBuildVirtualInnerDims(
+          checked.get(),
+          device_multiprocessor_count,
+          n_elems,
+          shape_in_ref1,
+          inner_most_pos1_in_ref1,
+          inner_most_pos2_in_ref1);
+      NVF_ERROR(
+          !utils::hasSmallTransposeDimensions(checked),
+          "combination of view op with small transpose dimensions are not "
+          "supported by transpose scheduler");
+    }
+
+    std::string state = "transpose.virtual_axes.v1\nshape=";
+    for (size_t i = 0; i < shape_in_ref1.size(); ++i) {
+      if (i != 0) {
+        state += ',';
+      }
+      state += std::to_string(shape_in_ref1[i]);
+    }
+    state += "\ninner1=" + std::to_string(inner_most_pos1_in_ref1);
+    state += "\ninner2=" + std::to_string(inner_most_pos2_in_ref1);
+    state += "\ntile1=" + std::to_string(tparams->tile_size1);
+    state += "\ntile2=" + std::to_string(tparams->tile_size2);
+    state += "\nsm_count=" + std::to_string(device_multiprocessor_count);
+    state += "\nn_elems=" + std::to_string(n_elems);
+    state += "\nhas_view=" + std::to_string(has_view);
+
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"original", "Tile the original inner axes"}};
+    if (!has_view) {
+      options.push_back(
+          {"virtual", "Construct the source-supported virtual inner axes"});
+    }
+
+    std::string native_choice;
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      const int64_t wave_elements = device_multiprocessor_count *
+          std::min<int64_t>(shape_in_ref1[inner_most_pos1_in_ref1],
+                            tparams->tile_size1) *
+          std::min<int64_t>(shape_in_ref1[inner_most_pos2_in_ref1],
+                            tparams->tile_size2);
+      native_choice =
+          !has_view && wave_elements < n_elems ? "virtual" : "original";
+    }
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR1", state, options, native_choice);
+    NVF_ERROR(
+        selected == "original" || (selected == "virtual" && !has_view),
+        "TR1 response is outside native hard bounds");
+    if (selected == "virtual") {
+      // The API chooses whether to request this complete native plan; it never
+      // supplies individual merge indices or split factors.
+      utils::maybeBuildVirtualInnerDims(
+          tparams.get(),
+          device_multiprocessor_count,
+          n_elems,
+          shape_in_ref1,
+          inner_most_pos1_in_ref1,
+          inner_most_pos2_in_ref1);
+    }
+  }
 
   NVF_ERROR(
-      !utils::hasSmallTransposeDimensions(tparams) ||
-          scheduler_utils::getViewTVs(fusion).empty(),
+      !utils::hasSmallTransposeDimensions(tparams) || !has_view,
       "combination of view op with small transpose dimensions are not "
       "supported by transpose scheduler");
+
+  // Choose a complete, square tile before the vector/unroll and CTA analyses.
+  // The smaller candidate is confined to untransformed original axes whose
+  // extents divide both tiles. All dependent parameters are recomputed below.
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::string state = "transpose.tile.v1\nshape=";
+    for (size_t i = 0; i < shape_in_ref1.size(); ++i) {
+      if (i != 0) {
+        state += ',';
+      }
+      state += std::to_string(shape_in_ref1[i]);
+    }
+    state += "\ninner1=" + std::to_string(inner_most_pos1_in_ref1);
+    state += "\ninner2=" + std::to_string(inner_most_pos2_in_ref1);
+    state += "\ntile1=" + std::to_string(tparams->tile_size1);
+    state += "\ntile2=" + std::to_string(tparams->tile_size2);
+    state += "\nsm_count=" + std::to_string(device_multiprocessor_count);
+    state += "\nn_elems=" + std::to_string(n_elems);
+    state += "\nhas_view=" + std::to_string(has_view);
+
+    const bool square_16_eligible =
+        !has_view && !utils::hasSmallTransposeDimensions(tparams) &&
+        tparams->tile_size1 == TransposeParams::getDefaultTileSize() &&
+        tparams->tile_size2 == TransposeParams::getDefaultTileSize() &&
+        shape_in_ref1[inner_most_pos1_in_ref1] >= 32 &&
+        shape_in_ref1[inner_most_pos2_in_ref1] >= 32 &&
+        shape_in_ref1[inner_most_pos1_in_ref1] % 32 == 0 &&
+        shape_in_ref1[inner_most_pos2_in_ref1] % 32 == 0 &&
+        n_elems / device_multiprocessor_count >= 32 * 32;
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"tile32", "Tile both transpose axes by 32"}};
+    if (square_16_eligible) {
+      options.push_back({"tile16", "Tile both transpose axes by 16"});
+    }
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR2.tile",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "tile32" : "");
+    if (selected == "tile16" && square_16_eligible) {
+      tparams->tile_size1 = 16;
+      tparams->tile_size2 = 16;
+    } else {
+      NVF_ERROR(
+          selected == "tile32",
+          "TR2.tile response is outside native hard bounds");
+    }
+  }
 
   // Note [vectorization and unroll of input and output]
   //
@@ -284,30 +403,95 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
   scan_max_dtype_size(fusion->inputs());
   scan_max_dtype_size(fusion->outputs());
 
-  auto max_unroll_factor = ceilDiv(
-      // Available unrolling based on size of data type
-      kSixteen / max_io_dtype_size,
-      // Reduce max unrolling factor if we have many inputs/outputs to unroll
-      // as it could start consuming a lot of registers.
-      std::max(
-          (scheduler_utils::lastPow2(
-               (int64_t)grouped_inputs_outputs[0].size() +
-               (int64_t)grouped_inputs_outputs[1].size()) >>
-           2),
-          (int64_t)1));
+  int64_t max_unroll_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Keep the original numeric cap in off mode. Record uses it to identify
+    // the native Choice; the selected effective cap is applied below.
+    max_unroll_factor = ceilDiv(
+        // Available unrolling based on size of data type
+        kSixteen / max_io_dtype_size,
+        // Reduce max unrolling factor if we have many inputs/outputs to unroll
+        // as it could start consuming a lot of registers.
+        std::max(
+            (scheduler_utils::lastPow2(
+                 (int64_t)grouped_inputs_outputs[0].size() +
+                 (int64_t)grouped_inputs_outputs[1].size()) >>
+             2),
+            (int64_t)1));
 
-  // Don't unroll at the cost of getting a full wave on the GPU
-  auto max_unroll_factor_occupancy = ceilDiv(
-      n_elems,
-      device_multiprocessor_count * (int64_t)tparams->tile_size1 *
-          (int64_t)tparams->tile_size2);
-  max_unroll_factor = std::min(max_unroll_factor, max_unroll_factor_occupancy);
+    // Don't unroll at the cost of getting a full wave on the GPU
+    auto max_unroll_factor_occupancy = ceilDiv(
+        n_elems,
+        device_multiprocessor_count * (int64_t)tparams->tile_size1 *
+            (int64_t)tparams->tile_size2);
+    max_unroll_factor =
+        std::min(max_unroll_factor, max_unroll_factor_occupancy);
 
-  // Don't unroll at the cost of getting a full warp, useful for the case where
-  // tile sizes are small
-  auto max_unroll_factor_block =
-      ceilDiv((int64_t)tparams->tile_size1 * (int64_t)tparams->tile_size2, 32l);
-  max_unroll_factor = std::min(max_unroll_factor, max_unroll_factor_block);
+    // Don't unroll at the cost of getting a full warp, useful for the case
+    // where tile sizes are small
+    auto max_unroll_factor_block = ceilDiv(
+        (int64_t)tparams->tile_size1 * (int64_t)tparams->tile_size2, 32l);
+    max_unroll_factor = std::min(max_unroll_factor, max_unroll_factor_block);
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // A cap above 16 bytes per I/O element can form a vector instruction that
+    // the native rule never offers. The tile and byte limits are structural;
+    // neither uses the native register, wave, or warp preference.
+    const int64_t tile_elements =
+        (int64_t)tparams->tile_size1 * (int64_t)tparams->tile_size2;
+    const int64_t hard_cap =
+        std::min(tile_elements, kSixteen / max_io_dtype_size);
+    std::vector<scheduler::jev::ChoiceOption> options;
+    if (hard_cap == 0) {
+      // Preserve the legacy zero input for an I/O dtype wider than 16 bytes.
+      options.push_back({"u0", "Use the legacy zero helper input"});
+    } else {
+      for (int64_t factor = 1; factor <= hard_cap; factor *= 2) {
+        options.push_back(
+            {"u" + std::to_string(factor),
+             "Limit the per-thread vector/unroll cap to " +
+                 std::to_string(factor)});
+      }
+    }
+
+    const std::string state =
+        "transpose.unroll_cap.v1\nmax_io_dtype_bytes=" +
+        std::to_string(max_io_dtype_size) + "\ngroup1_io=" +
+        std::to_string(grouped_inputs_outputs[0].size()) + "\ngroup2_io=" +
+        std::to_string(grouped_inputs_outputs[1].size()) + "\nn_elems=" +
+        std::to_string(n_elems) + "\nsm_count=" +
+        std::to_string(device_multiprocessor_count) + "\ntile1=" +
+        std::to_string(tparams->tile_size1) + "\ntile2=" +
+        std::to_string(tparams->tile_size2);
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "u" + std::to_string(
+                    max_unroll_factor == 0
+                        ? 0
+                        : scheduler_utils::maxVectorizationWidth(
+                              max_unroll_factor))
+        : "";
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR2.unroll", state, options, native_choice);
+    // The helper uses maxVectorizationWidth, so Record's selected power of two
+    // is the same effective cap as the native raw value. Apply the selected cap
+    // in both modes to keep equivalent downstream width requests identical.
+    bool found = false;
+    if (hard_cap == 0 && selected == "u0") {
+      max_unroll_factor = 0;
+      found = true;
+    } else {
+      for (int64_t factor = 1; factor <= hard_cap; factor *= 2) {
+        if (selected == "u" + std::to_string(factor)) {
+          max_unroll_factor = factor;
+          found = true;
+          break;
+        }
+      }
+    }
+    NVF_ERROR(found, "TR2.unroll response is outside native hard bounds");
+  }
 
   // Note: [Computing Vectorization Width for Transpose]
   //
@@ -353,27 +537,182 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
     inner_most_pos1_in_ref1 = to_update[0];
     inner_most_pos2_in_ref1 = to_update[1];
 
-    tparams->vectorize_factor1 =
-        vectorize_helper::getVectorizationFactorTransposeGroup(
+    auto choose_group_width = [&](int64_t group,
+                                  int64_t inner_dim,
+                                  const std::vector<int64_t>& merged_dims,
+                                  const std::vector<TensorView*>& group_tvs)
+        -> int64_t {
+      if (jev_mode == scheduler::jev::Mode::Off) {
+        return vectorize_helper::getVectorizationFactorTransposeGroup(
             runtime_info,
             reference1,
-            inner_most_pos1_in_ref1,
-            tparams->dims_merged_with_1,
-            grouped_inputs_outputs[0],
+            inner_dim,
+            merged_dims,
+            group_tvs,
             max_unroll_factor);
+      }
+
+      // The mapper, not the API, determines which contiguous inner regions
+      // each tensor can vectorize. All smaller powers of two remain legal.
+      const auto mapped_sizes =
+          vectorize_helper::getTransposeGroupContiguousInnerSizes(
+              runtime_info, reference1, inner_dim, merged_dims, group_tvs);
+      NVF_ERROR(!mapped_sizes.empty(), "Transpose group has no I/O tensors");
+      int64_t max_legal =
+          scheduler_utils::maxVectorizationWidth(max_unroll_factor);
+      for (auto size : mapped_sizes) {
+        NVF_ERROR(size > 0, "Transpose contiguous inner size must be positive");
+        max_legal = std::min(
+            max_legal, scheduler_utils::maxVectorizationWidth(size));
+      }
+      NVF_ERROR(max_legal > 0, "Transpose vector width must be positive");
+
+      // With a normal cap, TR2.unroll has already limited each width to the
+      // tile work and 16 bytes per widest I/O type. The legacy zero helper
+      // input is different: it means an effectively unbounded cap, not width 0.
+      const bool legacy_zero_cap = max_unroll_factor == 0;
+      if (!legacy_zero_cap) {
+        NVF_ERROR(
+            max_legal <=
+                    (int64_t)tparams->tile_size1 * tparams->tile_size2 &&
+                max_legal <= kSixteen / max_io_dtype_size,
+            "Transpose group width exceeds native tile or byte bound");
+      }
+
+      std::vector<scheduler::jev::ChoiceOption> options;
+      if (legacy_zero_cap) {
+        // Retain the original helper's exact sentinel behavior; no new
+        // width above the original result or zero-width option is exposed.
+        options.push_back(
+            {"w" + std::to_string(max_legal),
+             "Use the only legacy-zero-cap group width"});
+      } else {
+        for (int64_t factor = 1; factor <= max_legal; factor *= 2) {
+          options.push_back(
+              {"w" + std::to_string(factor),
+               "Vectorize this transpose group by " + std::to_string(factor)});
+        }
+      }
+
+      std::string state =
+          "transpose.group_width.v1\ngroup=" + std::to_string(group) +
+          "\nmax_unroll_input=" + std::to_string(max_unroll_factor) +
+          "\nmax_io_dtype_bytes=" + std::to_string(max_io_dtype_size) +
+          "\ntile1=" + std::to_string(tparams->tile_size1) +
+          "\ntile2=" + std::to_string(tparams->tile_size2) +
+          "\nmapped_sizes=";
+      for (size_t i = 0; i < mapped_sizes.size(); ++i) {
+        if (i != 0) {
+          state += ',';
+        }
+        state += std::to_string(mapped_sizes[i]);
+      }
+
+      std::string native_choice;
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        const int64_t native_width =
+            vectorize_helper::getVectorizationFactorTransposeGroup(
+                runtime_info,
+                reference1,
+                inner_dim,
+                merged_dims,
+                group_tvs,
+                max_unroll_factor);
+        NVF_ERROR_EQ(native_width, max_legal);
+        native_choice = "w" + std::to_string(native_width);
+      }
+      const auto selected = scheduler::jev::chooseDecision(
+          "TR2.width" + std::to_string(group),
+          state,
+          options,
+          native_choice);
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          return std::stoll(selected.substr(1));
+        }
+      }
+      NVF_THROW("TR2 group width response is outside native hard bounds");
+    };
+
+    tparams->vectorize_factor1 = choose_group_width(
+        1,
+        inner_most_pos1_in_ref1,
+        tparams->dims_merged_with_1,
+        grouped_inputs_outputs[0]);
 
     // TODO: Since group2 only has global->shared and shared->global set op, we
     // can have fine-grained control of unroll/vectorization at per tensor
     // level. We should not be using a single global vectorize factor for the
     // entire group 2
-    tparams->vectorize_factor2 =
-        vectorize_helper::getVectorizationFactorTransposeGroup(
-            runtime_info,
-            reference1,
-            inner_most_pos2_in_ref1,
-            tparams->dims_merged_with_2,
-            grouped_inputs_outputs[1],
-            max_unroll_factor);
+    tparams->vectorize_factor2 = choose_group_width(
+        2,
+        inner_most_pos2_in_ref1,
+        tparams->dims_merged_with_2,
+        grouped_inputs_outputs[1]);
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // The tile and group widths have already been chosen. Both groups use the
+    // same TIDx extent, while the tile, block grid, and shared allocations are
+    // unchanged by this choice. Require exact tile coverage, a bounded amount
+    // of per-thread tile work, and the device launch bound for alternatives.
+    const int64_t tile_elements = tparams->tile_size1 * tparams->tile_size2;
+    const int64_t native_threads = tparams->getThreadsPerBlock();
+    const int64_t tile_vectors1 =
+        ceilDiv(tile_elements, tparams->vectorize_factor1);
+    const int64_t tile_vectors2 =
+        ceilDiv(tile_elements, tparams->vectorize_factor2);
+    const int64_t device_max_threads =
+        at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock;
+    const int64_t device_max_threads_x =
+        at::cuda::getCurrentDeviceProperties()->maxThreadsDim[0];
+    std::vector<scheduler::jev::ChoiceOption> options = {
+        {"t" + std::to_string(native_threads),
+         "Use " + std::to_string(native_threads) +
+             " threads per CTA for both transpose groups"}};
+    const bool exact_tile_vectors =
+        tile_elements % tparams->vectorize_factor1 == 0 &&
+        tile_elements % tparams->vectorize_factor2 == 0;
+    for (const int64_t threads : {64L, 256L}) {
+      if (threads == native_threads || !exact_tile_vectors ||
+          threads > device_max_threads || threads > device_max_threads_x ||
+          tile_elements % threads != 0 ||
+          tile_elements / threads > 16 || tile_vectors1 % threads != 0 ||
+          tile_vectors2 % threads != 0) {
+        continue;
+      }
+      options.push_back(
+          {"t" + std::to_string(threads),
+           "Use " + std::to_string(threads) +
+               " threads per CTA for both transpose groups"});
+    }
+    const std::string state =
+        "transpose.cta.v1\ntile1=" + std::to_string(tparams->tile_size1) +
+        "\ntile2=" + std::to_string(tparams->tile_size2) +
+        "\nwidth1=" + std::to_string(tparams->vectorize_factor1) +
+        "\nwidth2=" + std::to_string(tparams->vectorize_factor2) +
+        "\nmax_threads_per_block=" + std::to_string(device_max_threads) +
+        "\nmax_threads_x=" + std::to_string(device_max_threads_x);
+    const auto selected = scheduler::jev::chooseDecision(
+        "TR2.cta",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record
+            ? "t" + std::to_string(native_threads)
+            : "");
+    if (jev_mode == scheduler::jev::Mode::Remote) {
+      bool found = false;
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          if (selected != "t" + std::to_string(native_threads)) {
+            tparams->threads_per_block_cap = std::stoll(selected.substr(1));
+          }
+          found = true;
+          break;
+        }
+      }
+      NVF_ERROR(found, "TR2.cta response is outside native hard bounds");
+    }
   }
 
   tparams->lparams.bind(tparams->getThreadsPerBlock(), ParallelType::TIDx);
