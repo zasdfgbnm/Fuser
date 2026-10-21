@@ -20,6 +20,7 @@
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
+#include "scheduler/pointwise_unroll_envelope.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/utils.h"
@@ -687,110 +688,116 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   bool divisible_split = break_point > 0
       ? (right_elem_count % (params->vectorization_factor * bdimx) == 0)
       : (n_elems % (params->vectorization_factor * bdimx) == 0);
-  int64_t unroll_factor = 0;
-  if (jev_mode != scheduler::jev::Mode::Remote || block_quantization) {
-    unroll_factor = getUnrollFactor(
-        fusion,
-        break_point,
-        total_blocks,
-        break_point > 0 ? kThreadX : bdimx,
-        params->vectorization_factor * max_dtype_size_bit_for_vectorization,
-        divisible_split,
-        vectorizable_inputs_outputs,
-        data_cache);
-  }
+  // Both Record and Remote must evaluate the native factor to agree on
+  // whether the bounded model menu is available for this invocation.
+  int64_t unroll_factor = getUnrollFactor(
+      fusion,
+      break_point,
+      total_blocks,
+      break_point > 0 ? kThreadX : bdimx,
+      params->vectorization_factor * max_dtype_size_bit_for_vectorization,
+      divisible_split,
+      vectorizable_inputs_outputs,
+      data_cache);
   if (jev_mode != scheduler::jev::Mode::Off && !block_quantization) {
-    // Any positive integer up to max(1, total_blocks) can be represented by
-    // the pointwise split, including non-power-of-two factors and tails. The
-    // source's element-based cap also guarantees its native choice is in this
-    // range. Partition large ranges to respect Jev's 255-choice limit.
-    const int64_t hard_max = std::max<int64_t>(1, total_blocks);
+    // The pointwise split represents any positive factor up to total_blocks,
+    // including non-power-of-two factors and tails. Limit model-selected
+    // factors further to avoid pathological expansion of the generated kernel.
+    const int64_t schedule_max = std::max<int64_t>(1, total_blocks);
     NVF_ERROR(
-        jev_mode != scheduler::jev::Mode::Record ||
-            (unroll_factor >= 1 && unroll_factor <= hard_max),
+        unroll_factor >= 1 && unroll_factor <= schedule_max,
         "PW3.unroll native factor exceeds the schedule's hard range");
-
-    const auto inputs =
-        getUniqueVectorizableInputs(vectorizable_inputs_outputs);
-    const auto outer_flags = getOuterBcastInputFlags(inputs, break_point);
-    const auto op_counts = countExpensiveOps(fusion);
-    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
-    int memory_clock_khz = 0;
-    NVF_ERROR(
-        cudaDeviceGetAttribute(
-            &memory_clock_khz,
-            cudaDevAttrMemoryClockRate,
-            at::cuda::current_device()) == cudaSuccess,
-        "PW3.unroll could not read CUDA memory clock");
-    std::string flags = outer_flags.empty() ? "-" : std::string();
-    for (size_t i = 0; i < outer_flags.size(); ++i) {
-      if (i != 0) {
-        flags += ',';
-      }
-      flags += (outer_flags[i] ? '1' : '0');
-    }
-    std::string state_base = "pointwise.unroll.v1\n";
-    state_base += "axis=" +
-        std::string(is_outer_broadcast_dominated ? "outer" : "inner") + '\n';
-    state_base += "break_point=" + std::to_string(break_point) + '\n';
-    state_base += "n_elems=" + std::to_string(n_elems) + '\n';
-    state_base += "right_elems=" + std::to_string(right_elem_count) + '\n';
-    state_base += "bdimx=" + std::to_string(bdimx) + '\n';
-    state_base += "gdim_left=" + std::to_string(gdim_left) + '\n';
-    state_base += "gdim_right=" + std::to_string(gdim_right) + '\n';
-    state_base += "vector_width=" + std::to_string(vectorization_factor) + '\n';
-    state_base += "max_dtype_bits=" +
-        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
-    state_base += "input_outer_bcast_flags=" + flags + '\n';
-    state_base += "tanh_ops=" + std::to_string(op_counts.tanh) + '\n';
-    state_base += "exp_ops=" + std::to_string(op_counts.exp) + '\n';
-    state_base +=
-        "reciprocal_ops=" + std::to_string(op_counts.reciprocal) + '\n';
-    state_base +=
-        "sm_count=" + std::to_string(dev_prop->multiProcessorCount) + '\n';
-    state_base += "max_threads_per_sm=" +
-        std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
-    state_base +=
-        "memory_bus_bits=" + std::to_string(dev_prop->memoryBusWidth) + '\n';
-    state_base += "memory_clock_khz=" + std::to_string(memory_clock_khz) + '\n';
-    state_base += "block_quantization=" +
-        std::to_string(static_cast<int>(block_quantization)) + '\n';
-
-    int64_t range_low = 1;
-    int64_t range_high = hard_max;
-    for (;;) {
-      const auto ranges = getUnrollRanges(range_low, range_high);
-      std::vector<scheduler::jev::ChoiceOption> options;
-      options.reserve(ranges.size());
-      std::string native_choice;
-      for (const auto& range : ranges) {
-        options.push_back(
-            {range.id,
-             "Unroll factor in [" + std::to_string(range.low) + ", " +
-                 std::to_string(range.high) + "]"});
-        if (jev_mode == scheduler::jev::Mode::Record &&
-            range.low <= unroll_factor && unroll_factor <= range.high) {
-          native_choice = range.id;
-        }
-      }
-      const std::string state = state_base +
-          "range_low=" + std::to_string(range_low) + '\n' +
-          "range_high=" + std::to_string(range_high) + '\n';
-      const auto selected = scheduler::jev::chooseDecision(
-          "PW3.unroll", state, options, native_choice);
-      const auto selected_range = std::find_if(
-          ranges.begin(), ranges.end(), [&](const FactorRange& range) {
-            return range.id == selected;
-          });
+    const auto envelope = getPointwiseUnrollEnvelope(
+        total_blocks,
+        fusion->exprs().size(),
+        vectorization_factor,
+        unroll_factor);
+    const int64_t model_max = envelope.model_limit;
+    if (envelope.offer_choice) {
+      const auto inputs =
+          getUniqueVectorizableInputs(vectorizable_inputs_outputs);
+      const auto outer_flags = getOuterBcastInputFlags(inputs, break_point);
+      const auto op_counts = countExpensiveOps(fusion);
+      const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+      int memory_clock_khz = 0;
       NVF_ERROR(
-          selected_range != ranges.end(),
-          "PW3.unroll response is outside native hard bounds");
-      if (selected_range->low == selected_range->high) {
-        unroll_factor = selected_range->low;
-        break;
+          cudaDeviceGetAttribute(
+              &memory_clock_khz,
+              cudaDevAttrMemoryClockRate,
+              at::cuda::current_device()) == cudaSuccess,
+          "PW3.unroll could not read CUDA memory clock");
+      std::string flags = outer_flags.empty() ? "-" : std::string();
+      for (size_t i = 0; i < outer_flags.size(); ++i) {
+        if (i != 0) {
+          flags += ',';
+        }
+        flags += (outer_flags[i] ? '1' : '0');
       }
-      range_low = selected_range->low;
-      range_high = selected_range->high;
+      std::string state_base = "pointwise.unroll.v2\n";
+      state_base += "axis=" +
+          std::string(is_outer_broadcast_dominated ? "outer" : "inner") + '\n';
+      state_base += "break_point=" + std::to_string(break_point) + '\n';
+      state_base += "n_elems=" + std::to_string(n_elems) + '\n';
+      state_base += "right_elems=" + std::to_string(right_elem_count) + '\n';
+      state_base += "bdimx=" + std::to_string(bdimx) + '\n';
+      state_base += "gdim_left=" + std::to_string(gdim_left) + '\n';
+      state_base += "gdim_right=" + std::to_string(gdim_right) + '\n';
+      state_base += "vector_width=" + std::to_string(vectorization_factor) + '\n';
+      state_base +=
+          "expr_count=" + std::to_string(fusion->exprs().size()) + '\n';
+      state_base += "max_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+      state_base += "input_outer_bcast_flags=" + flags + '\n';
+      state_base += "tanh_ops=" + std::to_string(op_counts.tanh) + '\n';
+      state_base += "exp_ops=" + std::to_string(op_counts.exp) + '\n';
+      state_base +=
+          "reciprocal_ops=" + std::to_string(op_counts.reciprocal) + '\n';
+      state_base +=
+          "sm_count=" + std::to_string(dev_prop->multiProcessorCount) + '\n';
+      state_base += "max_threads_per_sm=" +
+          std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
+      state_base +=
+          "memory_bus_bits=" + std::to_string(dev_prop->memoryBusWidth) + '\n';
+      state_base += "memory_clock_khz=" + std::to_string(memory_clock_khz) + '\n';
+      state_base += "block_quantization=" +
+          std::to_string(static_cast<int>(block_quantization)) + '\n';
+
+      int64_t range_low = 1;
+      int64_t range_high = model_max;
+      for (;;) {
+        const auto ranges = getUnrollRanges(range_low, range_high);
+        std::vector<scheduler::jev::ChoiceOption> options;
+        options.reserve(ranges.size());
+        std::string native_choice;
+        for (const auto& range : ranges) {
+          options.push_back(
+              {range.id,
+               "Unroll factor in [" + std::to_string(range.low) + ", " +
+                   std::to_string(range.high) + "]"});
+          if (jev_mode == scheduler::jev::Mode::Record &&
+              range.low <= unroll_factor && unroll_factor <= range.high) {
+            native_choice = range.id;
+          }
+        }
+        const std::string state = state_base +
+            "range_low=" + std::to_string(range_low) + '\n' +
+            "range_high=" + std::to_string(range_high) + '\n';
+        const auto selected = scheduler::jev::chooseDecision(
+            "PW3.unroll", state, options, native_choice);
+        const auto selected_range = std::find_if(
+            ranges.begin(), ranges.end(), [&](const FactorRange& range) {
+              return range.id == selected;
+            });
+        NVF_ERROR(
+            selected_range != ranges.end(),
+            "PW3.unroll response is outside the bounded model menu");
+        if (selected_range->low == selected_range->high) {
+          unroll_factor = selected_range->low;
+          break;
+        }
+        range_low = selected_range->low;
+        range_high = selected_range->high;
+      }
     }
   } else if (jev_mode == scheduler::jev::Mode::Record && block_quantization) {
     scheduler::jev::recordCoverageSkip("PW3.unroll", "block_quantization");

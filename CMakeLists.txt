@@ -1238,6 +1238,16 @@ if(BUILD_TEST)
     set_tests_properties(jev_alternate_numeric_pointwise_1d_cta_x${CTA_THREADS}
       PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   endforeach()
+  add_test(NAME jev_alternate_numeric_pointwise_unroll_u2
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site PW3.unroll --alternate u2
+      --gtest PointwiseTest.JevAlternateOneDimensionalCta_CUDA
+      --case-key jev_alternate_numeric_pointwise_unroll_u2)
+  set_tests_properties(jev_alternate_numeric_pointwise_unroll_u2
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(reduction
     "Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA" "RD")
   add_jev_remote_numeric_test(transpose

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Standalone, CPU-only protocol test: build with jev_client.cpp and -pthread.
 #include <scheduler/jev_client.h>
+#include <scheduler/pointwise_unroll_envelope.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -327,6 +328,38 @@ int main() {
                   "\",\"compute_event_index\":3,\"scheduler_type\":\"Reduction\"") !=
                   std::string::npos,
           "deterministic Record events changed Choice or compute sequencing");
+  const std::string decisions_before_unroll = readFile(path);
+  std::string record_unroll_id;
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "bounded pointwise unroll", {});
+    record_unroll_id = scope.invocationId();
+    const auto bypass =
+        nvfuser::pointwise::non_tma::getPointwiseUnrollEnvelope(100, 4096, 1, 3);
+    require(
+        bypass.model_limit == 2 && bypass.native_factor == 3 &&
+            !bypass.offer_choice,
+        "Record over-budget unroll did not preserve the native factor");
+    const auto offered =
+        nvfuser::pointwise::non_tma::getPointwiseUnrollEnvelope(100, 128, 4, 3);
+    require(
+        offered.model_limit == 16 && offered.native_factor == 3 &&
+            offered.offer_choice,
+        "Record in-budget unroll did not offer the bounded menu");
+    scope.complete("PointWise");
+  }
+  const std::string record_unroll_trace = readFile(compute_path);
+  require(
+      readFile(path) == decisions_before_unroll &&
+          record_unroll_trace.find(
+              "\"compute_invocation_id\":\"" + record_unroll_id +
+              "\",\"compute_event_index\":1,\"site\":\"PW3.unroll\",\"selected\":\"u3\",\"reason\":\"native factor exceeds bounded model resource envelope\",\"selection_source\":\"native_unroll\"") !=
+              std::string::npos &&
+          record_unroll_trace.find(
+              "\"compute_invocation_id\":\"" + record_unroll_id +
+              "\",\"compute_event_index\":2,\"scheduler_type\":\"PointWise\"") !=
+              std::string::npos,
+      "Record over-budget unroll emitted a Choice or lost its no_choice row");
   ::unsetenv("NVFUSER_JEV_CASE_KEY");
   const std::string before_link = readFile(path);
 
@@ -504,6 +537,32 @@ int main() {
                   "\",\"compute_event_index\":2,\"scheduler_type\":\"Reduction\"") !=
                   std::string::npos,
           "deterministic Remote event changed Choice or compute sequencing");
+  const std::string remote_decisions_before_unroll = readFile(path);
+  std::string remote_unroll_id;
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "remote bounded pointwise unroll", {});
+    remote_unroll_id = scope.invocationId();
+    const auto bypass =
+        nvfuser::pointwise::non_tma::getPointwiseUnrollEnvelope(100, 4096, 1, 3);
+    require(
+        bypass.model_limit == 2 && bypass.native_factor == 3 &&
+            !bypass.offer_choice,
+        "Remote over-budget unroll did not preserve the native factor");
+    scope.complete("PointWise");
+  }
+  const std::string remote_unroll_trace = readFile(compute_path);
+  require(
+      readFile(path) == remote_decisions_before_unroll &&
+          remote_unroll_trace.find(
+              "\"compute_invocation_id\":\"" + remote_unroll_id +
+              "\",\"compute_event_index\":1,\"site\":\"PW3.unroll\",\"selected\":\"u3\",\"reason\":\"native factor exceeds bounded model resource envelope\",\"selection_source\":\"native_unroll\"") !=
+              std::string::npos &&
+          remote_unroll_trace.find(
+              "\"compute_invocation_id\":\"" + remote_unroll_id +
+              "\",\"compute_event_index\":2,\"scheduler_type\":\"PointWise\"") !=
+              std::string::npos,
+      "Remote over-budget unroll emitted a Choice or lost its no_choice row");
   {
     FakeServer server(answer("bp2"));
     ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);

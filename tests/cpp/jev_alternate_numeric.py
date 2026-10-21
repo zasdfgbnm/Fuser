@@ -822,7 +822,8 @@ def check_alternate_report(report: dict[str, Any],
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected tile-dependent decisions: {issues}")
     elif require_pointwise_1d_cta:
-        from jev_shim import evaluate, parse_launch_1d_state, parse_unroll_state
+        from jev_shim import (analyze_unroll, evaluate, parse_launch_1d_state,
+                              parse_unroll_state)
 
         launch = parse_launch_1d_state(event["state"])
         if (site != "PW3.cta_1d" or event["native"] != "x128" or
@@ -833,20 +834,23 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("1D pointwise fixture lacks its complete CTA menu")
         before, after, dependent_issues = paired_state_rows(
             report, "PW3.unroll")
-        original = state_fields(before, "pointwise.unroll.v1")
-        selected = state_fields(after, "pointwise.unroll.v1")
+        original = state_fields(before, "pointwise.unroll.v2")
+        selected = state_fields(after, "pointwise.unroll.v2")
         for row, fields, threads, side in (
                 (before, original, 128, "record"),
                 (after, selected, int(alternate[1:]), "remote")):
             state = parse_unroll_state(row["request"]["state"])
             response, _ = evaluate(row["request"])
             blocks = (launch.n_elems // launch.vector_width + threads - 1) // threads
+            model_limit = min(max(1, blocks), 64, max(
+                1, 8192 // max(1, state.expr_count) // state.vector_width))
             if (state.break_point != 0 or state.bdimx != threads or
-                    state.range_low != 1 or state.range_high != blocks or
+                    state.range_low != 1 or state.range_high != model_limit or
+                    analyze_unroll(state).hard_max != model_limit or
                     row[side] != {"u1": 1} or
                     response["answers"]["PW3.unroll"]["choice"] != "u1" or
                     set(row["request"]["questions"]["PW3.unroll"]["criteria"]) !=
-                    {f"u{factor}" for factor in range(1, blocks + 1)}):
+                    {f"u{factor}" for factor in range(1, model_limit + 1)}):
                 raise ValueError("1D CTA did not reach a complete dependent unroll plan")
         if ({key: value for key, value in original.items()
              if key not in {"bdimx", "range_high"}} !=
@@ -860,6 +864,20 @@ def check_alternate_report(report: dict[str, Any],
                 raise ValueError(f"unrelated pointwise decision changed: {row}")
         if sorted(issues, key=str) != sorted([intended, *dependent_issues], key=str):
             raise ValueError(f"unexpected 1D CTA dependencies: {issues}")
+    elif site == "PW3.unroll":
+        from jev_shim import analyze_unroll, parse_unroll_state
+
+        state = parse_unroll_state(event["state"])
+        decision = analyze_unroll(state)
+        if (event["native"] != "u1" or alternate != "u2" or
+                state.break_point != 0 or state.n_elems != 16388 or
+                state.bdimx != 128 or state.vector_width != 4 or
+                state.range_low != 1 or
+                state.range_high != decision.hard_max or
+                set(event["candidates"]) != {
+                    f"u{factor}" for factor in range(1, decision.hard_max + 1)} or
+                issues != [intended]):
+            raise ValueError("1D pointwise unroll fixture lacks a bounded legal menu")
     elif site == "OP3.redu_unroll":
         if event["native"] != "r1" or set(event["candidates"]) != {
                 "r1", "r2", "r4"}:
