@@ -31,38 +31,6 @@ namespace {
 // Unused at the moment, commenting for clang tidy
 constexpr int64_t kThreadX = 128;
 
-// Shared model-visible invocation and device context for sequential
-// PointWise decisions. Capture happens at computeHeuristics entry, before any
-// scheduling mutation, and an unavailable/oversized snapshot fails closed.
-std::string semanticPointwiseWorkload(
-    int64_t sm_count,
-    const cudaDeviceProp* device) {
-  const auto snapshot = scheduler::jev::computeInvocationInputSnapshot();
-  NVF_ERROR(
-      !snapshot.empty(),
-      "PointWise semantic request has no complete computeHeuristics snapshot: ",
-      scheduler::jev::computeInvocationInputUnavailableReason());
-  std::string workload = "{\"fusion_and_runtime\":" +
-      scheduler::jev::jsonQuote(snapshot) +
-      ",\"snapshot_format\":\"nvfuser.compute_invocation_input.v1\"";
-  workload += ",\"hardware\":{\"sm_count\":" + std::to_string(sm_count) +
-      ",\"device_name\":" + scheduler::jev::jsonQuote(device->name) +
-      ",\"compute_capability_major\":" + std::to_string(device->major) +
-      ",\"compute_capability_minor\":" + std::to_string(device->minor) +
-      ",\"warp_size\":" + std::to_string(device->warpSize) +
-      ",\"max_threads_per_block\":" +
-      std::to_string(device->maxThreadsPerBlock) +
-      ",\"max_threads_per_sm\":" +
-      std::to_string(device->maxThreadsPerMultiProcessor) +
-      ",\"registers_per_sm\":" +
-      std::to_string(device->regsPerMultiprocessor) +
-      ",\"shared_memory_per_sm_bytes\":" +
-      std::to_string(device->sharedMemPerMultiprocessor) +
-      ",\"max_grid_x\":" + std::to_string(device->maxGridSize[0]) +
-      "}}";
-  return workload;
-}
-
 std::vector<TensorView*> getUniqueVectorizableInputs(
     const std::vector<TensorView*>& vectorizable_io_tvs) {
   std::vector<TensorView*> inputs;
@@ -474,7 +442,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
           "memory instruction count, register pressure, and available "
           "parallelism.\"";
       state += ",\"workload\":" +
-          semanticPointwiseWorkload(device_multiprocessor_count, device);
+          pointwise_utils::semanticPointwiseWorkload(
+              device_multiprocessor_count, device);
       state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
       state += ",\"breakpoint_analysis_requested\":" +
           std::string(analyze_2d_break_point ? "true" : "false");
@@ -629,7 +598,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
         state += ",\"objective\":\"Minimize expected runtime by choosing "
             "a legal 1D CTA thread count for this fusion; balance grid "
             "coverage, thread occupancy, wave count, and tail waste.\"";
-        state += ",\"workload\":" + semanticPointwiseWorkload(
+        state += ",\"workload\":" + pointwise_utils::semanticPointwiseWorkload(
             device_multiprocessor_count, dev_prop);
         state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
         state += ",\"breakpoint_analysis_requested\":" +

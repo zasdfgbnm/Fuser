@@ -7,6 +7,8 @@
 // clang-format on
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,6 +26,13 @@ class SchedulerRuntimeInfo;
 class HeuristicDataCache;
 
 namespace pointwise_utils {
+
+// Model-visible invocation and device context shared by ordinary PointWise
+// decisions. The caller supplies hardware; the complete fusion/runtime
+// snapshot is captured by the surrounding computeHeuristics scope.
+std::string semanticPointwiseWorkload(
+    int64_t sm_count,
+    const cudaDeviceProp* device);
 
 // Return reference tensor view.
 TensorView* getReferenceTensor(Fusion* fusion);
