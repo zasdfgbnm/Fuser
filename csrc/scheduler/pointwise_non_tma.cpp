@@ -31,6 +31,38 @@ namespace {
 // Unused at the moment, commenting for clang tidy
 constexpr int64_t kThreadX = 128;
 
+// Shared model-visible invocation and device context for sequential
+// PointWise decisions. Capture happens at computeHeuristics entry, before any
+// scheduling mutation, and an unavailable/oversized snapshot fails closed.
+std::string semanticPointwiseWorkload(
+    int64_t sm_count,
+    const cudaDeviceProp* device) {
+  const auto snapshot = scheduler::jev::computeInvocationInputSnapshot();
+  NVF_ERROR(
+      !snapshot.empty(),
+      "PointWise semantic request has no complete computeHeuristics snapshot: ",
+      scheduler::jev::computeInvocationInputUnavailableReason());
+  std::string workload = "{\"fusion_and_runtime\":" +
+      scheduler::jev::jsonQuote(snapshot) +
+      ",\"snapshot_format\":\"nvfuser.compute_invocation_input.v1\"";
+  workload += ",\"hardware\":{\"sm_count\":" + std::to_string(sm_count) +
+      ",\"device_name\":" + scheduler::jev::jsonQuote(device->name) +
+      ",\"compute_capability_major\":" + std::to_string(device->major) +
+      ",\"compute_capability_minor\":" + std::to_string(device->minor) +
+      ",\"warp_size\":" + std::to_string(device->warpSize) +
+      ",\"max_threads_per_block\":" +
+      std::to_string(device->maxThreadsPerBlock) +
+      ",\"max_threads_per_sm\":" +
+      std::to_string(device->maxThreadsPerMultiProcessor) +
+      ",\"registers_per_sm\":" +
+      std::to_string(device->regsPerMultiprocessor) +
+      ",\"shared_memory_per_sm_bytes\":" +
+      std::to_string(device->sharedMemPerMultiprocessor) +
+      ",\"max_grid_x\":" + std::to_string(device->maxGridSize[0]) +
+      "}}";
+  return workload;
+}
+
 std::vector<TensorView*> getUniqueVectorizableInputs(
     const std::vector<TensorView*>& vectorizable_io_tvs) {
   std::vector<TensorView*> inputs;
@@ -424,15 +456,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     const bool semantic = scheduler::jev::semanticProtocolEnabled();
     std::string state;
     if (semantic) {
-      // This is the entire state visible to a stateless System One model.
-      // The entry snapshot is never shortened to fit the HTTP limit. The
-      // client rejects a request exceeding 64 KiB in either active mode.
-      const auto snapshot = scheduler::jev::computeInvocationInputSnapshot();
-      NVF_ERROR(
-          !snapshot.empty(),
-          "PW3.width semantic request has no complete computeHeuristics "
-          "snapshot: ",
-          scheduler::jev::computeInvocationInputUnavailableReason());
+      // The client rejects a complete request exceeding 64 KiB; no snapshot
+      // is shortened to fit the HTTP limit.
       const auto* device = at::cuda::getCurrentDeviceProperties();
       const int64_t right_elems = bp_info.break_point > 0
           ? bp_info.right_elem_count
@@ -448,27 +473,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
           "fusion by choosing a legal per-thread vector width; balance "
           "memory instruction count, register pressure, and available "
           "parallelism.\"";
-      state += ",\"workload\":{\"fusion_and_runtime\":" +
-          scheduler::jev::jsonQuote(snapshot) +
-          ",\"snapshot_format\":\"nvfuser.compute_invocation_input.v1\"";
-      state += ",\"hardware\":{\"sm_count\":" +
-          std::to_string(device_multiprocessor_count) +
-          ",\"device_name\":" + scheduler::jev::jsonQuote(device->name) +
-          ",\"compute_capability_major\":" +
-          std::to_string(device->major) +
-          ",\"compute_capability_minor\":" +
-          std::to_string(device->minor) +
-          ",\"warp_size\":" + std::to_string(device->warpSize) +
-          ",\"max_threads_per_block\":" +
-          std::to_string(device->maxThreadsPerBlock) +
-          ",\"max_threads_per_sm\":" +
-          std::to_string(device->maxThreadsPerMultiProcessor) +
-          ",\"registers_per_sm\":" +
-          std::to_string(device->regsPerMultiprocessor) +
-          ",\"shared_memory_per_sm_bytes\":" +
-          std::to_string(device->sharedMemPerMultiprocessor) +
-          ",\"max_grid_x\":" + std::to_string(device->maxGridSize[0]) +
-          "}}";
+      state += ",\"workload\":" +
+          semanticPointwiseWorkload(device_multiprocessor_count, device);
       state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
       state += ",\"breakpoint_analysis_requested\":" +
           std::string(analyze_2d_break_point ? "true" : "false");
@@ -612,21 +618,85 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
             {"x" + std::to_string(candidate),
              "Use " + std::to_string(candidate) + " threads per 1D CTA"});
       }
-      std::string state = "pointwise.launch_1d.v1\n";
-      state += "n_elems=" + std::to_string(n_elems) + '\n';
-      state += "vector_width=" + std::to_string(vectorization_factor) + '\n';
-      state += "warp_size=" + std::to_string(warp_size) + '\n';
-      state += "max_threads_x=" +
-          std::to_string(dev_prop->maxThreadsDim[0]) + '\n';
-      state += "max_threads_per_block=" +
-          std::to_string(dev_prop->maxThreadsPerBlock) + '\n';
-      state += "max_threads_per_sm=" +
-          std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
-      state += "max_grid_x=" +
-          std::to_string(dev_prop->maxGridSize[0]) + '\n';
-      const auto selected = scheduler::jev::chooseDecision(
-          "PW3.cta_1d", state, options,
-          jev_mode == scheduler::jev::Mode::Record ? "x128" : "");
+      const bool semantic = scheduler::jev::semanticProtocolEnabled();
+      std::string state;
+      if (semantic) {
+        NVF_ERROR(
+            vectorization_factor > 0 && n_elems > 0 &&
+                device_multiprocessor_count > 0,
+            "PW3.cta_1d semantic request needs a valid partial schedule");
+        state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
+        state += ",\"objective\":\"Minimize expected runtime by choosing "
+            "a legal 1D CTA thread count for this fusion; balance grid "
+            "coverage, thread occupancy, wave count, and tail waste.\"";
+        state += ",\"workload\":" + semanticPointwiseWorkload(
+            device_multiprocessor_count, dev_prop);
+        state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
+        state += ",\"breakpoint_analysis_requested\":" +
+            std::string(analyze_2d_break_point ? "true" : "false") +
+            ",\"break_point\":0,\"right_elems\":" +
+            std::to_string(n_elems) +
+            ",\"vector_width\":" + std::to_string(vectorization_factor) +
+            ",\"vector_width_already_selected\":true,\"unroll\":\"pending\"}";
+        state += ",\"decision\":{\"kind\":\"cta_threads_1d\"";
+        state += ",\"n_elems\":" + std::to_string(n_elems) +
+            ",\"max_threads_x\":" +
+            std::to_string(dev_prop->maxThreadsDim[0]) +
+            ",\"candidates\":[";
+        const int64_t vector_iterations =
+            ceilDiv(n_elems, vectorization_factor);
+        for (size_t i = 0; i < options.size(); ++i) {
+          const int64_t threads = std::stoll(options[i].id.substr(1));
+          const int64_t grid_x = ceilDiv(vector_iterations, threads);
+          const int64_t blocks_per_sm =
+              dev_prop->maxThreadsPerMultiProcessor / threads;
+          if (i != 0) state += ',';
+          state += "{\"id\":\"x" + std::to_string(threads) +
+              "\",\"threads\":" + std::to_string(threads) +
+              ",\"vector_iterations\":" +
+              std::to_string(vector_iterations) +
+              ",\"grid_x_if_unrolled_one\":" +
+              std::to_string(grid_x) +
+              ",\"floor_divided_unroll_blocks\":" +
+              std::to_string(ceilDiv(n_elems / vectorization_factor, threads)) +
+              ",\"blocks_per_sm_thread_limit\":" +
+              std::to_string(blocks_per_sm) +
+              ",\"thread_limit_waves_if_unrolled_one\":" +
+              std::to_string(ceilDiv(
+                  grid_x, blocks_per_sm * device_multiprocessor_count)) +
+              ",\"tail_elements\":" +
+              std::to_string(n_elems % (vectorization_factor * threads)) +
+              ",\"symbolic_thread_split\":" +
+              std::string(threads == kThreadX ? "false" : "true") + '}';
+        }
+        state += "]}}";
+      } else {
+        state = "pointwise.launch_1d.v1\n";
+        state += "n_elems=" + std::to_string(n_elems) + '\n';
+        state += "vector_width=" + std::to_string(vectorization_factor) + '\n';
+        state += "warp_size=" + std::to_string(warp_size) + '\n';
+        state += "max_threads_x=" +
+            std::to_string(dev_prop->maxThreadsDim[0]) + '\n';
+        state += "max_threads_per_block=" +
+            std::to_string(dev_prop->maxThreadsPerBlock) + '\n';
+        state += "max_threads_per_sm=" +
+            std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
+        state += "max_grid_x=" +
+            std::to_string(dev_prop->maxGridSize[0]) + '\n';
+      }
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record ? "x128" : "";
+      const auto selected = semantic
+          ? scheduler::jev::chooseSemanticDecision(
+                "PW3.cta_1d", state,
+                "Choose the legal 1D CTA thread count for this fusion. "
+                "The vector width is already selected. Compare the listed "
+                "grid coverage, thread-limit waves and tails; unroll is "
+                "chosen later, so grid and waves are conditional previews. "
+                "Favor expected kernel runtime and return one listed CTA.",
+                options, native_choice)
+          : scheduler::jev::chooseDecision(
+                "PW3.cta_1d", state, options, native_choice);
       bool matched = false;
       for (const auto& option : options) {
         if (selected == option.id) {
