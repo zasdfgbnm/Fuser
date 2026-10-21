@@ -573,8 +573,15 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
           .get();
   const bool block_quantization = !block_quantization_ops.empty();
   const auto configured_jev_mode = scheduler::jev::mode();
+  const char* semantic_graph_reason = nullptr;
+  if (configured_jev_mode != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticProtocolEnabled() && !block_quantization) {
+    semantic_graph_reason = pointwise_utils::semanticPointwiseEligibilityReason(
+        fusion, scheduler::jev::computeInvocationInputSnapshot());
+  }
   std::optional<scheduler::jev::ScopedNativeDecisions> native_decisions;
-  if (block_quantization && configured_jev_mode != scheduler::jev::Mode::Off) {
+  if ((block_quantization || semantic_graph_reason != nullptr) &&
+      configured_jev_mode != scheduler::jev::Mode::Off) {
     native_decisions.emplace();
   }
 
@@ -630,6 +637,31 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
   }
 
   native_decisions.reset();
+  if (semantic_graph_reason != nullptr) {
+    const auto* pointwise = pparams->as<PointwiseParams>();
+    if (pointwise->use_tma_load) {
+      scheduler::jev::recordNoChoiceDecision(
+          "PW1", "tma", semantic_graph_reason, "native");
+    } else {
+      scheduler::jev::recordNoChoiceDecision(
+          "PW3.width",
+          "w" + std::to_string(pointwise->vectorization_factor),
+          semantic_graph_reason,
+          "native");
+      scheduler::jev::recordNoChoiceDecision(
+          pointwise->break_point > 0 ? "PW3.launch" : "PW3.cta_1d",
+          "x" + std::to_string(pointwise->lparams.bdimx()),
+          semantic_graph_reason,
+          "native");
+      scheduler::jev::recordNoChoiceDecision(
+          "PW3.unroll",
+          "u" + std::to_string(
+                    pointwise->unroll_factor_inner *
+                    pointwise->unroll_factor_outer),
+          semantic_graph_reason,
+          "native");
+    }
+  }
   if (block_quantization &&
       configured_jev_mode == scheduler::jev::Mode::Record) {
     const auto* pointwise = pparams->as<PointwiseParams>();

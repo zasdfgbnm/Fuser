@@ -11,6 +11,7 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "compute_at_map.h"
@@ -26,6 +27,13 @@ class SchedulerRuntimeInfo;
 class HeuristicDataCache;
 
 namespace pointwise_utils {
+
+// A null result means Fusion::print's visible loop axes can be bound to the
+// input runtime logical axes for the mock's strict PointWise graph subset.
+// Unsupported or unavailable context must retain the native schedule.
+const char* semanticPointwiseEligibilityReason(
+    Fusion* fusion,
+    std::string_view snapshot);
 
 // Model-visible invocation and device context shared by ordinary PointWise
 // decisions. The caller supplies hardware; the complete fusion/runtime

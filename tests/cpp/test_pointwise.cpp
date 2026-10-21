@@ -109,6 +109,69 @@ class DomainMapUnitTest : public scheduler_tools::DomainMap {
 
 } // namespace
 
+TEST_F(PointwiseTest, JevSemanticGraphEligibility) {
+  constexpr std::string_view snapshot = "complete invocation snapshot";
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  auto* other = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addInput(other);
+  auto* broadcasted = broadcast(input, {true, false});
+  fusion.addOutput(add(broadcasted, other));
+
+  // A normal broadcast may add a logical dimension without a hidden domain
+  // transform. It must remain available to the strict semantic graph path.
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(&fusion, snapshot),
+      nullptr);
+  EXPECT_STREQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(&fusion, {}),
+      "semantic_graph_snapshot_unavailable");
+  EXPECT_STREQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(8193, 'x')),
+      "semantic_graph_snapshot_too_large");
+}
+
+TEST_F(PointwiseTest, JevSemanticGraphRejectsHiddenTransformsAndOps) {
+  constexpr std::string_view snapshot = "complete invocation snapshot";
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(add(input, input));
+    input->split(0, 4);
+    EXPECT_NE(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, snapshot),
+        nullptr);
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(exp(input));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, snapshot),
+        "semantic_graph_unsupported_operator");
+  }
+}
+
+TEST_F(PointwiseTest, JevSemanticGraphAcceptsNoncontiguousInput) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input =
+      TensorViewBuilder().ndims(2).contiguity({false, true}).build();
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, "complete invocation snapshot"),
+      nullptr);
+}
+
 // A non-CTA-multiple extent exercises the 1D tail for every offered warp
 // count. The alternate numeric harness runs this with native x128 and forced
 // x32/x64 choices through the same scheduler and checks the ATen result.

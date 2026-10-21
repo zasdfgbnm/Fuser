@@ -22,6 +22,119 @@
 namespace nvfuser {
 namespace pointwise_utils {
 
+const char* semanticPointwiseEligibilityReason(
+    Fusion* fusion,
+    std::string_view snapshot) {
+  // The largest real 2D request is about 55 KiB after its 128 candidates are
+  // added. Keep enough room for that menu under the client's 64 KiB limit.
+  if (snapshot.empty()) {
+    return "semantic_graph_snapshot_unavailable";
+  }
+  if (snapshot.size() > 8192) {
+    return "semantic_graph_snapshot_too_large";
+  }
+  if (fusion == nullptr || fusion->inputs().empty() ||
+      fusion->outputs().empty()) {
+    return "semantic_graph_missing_tensors";
+  }
+  for (Val* input : fusion->inputs()) {
+    if (!input->isA<TensorView>()) {
+      return "semantic_graph_scalar_input";
+    }
+  }
+  for (Val* output : fusion->outputs()) {
+    if (!output->isA<TensorView>() ||
+        fusion->getOutputAlias(output).type != AllocationType::New) {
+      return "semantic_graph_output_or_alias";
+    }
+  }
+  // Fusion::print(false) renders loop domains, while ExpressionEvaluator
+  // binds runtime tensor dimensions to logical domains. The equality check
+  // must include intermediate TVs, not only fusion inputs and outputs.
+  for (Val* val : fusion->vals()) {
+    if (!val->isA<TensorView>()) {
+      continue;
+    }
+    const auto* tv = val->as<TensorView>();
+    const auto& logical = tv->getLogicalDomain();
+    const auto& loop = tv->getLoopDomain();
+    if (tv->hasDeviceMesh() || tv->isCpuScalar()) {
+      return "semantic_graph_sharded_or_cpu_scalar";
+    }
+    if (tv->getMemoryType() != MemoryType::Global &&
+        tv->getMemoryType() != MemoryType::Local) {
+      return "semantic_graph_memory_type";
+    }
+    if (tv->dtype() != DataType::Float && tv->dtype() != DataType::Half) {
+      return "semantic_graph_dtype";
+    }
+    if (logical.empty() || logical != loop ||
+        tv->getMaybeAllocationDomain() != logical ||
+        !tv->domain()->allExprs().empty()) {
+      return "semantic_graph_hidden_domain_transform";
+    }
+    for (size_t i = 0; i < logical.size(); ++i) {
+      const auto* id = logical[i];
+      if (id->isReduction() || id->isStride() || id->isSymbolic() ||
+          id->isDeviceDim() || id->hasExpandedExtent() ||
+          id->isParallelized() ||
+          (!id->isIteration() && !id->isBroadcast())) {
+        return "semantic_graph_unsupported_axis";
+      }
+    }
+    // Contiguity affects native vectorization limits, but does not change
+    // logical extents. Runtime sizes and strides are part of the snapshot;
+    // the semantic mock only derives extents and checks native summaries.
+    // BroadcastOp may introduce a logical axis, so root==logical is not
+    // required. Domain transforms are excluded by allExprs() above.
+  }
+  // IrPrinter emits exactly fusion->exprs(). Restrict this set to the mock's
+  // proven unary/binary/broadcast/set grammar; other ops stay native.
+  for (Expr* expr : fusion->exprs()) {
+    if (expr->isA<BroadcastOp>()) {
+      continue;
+    }
+    if (expr->isA<LoadStoreOp>()) {
+      const auto* op = expr->as<LoadStoreOp>();
+      if (op->opType() == LoadStoreOpType::Set &&
+          op->cacheOp() == CacheOp::Unspecified) {
+        continue;
+      }
+    }
+    if (expr->isA<UnaryOp>()) {
+      const auto* op = expr->as<UnaryOp>();
+      if (op->getUnaryOpType() == UnaryOpType::Neg ||
+          op->getUnaryOpType() == UnaryOpType::Erf ||
+          op->getUnaryOpType() == UnaryOpType::Tanh) {
+        if (op->out()->isA<TensorView>()) {
+          continue;
+        }
+      }
+      if (op->getUnaryOpType() == UnaryOpType::Cast &&
+          ((op->in()->dtype() == DataType::Half &&
+            op->out()->dtype() == DataType::Float) ||
+           (op->in()->dtype() == DataType::Float &&
+            op->out()->dtype() == DataType::Half) ||
+           (op->in()->isConstScalar() &&
+            op->out()->dtype() == DataType::Float))) {
+        continue;
+      }
+    }
+    if (expr->isA<BinaryOp>()) {
+      const auto* op = expr->as<BinaryOp>();
+      if (op->out()->isA<TensorView>() &&
+          (op->getBinaryOpType() == BinaryOpType::Add ||
+           op->getBinaryOpType() == BinaryOpType::Sub ||
+           op->getBinaryOpType() == BinaryOpType::Mul ||
+           op->getBinaryOpType() == BinaryOpType::Div)) {
+        continue;
+      }
+    }
+    return "semantic_graph_unsupported_operator";
+  }
+  return nullptr;
+}
+
 std::string semanticPointwiseWorkload(
     int64_t sm_count,
     const cudaDeviceProp* device) {
