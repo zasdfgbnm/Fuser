@@ -50,7 +50,7 @@ bool isExactSm89Add2x16Carrier(
       device->major != 8 || device->minor != 9 ||
       device->multiProcessorCount != 128 || device->warpSize != 32 ||
       prop.n_elems != 32 || prop.elem_counts != std::vector<int64_t>{2, 16} ||
-      prop.has_reshapes ||
+      prop.has_reshapes || prop.index_type != PrimDataType::Int32 ||
       prop.min_dtype_size_bit_for_vectorization != 32 ||
       prop.max_dtype_size_bit_for_vectorization != 32 ||
       fusion->inputs().size() != 1 || fusion->outputs().size() != 1 ||
@@ -102,6 +102,10 @@ bool isExactSm89Add2x16Carrier(
   if (!snapshot.starts_with("nvfuser.compute_invocation_input.v2\n")) {
     return false;
   }
+  if (snapshot.find("\nindex_type 11\ninputs 1\n") ==
+      std::string_view::npos) {
+    return false;
+  }
   const auto line_begin = snapshot.find("\ninput 0 ");
   const auto line_end = line_begin == std::string_view::npos
       ? std::string_view::npos
@@ -111,7 +115,7 @@ bool isExactSm89Add2x16Carrier(
               .find(
                   "input 0 dtype 5:float tensor scalar_type 6 device "
                   "6:cuda:0 storage_offset 0 sizes 2 2 16 strides 2 16 1 "
-                  "alignment_bits ") == std::string_view::npos) {
+                  "alignment_bits 128") == std::string_view::npos) {
     return false;
   }
   return runtime_info.getInputAllocationSizes(input) ==
@@ -763,8 +767,20 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   params->vectorization_factor = vectorization_factor;
 
   // Calculate block and grid configuration based on break point
+  const bool exact_add_continuation =
+      jev_mode != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticV3Enabled() && isExactSm89Add2x16Carrier(
+          fusion,
+          runtime_info,
+          prop,
+          at::cuda::getCurrentDeviceProperties());
   auto config = pointwise_utils::getBlockGridConfig(
-      prop, bp_info, vectorization_factor, kThreadX, block_quantization);
+      prop,
+      bp_info,
+      vectorization_factor,
+      kThreadX,
+      block_quantization,
+      exact_add_continuation);
 
   // Extract results
   break_point = config.break_point;
@@ -815,8 +831,6 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
       }
       const bool semantic = scheduler::jev::semanticProtocolEnabled();
       const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
-      const bool exact_add_continuation = semantic_v3 &&
-          isExactSm89Add2x16Carrier(fusion, runtime_info, prop, dev_prop);
       if (semantic_v3) {
         NVF_ERROR(
             vectorization_factor > 0 && n_elems > 0 &&

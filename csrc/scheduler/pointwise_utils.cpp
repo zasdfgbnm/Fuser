@@ -18,6 +18,7 @@
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/native_diagnostic_jsonl.h"
+#include "scheduler/pointwise_add_cta_continuation.h"
 #include "scheduler/registry.h"
 #include "scheduler/runtime_info.h"
 
@@ -685,7 +686,8 @@ BlockGridConfig getBlockGridConfig(
     const BreakPointInfo& bp_info,
     int64_t max_vect_factor,
     int64_t kThreadX,
-    bool block_quantization) {
+    bool block_quantization,
+    bool exact_add2x16_continuation) {
   BlockGridConfig result;
 
   // Copy break point information
@@ -776,8 +778,8 @@ BlockGridConfig getBlockGridConfig(
         }
       } else {
         if (semantic_v3) {
-          // Match the conditional v2 per-candidate preview. The later unroll
-          // and grid split remain decisions, not properties of this CTA menu.
+          // Preserve the v2 local preview. The exact Add carrier additionally
+          // carries a bounded formula for every downstream unroll leaf.
           for (auto& option : options) {
             const int64_t candidate = std::stoll(option.id.substr(1));
             const int64_t threads_y = kThreadX / candidate;
@@ -814,8 +816,71 @@ BlockGridConfig getBlockGridConfig(
                 ",\"idle_left_rows_last_cta\":" + std::to_string(idle_left) +
                 ",\"right_tail_elements_last_vector\":" +
                 std::to_string(tail_elements) +
-                ",\"unroll_status\":\"pending\","
-                "\"grid_split_status\":\"pending\"}";
+                ",\"unroll_status\":\"" +
+                (exact_add2x16_continuation ? "bounded_by_candidate"
+                                             : "pending") +
+                "\",\"grid_split_status\":\"" +
+                (exact_add2x16_continuation ? "none_for_carrier" : "pending") +
+                "\"}";
+            if (exact_add2x16_continuation) {
+              const auto continuation =
+                  pointwise::non_tma::addLaunch2DContinuation(
+                      cur_left_elem_count,
+                      result.right_elem_count,
+                      max_vect_factor,
+                      candidate,
+                      /*expression_count=*/1);
+              NVF_ERROR(
+                  continuation.has_value() &&
+                      continuation->threads_y == threads_y &&
+                      continuation->preliminary_grid_left == grid_left &&
+                      continuation->preliminary_grid_right == grid_right,
+                  "PW3.launch exact Add continuation differs from source "
+                  "preliminary geometry");
+              using scheduler::native_diagnostic::Object;
+              Object grammar;
+              grammar.add("schema", "nvfuser.pw3.launch.add2x16.v1");
+              grammar.add("plan_scope", "ordinary_pointwise_branch");
+              grammar.add("left_elems", cur_left_elem_count);
+              grammar.add("right_elems", result.right_elem_count);
+              grammar.add("vector_width", max_vect_factor);
+              grammar.add("threads_x", candidate);
+              grammar.add("threads_y", threads_y);
+              grammar.add("preliminary_grid_left", grid_left);
+              grammar.add("preliminary_grid_right", grid_right);
+              grammar.add(
+                  "unroll_total_blocks",
+                  continuation->preliminary_grid_left *
+                      continuation->preliminary_grid_right);
+              grammar.add("unroll_bound", continuation->unroll_bound);
+              grammar.add(
+                  "unroll_choices_kind",
+                  continuation->unroll_bound == 1 ? "no_choice"
+                                                  : "bounded_choice");
+              grammar.add("unroll_range_low", int64_t{1});
+              grammar.add("unroll_range_high", continuation->unroll_bound);
+              grammar.add(
+                  "unroll_bound_formula",
+                  "min(max(1,L*R),64,max(1,floor(8192/E/W)))");
+              grammar.add("post_unroll_right_formula", "ceil(R/U)");
+              grammar.add(
+                  "effective_grid_x_formula",
+                  result.flip_grid_binding ? "L" : "ceil(R/U)");
+              grammar.add(
+                  "effective_grid_y_formula",
+                  result.flip_grid_binding ? "ceil(R/U)" : "L");
+              grammar.add(
+                  "right_coverage_formula", "ceil(R/U)*X*W*U");
+              grammar.add("right_tail_formula", "right_coverage-16");
+              grammar.add("grid_split_status", "none_for_carrier");
+              option.consequence_json.pop_back();
+              option.consequence_json +=
+                  ",\"continuation\":" + grammar.str() +
+                  ",\"pending_choices\":" +
+                  (continuation->unroll_bound == 1
+                       ? std::string("[]}")
+                       : std::string("[\"PW3.unroll\"]}"));
+            }
           }
         }
         std::string state;
@@ -892,7 +957,8 @@ BlockGridConfig getBlockGridConfig(
           }
           state += "]}}";
         } else if (semantic_v3) {
-          state = "pointwise.launch.v2\n";
+          state = exact_add2x16_continuation ? "pointwise.launch.v3\n"
+                                             : "pointwise.launch.v2\n";
           state += "n_elems=" + std::to_string(n_elems) + '\n';
           state +=
               "right_elems=" + std::to_string(result.right_elem_count) + '\n';
@@ -913,8 +979,19 @@ BlockGridConfig getBlockGridConfig(
           state += "max_grid_x=" + std::to_string(device->maxGridSize[0]) + '\n';
           state += "max_grid_y=" + std::to_string(device->maxGridSize[1]) + '\n';
           state += "grid_y_split_threshold=65535\n";
-          state += "unroll_status=pending\n";
-          state += "grid_split_status=pending\n";
+          state += exact_add2x16_continuation
+              ? "unroll_status=bounded_by_candidate\n"
+              : "unroll_status=pending\n";
+          state += exact_add2x16_continuation
+              ? "grid_split_status=none_for_carrier\n"
+              : "grid_split_status=pending\n";
+          if (exact_add2x16_continuation) {
+            state += "carrier=sm89_fp32_add_2x16\n";
+            state += "expr_count=1\n";
+            state += "unroll_max_cap=64\n";
+            state += "unroll_expr_width_budget=8192\n";
+            state += "left_elems=2\n";
+          }
         } else {
           state = "pointwise.launch.v1\n";
           state += "n_elems=" + std::to_string(n_elems) + '\n';

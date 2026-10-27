@@ -1927,6 +1927,7 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     std::string row;
     std::string pw2_row;
     std::string cta_1d_row;
+    std::string launch_row;
     std::string unroll_row;
     bool saw_unroll_choice = false;
     while (std::getline(decision_log, row)) {
@@ -1937,6 +1938,10 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       if (row.rfind("{\"site\":\"PW3.cta_1d\",", 0) == 0) {
         ASSERT_TRUE(cta_1d_row.empty());
         cta_1d_row = row;
+      }
+      if (row.rfind("{\"site\":\"PW3.launch\",", 0) == 0) {
+        ASSERT_TRUE(launch_row.empty());
+        launch_row = row;
       }
       saw_unroll_choice |=
           row.rfind("{\"site\":\"PW3.unroll\",", 0) == 0;
@@ -2000,6 +2005,11 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       EXPECT_EQ(params->break_point, 0);
     }
 
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    const bool exact_carrier_device =
+        std::string_view(device->name) == "NVIDIA GeForce RTX 4090" &&
+        device->major == 8 && device->minor == 9 &&
+        device->multiProcessorCount == 128 && device->warpSize == 32;
     if (params->break_point == 0) {
       ASSERT_FALSE(cta_1d_row.empty());
       ASSERT_NE(results.kernel_executor, nullptr);
@@ -2016,11 +2026,6 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
           ::testing::HasSubstr(
               "\"tail_right_positions\":" +
               std::to_string(threads * width - 32)));
-      const auto* device = at::cuda::getCurrentDeviceProperties();
-      const bool exact_carrier_device =
-          std::string_view(device->name) == "NVIDIA GeForce RTX 4090" &&
-          device->major == 8 && device->minor == 9 &&
-          device->multiProcessorCount == 128 && device->warpSize == 32;
       if (exact_carrier_device) {
         EXPECT_THAT(
             cta_1d_row, ::testing::HasSubstr("pointwise.launch_1d.v2"));
@@ -2116,6 +2121,185 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       }
     }
 
+    if (params->break_point == 1) {
+      ASSERT_FALSE(launch_row.empty());
+      ASSERT_NE(results.kernel_executor, nullptr);
+      const int64_t width = params->vectorization_factor;
+      const int64_t x = params->lparams.bdimx();
+      const int64_t y = 128 / x;
+      const int64_t left = (2 + y - 1) / y;
+      const int64_t right_vectors = (16 + width - 1) / width;
+      const int64_t right = (right_vectors + x - 1) / x;
+      const int64_t u = params->unroll_factor_inner;
+      const int64_t final_right = (right + u - 1) / u;
+      const auto launch = results.kernel_executor->lastLaunchParams();
+      EXPECT_EQ(params->unroll_factor_outer, 1);
+      EXPECT_EQ(launch.bdimx(), x);
+      EXPECT_EQ(launch.bdimy(), y);
+      EXPECT_EQ(
+          launch.gdimx(), params->flip_grid_binding ? left : final_right);
+      EXPECT_EQ(
+          launch.gdimy(), params->flip_grid_binding ? final_right : left);
+      EXPECT_FALSE(params->split_grid_y_dim);
+      if (exact_carrier_device) {
+        EXPECT_THAT(launch_row, ::testing::HasSubstr("pointwise.launch.v3"));
+        EXPECT_LT(launch_row.size(), 8u * 1024u * 1024u);
+        for (int64_t offered_x = 1; offered_x <= 128; ++offered_x) {
+          const std::string offered_id =
+              "\"id\":\"x" + std::to_string(offered_x) + "\"";
+          const auto offered_begin = launch_row.find(offered_id);
+          ASSERT_NE(offered_begin, std::string::npos);
+          const auto offered_next = launch_row.find(
+              "\"id\":\"x", offered_begin + offered_id.size());
+          const std::string card =
+              launch_row.substr(offered_begin, offered_next - offered_begin);
+          const int64_t offered_y = 128 / offered_x;
+          const int64_t offered_left = (2 + offered_y - 1) / offered_y;
+          const int64_t offered_right =
+              (right_vectors + offered_x - 1) / offered_x;
+          const int64_t bound = offered_left * offered_right;
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"threads_x\":" + std::to_string(offered_x) +
+                  ",\"threads_y\":" + std::to_string(offered_y)));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"preliminary_grid_left\":" +
+                  std::to_string(offered_left) +
+                  ",\"preliminary_grid_right\":" +
+                  std::to_string(offered_right)));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"unroll_bound\":" + std::to_string(bound)));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"unroll_choices_kind\":\"" +
+                  std::string(bound == 1 ? "no_choice" : "bounded_choice") +
+                  "\""));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"effective_grid_x_formula\":\"" +
+                  std::string(
+                      params->flip_grid_binding ? "L" : "ceil(R/U)") +
+                  "\""));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"effective_grid_y_formula\":\"" +
+                  std::string(
+                      params->flip_grid_binding ? "ceil(R/U)" : "L") +
+                  "\""));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  bound == 1 ? "\"pending_choices\":[]"
+                             : "\"pending_choices\":[\"PW3.unroll\"]"));
+        }
+        const std::string selected_id =
+            "\"id\":\"x" + std::to_string(x) + "\"";
+        const auto begin = launch_row.find(selected_id);
+        ASSERT_NE(begin, std::string::npos);
+        const auto next =
+            launch_row.find("\"id\":\"x", begin + selected_id.size());
+        const std::string selected_card =
+            launch_row.substr(begin, next - begin);
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"unroll_bound\":" + std::to_string(left * right)));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"preliminary_grid_left\":" + std::to_string(left)));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"preliminary_grid_right\":" + std::to_string(right)));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"schema\":\"nvfuser.pw3.launch.add2x16.v1\""));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                left * right == 1
+                    ? "\"pending_choices\":[]"
+                    : "\"pending_choices\":[\"PW3.unroll\"]"));
+        if (left * right == 1) {
+          EXPECT_FALSE(saw_unroll_choice);
+          std::ifstream outcomes(outcome_path);
+          ASSERT_TRUE(outcomes.good());
+          outcomes.seekg(outcome_start);
+          bool saw_u1_no_choice = false;
+          while (std::getline(outcomes, row)) {
+            saw_u1_no_choice |=
+                row.find("\"kind\":\"no_choice\"") !=
+                    std::string::npos &&
+                row.find("\"site\":\"PW3.unroll\"") !=
+                    std::string::npos &&
+                row.find("\"selected\":\"u1\"") != std::string::npos;
+          }
+          EXPECT_TRUE(saw_u1_no_choice);
+        } else {
+          ASSERT_FALSE(unroll_row.empty());
+          const std::string unroll_id =
+              "\"id\":\"u" + std::to_string(u) + "\"";
+          const auto unroll_begin = unroll_row.find(unroll_id);
+          ASSERT_NE(unroll_begin, std::string::npos);
+          const auto unroll_next = unroll_row.find(
+              "\"id\":\"u", unroll_begin + unroll_id.size());
+          const std::string unroll_card =
+              unroll_row.substr(unroll_begin, unroll_next - unroll_begin);
+          scheduler::native_diagnostic::Object actual_plan;
+          actual_plan.add("tag", params->tag);
+          actual_plan.add("break_point", params->break_point);
+          actual_plan.add("split_block", params->split_block);
+          actual_plan.add("symbolic_1d_cta", params->symbolic_1d_cta);
+          actual_plan.add("split_grid_y_dim", params->split_grid_y_dim);
+          actual_plan.add("flip_grid_binding", params->flip_grid_binding);
+          actual_plan.add("vectorization_factor", params->vectorization_factor);
+          actual_plan.add("vectorize_casts", params->vectorize_casts);
+          actual_plan.add("unroll_factor_outer", params->unroll_factor_outer);
+          actual_plan.add("unroll_factor_inner", params->unroll_factor_inner);
+          actual_plan.add("use_tma_load", params->use_tma_load);
+          actual_plan.add("use_tma_store", params->use_tma_store);
+          actual_plan.add("tma_domain_inner", params->tma_domain_inner);
+          actual_plan.add("tma_tile_outer", params->tma_tile_outer);
+          actual_plan.add("tma_tile_inner", params->tma_tile_inner);
+          if (params->cparams.index_type.has_value()) {
+            actual_plan.add(
+                "index_type",
+                static_cast<int64_t>(*params->cparams.index_type));
+          } else {
+            actual_plan.addRaw("index_type", "null");
+          }
+          EXPECT_THAT(
+              unroll_card,
+              ::testing::HasSubstr(
+                  "\"final_pointwise_plan\":" + actual_plan.str()));
+          EXPECT_THAT(
+              unroll_card,
+              ::testing::HasSubstr(
+                  "\"effective_launch\":{\"grid_x\":" +
+                  std::to_string(launch.gdimx()) +
+                  ",\"grid_y\":" + std::to_string(launch.gdimy()) +
+                  ",\"grid_z\":1,\"block_x\":" + std::to_string(x) +
+                  ",\"block_y\":" + std::to_string(y) +
+                  ",\"block_z\":1}"));
+          EXPECT_THAT(
+              unroll_card,
+              ::testing::HasSubstr(
+                  "\"tail_right_positions\":" +
+                  std::to_string(final_right * x * width * u - 16)));
+        }
+      }
+    }
+
     // The forced bp1_normal/w1/x1 path makes PW3.unroll terminal for this
     // ordinary branch. Compare its selected effect with the physical launch,
     // since the heuristic's raw grid dimensions are intentionally unset.
@@ -2207,6 +2391,37 @@ TEST_F(PointwiseTest, AddCtaBoundedContinuation) {
   EXPECT_FALSE(addCtaContinuation(32, 8, 32, 1).has_value());
   EXPECT_FALSE(addCtaContinuation(32, 1, 16, 1).has_value());
   EXPECT_FALSE(addCtaContinuation(32, 1, 32, 2).has_value());
+}
+
+TEST_F(PointwiseTest, AddLaunch2DBoundedContinuation) {
+  using pointwise::non_tma::addLaunch2DContinuation;
+  for (const int64_t width : {1L, 2L, 4L}) {
+    int64_t terminal_count = 0;
+    for (int64_t x = 1; x <= 128; ++x) {
+      const auto c = addLaunch2DContinuation(2, 16, width, x, 1);
+      ASSERT_TRUE(c.has_value()) << width << ',' << x;
+      const int64_t y = 128 / x;
+      const int64_t left = (2 + y - 1) / y;
+      const int64_t right = ((16 + width - 1) / width + x - 1) / x;
+      EXPECT_EQ(c->threads_y, y);
+      EXPECT_EQ(c->preliminary_grid_left, left);
+      EXPECT_EQ(c->preliminary_grid_right, right);
+      EXPECT_EQ(c->unroll_bound, left * right);
+      for (int64_t u = 1; u <= c->unroll_bound; ++u) {
+        const int64_t final_right = (right + u - 1) / u;
+        EXPECT_EQ(c->rightGridAfterUnroll(u), final_right);
+        EXPECT_EQ(c->coveredRightPositions(x, width, u),
+                  final_right * x * width * u);
+        EXPECT_GE(c->coveredRightPositions(x, width, u), 16);
+        ++terminal_count;
+      }
+    }
+    EXPECT_EQ(terminal_count, width == 1 ? 237 : width == 2 ? 208 : 197);
+  }
+  EXPECT_FALSE(addLaunch2DContinuation(3, 16, 1, 1, 1).has_value());
+  EXPECT_FALSE(addLaunch2DContinuation(2, 16, 8, 1, 1).has_value());
+  EXPECT_FALSE(addLaunch2DContinuation(2, 16, 1, 129, 1).has_value());
+  EXPECT_FALSE(addLaunch2DContinuation(2, 16, 1, 1, 2).has_value());
 }
 
 TEST_F(PointwiseTest, AddCtaNonzeroStorageOffsetKeepsConditionalPreview_CUDA) {
