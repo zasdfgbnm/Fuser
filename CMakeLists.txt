@@ -1261,6 +1261,17 @@ if(BUILD_TEST)
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(reduction
     "Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA" "RD")
+  add_test(NAME jev_remote_numeric_inner3d_iter_unroll_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dEquivalentWavesRecordNative_CUDA
+      --case-key jev_remote_numeric_inner_three_d_iter_unroll_singleton
+      --site-prefix RD
+      --expect-no-choice RD5.iter_unroll=u1
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner3d_iter_unroll_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(transpose
     "TransposeTest.FusionScheduleTransposeSmall:Gpu3Test.JevTransposeFp16Inner3D12Ordinal11833_CUDA" "TR")
   add_test(NAME jev_alternate_numeric_transpose_cta

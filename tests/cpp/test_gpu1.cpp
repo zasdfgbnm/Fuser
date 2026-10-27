@@ -6200,7 +6200,17 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
     }
   } file_cleanup{log_path};
   ScopedJevEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
-  ScopedJevEnv log("NVFUSER_JEV_LOG", log_path);
+  // Keep the outer numeric harness's log path so it can compare the Record
+  // and Remote requests. Standalone GTest runs use a temporary local log.
+  std::optional<ScopedJevEnv> local_log;
+  const char* inherited_log = std::getenv("NVFUSER_JEV_LOG");
+  if (inherited_log == nullptr || *inherited_log == '\0') {
+    local_log.emplace("NVFUSER_JEV_LOG", log_path);
+  }
+  const std::string decision_log_path =
+      local_log.has_value() ? log_path : inherited_log;
+  const bool test_remote =
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote;
 
   Fusion fusion;
   FusionGuard fg(&fusion);
@@ -6208,43 +6218,65 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   fusion.addInput(input);
   fusion.addOutput(reductionOp(
       BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input));
-  const auto tensor = at::empty(
+  const auto tensor = at::randn(
       {4, 32, 128}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
   SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
   auto scheduler = SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
   std::unique_ptr<HeuristicParams> native;
-  std::unique_ptr<HeuristicParams> recorded;
   {
     ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
     native = scheduler->computeHeuristics(&fusion, runtime_info);
   }
-  {
-    ScopedJevEnv mode("NVFUSER_JEV_MODE", "record");
-    recorded = scheduler->computeHeuristics(&fusion, runtime_info);
-  }
+  auto results = [&] {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", test_remote ? "remote" : "record");
+    return scheduleAndRun(&fusion, SchedulerType::Reduction, {tensor});
+  }();
   ASSERT_NE(native, nullptr);
-  ASSERT_NE(recorded, nullptr);
-  EXPECT_EQ(native->toString(), recorded->toString());
+  ASSERT_NE(results.heuristic_params, nullptr);
+  EXPECT_EQ(native->toString(), results.heuristic_params->toString());
+  EXPECT_TRUE(results.heuristic_params->as<ReductionParams>()->schedule_3d);
+  auto reference = tensor.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
 
-  std::ifstream decision_log(log_path);
+  std::ifstream decision_log(decision_log_path);
   std::string row;
   bool saw_wave_request = false;
+  bool saw_iter_unroll_request = false;
   while (std::getline(decision_log, row)) {
     saw_wave_request |=
         row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
         row.find("\"request\":") != std::string::npos;
+    saw_iter_unroll_request |=
+        row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos;
   }
-  std::ifstream outcome_log(std::string(log_path) + ".outcome.jsonl");
-  bool saw_no_choice = false;
+  std::ifstream outcome_log(decision_log_path + ".outcome.jsonl");
+  bool saw_wave_no_choice = false;
+  bool saw_iter_unroll_no_choice = false;
   while (std::getline(outcome_log, row)) {
-    saw_no_choice |=
+    saw_wave_no_choice |=
         row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
         row.find("\"kind\":\"no_choice\"") != std::string::npos &&
         row.find("wave caps have equal block and thread targets") !=
             std::string::npos;
+    saw_iter_unroll_no_choice |=
+        row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos &&
+        row.find("\"selected\":\"u1\"") != std::string::npos &&
+        row.find("only one hard-legal iteration unroll factor") !=
+            std::string::npos;
   }
-  EXPECT_TRUE(saw_no_choice);
+  EXPECT_TRUE(saw_wave_no_choice);
+  EXPECT_TRUE(saw_iter_unroll_no_choice);
   EXPECT_FALSE(saw_wave_request);
+  EXPECT_FALSE(saw_iter_unroll_request);
 }
 
 // The wave cap changes the complete CTA: four waves target five outer

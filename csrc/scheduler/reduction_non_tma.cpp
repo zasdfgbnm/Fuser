@@ -1892,40 +1892,49 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         jev_mode_3d != scheduler::jev::Mode::Record ||
             iter_unroll_factor <= hard_limit,
         "RD5.iter_unroll native factor exceeds the bounded option set");
-    std::vector<scheduler::jev::ChoiceOption> options;
-    for (int64_t factor = 1; factor <= hard_limit; ++factor) {
-      options.push_back(
-          {"u" + std::to_string(factor),
-           "Unroll " + std::to_string(factor) + " output(s) per thread"});
-    }
-    const std::string state =
-        "reduction.inner3d_iter_unroll.v1\niteration_numel=" +
-        std::to_string(total_iteration_numel) +
-        "\nbdimy=" + std::to_string(bdimy) +
-        "\npre_unroll_godim=" + std::to_string(pre_unroll_godim) +
-        "\nmax_dtype_bits=" +
-        std::to_string(max_dtype_size_bit_for_vectorization) +
-        "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
-        "\ninner_unroll=" +
-        std::to_string(inner_reduction_unroll_factor) +
-        "\nouter_unroll=" +
-        std::to_string(outer_reduction_unroll_factor) +
-        "\nsm_count=" + std::to_string(device_multiprocessor_count);
-    const std::string native_choice =
-        jev_mode_3d == scheduler::jev::Mode::Record
-        ? "u" + std::to_string(iter_unroll_factor)
-        : "";
-    const auto selected = scheduler::jev::chooseDecision(
-        "RD5.iter_unroll", state, options, native_choice);
-    bool matched = false;
-    for (int64_t factor = 1; factor <= hard_limit; ++factor) {
-      if (selected == "u" + std::to_string(factor)) {
-        iter_unroll_factor = factor;
-        matched = true;
-        break;
+    if (hard_limit == 1) {
+      // A singleton has no performance decision for the API to make.
+      scheduler::jev::recordNoChoiceDecision(
+          "RD5.iter_unroll",
+          "u1",
+          "only one hard-legal iteration unroll factor",
+          "hard_legal_singleton");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t factor = 1; factor <= hard_limit; ++factor) {
+        options.push_back(
+            {"u" + std::to_string(factor),
+             "Unroll " + std::to_string(factor) + " output(s) per thread"});
       }
+      const std::string state =
+          "reduction.inner3d_iter_unroll.v1\niteration_numel=" +
+          std::to_string(total_iteration_numel) +
+          "\nbdimy=" + std::to_string(bdimy) +
+          "\npre_unroll_godim=" + std::to_string(pre_unroll_godim) +
+          "\nmax_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) +
+          "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+          "\ninner_unroll=" +
+          std::to_string(inner_reduction_unroll_factor) +
+          "\nouter_unroll=" +
+          std::to_string(outer_reduction_unroll_factor) +
+          "\nsm_count=" + std::to_string(device_multiprocessor_count);
+      const std::string native_choice =
+          jev_mode_3d == scheduler::jev::Mode::Record
+          ? "u" + std::to_string(iter_unroll_factor)
+          : "";
+      const auto selected = scheduler::jev::chooseDecision(
+          "RD5.iter_unroll", state, options, native_choice);
+      bool matched = false;
+      for (int64_t factor = 1; factor <= hard_limit; ++factor) {
+        if (selected == "u" + std::to_string(factor)) {
+          iter_unroll_factor = factor;
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "RD5.iter_unroll response exceeds native bounds");
     }
-    NVF_ERROR(matched, "RD5.iter_unroll response exceeds native bounds");
   }
 
   godim = ceilDiv(total_iteration_numel, bdimy * iter_unroll_factor);
