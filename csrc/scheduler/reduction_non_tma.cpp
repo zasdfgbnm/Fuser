@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <string>
@@ -158,7 +159,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     const int64_t n_tensor_inputs,
     const int64_t max_dtype_size_bit_for_vectorization,
     const int64_t max_vectorize_factor,
-    const bool has_mufu_computation) {
+    const bool has_mufu_computation,
+    const bool suppress_scheduler_debug = false) {
   // Get device properties
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
   const int64_t threads_per_warp = dev_prop->warpSize;
@@ -893,7 +895,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
       bdimy > 1 ? bdimy : LaunchParams::UNINITIALIZED_VAL,
       LaunchParams::UNINITIALIZED_VAL);
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (!suppress_scheduler_debug &&
+      isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << "\n===== Inner 2D Reduction Stats ========\n"
             << "total_reduction_numel: " << total_reduction_numel << "\n"
             << "total_iteration_numel: " << total_iteration_numel << "\n"
@@ -1157,6 +1160,36 @@ bool inner3dOuterUnrollPlanIsSafe(
   return true;
 }
 
+bool flat2DAlternativeLegal(
+    const int64_t total_reduction_numel,
+    const int64_t total_iteration_numel,
+    const int64_t n_tensor_inputs,
+    const int64_t max_dtype_size_bit_for_vectorization,
+    const size_t vectorize_factor,
+    const cudaDeviceProp& dev_prop) {
+  const int64_t max_threads_per_block = dev_prop.maxThreadsPerBlock;
+  const int64_t max_threads_per_sm = dev_prop.maxThreadsPerMultiProcessor;
+  const int64_t sm_count = dev_prop.multiProcessorCount;
+  return total_iteration_numel > 0 &&
+      total_iteration_numel <= scheduler_utils::y_grid_limit &&
+      512 <= max_threads_per_block &&
+      max_threads_per_block <= max_threads_per_sm &&
+      max_threads_per_sm <= 65536 && sm_count >= 1 && sm_count <= 65536 &&
+      max_dtype_size_bit_for_vectorization > 0 &&
+      max_dtype_size_bit_for_vectorization <= 128 &&
+      (max_dtype_size_bit_for_vectorization &
+       (max_dtype_size_bit_for_vectorization - 1)) == 0 &&
+      n_tensor_inputs > 0 &&
+      n_tensor_inputs <=
+          std::numeric_limits<int64_t>::max() /
+              max_dtype_size_bit_for_vectorization &&
+      vectorize_factor > 0 &&
+      vectorize_factor <= static_cast<size_t>(total_reduction_numel) &&
+      vectorize_factor <= static_cast<size_t>(std::max(
+          int64_t{1},
+          int64_t{128} / max_dtype_size_bit_for_vectorization));
+}
+
 std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     const int64_t total_reduction_numel,
     const int64_t total_iteration_numel,
@@ -1164,7 +1197,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     const int64_t n_tensor_inputs,
     const int64_t max_dtype_size_bit_for_vectorization,
     const size_t vectorize_factor,
-    const bool has_mufu_computation) {
+    const bool has_mufu_computation,
+    const bool suppress_scheduler_debug = false) {
   // Set some targets for parallelization
 
   const int64_t n_elems = total_reduction_numel * total_iteration_numel;
@@ -2174,7 +2208,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       bdimy > 1 ? bdimy : LaunchParams::UNINITIALIZED_VAL,
       bdimz > 1 ? bdimz : LaunchParams::UNINITIALIZED_VAL);
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (!suppress_scheduler_debug &&
+      isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << "\n===== Inner 3D Reduction Stats ========\n"
             << "total_reduction_numel: "
             << total_reduction_numel / inner_most_dimension_numel << " * "
@@ -2195,7 +2230,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     if (rparams->multiple_reds_per_blk &&
         (rparams->cross_grid_inner_reduction ||
          rparams->cross_grid_outer_reduction)) {
-      if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+      if (!suppress_scheduler_debug &&
+          isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
         debug() << "\n===== UNSUPPORTED REDUCTION HEURISTIC ========\n";
         debug() << rparams->multiple_reds_per_blk << ", "
                 << (rparams->unroll_factor_inner_reduction > 1) << ", "
@@ -2207,7 +2243,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           (int64_t)n_tensor_inputs,
           (int64_t)max_dtype_size_bit_for_vectorization,
           (int64_t)vectorize_factor,
-          has_mufu_computation);
+          has_mufu_computation,
+          suppress_scheduler_debug);
     }
   }
 
@@ -2223,25 +2260,13 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     const int64_t max_threads_per_block = dev_prop->maxThreadsPerBlock;
     const int64_t max_threads_per_sm = dev_prop->maxThreadsPerMultiProcessor;
     const int64_t sm_count = dev_prop->multiProcessorCount;
-    const bool flat2d_legal =
-        total_iteration_numel > 0 &&
-        total_iteration_numel <= scheduler_utils::y_grid_limit &&
-        512 <= max_threads_per_block &&
-        max_threads_per_block <= max_threads_per_sm &&
-        max_threads_per_sm <= 65536 && sm_count >= 1 && sm_count <= 65536 &&
-        max_dtype_size_bit_for_vectorization > 0 &&
-        max_dtype_size_bit_for_vectorization <= 128 &&
-        (max_dtype_size_bit_for_vectorization &
-         (max_dtype_size_bit_for_vectorization - 1)) == 0 &&
-        n_tensor_inputs > 0 &&
-        n_tensor_inputs <=
-            std::numeric_limits<int64_t>::max() /
-                max_dtype_size_bit_for_vectorization &&
-        vectorize_factor > 0 &&
-        vectorize_factor <= static_cast<size_t>(total_reduction_numel) &&
-        vectorize_factor <= static_cast<size_t>(std::max(
-            int64_t{1},
-            int64_t{128} / max_dtype_size_bit_for_vectorization));
+    const bool flat2d_legal = flat2DAlternativeLegal(
+        total_reduction_numel,
+        total_iteration_numel,
+        n_tensor_inputs,
+        max_dtype_size_bit_for_vectorization,
+        vectorize_factor,
+        *dev_prop);
     std::vector<scheduler::jev::ChoiceOption> options = {
         {"3d", "Keep the native inner and outer reduction axes"}};
     if (flat2d_legal) {
@@ -2278,7 +2303,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           n_tensor_inputs,
           max_dtype_size_bit_for_vectorization,
           static_cast<int64_t>(vectorize_factor),
-          has_mufu_computation);
+          has_mufu_computation,
+          suppress_scheduler_debug);
     }
   }
 
@@ -2357,6 +2383,76 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   }
 
   return rparams;
+}
+
+struct NativeInnerMappingPreviews {
+  std::unique_ptr<ReductionParams> three_d;
+  std::unique_ptr<ReductionParams> flat2d;
+};
+
+// These constructors use only their numeric inputs and device properties;
+// they do not receive or mutate Fusion, runtime_info, or data_cache. Preview
+// the native topology before any live RD5 Choice and suppress SchedulerDebug
+// for both the 3D plan and its possible unsupported-3D-to-2D fallback.
+NativeInnerMappingPreviews previewNativeInnerMapping(
+    const reduction_scheduler_utils::FusionRuntimeProperties& prop) {
+  scheduler::jev::ScopedNativeDecisions native_decisions;
+  NativeInnerMappingPreviews previews;
+  previews.three_d = inner3dReductionHeuristic(
+      prop.total_reduction_numel,
+      prop.total_iteration_numel,
+      prop.inner_most_dimension_numel,
+      (int64_t)prop.n_tensor_inputs,
+      (int64_t)prop.max_dtype_size_bit_for_vectorization,
+      prop.vectorize_factor,
+      prop.has_mufu_computation,
+      /*suppress_scheduler_debug=*/true);
+  if (previews.three_d->schedule_3d &&
+      flat2DAlternativeLegal(
+          prop.total_reduction_numel,
+          prop.total_iteration_numel,
+          (int64_t)prop.n_tensor_inputs,
+          (int64_t)prop.max_dtype_size_bit_for_vectorization,
+          prop.vectorize_factor,
+          *at::cuda::getCurrentDeviceProperties())) {
+    // The existing guard is conservative but does not prove the full 2D
+    // constructor succeeds. An unsuccessful optional preview must not change
+    // the current RD4 menu or the native Record result in this slice.
+    try {
+      previews.flat2d = inner2dReductionHeuristic(
+          prop.total_reduction_numel,
+          prop.total_iteration_numel,
+          (int64_t)prop.n_tensor_inputs,
+          (int64_t)prop.max_dtype_size_bit_for_vectorization,
+          (int64_t)prop.vectorize_factor,
+          prop.has_mufu_computation,
+          /*suppress_scheduler_debug=*/true);
+    } catch (const std::exception&) {
+      previews.flat2d.reset();
+    }
+  }
+  return previews;
+}
+
+bool sameNativeReductionPlan(
+    const ReductionParams& preview,
+    const ReductionParams& selected) {
+  if (preview.cparams.index_type != selected.cparams.index_type) {
+    return false;
+  }
+  // ReductionParams::sameAs uses CompileParams::operator==, which requires an
+  // index type. The runtime index analysis fills this only after the numeric
+  // heuristic returns. Normalize copies solely for the typed comparison.
+  auto preview_copy = preview;
+  auto selected_copy = selected;
+  if (!preview_copy.cparams.index_type.has_value()) {
+    preview_copy.cparams.index_type = DataType::Int;
+    selected_copy.cparams.index_type = DataType::Int;
+  }
+  return preview_copy.sameAs(&selected_copy) &&
+      nativeLaunchFields(preview.lparams) ==
+          nativeLaunchFields(selected.lparams) &&
+      preview.toString() == selected.toString();
 }
 
 struct OuterReductionParams {
@@ -3726,7 +3822,23 @@ std::unique_ptr<ReductionParams> reductionHeuristic(
           (int64_t)prop.vectorize_factor,
           prop.has_mufu_computation);
     } else {
-      return inner3dReductionHeuristic(
+      if (scheduler::jev::mode() != scheduler::jev::Mode::Record) {
+        return inner3dReductionHeuristic(
+            prop.total_reduction_numel,
+            prop.total_iteration_numel,
+            prop.inner_most_dimension_numel,
+            (int64_t)prop.n_tensor_inputs,
+            (int64_t)prop.max_dtype_size_bit_for_vectorization,
+            prop.vectorize_factor,
+            prop.has_mufu_computation);
+      }
+      const auto previews = previewNativeInnerMapping(prop);
+      if (previews.flat2d != nullptr) {
+        NVF_ERROR(
+            !previews.flat2d->schedule_3d,
+            "RD4 native flat2D preview retained a 3D topology");
+      }
+      auto selected = inner3dReductionHeuristic(
           prop.total_reduction_numel,
           prop.total_iteration_numel,
           prop.inner_most_dimension_numel,
@@ -3734,6 +3846,10 @@ std::unique_ptr<ReductionParams> reductionHeuristic(
           (int64_t)prop.max_dtype_size_bit_for_vectorization,
           prop.vectorize_factor,
           prop.has_mufu_computation);
+      NVF_ERROR(
+          sameNativeReductionPlan(*previews.three_d, *selected),
+          "RD4 native 3D preview differs from the live Record result");
+      return selected;
     }
 
   } else {
@@ -3749,6 +3865,17 @@ std::unique_ptr<ReductionParams> reductionHeuristic(
 }
 
 } // namespace
+
+std::array<int64_t, 7> nativeLaunchFields(const LaunchParams& params) {
+  return {
+      params.getRawVal(ParallelType::BIDx),
+      params.getRawVal(ParallelType::BIDy),
+      params.getRawVal(ParallelType::BIDz),
+      params.getRawVal(ParallelType::TIDx),
+      params.getRawVal(ParallelType::TIDy),
+      params.getRawVal(ParallelType::TIDz),
+      params.smem()};
+}
 
 Inner3DWaveTarget previewInner3DWaveTarget(
     int64_t n_elems,

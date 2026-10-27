@@ -7,6 +7,7 @@
 // clang-format on
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -17,6 +18,10 @@
 namespace nvfuser {
 namespace reduction {
 namespace non_tma {
+
+// LaunchParams::operator== omits the z dimensions. Native preview parity must
+// compare the complete launch, including shared-memory bytes.
+std::array<int64_t, 7> nativeLaunchFields(const LaunchParams& params);
 
 // Preview the two wave-dependent targets consumed by the remaining bounded
 // inner 3D planner. Equal targets give identical descendant CTA and grid menus.

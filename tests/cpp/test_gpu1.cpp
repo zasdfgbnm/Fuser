@@ -6299,6 +6299,26 @@ TEST(ReductionInner3DWaveTarget, DeduplicatesEquivalentCaps) {
         {2, 4, 8});
 }
 
+TEST(ReductionNativeLaunchFields, IncludesBothZDimensionsAndRawBindings) {
+  const LaunchParams baseline(4, 5, 6, 32, 4, 2);
+  const LaunchParams grid_z(4, 5, 7, 32, 4, 2);
+  const LaunchParams block_z(4, 5, 6, 32, 4, 3);
+  const LaunchParams unbound_z(4, 5, 6, 32, 4);
+  // The existing LaunchParams equality ignores both z fields. The preview
+  // signature must detect them and preserve unbound versus explicit binding.
+  EXPECT_EQ(baseline, grid_z);
+  EXPECT_EQ(baseline, block_z);
+  EXPECT_NE(
+      reduction::non_tma::nativeLaunchFields(baseline),
+      reduction::non_tma::nativeLaunchFields(grid_z));
+  EXPECT_NE(
+      reduction::non_tma::nativeLaunchFields(baseline),
+      reduction::non_tma::nativeLaunchFields(block_z));
+  EXPECT_NE(
+      reduction::non_tma::nativeLaunchFields(baseline),
+      reduction::non_tma::nativeLaunchFields(unbound_z));
+}
+
 TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   const auto* device = at::cuda::getCurrentDeviceProperties();
   if (device->multiProcessorCount != 128 ||
@@ -6351,6 +6371,13 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   }();
   ASSERT_NE(native, nullptr);
   ASSERT_NE(results.heuristic_params, nullptr);
+  EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+  EXPECT_EQ(
+      reduction::non_tma::nativeLaunchFields(native->lparams),
+      reduction::non_tma::nativeLaunchFields(results.heuristic_params->lparams));
+  EXPECT_EQ(
+      native->lparams.toString(),
+      results.heuristic_params->lparams.toString());
   EXPECT_EQ(native->toString(), results.heuristic_params->toString());
   EXPECT_TRUE(results.heuristic_params->as<ReductionParams>()->schedule_3d);
   auto reference = tensor.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
@@ -6368,7 +6395,17 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   std::string row;
   bool saw_wave_request = false;
   bool saw_iter_unroll_request = false;
+  std::vector<std::string> choice_sites;
   while (std::getline(decision_log, row)) {
+    if (row.rfind("{\"site\":\"", 0) == 0) {
+      const auto end = row.find('"', 9);
+      ASSERT_NE(end, std::string::npos);
+      const auto site = row.substr(9, end - 9);
+      EXPECT_EQ(std::find(choice_sites.begin(), choice_sites.end(), site),
+                choice_sites.end())
+          << site << " was emitted twice by the native preview";
+      choice_sites.push_back(site);
+    }
     saw_wave_request |=
         row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
         row.find("\"request\":") != std::string::npos;
@@ -6378,7 +6415,16 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   std::ifstream outcome_log(decision_log_path + ".outcome.jsonl");
   bool saw_wave_no_choice = false;
   bool saw_iter_unroll_no_choice = false;
+  int wave_no_choice_count = 0;
+  int iter_unroll_no_choice_count = 0;
   while (std::getline(outcome_log, row)) {
+    wave_no_choice_count +=
+        row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos;
+    iter_unroll_no_choice_count +=
+        row.find("\"site\":\"RD5.iter_unroll\"") !=
+            std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos;
     saw_wave_no_choice |=
         row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
         row.find("\"kind\":\"no_choice\"") != std::string::npos &&
@@ -6393,6 +6439,8 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   }
   EXPECT_TRUE(saw_wave_no_choice);
   EXPECT_TRUE(saw_iter_unroll_no_choice);
+  EXPECT_EQ(wave_no_choice_count, 1);
+  EXPECT_EQ(iter_unroll_no_choice_count, 1);
   EXPECT_FALSE(saw_wave_request);
   EXPECT_FALSE(saw_iter_unroll_request);
 }
