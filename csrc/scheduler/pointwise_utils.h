@@ -33,7 +33,8 @@ namespace pointwise_utils {
 // Unsupported or unavailable context must retain the native schedule.
 const char* semanticPointwiseEligibilityReason(
     Fusion* fusion,
-    std::string_view snapshot);
+    std::string_view snapshot,
+    bool semantic_v3 = false);
 
 // Model-visible invocation and device context shared by ordinary PointWise
 // decisions. The caller supplies hardware; the complete fusion/runtime

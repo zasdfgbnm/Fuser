@@ -575,9 +575,12 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
   const auto configured_jev_mode = scheduler::jev::mode();
   const char* semantic_graph_reason = nullptr;
   if (configured_jev_mode != scheduler::jev::Mode::Off &&
-      scheduler::jev::semanticProtocolEnabled() && !block_quantization) {
+      !block_quantization &&
+      (scheduler::jev::semanticProtocolEnabled() ||
+       scheduler::jev::semanticV3Enabled())) {
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
     semantic_graph_reason = pointwise_utils::semanticPointwiseEligibilityReason(
-        fusion, scheduler::jev::computeInvocationInputSnapshot());
+        fusion, scheduler::jev::computeInvocationInputSnapshot(), semantic_v3);
   }
   std::optional<scheduler::jev::ScopedNativeDecisions> native_decisions;
   if ((block_quantization || semantic_graph_reason != nullptr) &&
@@ -638,6 +641,7 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
 
   native_decisions.reset();
   if (semantic_graph_reason != nullptr) {
+    scheduler::jev::recordContextFallback(semantic_graph_reason);
     const auto* pointwise = pparams->as<PointwiseParams>();
     if (pointwise->use_tma_load) {
       scheduler::jev::recordNoChoiceDecision(

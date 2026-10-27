@@ -24,13 +24,14 @@ namespace pointwise_utils {
 
 const char* semanticPointwiseEligibilityReason(
     Fusion* fusion,
-    std::string_view snapshot) {
-  // The largest real 2D request is about 55 KiB after its 128 candidates are
-  // added. Keep enough room for that menu under the client's 64 KiB limit.
+    std::string_view snapshot,
+    bool semantic_v3) {
+  // v2 requests have a 64 KiB limit after candidates are added. v3 captures
+  // at most 1 MiB of invocation input and allows an 8 MiB complete request.
   if (snapshot.empty()) {
     return "semantic_graph_snapshot_unavailable";
   }
-  if (snapshot.size() > 8192) {
+  if (snapshot.size() > (semantic_v3 ? 1024 * 1024 : 8192)) {
     return "semantic_graph_snapshot_too_large";
   }
   if (fusion == nullptr || fusion->inputs().empty() ||

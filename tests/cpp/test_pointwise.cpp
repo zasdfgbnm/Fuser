@@ -135,6 +135,18 @@ TEST_F(PointwiseTest, JevSemanticGraphEligibility) {
       pointwise_utils::semanticPointwiseEligibilityReason(
           &fusion, std::string(8193, 'x')),
       "semantic_graph_snapshot_too_large");
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(8193, 'x'), true),
+      nullptr);
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(1024 * 1024, 'x'), true),
+      nullptr);
+  EXPECT_STREQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(1024 * 1024 + 1, 'x'), true),
+      "semantic_graph_snapshot_too_large");
 }
 
 TEST_F(PointwiseTest, JevIrMetadataV2CapturesPointwiseEligibilityFacts) {
@@ -275,6 +287,76 @@ TEST_F(PointwiseTest, JevSemanticGraphAcceptsNoncontiguousInput) {
       pointwise_utils::semanticPointwiseEligibilityReason(
           &fusion, "complete invocation snapshot"),
       nullptr);
+}
+
+TEST_F(PointwiseTest, JevSemanticV3UnsupportedGraphFallsBackBeforeChoice_CUDA) {
+  char log_path[] = "/tmp/nvfuser-pw3-unsupported-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+  ScopedTestEnv invalid_port("NVFUSER_JEV_PORT", "0");
+
+  Fusion unsupported;
+  FusionGuard fg(&unsupported);
+  auto* input = makeContigTensor(1);
+  unsupported.addInput(input);
+  unsupported.addOutput(exp(input));
+  const auto tensor = at::empty(
+      {16388}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&unsupported, {tensor});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::PointWise);
+  const auto compute = [&](const char* configured_mode) {
+    ScopedTestEnv mode("NVFUSER_JEV_MODE", configured_mode);
+    return scheduler->computeHeuristics(&unsupported, runtime_info);
+  };
+  const auto native = compute("off");
+  const auto recorded = compute("record");
+  const auto remote = compute("remote");
+  ASSERT_NE(native, nullptr);
+  ASSERT_NE(recorded, nullptr);
+  ASSERT_NE(remote, nullptr);
+  EXPECT_EQ(native->toString(), recorded->toString());
+  EXPECT_EQ(native->toString(), remote->toString());
+
+  std::ifstream log_file(log_path);
+  std::stringstream records;
+  records << log_file.rdbuf();
+  EXPECT_THAT(
+      records.str(), ::testing::HasSubstr("\"kind\":\"context_fallback\""));
+  EXPECT_THAT(
+      records.str(),
+      ::testing::HasSubstr(
+          "\"reason\":\"semantic_graph_unsupported_operator\""));
+  EXPECT_THAT(
+      records.str(), ::testing::Not(::testing::HasSubstr("\"request\":")));
+
+  Fusion supported;
+  FusionGuard supported_guard(&supported);
+  auto* supported_input = makeContigTensor(1);
+  supported.addInput(supported_input);
+  supported.addOutput(add(supported_input, supported_input));
+  SchedulerRuntimeInfo supported_info(&supported, {tensor});
+  {
+    ScopedTestEnv mode("NVFUSER_JEV_MODE", "remote");
+    try {
+      (void)scheduler->computeHeuristics(&supported, supported_info);
+      FAIL() << "Supported semantic-v3 graph bypassed the remote Choice";
+    } catch (const std::runtime_error& error) {
+      EXPECT_THAT(
+          error.what(),
+          ::testing::HasSubstr("NVFUSER_JEV_PORT must be an integer"));
+    }
+  }
 }
 
 // A non-CTA-multiple extent exercises the 1D tail for every offered warp
