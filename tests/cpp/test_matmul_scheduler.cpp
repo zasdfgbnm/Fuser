@@ -19,6 +19,7 @@
 #include "scheduler/all_schedulers.h"
 #include "scheduler/matmul_heuristic_plugin.h"
 #include "scheduler/matmul_heuristic_plugin_api.h"
+#include "scheduler/matmul_utils.h"
 #include "scheduler/mma_utils.h"
 #include "tests/cpp/utils.h"
 #include "validator_utils.h"
@@ -26,6 +27,39 @@
 namespace nvfuser {
 
 namespace {
+// CPU-only reproduction of a 64^3 Half x Half -> Float problem: the native
+// two-byte epilogue estimate admits this tile with one stage, but the actual
+// Float output reservation leaves no room for that stage.
+TEST(HopperTileStageBudgetTest, FloatOutputMustLeaveOneOperandStage) {
+  const GemmTile tile{128, 192, 256};
+  constexpr int64_t hopper_smem_bytes = 227328;
+  constexpr int64_t problem_extent = 64;
+  EXPECT_GE(tile.m, problem_extent);
+  EXPECT_GE(tile.n, problem_extent);
+  EXPECT_GE(tile.k, problem_extent);
+  const auto half_output = matmul_utils::defaultHopperTileStageBudget(
+      tile, hopper_smem_bytes, /*output_dtype_bytes_sum=*/2,
+      /*num_problems=*/1);
+  EXPECT_EQ(half_output.output_smem_reserve_bytes, 49152);
+  EXPECT_EQ(half_output.operand_stage_bytes, 163856);
+  EXPECT_EQ(half_output.max_operand_stages, 1);
+  EXPECT_LE(
+      half_output.operand_stage_bytes + half_output.output_smem_reserve_bytes,
+      hopper_smem_bytes);
+
+  const auto float_output = matmul_utils::defaultHopperTileStageBudget(
+      tile, hopper_smem_bytes, /*output_dtype_bytes_sum=*/4,
+      /*num_problems=*/1);
+  EXPECT_EQ(float_output.output_smem_reserve_bytes, 98304);
+  EXPECT_EQ(float_output.operand_stage_bytes, 163856);
+  EXPECT_EQ(float_output.max_operand_stages, 0);
+
+  const auto smaller_tile = matmul_utils::defaultHopperTileStageBudget(
+      GemmTile{64, 64, 64}, hopper_smem_bytes,
+      /*output_dtype_bytes_sum=*/4, /*num_problems=*/1);
+  EXPECT_EQ(smaller_tile.max_operand_stages, 12);
+}
+
 class MatmulSchedulerTest : public NVFuserTest {
  protected:
   MatmulSchedulerTest() : optimization_guard_(false) {}

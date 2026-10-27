@@ -310,6 +310,18 @@ void fillOptimalHopperTileSizes(
   const int64_t a_dtype_bytes = dataTypeSizeByte(as.front()->dtype());
   const int64_t b_dtype_bytes = dataTypeSizeByte(bs.front()->dtype());
   const int64_t output_dtype_bytes = dataTypeSizeByte(outs.front()->dtype());
+  int64_t output_dtype_bytes_sum = 0;
+  if (jev_tile_enabled) {
+    for (const TensorView* out : outs) {
+      const int64_t bytes = dataTypeSizeByte(out->dtype());
+      NVF_ERROR(
+          bytes > 0 &&
+              output_dtype_bytes_sum <=
+                  std::numeric_limits<int64_t>::max() - bytes,
+          "MM1 output dtype sizes exceed the bounded Choice analysis");
+      output_dtype_bytes_sum += bytes;
+    }
+  }
   const bool offer_low_stage_tiles =
       jev_tile_enabled && num_problems == 1 && as.size() == 1 &&
       bs.size() == 1 && outs.size() == 1 && epilogue_input_count == 0 &&
@@ -396,7 +408,10 @@ void fillOptimalHopperTileSizes(
             .instr = {64L, instr_n, 16L},
         };
         has_native_config |= native_valid;
-        if (jev_tile_enabled) {
+        if (jev_tile_enabled &&
+            defaultHopperTileStageBudget(
+                cfg.cta, smem_bytes, output_dtype_bytes_sum, num_problems)
+                    .max_operand_stages >= 1) {
           legal_configs.push_back(cfg);
         }
         if (!score_native || !native_valid) {
@@ -437,9 +452,13 @@ void fillOptimalHopperTileSizes(
     if (legal_configs.empty()) {
       if (jev_mode == scheduler::jev::Mode::Record) {
         scheduler::jev::recordCoverageSkip(
-            "MM1.tile", "no native-valid Hopper tile; preserved legacy fallback");
+            "MM1.tile",
+            has_native_config
+                ? "no Hopper tile leaves a positive actual operand stage; "
+                  "preserved legacy fallback"
+                : "no native-valid Hopper tile; preserved legacy fallback");
       } else {
-        NVF_ERROR(false, "MM1.tile has no native-valid Hopper tile");
+        NVF_ERROR(false, "MM1.tile has no positive-stage Hopper tile");
       }
     } else {
       const auto choice_id = [](const TileConfig& cfg) {
@@ -450,6 +469,8 @@ void fillOptimalHopperTileSizes(
       std::vector<scheduler::jev::ChoiceOption> options;
       options.reserve(legal_configs.size());
       for (const TileConfig& cfg : legal_configs) {
+        const auto budget = defaultHopperTileStageBudget(
+            cfg.cta, smem_bytes, output_dtype_bytes_sum, num_problems);
         options.push_back({
             choice_id(cfg),
             "CTA " + std::to_string(cfg.cta.m) + "x" +
@@ -460,10 +481,14 @@ void fillOptimalHopperTileSizes(
                 std::to_string(cfg.warp.k) + "; instruction " +
                 std::to_string(cfg.instr.m) + "x" +
                 std::to_string(cfg.instr.n) + "x" +
-                std::to_string(cfg.instr.k)});
+                std::to_string(cfg.instr.k) +
+                "; output SMEM reserve " +
+                std::to_string(budget.output_smem_reserve_bytes) +
+                " bytes; max operand stages " +
+                std::to_string(budget.max_operand_stages)});
       }
       const std::string state =
-          "matmul.hopper_tile.v2\nm_extent=" + std::to_string(m) +
+          "matmul.hopper_tile.v3\nm_extent=" + std::to_string(m) +
           "\nn_extent=" + std::to_string(n) +
           "\nk_extent=" + std::to_string(k) +
           "\nsm_count=" + std::to_string(num_sms) +
@@ -475,7 +500,10 @@ void fillOptimalHopperTileSizes(
           "\nepilogue_input_count=" + std::to_string(epilogue_input_count) +
           "\na_dtype_bytes=" + std::to_string(a_dtype_bytes) +
           "\nb_dtype_bytes=" + std::to_string(b_dtype_bytes) +
-          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes);
+          "\noutput_dtype_bytes=" + std::to_string(output_dtype_bytes) +
+          "\noutput_dtype_bytes_sum=" +
+          std::to_string(output_dtype_bytes_sum) +
+          "\nreserve_output_smem=1";
       const auto native_it = std::find_if(
           legal_configs.begin(), legal_configs.end(), [&](const TileConfig& cfg) {
             return cfg.cta.m == best_config.cta.m &&
@@ -486,7 +514,7 @@ void fillOptimalHopperTileSizes(
       if (jev_mode == scheduler::jev::Mode::Record &&
           native_it == legal_configs.end()) {
         scheduler::jev::recordCoverageSkip(
-            "MM1.tile", "legacy winner is outside the native-valid tile menu");
+            "MM1.tile", "legacy winner lacks a positive actual operand stage");
       } else {
         const std::string selected = scheduler::jev::chooseDecision(
             "MM1.tile",
@@ -1319,6 +1347,41 @@ MatmulParams::SupportedVectorization getSupportedVectorization(
 }
 
 } // anonymous namespace
+
+HopperTileStageBudget defaultHopperTileStageBudget(
+    const GemmTile& cta_tile,
+    int64_t smem_per_block_bytes,
+    int64_t output_dtype_bytes_sum,
+    size_t num_problems) {
+  NVF_ERROR(
+      cta_tile.m > 0 && cta_tile.n > 0 && cta_tile.k > 0 &&
+          smem_per_block_bytes >= 0 && output_dtype_bytes_sum > 0 &&
+          num_problems > 0,
+      "Default Hopper tile budget requires positive dimensions and dtypes");
+  constexpr int64_t max_int64 = std::numeric_limits<int64_t>::max();
+  const auto add = [](int64_t lhs, int64_t rhs) {
+    return lhs > max_int64 - rhs ? max_int64 : lhs + rhs;
+  };
+  const auto multiply = [](int64_t lhs, int64_t rhs) {
+    return lhs > max_int64 / rhs ? max_int64 : lhs * rhs;
+  };
+  if (num_problems > static_cast<size_t>(max_int64)) {
+    return {max_int64, max_int64, 0};
+  }
+  const int64_t output_reserve = multiply(
+      multiply(output_dtype_bytes_sum, cta_tile.m), cta_tile.n);
+  const int64_t operand_stage = add(
+      multiply(
+          multiply(
+              multiply(static_cast<int64_t>(num_problems), 2),
+              add(cta_tile.m, cta_tile.n)),
+          cta_tile.k),
+      16);
+  const int64_t stages = output_reserve <= smem_per_block_bytes
+      ? (smem_per_block_bytes - output_reserve) / operand_stage
+      : 0;
+  return {output_reserve, operand_stage, stages};
+}
 
 std::unique_ptr<MatmulParams> getMatmulHeuristics(
     Fusion* fusion,
