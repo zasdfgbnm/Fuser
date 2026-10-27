@@ -26,6 +26,7 @@
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/reduction.h"
+#include "scheduler/reduction_inner3d_iter_unroll_continuation.h"
 #include "scheduler/reduction_inner_remainder_choice.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
@@ -1900,41 +1901,78 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           "only one hard-legal iteration unroll factor",
           "hard_legal_singleton");
     } else {
-      std::vector<scheduler::jev::ChoiceOption> options;
-      for (int64_t factor = 1; factor <= hard_limit; ++factor) {
-        options.push_back(
-            {"u" + std::to_string(factor),
-             "Unroll " + std::to_string(factor) + " output(s) per thread"});
-      }
-      const std::string state =
-          "reduction.inner3d_iter_unroll.v1\niteration_numel=" +
-          std::to_string(total_iteration_numel) +
-          "\nbdimy=" + std::to_string(bdimy) +
-          "\npre_unroll_godim=" + std::to_string(pre_unroll_godim) +
-          "\nmax_dtype_bits=" +
-          std::to_string(max_dtype_size_bit_for_vectorization) +
-          "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
-          "\ninner_unroll=" +
-          std::to_string(inner_reduction_unroll_factor) +
-          "\nouter_unroll=" +
-          std::to_string(outer_reduction_unroll_factor) +
-          "\nsm_count=" + std::to_string(device_multiprocessor_count);
-      const std::string native_choice =
+      const int64_t native_factor = iter_unroll_factor;
+      const auto request = inner3d_iter_continuation::buildRequest(
+          {total_iteration_numel,
+           bdimy,
+           pre_unroll_godim,
+           max_dtype_size_bit_for_vectorization,
+           n_tensor_inputs,
+           inner_reduction_unroll_factor,
+           outer_reduction_unroll_factor,
+           device_multiprocessor_count,
+           total_reduction_numel,
+           inner_most_dimension_numel,
+           bdimx,
+           bdimz,
+           target_iterations,
+           target_blocks,
+           remainder_in_reduction,
+           remainder_in_inner_dim,
+           scheduler_utils::x_grid_limit,
+           scheduler_utils::y_grid_limit,
+           scheduler_utils::z_grid_limit},
+          hard_limit,
           jev_mode_3d == scheduler::jev::Mode::Record
-          ? "u" + std::to_string(iter_unroll_factor)
-          : "";
-      const auto selected = scheduler::jev::chooseDecision(
-          "RD5.iter_unroll", state, options, native_choice);
-      bool matched = false;
-      for (int64_t factor = 1; factor <= hard_limit; ++factor) {
-        if (selected == "u" + std::to_string(factor)) {
-          iter_unroll_factor = factor;
-          matched = true;
-          break;
+              ? std::optional<int64_t>{native_factor}
+              : std::nullopt);
+      if (request.candidates.size() == 1) {
+        scheduler::jev::recordNoChoiceDecision(
+            "RD5.iter_unroll",
+            "u" + std::to_string(native_factor),
+            "all iteration unroll factors realize the same grid plan",
+            "native_iteration_unroll");
+      } else {
+        std::vector<scheduler::jev::ChoiceOption> options;
+        options.reserve(request.candidates.size());
+        for (const auto& candidate : request.candidates) {
+          options.push_back(
+              {candidate.id, candidate.description, candidate.consequence_json});
         }
+        NVF_ERROR(
+            jev_mode_3d != scheduler::jev::Mode::Record ||
+                !request.native_choice.empty(),
+            "RD5.iter_unroll native grid plan is missing from the menu");
+        const auto selected = scheduler::jev::chooseDecision(
+            "RD5.iter_unroll",
+            request.state,
+            options,
+            request.native_choice);
+        const auto found = std::find_if(
+            request.candidates.begin(),
+            request.candidates.end(),
+            [&](const auto& candidate) { return selected == candidate.id; });
+        NVF_ERROR(
+            found != request.candidates.end(),
+            "RD5.iter_unroll response exceeds realized grid plans");
+        iter_unroll_factor = found->factor;
       }
-      NVF_ERROR(matched, "RD5.iter_unroll response exceeds native bounds");
     }
+  }
+
+  inner3d_iter_continuation::Plan selected_iter_plan{};
+  const bool check_iter_plan = jev_mode_3d != scheduler::jev::Mode::Off;
+  if (check_iter_plan) {
+    selected_iter_plan = inner3d_iter_continuation::preview(
+        {total_iteration_numel,
+         bdimy,
+         iter_unroll_factor,
+         target_blocks,
+         remainder_in_reduction,
+         remainder_in_inner_dim,
+         bdimx,
+         device_multiprocessor_count,
+         scheduler_utils::y_grid_limit});
   }
 
   godim = ceilDiv(total_iteration_numel, bdimy * iter_unroll_factor);
@@ -1984,13 +2022,25 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   // offer to one output per CTA and no output unroll, so neither plan can hit
   // the unsupported 3D fallback or change the grid-unroll rollback below.
   // The native grid construction above remains exact in Off and Record modes.
-  if (jev_mode_3d != scheduler::jev::Mode::Off &&
+  const bool rd5_grid_eligible =
+      jev_mode_3d != scheduler::jev::Mode::Off &&
       raw_inner_grid > gridim && gridim >= 1 &&
       raw_inner_grid <= 1024 && bdimy == 1 && grodim == 1 &&
       iter_unroll_factor == 1 && total_iteration_numel == godim &&
       godim >= 1 && godim <= scheduler_utils::y_grid_limit &&
       device_multiprocessor_count >= 1 &&
-      device_multiprocessor_count <= 256) {
+      device_multiprocessor_count <= 256;
+  if (check_iter_plan) {
+    NVF_ERROR(
+        godim == selected_iter_plan.pre_rollback_godim &&
+            raw_inner_grid == selected_iter_plan.raw_gridim &&
+            gridim == selected_iter_plan.clean_gridim &&
+            grodim == selected_iter_plan.grodim &&
+            rd5_grid_eligible == selected_iter_plan.rd5_grid_eligible,
+        "RD5.iter_unroll preview disagrees with grid continuation");
+  }
+  bool rd5_grid_selected_raw = false;
+  if (jev_mode_3d != scheduler::jev::Mode::Off && rd5_grid_eligible) {
     const std::string state =
         "reduction.inner3d_grid_wave.v1\nraw_inner_grid=" +
         std::to_string(raw_inner_grid) +
@@ -2012,6 +2062,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         "RD5.grid response exceeds native bounds");
     if (selected == "raw") {
       gridim = raw_inner_grid;
+      rd5_grid_selected_raw = true;
     }
   }
 
@@ -2024,6 +2075,15 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     }
     // This could mess up parallelization which could be redone, but that would
     // require iterating over this entire function.
+  }
+  if (check_iter_plan) {
+    NVF_ERROR(
+        iter_unroll_factor == selected_iter_plan.final_unroll &&
+            godim == selected_iter_plan.final_godim &&
+            gridim == (rd5_grid_selected_raw ? selected_iter_plan.raw_gridim
+                                             : selected_iter_plan.clean_gridim) &&
+            grodim == selected_iter_plan.grodim,
+        "RD5.iter_unroll preview disagrees with final grid plan");
   }
 
   auto rparams = std::make_unique<ReductionParams>();

@@ -8,6 +8,7 @@
 #include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
 #include <scheduler/reduction_inner_remainder_choice.h>
+#include <scheduler/reduction_inner3d_iter_unroll_continuation.h>
 #include <scheduler/reduction_tma_unroll_choice.h>
 
 #include <arpa/inet.h>
@@ -100,6 +101,96 @@ void testTmaTemporaryReadWidthContinuation() {
           byte_eight.hard_valid && byte_eight.tmp_write_width_seed == 16 &&
           byte_eight.tmp_write_choice_pending,
       "IOP2 selected w8 cannot reach a hard-valid w8/w16 write choice");
+}
+
+void testInner3dIterUnrollContinuation() {
+  using namespace nvfuser::reduction::non_tma::inner3d_iter_continuation;
+  const Input equivalent{512, 1, 1, 200, 16, 1, 32, 128, 65535};
+  std::vector<Candidate> same_plans;
+  for (int64_t factor : {1, 2, 4}) {
+    auto candidate = equivalent;
+    candidate.requested_unroll = factor;
+    same_plans.push_back({factor, preview(candidate)});
+    require(
+        same_plans.back().plan.final_unroll == 1 &&
+            same_plans.back().plan.final_godim == 512 &&
+            same_plans.back().plan.raw_gridim == 1 &&
+            same_plans.back().plan.grodim == 16 &&
+            !same_plans.back().plan.rd5_grid_eligible,
+        "RD5 u>1 rollback did not preserve the complete final grid plan");
+  }
+  const auto single = distinctCandidates(same_plans);
+  require(
+      single.size() == 1 && single.front().factor == 1,
+      "RD5 equivalence did not retain the canonical representative");
+
+  // Native u2 and u1 have the same realized plan, while u3 differs. The
+  // Record and Remote menus must both use the canonical IDs u1 and u3;
+  // Record maps native u2 to u1 without leaking its preference in the menu.
+  const StateFields mixed_classes{
+      257, 1, 257, 32, 1, 1, 1, 128, 1024, 128, 32, 1, 4, 32,
+      8,   8, 2147483647, 65535, 65535};
+  const auto record_request = buildRequest(mixed_classes, 3, 2);
+  const auto remote_request = buildRequest(mixed_classes, 3, std::nullopt);
+  require(
+      record_request.state == remote_request.state &&
+          record_request.state.find(
+              "reduction.inner3d_iter_unroll.v2\niteration_numel=257\n") ==
+              0 &&
+          record_request.candidates.size() == 2 &&
+          remote_request.candidates.size() == 2 &&
+          record_request.candidates[0].id == "u1" &&
+          record_request.candidates[1].id == "u3" &&
+          record_request.native_choice == "u1" &&
+          remote_request.native_choice.empty() &&
+          record_request.candidates[1].plan.clean_gridim == 7,
+      "RD5 Record/Remote state or IDs differ, or native u2 did not map to u1");
+  for (size_t i = 0; i < record_request.candidates.size(); ++i) {
+    require(
+        record_request.candidates[i].description ==
+                remote_request.candidates[i].description &&
+            record_request.candidates[i].consequence_json ==
+                remote_request.candidates[i].consequence_json,
+        "RD5 Record/Remote candidate bytes differ");
+  }
+
+  const Input trigger{512, 1, 1, 300, 1, 2, 32, 128, 65535};
+  auto trigger_u2 = trigger;
+  trigger_u2.requested_unroll = 2;
+  const auto before = preview(trigger);
+  const auto after = preview(trigger_u2);
+  require(
+      before.final_unroll == 1 && after.final_unroll == 1 &&
+          before.final_godim == after.final_godim &&
+          before.clean_gridim == 1 && after.clean_gridim == 2 &&
+          before.realizedSignature() != after.realizedSignature(),
+      "RD5 deduplicated factors that change the cross-grid trigger");
+
+  // Exact 3D Reduction CUDA witness {2,512,8193}: u2 rolls back to u1 but
+  // retains a six-way inner grid, whereas requested u1 has no inner grid.
+  const Input cuda_witness{512, 1, 1, 512, 6, 6, 384, 128, 65535};
+  auto cuda_u2_input = cuda_witness;
+  cuda_u2_input.requested_unroll = 2;
+  const auto cuda_u1 = preview(cuda_witness);
+  const auto cuda_u2 = preview(cuda_u2_input);
+  require(
+      cuda_u1.final_unroll == 1 && cuda_u2.final_unroll == 1 &&
+          cuda_u1.final_godim == 512 && cuda_u2.final_godim == 512 &&
+          cuda_u1.clean_gridim == 1 && cuda_u2.clean_gridim == 6 &&
+          cuda_u1.realizedSignature() != cuda_u2.realizedSignature(),
+      "RD5 real rollback witness lost its distinct six-way grid effect");
+
+  const Input pending_grid{3, 1, 1, 100, 64, 64, 32, 128, 65535};
+  auto pending_u2 = pending_grid;
+  pending_u2.requested_unroll = 2;
+  const auto grid_u1 = preview(pending_grid);
+  const auto grid_u2 = preview(pending_u2);
+  require(
+      grid_u1.raw_gridim == 64 && grid_u1.clean_gridim == 42 &&
+          grid_u1.rd5_grid_eligible && grid_u2.raw_gridim == 64 &&
+          grid_u2.clean_gridim == 64 && !grid_u2.rd5_grid_eligible &&
+          grid_u1.realizedSignature() != grid_u2.realizedSignature(),
+      "RD5 iteration factor removed a distinct later RD5.grid choice");
 }
 
 std::string readFile(const std::string& path) {
@@ -373,6 +464,7 @@ void testInnerOuterGridRowsAdmission() {
 int main() {
   testHopperLowStageMenu();
   testTmaTemporaryReadWidthContinuation();
+  testInner3dIterUnrollContinuation();
   testInnerRemainderPlateauScan();
   testInnerOuterGridRowsAdmission();
   using nvfuser::inner_outer_mode_preflight::Action;

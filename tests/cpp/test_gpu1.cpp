@@ -6387,6 +6387,97 @@ TEST_F(Gpu1Test, JevAlternateInner3dOuterUnroll_CUDA) {
       results.heuristic_params->lparams);
 }
 
+TEST_F(Gpu1Test, JevInner3dIterUnrollRollback_CUDA) {
+  char log_path[] = "/tmp/nvfuser-rd5-iter-rollback-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  std::optional<ScopedJevEnv> local_protocol;
+  const char* inherited_protocol = std::getenv("NVFUSER_JEV_PROTOCOL");
+  if (inherited_protocol == nullptr || *inherited_protocol == '\0') {
+    local_protocol.emplace("NVFUSER_JEV_PROTOCOL", "text-v1");
+  }
+  std::optional<ScopedJevEnv> local_log;
+  const char* inherited_log = std::getenv("NVFUSER_JEV_LOG");
+  if (inherited_log == nullptr || *inherited_log == '\0') {
+    local_log.emplace("NVFUSER_JEV_LOG", log_path);
+  }
+  const std::string decision_log_path =
+      local_log.has_value() ? log_path : inherited_log;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input));
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({2, 512, 8193}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler = SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_NE(native, nullptr);
+  EXPECT_EQ(native->toString(), results.heuristic_params->toString());
+  EXPECT_EQ(rparams->unroll_factor_outer_reduction, 2);
+  EXPECT_EQ(rparams->unroll_factor_iter_dom, 1);
+  EXPECT_EQ(rparams->lparams.gdimx(), 6);
+  EXPECT_TRUE(rparams->cross_grid_inner_reduction);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Off) {
+    std::ifstream decision_log(decision_log_path);
+    std::string row;
+    bool saw_selected_u2 = false;
+    while (std::getline(decision_log, row)) {
+      saw_selected_u2 |=
+          row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos &&
+          row.find("\"selected\":\"u2\"") != std::string::npos &&
+          row.find("reduction.inner3d_iter_unroll.v2") != std::string::npos;
+    }
+    EXPECT_TRUE(saw_selected_u2);
+    if (std::getenv("NVFUSER_JEV_PROTOCOL") != nullptr &&
+        std::string(std::getenv("NVFUSER_JEV_PROTOCOL")) == "semantic-v3") {
+      std::ifstream semantic_log(decision_log_path);
+      bool saw_distinct_grid_effects = false;
+      while (std::getline(semantic_log, row)) {
+        saw_distinct_grid_effects |=
+            row.find("\"site\":\"RD5.iter_unroll\"") !=
+                std::string::npos &&
+            row.find("\"clean_gridim\":1") != std::string::npos &&
+            row.find("\"clean_gridim\":6") != std::string::npos &&
+            row.find("\"final_unroll_if_clean\":1") !=
+                std::string::npos;
+      }
+      EXPECT_TRUE(saw_distinct_grid_effects);
+    }
+  }
+}
+
 // Hold the native 3D reduction block/grid plan fixed while the local API
 // chooses a smaller, still aligned vector width for its innermost axis.
 TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
