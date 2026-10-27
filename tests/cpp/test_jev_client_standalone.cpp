@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Standalone, CPU-only protocol test: build with jev_client.cpp and -pthread.
 #include <scheduler/jev_client.h>
+#include <scheduler/inner_outer_mode_preflight.h>
 #include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
 #include <scheduler/reduction_inner_remainder_choice.h>
@@ -267,6 +268,24 @@ void testInnerRemainderPlateauScan() {
 
 int main() {
   testInnerRemainderPlateauScan();
+  using nvfuser::inner_outer_mode_preflight::Action;
+  using nvfuser::inner_outer_mode_preflight::actionForValidWs;
+  using nvfuser::scheduler::jev::Mode;
+  require(
+      actionForValidWs(Mode::Record, false, false) ==
+          Action::PreserveNativeMultiwave,
+      "Record rejected its native multiwave plan after preview failure");
+  require(
+      actionForValidWs(Mode::Record, false, true) == Action::PreserveNativeWs,
+      "Record rejected its native WS plan after preview failure");
+  require(
+      actionForValidWs(Mode::Remote, false, false) == Action::RejectRemote &&
+          actionForValidWs(Mode::Remote, false, true) == Action::RejectRemote,
+      "Remote offered an unproved multiwave alternative");
+  require(
+      actionForValidWs(Mode::Record, true, false) == Action::OfferChoice &&
+          actionForValidWs(Mode::Remote, true, false) == Action::OfferChoice,
+      "hard-valid IOP1 alternatives lost their Choice");
   using nvfuser::scheduler::jev::ChoiceOption;
   using nvfuser::scheduler::jev::chooseDecision;
   const std::vector<ChoiceOption> options{{"bp0", "one dimensional"}, {"bp1", "split"}};

@@ -14,6 +14,7 @@
 #include "instrumentation.h"
 #include "options.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/inner_outer_mode_preflight.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/normalization_inner_outer_multi_wave.h"
 #include "scheduler/normalization_inner_outer_tma_ws.h"
@@ -745,14 +746,28 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
                 // An unconstructible plan is never offered to the model.
               }
             }
-            if (!multiwave_valid) {
+            const auto preflight_action =
+                inner_outer_mode_preflight::actionForValidWs(
+                    jev_mode, multiwave_valid, native_ws);
+            if (preflight_action !=
+                inner_outer_mode_preflight::Action::OfferChoice) {
               if (jev_mode == scheduler::jev::Mode::Record) {
                 scheduler::jev::recordCoverageSkip(
                     "IOP1.mode", "multiwave preflight fails hard bounds");
-                if (native_ws) {
-                  return makeWarpSpecialized(
-                      buffer_params, /*debug=*/true, /*choice=*/true);
-                }
+              }
+              if (preflight_action ==
+                  inner_outer_mode_preflight::Action::PreserveNativeWs) {
+                return makeWarpSpecialized(
+                    buffer_params, /*debug=*/true, /*choice=*/true);
+              }
+              if (preflight_action ==
+                  inner_outer_mode_preflight::Action::PreserveNativeMultiwave) {
+                // Replay Off's multiwave construction. Its conservative
+                // preview only gates a model comparison.
+                return makeMultiWave(
+                    multiwave_buffers,
+                    vectorize_factor,
+                    /*enable_jev_choice=*/false);
               }
               NVF_ERROR(false, "No hard-valid IOP1 multiwave alternative");
             }
