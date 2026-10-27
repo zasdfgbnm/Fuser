@@ -789,6 +789,7 @@ list(APPEND JIT_TEST_SRCS
   ${NVFUSER_ROOT}/tests/cpp/test_tensor_factories.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_tmem.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_transpose.cpp
+  ${NVFUSER_ROOT}/tests/cpp/test_transpose_virtual_axes.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_unary.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_utils.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_vectorization.cpp
@@ -1284,6 +1285,19 @@ if(BUILD_TEST)
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(transpose
     "TransposeTest.FusionScheduleTransposeSmall:Gpu3Test.JevTransposeFp16Inner3D12Ordinal11833_CUDA" "TR")
+  add_jev_remote_numeric_test(transpose_virtual_changed
+    "TransposeTest.FusionScheduleTransposeSmall" "TR" "TR1")
+  add_test(NAME jev_remote_numeric_transpose_virtual_one_wave_no_choice
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter TransposeTest.JevTransposeVirtualOneWaveNoChoice_CUDA
+      --case-key jev_remote_numeric_transpose_virtual_one_wave_no_choice
+      --site-prefix TR
+      --expect-no-choice TR1=original
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_transpose_virtual_one_wave_no_choice
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_transpose_cta
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

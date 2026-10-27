@@ -708,6 +708,30 @@ TEST_F(TransposeTest, FusionScheduleTransposeSmall) {
   testValidate(&fusion, cg_outputs, {input}, __LINE__, __FILE__);
 }
 
+// A complete wave already covers the small transpose. Record and Remote must
+// keep the original axes without sending the no-op TR1 option to the API.
+TEST_F(TransposeTest, JevTransposeVirtualOneWaveNoChoice_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto input_tv = makeContigTensor(3);
+  fusion.addInput(input_tv);
+  auto output_tv = cos(transpose(sin(input_tv), 1, 2));
+  fusion.addOutput(output_tv);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor input = at::randn({2, 16, 16}, options);
+  auto result = scheduleAndRun(
+      &fusion, SchedulerType::Transpose, {input}, /*validate_scheduler=*/false);
+  auto* params = dynamic_cast<TransposeParams*>(result.heuristic_params.get());
+  ASSERT_NE(params, nullptr);
+  EXPECT_TRUE(params->split_before_tiling.empty());
+  EXPECT_TRUE(params->dims_merged_with_1.empty());
+  EXPECT_TRUE(params->dims_merged_with_2.empty());
+  auto reference = input.sin().transpose(1, 2).cos();
+  testValidate(
+      &fusion, result.outputs, {input}, {reference}, __LINE__, __FILE__);
+}
+
 // Both original inner axes are exact multiples of the native 32x32 tile.
 // TR2.tile may select a 16x16 tile while all dependent parameters are rebuilt.
 TEST_F(TransposeTest, FusionScheduleTransposeTileChoice) {

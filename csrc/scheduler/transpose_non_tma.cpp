@@ -242,72 +242,82 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
         inner_most_pos1_in_ref1,
         inner_most_pos2_in_ref1);
   } else {
+    // Preview the exact source constructor without mutating the selected
+    // plan. Its one-wave return and already-satisfied axes can both make the
+    // nominal virtual option identical to the original-axis plan.
+    auto virtual_preview = std::make_unique<TransposeParams>();
+    virtual_preview->tile_size1 = tparams->tile_size1;
+    virtual_preview->tile_size2 = tparams->tile_size2;
+    utils::maybeBuildVirtualInnerDims(
+        virtual_preview.get(),
+        device_multiprocessor_count,
+        n_elems,
+        shape_in_ref1,
+        inner_most_pos1_in_ref1,
+        inner_most_pos2_in_ref1);
+    const bool virtual_changes_axes =
+        utils::hasSmallTransposeDimensions(virtual_preview);
     if (has_view) {
-      // Preserve the pre-existing unsupported combination even when a remote
-      // answer would otherwise request the original axes.
-      auto checked = std::make_unique<TransposeParams>();
-      checked->tile_size1 = tparams->tile_size1;
-      checked->tile_size2 = tparams->tile_size2;
-      utils::maybeBuildVirtualInnerDims(
-          checked.get(),
-          device_multiprocessor_count,
-          n_elems,
-          shape_in_ref1,
-          inner_most_pos1_in_ref1,
-          inner_most_pos2_in_ref1);
+      // Preserve the pre-existing unsupported view combination even when a
+      // remote answer would otherwise request the original axes.
       NVF_ERROR(
-          !utils::hasSmallTransposeDimensions(checked),
+          !virtual_changes_axes,
           "combination of view op with small transpose dimensions are not "
           "supported by transpose scheduler");
     }
 
-    std::string state = "transpose.virtual_axes.v1\nshape=";
-    for (size_t i = 0; i < shape_in_ref1.size(); ++i) {
-      if (i != 0) {
-        state += ',';
+    if (has_view || !virtual_changes_axes) {
+      scheduler::jev::recordNoChoiceDecision(
+          "TR1",
+          "original",
+          has_view ? "view_disallows_virtual_axes"
+                   : "virtual_axis_constructor_no_effect",
+          "native_axis_plan");
+    } else {
+      std::string state = "transpose.virtual_axes.v1\nshape=";
+      for (size_t i = 0; i < shape_in_ref1.size(); ++i) {
+        if (i != 0) {
+          state += ',';
+        }
+        state += std::to_string(shape_in_ref1[i]);
       }
-      state += std::to_string(shape_in_ref1[i]);
-    }
-    state += "\ninner1=" + std::to_string(inner_most_pos1_in_ref1);
-    state += "\ninner2=" + std::to_string(inner_most_pos2_in_ref1);
-    state += "\ntile1=" + std::to_string(tparams->tile_size1);
-    state += "\ntile2=" + std::to_string(tparams->tile_size2);
-    state += "\nsm_count=" + std::to_string(device_multiprocessor_count);
-    state += "\nn_elems=" + std::to_string(n_elems);
-    state += "\nhas_view=" + std::to_string(has_view);
+      state += "\ninner1=" + std::to_string(inner_most_pos1_in_ref1);
+      state += "\ninner2=" + std::to_string(inner_most_pos2_in_ref1);
+      state += "\ntile1=" + std::to_string(tparams->tile_size1);
+      state += "\ntile2=" + std::to_string(tparams->tile_size2);
+      state += "\nsm_count=" + std::to_string(device_multiprocessor_count);
+      state += "\nn_elems=" + std::to_string(n_elems);
+      state += "\nhas_view=" + std::to_string(has_view);
 
-    std::vector<scheduler::jev::ChoiceOption> options = {
-        {"original", "Tile the original inner axes"}};
-    if (!has_view) {
-      options.push_back(
-          {"virtual", "Construct the source-supported virtual inner axes"});
-    }
+      std::vector<scheduler::jev::ChoiceOption> options = {
+          {"original", "Tile the original inner axes"},
+          {"virtual", "Construct the source-supported virtual inner axes"}};
 
-    std::string native_choice;
-    if (jev_mode == scheduler::jev::Mode::Record) {
-      const int64_t wave_elements = device_multiprocessor_count *
-          std::min<int64_t>(shape_in_ref1[inner_most_pos1_in_ref1],
-                            tparams->tile_size1) *
-          std::min<int64_t>(shape_in_ref1[inner_most_pos2_in_ref1],
-                            tparams->tile_size2);
-      native_choice =
-          !has_view && wave_elements < n_elems ? "virtual" : "original";
-    }
-    const auto selected = scheduler::jev::chooseDecision(
-        "TR1", state, options, native_choice);
-    NVF_ERROR(
-        selected == "original" || (selected == "virtual" && !has_view),
-        "TR1 response is outside native hard bounds");
-    if (selected == "virtual") {
-      // The API chooses whether to request this complete native plan; it never
-      // supplies individual merge indices or split factors.
-      utils::maybeBuildVirtualInnerDims(
-          tparams.get(),
-          device_multiprocessor_count,
-          n_elems,
-          shape_in_ref1,
-          inner_most_pos1_in_ref1,
-          inner_most_pos2_in_ref1);
+      std::string native_choice;
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        const int64_t wave_elements = device_multiprocessor_count *
+            std::min<int64_t>(shape_in_ref1[inner_most_pos1_in_ref1],
+                              tparams->tile_size1) *
+            std::min<int64_t>(shape_in_ref1[inner_most_pos2_in_ref1],
+                              tparams->tile_size2);
+        native_choice = wave_elements < n_elems ? "virtual" : "original";
+      }
+      const auto selected = scheduler::jev::chooseDecision(
+          "TR1", state, options, native_choice);
+      NVF_ERROR(
+          selected == "original" || selected == "virtual",
+          "TR1 response is outside native hard bounds");
+      if (selected == "virtual") {
+        // The API chooses whether to request this complete native plan; it never
+        // supplies individual merge indices or split factors.
+        utils::maybeBuildVirtualInnerDims(
+            tparams.get(),
+            device_multiprocessor_count,
+            n_elems,
+            shape_in_ref1,
+            inner_most_pos1_in_ref1,
+            inner_most_pos2_in_ref1);
+      }
     }
   }
 
