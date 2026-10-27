@@ -5783,8 +5783,21 @@ TEST_F(Gpu1Test, JevAlternateOuterWidth_CUDA) {
   const auto options =
       at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
   at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  std::unique_ptr<HeuristicParams> native;
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+    SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+    auto scheduler =
+        SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
   auto results =
       scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  if (native != nullptr) {
+    ASSERT_NE(results.heuristic_params, nullptr);
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(native->lparams, results.heuristic_params->lparams);
+  }
   auto reference = aten_input.to(at::kDouble).sum({0});
   testValidate(
       &fusion,

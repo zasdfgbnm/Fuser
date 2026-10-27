@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -2401,6 +2402,23 @@ struct OuterReductionParams {
     return ss.str();
   }
 };
+
+// toString omits redu_serial, so use all of the source planner's fields when
+// checking that a native preview is identical to the live grid continuation.
+std::array<int64_t, 9> outerReductionFields(
+    const OuterReductionParams& params) {
+  return {
+      params.total_iteration_numel,
+      params.total_reduction_numel,
+      params.iter_unroll_factor,
+      params.bdimx,
+      params.gidim,
+      params.redu_unroll_factor,
+      params.bdimy,
+      params.grdim,
+      params.redu_serial};
+}
+
 // compare block reduction with grid reduction
 bool isBetterThan(
     const OuterReductionParams& block_params,
@@ -3395,6 +3413,33 @@ OuterReductionParams getGridOuterReduction(
   return selected == options.front().id ? baseline : stride;
 }
 
+// A native grid baseline for comparing the outer block and grid topologies.
+// The scope prevents the seven grid-only RD9 sites from producing speculative
+// Choice or trace events. This preview does not certify the later Remote
+// continuation, whose selected alternatives retain their own hard checks.
+OuterReductionParams previewNativeGridOuterReduction(
+    const int64_t total_reduction_numel,
+    const int64_t total_iteration_numel,
+    const int64_t n_tensor_inputs,
+    const int64_t max_dtype_size_bit_for_vectorization,
+    const int64_t vectorize_factor,
+    const int64_t max_unroll,
+    const int64_t sm_count,
+    const int64_t max_threads_per_sm,
+    const int64_t max_threads_per_block) {
+  scheduler::jev::ScopedNativeDecisions native_decisions;
+  return getGridOuterReduction(
+      total_reduction_numel,
+      total_iteration_numel,
+      n_tensor_inputs,
+      max_dtype_size_bit_for_vectorization,
+      vectorize_factor,
+      max_unroll,
+      sm_count,
+      max_threads_per_sm,
+      max_threads_per_block);
+}
+
 std::unique_ptr<ReductionParams> outerReductionHeuristic(
     const int64_t total_reduction_numel,
     const int64_t total_iteration_numel,
@@ -3553,6 +3598,22 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
     }
   }
 
+  // Check that the event-free native preview reproduces the same grid plan as
+  // the live Record path. RD8 still runs after the grid choices in this step.
+  std::optional<OuterReductionParams> native_grid_preview;
+  if (jev_mode == scheduler::jev::Mode::Record) {
+    native_grid_preview = previewNativeGridOuterReduction(
+        total_reduction_numel,
+        total_iteration_numel,
+        n_tensor_inputs,
+        max_dtype_size_bit_for_vectorization,
+        vectorize_factor,
+        max_unroll,
+        sm_count,
+        max_threads_per_sm,
+        max_threads_per_block);
+  }
+
   // block or grid reduction heuristic
   auto grid_params = getGridOuterReduction(
       total_reduction_numel,
@@ -3564,6 +3625,12 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
       sm_count,
       max_threads_per_sm,
       max_threads_per_block);
+  if (native_grid_preview.has_value()) {
+    NVF_ERROR(
+        outerReductionFields(*native_grid_preview) ==
+            outerReductionFields(grid_params),
+        "RD8 native grid preview differs from the live Record continuation");
+  }
 
   // block reduction heuristic
   auto block_params = getBlockOuterReduction(
