@@ -73,7 +73,8 @@ def trace_rows(path: Path, *, outcome: bool = False) -> list[dict[str, Any]]:
 def require_no_choice(
         report: dict[str, Any], trace_paths: tuple[Path, Path] | None,
         site: str, selected: str,
-        reasons: tuple[str, str] | None = None) -> None:
+        reasons: tuple[str, str] | None = None,
+        sources: tuple[str, str] | None = None) -> None:
     """Check a suppressed Choice in both source outcome streams."""
     choices = [row for row in report["multiplicity"] if row["site"] == site]
     if choices:
@@ -87,7 +88,9 @@ def require_no_choice(
                 rows[0].get("mode") != mode or
                 rows[0].get("selected") != selected or
                 (reasons is not None and
-                 rows[0].get("reason") != reasons[index])):
+                 rows[0].get("reason") != reasons[index]) or
+                (sources is not None and
+                 rows[0].get("selection_source") != sources[index])):
             raise ValueError(f"expected {mode} {site} no-choice {selected}: {rows}")
         if site == "RD5.iter_unroll":
             final = [row for row in outcomes if
@@ -308,7 +311,8 @@ def check_rd5_wave_dependency(
     # rather than sending a redundant model request.
     require_no_choice(
         report, trace_paths, "RD5.waves", "waves4",
-        ("wave caps have equal block and thread targets",) * 2)
+        ("wave caps have equal block and thread targets",) * 2,
+        ("native_four_wave_cap",) * 2)
     return []
 
 
@@ -1785,6 +1789,10 @@ def check_alternate_report(report: dict[str, Any],
         require_no_choice(
             report, trace_paths, "RD5.iter_unroll", "u1",
             ("only one hard-legal iteration unroll factor",) * 2)
+        require_no_choice(
+            report, trace_paths, "RD5.waves", "waves4",
+            ("wave caps have equal block and thread targets",) * 2,
+            ("native_four_wave_cap",) * 2)
         if issues != [intended]:
             raise ValueError(f"unexpected 3D CTA comparison issues: {issues}")
     elif require_inner3d_warp_target:
@@ -2673,6 +2681,10 @@ def check_alternate_report(report: dict[str, Any],
             report, trace_paths, "RD5.iter_unroll", "u1",
             ("only one hard-legal iteration unroll factor",
              "all iteration unroll factors realize the same grid plan"))
+        require_no_choice(
+            report, trace_paths, "RD5.waves", "waves4",
+            ("outside bounded 3D wave domain",) * 2,
+            ("native_four_wave_cap",) * 2)
         if trace_paths is not None:
             final_outer = []
             for path in trace_paths:
