@@ -36,6 +36,7 @@ namespace nvfuser::scheduler::jev {
 namespace {
 
 constexpr size_t kMaxRequest = 64 * 1024;
+constexpr size_t kMaxSemanticV3Request = 8 * 1024 * 1024;
 constexpr size_t kMaxResponse = 64 * 1024;
 constexpr size_t kMaxHeaders = 8 * 1024;
 constexpr auto kTimeout = std::chrono::milliseconds(2000);
@@ -325,8 +326,8 @@ std::chrono::milliseconds timeoutFromEnv() {
   return std::chrono::milliseconds(timeout_ms);
 }
 
-std::string post(std::string_view body) {
-  if (body.size() > kMaxRequest) fail("request exceeds 64 KiB");
+std::string post(std::string_view body, size_t max_request) {
+  if (body.size() > max_request) fail("request exceeds protocol size limit");
   Fd socket(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
   sockaddr_in address{};
   address.sin_family = AF_INET;
@@ -534,7 +535,19 @@ bool semanticProtocolEnabled() {
     return false;
   if (configured == "semantic-v2")
     return true;
-  fail("NVFUSER_JEV_PROTOCOL must be text-v1 or semantic-v2");
+  if (configured == "semantic-v3")
+    return false;
+  fail("NVFUSER_JEV_PROTOCOL must be text-v1, semantic-v2, or semantic-v3");
+}
+
+bool semanticV3Enabled() {
+  const std::string configured = env("NVFUSER_JEV_PROTOCOL");
+  if (configured.empty() || configured == "text-v1" ||
+      configured == "semantic-v2") {
+    return false;
+  }
+  if (configured == "semantic-v3") return true;
+  fail("NVFUSER_JEV_PROTOCOL must be text-v1, semantic-v2, or semantic-v3");
 }
 
 bool computeTraceEnabled() noexcept {
@@ -554,10 +567,12 @@ bool computeTraceEnabled() noexcept {
 
 ComputeHeuristicsScope::ComputeHeuristicsScope(
     std::string_view input_snapshot,
-    std::string_view input_snapshot_unavailable_reason) noexcept
+    std::string_view input_snapshot_unavailable_reason,
+    std::string_view hardware_json) noexcept
     : previous_(active_compute_scope),
       input_snapshot_(input_snapshot),
-      input_snapshot_unavailable_reason_(input_snapshot_unavailable_reason) {
+      input_snapshot_unavailable_reason_(input_snapshot_unavailable_reason),
+      hardware_json_(hardware_json) {
   // A disabled nested call still shadows its parent invocation.
   active_compute_scope = this;
   if (!computeTraceEnabled()) return;
@@ -596,6 +611,28 @@ std::string_view ComputeHeuristicsScope::inputSnapshotUnavailableReason()
     const noexcept {
   return active_compute_scope == this ? input_snapshot_unavailable_reason_
                                       : std::string_view("no_compute_scope");
+}
+
+std::string_view ComputeHeuristicsScope::hardwareJson() const noexcept {
+  return active_compute_scope == this ? hardware_json_ : std::string_view{};
+}
+
+std::string ComputeHeuristicsScope::priorChoicesJson() const {
+  if (active_compute_scope != this) fail("semantic-v3 compute scope is inactive");
+  std::string result = "[";
+  for (const auto& [site, selected] : prior_choices_) {
+    if (result.size() != 1) result += ',';
+    result += "{\"site\":" + quote(site) + ",\"choice\":" +
+        quote(selected) + '}';
+  }
+  return result + ']';
+}
+
+void ComputeHeuristicsScope::recordSelectedChoice(
+    std::string_view site,
+    std::string_view selected) {
+  if (active_compute_scope != this) fail("semantic-v3 compute scope is inactive");
+  prior_choices_.emplace_back(site, selected);
 }
 
 std::string_view computeInvocationInputSnapshot() noexcept {
@@ -674,6 +711,26 @@ void recordNoChoiceDecision(
   if (active_compute_scope != nullptr) {
     active_compute_scope->recordNoChoice(
         site, selected, reason, selection_source);
+  }
+}
+
+void recordContextFallback(std::string_view reason) noexcept {
+  try {
+    if (mode() == Mode::Off || !semanticV3Enabled() || reason.empty()) return;
+    std::string row =
+        "{\"schema\":\"nvfuser.jev.context_fallback.v1\","
+        "\"kind\":\"context_fallback\",\"site\":\"semantic-v3\","
+        "\"selected\":\"native\",\"reason\":" + quote(reason) +
+        ",\"mode\":" + quote(mode() == Mode::Record ? "record" : "remote") +
+        ",\"case_key\":" + quote(env("NVFUSER_JEV_CASE_KEY"));
+    if (active_compute_scope != nullptr &&
+        !active_compute_scope->invocationId().empty()) {
+      row += ",\"compute_invocation_id\":" +
+          quote(active_compute_scope->invocationId());
+    }
+    appendLog(row + '}');
+  } catch (...) {
+    // A diagnostic write failure must not change the native fallback.
   }
 }
 
@@ -761,6 +818,47 @@ void PointwiseRecordScope::complete(
   active_invocation.completed = true;
 }
 
+namespace {
+
+std::string semanticV3State(
+    std::string_view site,
+    std::string_view analysis_inputs,
+    const std::vector<const ChoiceOption*>& ordered_options) {
+  if (active_compute_scope == nullptr || analysis_inputs.empty()) {
+    fail("semantic-v3 requires a computeHeuristics scope and analysis inputs");
+  }
+  const auto snapshot = active_compute_scope->inputSnapshot();
+  const auto hardware = active_compute_scope->hardwareJson();
+  if (snapshot.empty() || !active_compute_scope->inputSnapshotUnavailableReason().empty() ||
+      hardware.empty()) {
+    fail("semantic-v3 requires a complete fusion/runtime and hardware snapshot");
+  }
+  if (JsonReader(hardware).parse().kind != Json::Kind::Object) {
+    fail("semantic-v3 hardware snapshot must be a JSON object");
+  }
+
+  std::string result =
+      "{\"schema\":\"nvfuser.systemone.context.v3\","
+      "\"verification_status\":\"analysis_summary_only\","
+      "\"objective\":\"Choose the listed schedule alternative expected "
+      "to minimize fusion kernel runtime on the described GPU.\","
+      "\"workload\":{\"snapshot_format\":"
+      "\"nvfuser.compute_invocation_input.v1\",\"fusion_and_runtime\":";
+  result += quote(snapshot) + ",\"hardware\":" + std::string(hardware);
+  result += "},\"current_schedule\":{\"prior_choices\":" +
+      active_compute_scope->priorChoicesJson() + "},\"decision\":{\"site\":" +
+      quote(site) + ",\"analysis_inputs_text\":" + quote(analysis_inputs) +
+      ",\"candidates\":[";
+  for (const auto* option : ordered_options) {
+    if (result.back() != '[') result += ',';
+    result += "{\"id\":" + quote(option->id) + ",\"description\":" +
+        quote(option->description) + '}';
+  }
+  return result + "]}}";
+}
+
+} // namespace
+
 std::string chooseDecisionImpl(
     std::string_view site,
     std::string_view state,
@@ -786,36 +884,66 @@ std::string chooseDecisionImpl(
     fail("native choice is not an allowed candidate");
   if (!active_invocation.id.empty() && active_invocation.completed)
     fail("Pointwise Choice followed a final Record outcome");
-  if (semantic && JsonReader(state).parse().kind != Json::Kind::Object)
+  const bool semantic_v3 = !semantic && semanticV3Enabled();
+  std::vector<const ChoiceOption*> ordered_options;
+  ordered_options.reserve(options.size());
+  for (const auto& option : options) ordered_options.push_back(&option);
+  if (semantic_v3) {
+    std::sort(
+        ordered_options.begin(),
+        ordered_options.end(),
+        [](const ChoiceOption* lhs, const ChoiceOption* rhs) {
+          return lhs->id < rhs->id;
+        });
+  }
+  const bool structured = semantic || semantic_v3;
+  const std::string state_json = semantic_v3
+      ? semanticV3State(site, state, ordered_options)
+      : semantic ? std::string(state) : quote(state);
+  if (structured && JsonReader(state_json).parse().kind != Json::Kind::Object)
     fail("semantic state must be a JSON object");
   const std::string log_case_key = case_key.empty()
       ? (active_invocation.id.empty() ? env("NVFUSER_JEV_CASE_KEY")
                                       : active_invocation.case_key)
       : std::string(case_key);
 
+  const std::string question_instructions = semantic
+      ? std::string(instructions)
+      : semantic_v3
+          ? "Choose the alternative expected to minimize fusion kernel "
+            "runtime. The state contains the full invocation snapshot, "
+            "hardware, prior choices, and local analysis inputs. "
+            "Candidate final plans are not yet independently verified; "
+            "do not assume missing effects. Return one listed ID."
+          : "Choose nvFuser scheduler decision " + std::string(site);
+
   // Keep the exact model-visible question in both local logs. In record mode
   // this is the request that the remote mode would have sent, without the
   // native winner; comparing it catches mismatched option descriptions too.
   std::string request = "{\"model\":\"jev-latest\",\"state\":" +
-      (semantic ? std::string(state) : quote(state)) +
+      state_json +
       ",\"questions\":{" + quote(site) + ":{\"type\":\"choice\",\"instructions\":" +
-      quote(semantic ? instructions
-                     : "Choose nvFuser scheduler decision " + std::string(site)) +
+      quote(question_instructions) +
       ",\"criteria\":{";
-  for (size_t i = 0; i < options.size(); ++i) {
+  for (size_t i = 0; i < ordered_options.size(); ++i) {
     if (i != 0) request += ',';
-    request += quote(options[i].id) + ':' + quote(options[i].description);
+    request += quote(ordered_options[i]->id) + ':' +
+        quote(ordered_options[i]->description);
   }
   request += "}}}}";
+  const size_t max_request =
+      semantic_v3 ? kMaxSemanticV3Request : kMaxRequest;
+  if (semantic_v3 && request.size() > max_request)
+    fail("complete semantic-v3 request exceeds 8 MiB; no snapshot was truncated");
   if (semantic && request.size() > kMaxRequest)
     fail("complete semantic request exceeds 64 KiB; no snapshot was truncated");
   std::string selected(native_choice);
   int64_t roundtrip_us = 0;
   if (current_mode == Mode::Remote) {
     const auto begin = Clock::now();
-    const std::string response = post(request);
+    const std::string response = post(request, max_request);
     roundtrip_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count();
-    selected = selectedFromResponse(response, site, options, semantic);
+    selected = selectedFromResponse(response, site, options, structured);
   }
   std::string candidates = "[";
   for (size_t i = 0; i < options.size(); ++i) {
@@ -837,12 +965,13 @@ std::string chooseDecisionImpl(
                  quote(compute_event.invocation_id) +
                  ",\"compute_event_index\":" +
                  std::to_string(compute_event.index)) +
-      ",\"state\":" + (semantic ? std::string(state) : quote(state)) +
+      ",\"state\":" + state_json +
       ",\"candidates\":" + candidates +
       ",\"request\":" + request +
       ",\"selected\":" + quote(selected) + ",\"mode\":" +
       quote(current_mode == Mode::Record ? "record" : "remote") +
       ",\"roundtrip_us\":" + std::to_string(roundtrip_us) + '}');
+  if (semantic_v3) active_compute_scope->recordSelectedChoice(site, selected);
   return selected;
 }
 

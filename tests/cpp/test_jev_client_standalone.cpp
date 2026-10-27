@@ -578,6 +578,80 @@ int main() {
                 width_options) == "w1",
             "semantic Codex model response was rejected");
   }
+  // semantic-v3 wraps every text Choice. It carries a full invocation
+  // snapshot, hardware, prior selections, and an honest verification marker.
+  ::setenv("NVFUSER_JEV_PROTOCOL", "semantic-v3", 1);
+  const std::string v3_hardware = "{\"sm_count\":128}";
+  const std::vector<ChoiceOption> reverse_options{
+      {"bp1", "split"}, {"bp0", "one dimensional"}};
+  ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  const std::string before_v3_record = readFile(path);
+  nvfuser::scheduler::jev::recordContextFallback("snapshot_too_large");
+  require(
+      readFile(path).find(
+          "\"schema\":\"nvfuser.jev.context_fallback.v1\","
+          "\"kind\":\"context_fallback\",\"site\":\"semantic-v3\","
+          "\"selected\":\"native\",\"reason\":\"snapshot_too_large\"") !=
+          std::string::npos,
+      "semantic-v3 native fallback was absent from the decision log");
+  {
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "complete fusion and runtime", {}, v3_hardware);
+    require(chooseDecision("PW2", state, reverse_options, "bp1") == "bp1",
+            "semantic-v3 Record changed native choice");
+    require(chooseDecision("PW2", state, reverse_options, "bp0") == "bp0",
+            "semantic-v3 prior selection changed native choice");
+  }
+  const auto v3_record = readFile(path).substr(before_v3_record.size());
+  require(v3_record.find("\"schema\":\"nvfuser.systemone.context.v3\"") !=
+                  std::string::npos &&
+              v3_record.find("\"verification_status\":\"analysis_summary_only\"") !=
+                  std::string::npos &&
+              v3_record.find("\"fusion_and_runtime\":\"complete fusion and runtime\"") !=
+                  std::string::npos &&
+              v3_record.find("\"hardware\":{\"sm_count\":128}") !=
+                  std::string::npos &&
+              v3_record.find("\"prior_choices\":[{\"site\":\"PW2\",\"choice\":\"bp1\"}]") !=
+                  std::string::npos &&
+              v3_record.find("\"criteria\":{\"bp0\":\"one dimensional\",\"bp1\":\"split\"}") !=
+                  std::string::npos &&
+              v3_record.find("\"native_choice\"") == std::string::npos,
+          "semantic-v3 envelope, history, or canonical candidate order failed");
+  {
+    bool rejected = false;
+    try { (void)chooseDecision("PW2", state, options, "bp0"); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "semantic-v3 accepted a Choice without compute context");
+  }
+  {
+    const std::string before_oversized = readFile(path);
+    const std::string oversized_snapshot(8 * 1024 * 1024, 'x');
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        oversized_snapshot, {}, v3_hardware);
+    bool rejected = false;
+    try { (void)chooseDecision("PW2", state, options, "bp0"); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected && readFile(path) == before_oversized,
+            "semantic-v3 request exceeding 8 MiB was sent or logged");
+  }
+  ::setenv("NVFUSER_JEV_MODE", "remote", 1);
+  {
+    FakeServer server(answer("bp1"));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    const std::string full_snapshot =
+        "begin snapshot " + std::string(70 * 1024, 'x') + " end snapshot";
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        full_snapshot, {}, v3_hardware);
+    require(chooseDecision("PW2", state, reverse_options) == "bp1",
+            "semantic-v3 rejected a complete request larger than 64 KiB");
+    const auto body_start = server.request().find("\r\n\r\n");
+    require(body_start != std::string::npos, "semantic-v3 HTTP body missing");
+    const auto body = server.request().substr(body_start + 4);
+    require(body.size() > 64 * 1024 &&
+                body.find("begin snapshot ") != std::string::npos &&
+                body.find(" end snapshot") != std::string::npos,
+            "semantic-v3 request was truncated to the old protocol limit");
+  }
   ::unsetenv("NVFUSER_JEV_PROTOCOL");
   const std::string remote_decisions_before_no_choice = readFile(path);
   std::string remote_no_choice_id;

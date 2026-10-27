@@ -28,6 +28,32 @@
 namespace nvfuser {
 
 namespace {
+std::string jevHardwareSnapshot() {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device == nullptr) return {};
+  scheduler::native_diagnostic::Object hardware;
+  hardware.add("sm_count", static_cast<int64_t>(device->multiProcessorCount));
+  hardware.add("device_name", device->name);
+  hardware.add("compute_capability_major", static_cast<int64_t>(device->major));
+  hardware.add("compute_capability_minor", static_cast<int64_t>(device->minor));
+  hardware.add("warp_size", static_cast<int64_t>(device->warpSize));
+  hardware.add(
+      "max_threads_per_block",
+      static_cast<int64_t>(device->maxThreadsPerBlock));
+  hardware.add(
+      "max_threads_per_sm",
+      static_cast<int64_t>(device->maxThreadsPerMultiProcessor));
+  hardware.add("registers_per_sm", static_cast<int64_t>(device->regsPerMultiprocessor));
+  hardware.add(
+      "shared_memory_per_sm_bytes",
+      static_cast<int64_t>(device->sharedMemPerMultiprocessor));
+  hardware.add("max_threads_x", static_cast<int64_t>(device->maxThreadsDim[0]));
+  hardware.add("max_threads_y", static_cast<int64_t>(device->maxThreadsDim[1]));
+  hardware.add("max_grid_x", static_cast<int64_t>(device->maxGridSize[0]));
+  hardware.add("max_grid_y", static_cast<int64_t>(device->maxGridSize[1]));
+  return hardware.str();
+}
+
 //! A Utility for checking both dynamic and static part of
 //!  can schedule
 bool checkCanSchedule(Fusion* fusion, SchedulerType scheduler_type) {
@@ -140,12 +166,23 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
     HeuristicDataCache* data_cache) {
   scheduler::compute_invocation_input::Snapshot input_snapshot;
   const bool trace_enabled = scheduler::jev::computeTraceEnabled();
-  const bool semantic_enabled =
-      scheduler::jev::mode() != scheduler::jev::Mode::Off &&
-      scheduler::jev::semanticProtocolEnabled();
+  const bool jev_active = scheduler::jev::mode() != scheduler::jev::Mode::Off;
+  const bool semantic_v2_enabled =
+      jev_active && scheduler::jev::semanticProtocolEnabled();
+  const bool semantic_v3_enabled =
+      jev_active && scheduler::jev::semanticV3Enabled();
+  const bool semantic_enabled = semantic_v2_enabled || semantic_v3_enabled;
   if (trace_enabled || semantic_enabled) {
     input_snapshot =
         scheduler::compute_invocation_input::capture(fusion, runtime_info);
+  }
+  std::string hardware_json;
+  if (semantic_v3_enabled && input_snapshot.available()) {
+    try {
+      hardware_json = jevHardwareSnapshot();
+    } catch (...) {
+      // A v3 request without hardware must not be sent to the model.
+    }
   }
   scheduler::jev::ComputeHeuristicsScope compute_scope(
       input_snapshot.text,
@@ -154,8 +191,25 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
           : (input_snapshot.available()
                  ? std::string_view{}
                  : scheduler::compute_invocation_input::reasonName(
-                       input_snapshot.reason)));
-  auto params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
+                       input_snapshot.reason)),
+      hardware_json);
+  std::unique_ptr<HeuristicParams> params;
+  if (semantic_v3_enabled &&
+      (!input_snapshot.available() || hardware_json.empty())) {
+    const std::string_view fallback_reason = !input_snapshot.available()
+        ? scheduler::compute_invocation_input::reasonName(input_snapshot.reason)
+        : "hardware_snapshot_unavailable";
+    scheduler::jev::recordNoChoiceDecision(
+        "semantic-v3",
+        "native",
+        fallback_reason,
+        "incomplete_context_gate");
+    scheduler::jev::recordContextFallback(fallback_reason);
+    scheduler::jev::ScopedNativeDecisions native_decisions;
+    params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
+  } else {
+    params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
+  }
   if (params != nullptr && scheduler::native_diagnostic::enabled()) {
     // All serialization, including a potentially throwing toString(), is
     // isolated from the native scheduler result.

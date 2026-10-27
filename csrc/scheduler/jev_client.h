@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace nvfuser::scheduler::jev {
@@ -28,10 +29,12 @@ class ScopedNativeDecisions final {
 // Reuse the client's JSON string escaping for local diagnostic snapshots.
 std::string jsonQuote(std::string_view value);
 
-// Opt in with NVFUSER_JEV_PROTOCOL=semantic-v2. The default preserves the
-// historical text-state experiment. A semantic request is one complete,
-// model-visible JSON state object; callers must not send a truncated snapshot.
+// semantic-v2 is the existing PointWise-specific structured protocol.
+// semantic-v3 wraps every text Choice with the complete compute invocation
+// snapshot, hardware, prior Choice selections, and an explicitly unverified
+// local analysis summary. Neither protocol truncates a request.
 bool semanticProtocolEnabled();
+bool semanticV3Enabled();
 std::string_view computeInvocationInputSnapshot() noexcept;
 std::string_view computeInvocationInputUnavailableReason() noexcept;
 
@@ -85,7 +88,8 @@ class ComputeHeuristicsScope final {
  public:
   ComputeHeuristicsScope(
       std::string_view input_snapshot,
-      std::string_view input_snapshot_unavailable_reason) noexcept;
+      std::string_view input_snapshot_unavailable_reason,
+      std::string_view hardware_json = {}) noexcept;
   ~ComputeHeuristicsScope() noexcept;
   ComputeHeuristicsScope(const ComputeHeuristicsScope&) = delete;
   ComputeHeuristicsScope& operator=(const ComputeHeuristicsScope&) = delete;
@@ -94,6 +98,9 @@ class ComputeHeuristicsScope final {
   std::string_view invocationId() const noexcept;
   std::string_view inputSnapshot() const noexcept;
   std::string_view inputSnapshotUnavailableReason() const noexcept;
+  std::string_view hardwareJson() const noexcept;
+  std::string priorChoicesJson() const;
+  void recordSelectedChoice(std::string_view site, std::string_view selected);
   uint64_t nextEventIndex() noexcept;
   void recordNoChoice(
       std::string_view site,
@@ -114,6 +121,8 @@ class ComputeHeuristicsScope final {
   ComputeHeuristicsScope* previous_ = nullptr;
   std::string_view input_snapshot_;
   std::string_view input_snapshot_unavailable_reason_;
+  std::string_view hardware_json_;
+  std::vector<std::pair<std::string, std::string>> prior_choices_;
   std::string invocation_id_;
   std::string case_key_;
   std::string mode_;
@@ -129,6 +138,10 @@ void recordNoChoiceDecision(
     std::string_view selected,
     std::string_view reason,
     std::string_view selection_source) noexcept;
+
+// A v3 invocation without its complete workload or hardware stays native.
+// Keep this explicit in the primary decision log even without an outcome log.
+void recordContextFallback(std::string_view reason) noexcept;
 
 // Pointwise Record uses a separate outcome JSONL so the existing Choice-only
 // decision log and its record/remote comparator keep their wire contract.
