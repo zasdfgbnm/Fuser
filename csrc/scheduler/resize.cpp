@@ -10,7 +10,10 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <array>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <string>
 #include <vector>
@@ -66,6 +69,237 @@ std::pair<TensorView*, int64_t> getLargestTensor(
     }
   }
   return std::make_pair(largest_tv, max_num_elms);
+}
+
+struct DirectPadReorderConsequences {
+  std::string skip;
+  std::string keep;
+};
+
+// Bind the two local reorder effects to a deliberately small graph subset.
+// The server independently derives the same facts from the v2 invocation
+// snapshot; this check merely prevents an unsupported graph from claiming
+// that the producer has a complete candidate preview.
+std::optional<DirectPadReorderConsequences> directPadReorderConsequencesUnchecked(
+    Fusion* fusion,
+    TensorView* reference,
+    TensorView* largest_input,
+    SchedulerRuntimeInfo& runtime_info,
+    int64_t width) {
+  if (!scheduler::jev::computeInvocationInputSnapshot().starts_with(
+          "nvfuser.compute_invocation_input.v2\n") ||
+      width < 1 || width > 128 || (width & (width - 1)) != 0 ||
+      fusion->inputs().size() != 1 || fusion->outputs().size() != 1 ||
+      fusion->allTvs().size() != 2 || fusion->exprs().size() != 1 ||
+      largest_input == nullptr || reference == nullptr ||
+      fusion->inputs().front() != largest_input ||
+      fusion->outputs().front() != reference) {
+    return std::nullopt;
+  }
+  auto* pad = dynamic_cast<PadOp*>(fusion->exprs().front());
+  if (pad == nullptr || pad->in() != largest_input ||
+      pad->out() != reference || pad->inputs().size() != 8 ||
+      pad->outputs().size() != 1 || !pad->value()->isConstScalar() ||
+      pad->value()->dtype() != DataType::Float ||
+      pad->getPaddedAxes() != std::vector<int64_t>{2}) {
+    return std::nullopt;
+  }
+  const auto& alias = fusion->getOutputAlias(reference);
+  if (alias.type != AllocationType::New || alias.aliased_io != nullptr ||
+      alias.visibility != OutputVisibility::kVisible) {
+    return std::nullopt;
+  }
+  const auto plain_tv = [](TensorView* tv, size_t domain_expr_count) {
+    if (tv->dtype() != DataType::Float ||
+        tv->getMemoryType() != MemoryType::Global || tv->hasDeviceMesh() ||
+        tv->isCpuScalar() || tv->getLogicalDomain().size() != 3 ||
+        tv->getLoopDomain() != tv->getLogicalDomain() ||
+        tv->domain()->allExprs().size() != domain_expr_count ||
+        tv->getContiguity().size() != 3 ||
+        !std::ranges::all_of(tv->getContiguity(), [](const auto& contiguous) {
+          return contiguous.has_value() && *contiguous;
+        })) {
+      return false;
+    }
+    return std::ranges::all_of(
+        tv->getLogicalDomain(), [](const IterDomain* axis) {
+          return axis->isIteration() && !axis->isReduction() &&
+              !axis->isBroadcast() && !axis->isStride() &&
+              !axis->isSymbolic() && !axis->isDeviceDim() &&
+              !axis->hasExpandedExtent() && !axis->isParallelized() &&
+              axis->extent()->isConstScalar();
+        });
+  };
+  if (!plain_tv(largest_input, 0) || !plain_tv(reference, 1) ||
+      fusion->vals().count(largest_input) == 0 ||
+      fusion->vals().count(reference) == 0 ||
+      !largest_input->hasAllocation() || reference->hasAllocation() ||
+      reference->getMaybeAllocationDomain() !=
+          reference->getLogicalDomain()) {
+    return std::nullopt;
+  }
+  const auto& input_axes = largest_input->getLogicalDomain();
+  const auto& allocation = largest_input->getMaybeAllocationDomain();
+  if (allocation.size() != 3 || allocation[0] != input_axes[1] ||
+      allocation[1] != input_axes[0] || allocation[2] != input_axes[2]) {
+    return std::nullopt;
+  }
+  const auto& output_axes = reference->getLogicalDomain();
+  if (output_axes[0]->definition() != nullptr ||
+      output_axes[1]->definition() != nullptr ||
+      output_axes[2]->definition() == nullptr ||
+      !output_axes[2]->definition()->isA<Resize>()) {
+    return std::nullopt;
+  }
+  const auto widths = pad->getPadWidths();
+  if (widths.size() != 6) {
+    return std::nullopt;
+  }
+  std::array<int64_t, 3> input_shape{}, output_shape{};
+  for (size_t axis = 0; axis < 3; ++axis) {
+    auto input_extent =
+        runtime_info.expressionEvaluator().evaluate(input_axes[axis]->extent());
+    auto output_extent =
+        runtime_info.expressionEvaluator().evaluate(output_axes[axis]->extent());
+    if (!input_extent.hasValue() || !output_extent.hasValue()) {
+      return std::nullopt;
+    }
+    input_shape[axis] = input_extent.as<int64_t>();
+    output_shape[axis] = output_extent.as<int64_t>();
+    if (input_shape[axis] <= 0 || output_shape[axis] <= 0) {
+      return std::nullopt;
+    }
+  }
+  int64_t right_pad = 0;
+  for (size_t index = 0; index < widths.size(); ++index) {
+    if (!widths[index]->isConstScalar() ||
+        widths[index]->dtype() != DataType::Index) {
+      return std::nullopt;
+    }
+    auto amount = runtime_info.expressionEvaluator().evaluate(widths[index]);
+    if (!amount.hasValue() || amount.as<int64_t>() < 0 ||
+        (index != 5 && amount.as<int64_t>() != 0)) {
+      return std::nullopt;
+    }
+    if (index == 5) {
+      right_pad = amount.as<int64_t>();
+    }
+  }
+  if (right_pad <= 0 || output_shape[0] != input_shape[0] ||
+      output_shape[1] != input_shape[1] ||
+      input_shape[2] > std::numeric_limits<int64_t>::max() - right_pad ||
+      output_shape[2] != input_shape[2] + right_pad ||
+      input_shape[2] % width != 0 || output_shape[2] % width != 0 ||
+      runtime_info.getAlignmentSizeBit(largest_input) <
+          static_cast<size_t>(width * 32)) {
+    return std::nullopt;
+  }
+  const auto checked_product = [](const std::array<int64_t, 3>& shape)
+      -> std::optional<int64_t> {
+    int64_t count = 1;
+    for (int64_t extent : shape) {
+      if (count > std::numeric_limits<int64_t>::max() / extent) {
+        return std::nullopt;
+      }
+      count *= extent;
+    }
+    return count;
+  };
+  const auto read_elements = checked_product(input_shape);
+  const auto write_elements = checked_product(output_shape);
+  if (!read_elements || !write_elements || *write_elements < *read_elements) {
+    return std::nullopt;
+  }
+  const auto& allocation_strides =
+      runtime_info.getInputAllocationStrides(largest_input);
+  if (allocation_strides.size() != 3) {
+    return std::nullopt;
+  }
+  std::array<int64_t, 3> read_strides{};
+  int64_t dense_stride = 1;
+  for (int64_t i = 2; i >= 0; --i) {
+    if (allocation_strides.at(i) != dense_stride) {
+      return std::nullopt;
+    }
+    const size_t logical_axis = i == 0 ? 1 : i == 1 ? 0 : 2;
+    read_strides[logical_axis] = dense_stride;
+    if (dense_stride >
+        std::numeric_limits<int64_t>::max() / input_shape[logical_axis]) {
+      return std::nullopt;
+    }
+    dense_stride *= input_shape[logical_axis];
+  }
+  // The v2 snapshot exposes ATen's storage offset and logical strides.
+  // SchedulerRuntimeInfo's allocation strides alone do not prove either.
+  const auto& input_value =
+      runtime_info.expressionEvaluator().evaluate(largest_input);
+  if (!input_value.is<at::Tensor>()) {
+    return std::nullopt;
+  }
+  const auto& tensor = input_value.as<at::Tensor>();
+  if (!tensor.defined() || !tensor.is_cuda() ||
+      tensor.scalar_type() != at::kFloat || tensor.storage_offset() != 0 ||
+      tensor.dim() != 3) {
+    return std::nullopt;
+  }
+  for (int64_t axis = 0; axis < 3; ++axis) {
+    if (tensor.size(axis) != input_shape.at(axis) ||
+        tensor.stride(axis) != read_strides.at(axis)) {
+      return std::nullopt;
+    }
+  }
+  std::array<int64_t, 3> write_strides{
+      output_shape[1] * output_shape[2], output_shape[2], 1};
+  const auto native_permutation = scheduler_utils::reorderDomainLike(
+      {reference->getLoopDomain().begin(),
+       reference->getLoopDomain().begin() + 2},
+      allocation);
+  if (native_permutation != std::vector<int64_t>{1, 0}) {
+    return std::nullopt;
+  }
+  const auto three = [](const std::array<int64_t, 3>& values) {
+    return '[' + std::to_string(values[0]) + ',' +
+        std::to_string(values[1]) + ',' + std::to_string(values[2]) + ']';
+  };
+  const std::string common =
+      "\"reference_tv\":\"T" + std::to_string(reference->name()) +
+      "\",\"input_tv\":\"T" + std::to_string(largest_input->name()) +
+      "\",\"read_elements\":" + std::to_string(*read_elements) +
+      ",\"write_elements\":" + std::to_string(*write_elements) +
+      ",\"pad_fill_elements\":" +
+      std::to_string(*write_elements - *read_elements) +
+      ",\"innermost_axis\":2,\"width\":" + std::to_string(width);
+  const auto effect = [&](const std::array<int64_t, 3>& order) {
+    const std::array<int64_t, 3> read{
+        read_strides.at(order[0]),
+        read_strides.at(order[1]),
+        read_strides.at(order[2])};
+    const std::array<int64_t, 3> write{
+        write_strides.at(order[0]),
+        write_strides.at(order[1]),
+        write_strides.at(order[2])};
+    return "{" + common + ",\"loop_axis_order\":" + three(order) +
+        ",\"read_stride_by_loop\":" + three(read) +
+        ",\"write_stride_by_loop\":" + three(write) + '}';
+  };
+  return DirectPadReorderConsequences{
+      effect({0, 1, 2}), effect({1, 0, 2})};
+}
+
+std::optional<DirectPadReorderConsequences> directPadReorderConsequences(
+    Fusion* fusion,
+    TensorView* reference,
+    TensorView* largest_input,
+    SchedulerRuntimeInfo& runtime_info,
+    int64_t width) {
+  try {
+    return directPadReorderConsequencesUnchecked(
+        fusion, reference, largest_input, runtime_info, width);
+  } catch (const std::exception&) {
+    // This is only an optional model preview. Preserve the native schedule
+    // when runtime geometry or graph mapping cannot be proved here.
+    return std::nullopt;
+  }
 }
 
 } // namespace
@@ -336,26 +570,46 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
     // The target remains the first largest TensorView input selected above.
     // Reordering only changes the outer loop-axis order in schedule(), so
     // skipping it leaves the reference and innermost vectorized axis intact.
-    std::vector<scheduler::jev::ChoiceOption> options{
-        {"skip", "Keep the reference tensor's outer loop-axis order"}};
-    if (largest_input != nullptr) {
-      options.push_back(
-          {"keep", "Reorder outer loop axes like the largest input"});
-    }
-    const std::string state =
-        "resize.reorder.v1\ninput_elements=" + input_elements + '\n';
-    const std::string native_choice =
-        jev_mode == scheduler::jev::Mode::Record
-        ? (largest_input == nullptr ? "skip" : "keep")
-        : std::string();
-    const std::string selected = scheduler::jev::chooseDecision(
-        "RS1.reorder", state, options, native_choice);
-    if (selected == "skip") {
-      params->largest_input = -1;
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    const auto consequences = semantic_v3
+        ? directPadReorderConsequences(
+              fusion,
+              ref_tv,
+              largest_input,
+              runtime_info,
+              params->vectorization_factor)
+        : std::nullopt;
+    if (semantic_v3 && !consequences) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.reorder", "direct rank-3 right Pad preview is unavailable");
     } else {
-      NVF_ERROR(
-          selected == "keep" && largest_input != nullptr,
-          "RS1.reorder response is outside native hard bounds");
+      std::vector<scheduler::jev::ChoiceOption> options{
+          {"skip",
+           "Keep the reference tensor's outer loop-axis order",
+           consequences ? consequences->skip : ""}};
+      if (largest_input != nullptr) {
+        options.push_back({
+            "keep",
+            "Reorder outer loop axes like the largest input",
+            consequences ? consequences->keep : ""});
+      }
+      const std::string state =
+          (consequences ? "resize.reorder.v2\ninput_elements="
+                        : "resize.reorder.v1\ninput_elements=") +
+          input_elements + '\n';
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? (largest_input == nullptr ? "skip" : "keep")
+          : std::string();
+      const std::string selected = scheduler::jev::chooseDecision(
+          "RS1.reorder", state, options, native_choice);
+      if (selected == "skip") {
+        params->largest_input = -1;
+      } else {
+        NVF_ERROR(
+            selected == "keep" && largest_input != nullptr,
+            "RS1.reorder response is outside native hard bounds");
+      }
     }
   }
 

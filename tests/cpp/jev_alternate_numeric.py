@@ -22,7 +22,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
-from threading import Lock, Thread
+from threading import Lock, Thread, local
 from typing import Any, Callable
 
 from jev_remote_numeric import (checked_environment, file_hash, run_numeric,
@@ -78,7 +78,10 @@ class AlternateChoice:
     def __call__(self, request: Any) -> tuple[dict[str, Any], Any]:
         # Keep validation before override; malformed requests cannot acquire
         # an alternate answer, and every other site remains deterministic.
-        response, analysis = self.evaluator(request)
+        return self.apply(request, *self.evaluator(request))
+
+    def apply(self, request: Any, response: dict[str, Any],
+              analysis: Any) -> tuple[dict[str, Any], Any]:
         if self.site not in request["questions"]:
             return response, analysis
 
@@ -801,17 +804,75 @@ def check_alternate_report(report: dict[str, Any],
         raise ValueError(f"missing intended winner mismatch: {issues}")
     if require_resize_reorder:
         if (site != "RS1.reorder" or event["native"] != "keep" or
-                alternate != "skip" or
-                event["candidates"] != ["skip", "keep"] or
-                event["state"] != "resize.reorder.v1\ninput_elements=0:2240\n"):
+                alternate != "skip"):
             raise ValueError("resize fixture lacks its nontrivial legal reorder menu")
-        for unchanged in ("RS1.width", "RS1.cta"):
+        is_v3 = isinstance(event["state"], dict)
+        if is_v3:
+            from jev_shim import validate_request
+
+            context = event["state"]
+            decision = context["decision"]
+            expected = {
+                "skip": {
+                    "reference_tv": "T1", "input_tv": "T0",
+                    "loop_axis_order": [0, 1, 2],
+                    "read_stride_by_loop": [64, 320, 1],
+                    "write_stride_by_loop": [504, 72, 1],
+                    "read_elements": 2240, "write_elements": 2520,
+                    "pad_fill_elements": 280, "innermost_axis": 2, "width": 4,
+                },
+                "keep": {
+                    "reference_tv": "T1", "input_tv": "T0",
+                    "loop_axis_order": [1, 0, 2],
+                    "read_stride_by_loop": [320, 64, 1],
+                    "write_stride_by_loop": [72, 504, 1],
+                    "read_elements": 2240, "write_elements": 2520,
+                    "pad_fill_elements": 280, "innermost_axis": 2, "width": 4,
+                },
+            }
+            if (event["candidates"] != ["keep", "skip"] or
+                    context["schema"] != "nvfuser.systemone.context.v3" or
+                    decision["analysis_inputs_text"] !=
+                    "resize.reorder.v2\ninput_elements=0:2240\n" or
+                    context["current_schedule"]["prior_choices"] !=
+                    [{"site": "RS1.width", "choice": "w4"}] or
+                    {candidate["id"]: candidate.get("consequence")
+                     for candidate in decision["candidates"]} != expected or
+                    validate_request(entry["request"]).preview_verification !=
+                    "conditional_preview_verified"):
+                raise ValueError("Resize v3 reorder consequences are not bound to c19")
+        elif (event["candidates"] != ["skip", "keep"] or
+              event["state"] !=
+              "resize.reorder.v1\ninput_elements=0:2240\n"):
+            raise ValueError("resize fixture lacks its v1 reorder menu")
+        for unchanged in (("RS1.width",) if is_v3 else
+                          ("RS1.width", "RS1.cta")):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == unchanged]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"reorder changed unrelated {unchanged}: {rows}")
-        if issues != [intended]:
+        expected_issues = [intended]
+        if is_v3:
+            before, after, replacements = paired_state_rows(report, "RS1.cta")
+            record_state = before["request"]["state"]
+            remote_state = after["request"]["state"]
+            record_prior = record_state["current_schedule"]["prior_choices"]
+            remote_prior = remote_state["current_schedule"]["prior_choices"]
+            if (record_prior != [
+                    {"site": "RS1.width", "choice": "w4"},
+                    {"site": "RS1.reorder", "choice": "keep"}] or
+                    remote_prior != [
+                        {"site": "RS1.width", "choice": "w4"},
+                        {"site": "RS1.reorder", "choice": "skip"}] or
+                    {key: value for key, value in record_state.items()
+                     if key != "current_schedule"} !=
+                    {key: value for key, value in remote_state.items()
+                     if key != "current_schedule"} or
+                    before["record"] != after["remote"]):
+                raise ValueError("Resize CTA changed beyond its v3 prior-choice context")
+            expected_issues.extend(replacements)
+        if sorted(issues, key=str) != sorted(expected_issues, key=str):
             raise ValueError(f"unexpected resize reorder comparison issues: {issues}")
     elif require_transpose_tile:
         if (site != "TR2.tile" or event["native"] != "tile32" or
@@ -2443,6 +2504,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-transpose-tile", action="store_true")
     parser.add_argument("--require-pointwise-1d-cta", action="store_true")
     parser.add_argument("--require-resize-reorder", action="store_true")
+    parser.add_argument("--protocol", choices=("text-v1", "semantic-v3"))
     args = parser.parse_args(argv)
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
@@ -2471,6 +2533,7 @@ def main(argv: list[str] | None = None) -> int:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "case_key": args.case_key, "gtest": args.gtest,
         "target_site": args.site, "requested_alternate": args.alternate,
+        "protocol": args.protocol or "text-v1",
         "binary": str(args.binary), "binary_sha256": file_hash(args.binary),
         "loader": str(loader), "loader_sha256": file_hash(loader),
         "library_path": libraries,
@@ -2492,7 +2555,7 @@ def main(argv: list[str] | None = None) -> int:
         record = run_numeric(
             mode="record", binary=args.binary, names=[args.gtest],
             case_key=args.case_key, loader=loader, libraries=libraries,
-            directory=directory, port=None)
+            directory=directory, port=None, protocol=args.protocol)
         manifest["runs"].append(record)
         manifest["active_mode"] = "remote"
         write_manifest(manifest_path, manifest)
@@ -2501,7 +2564,24 @@ def main(argv: list[str] | None = None) -> int:
         server_log.touch(exist_ok=False)
         original = shim.evaluate
         override = AlternateChoice(original, args.site, args.alternate)
-        shim.evaluate = override
+        # DecisionServer validates and ranks in separate calls. Capture the
+        # checked request on its serving thread so the alternate is applied
+        # only after the production structural and preview validators pass.
+        original_validate = shim.validate_request
+        original_rank = shim.rank_validated_choice
+        pending = local()
+
+        def validate_for_override(request, *positional, **keyword):
+            checked = original_validate(request, *positional, **keyword)
+            pending.request = request
+            return checked
+
+        def rank_for_override(checked):
+            response, analysis = original_rank(checked)
+            return override.apply(pending.request, response, analysis)
+
+        shim.validate_request = validate_for_override
+        shim.rank_validated_choice = rank_for_override
         try:
             server = shim.DecisionServer(0, server_log)
             thread = Thread(target=server.serve_forever,
@@ -2512,13 +2592,15 @@ def main(argv: list[str] | None = None) -> int:
                 remote = run_numeric(
                     mode="remote", binary=args.binary, names=[args.gtest],
                     case_key=args.case_key, loader=loader, libraries=libraries,
-                    directory=directory, port=server.server_port)
+                    directory=directory, port=server.server_port,
+                    protocol=args.protocol)
             finally:
                 server.shutdown()
                 thread.join()
                 server.server_close()
         finally:
-            shim.evaluate = original
+            shim.validate_request = original_validate
+            shim.rank_validated_choice = original_rank
             # Persist the override trace even if the alternate kernel fails
             # compilation, execution, or its numerical reference check.
             forced_path = directory / "forced_choice.json"

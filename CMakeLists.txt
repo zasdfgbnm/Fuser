@@ -1225,6 +1225,17 @@ if(BUILD_TEST)
       --require-resize-reorder)
   set_tests_properties(jev_alternate_numeric_resize_reorder PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_resize_reorder_v2
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RS1.reorder --alternate skip
+      --gtest ResizeTest.JevAlternateOuterReorder_CUDA
+      --case-key jev_alternate_numeric_resize_reorder_v2
+      --require-resize-reorder --protocol semantic-v3)
+  set_tests_properties(jev_alternate_numeric_resize_reorder_v2 PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
   foreach(CTA_THREADS IN ITEMS 32 64)
     add_test(NAME jev_alternate_numeric_pointwise_1d_cta_x${CTA_THREADS}
       COMMAND "${Python_EXECUTABLE}"

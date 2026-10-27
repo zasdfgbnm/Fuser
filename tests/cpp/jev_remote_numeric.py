@@ -83,7 +83,7 @@ def check_numeric_output(output: str, expected: int) -> dict[str, int]:
 def run_numeric(
     *, mode: str, binary: Path, names: list[str], case_key: str,
     loader: Path, libraries: list[str], directory: Path, port: int | None,
-    analysis_only: bool = False,
+    analysis_only: bool = False, protocol: str | None = None,
 ) -> dict[str, Any]:
     decision_log = directory / f"{mode}.jsonl"
     output = directory / f"{mode}.stdout.txt"
@@ -94,6 +94,10 @@ def run_numeric(
     env.update({"NVFUSER_JEV_MODE": mode,
                 "NVFUSER_JEV_LOG": str(decision_log),
                 "NVFUSER_JEV_CASE_KEY": case_key})
+    if protocol is not None:
+        if protocol not in {"text-v1", "semantic-v2", "semantic-v3"}:
+            raise ValueError("unknown Jev numeric protocol")
+        env["NVFUSER_JEV_PROTOCOL"] = protocol
     if port is not None:
         env["NVFUSER_JEV_PORT"] = str(port)
     argv = [str(loader), "--library-path", ":".join(libraries),
