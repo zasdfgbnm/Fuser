@@ -6337,7 +6337,12 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
       ::unlink((std::string(path) + ".outcome.jsonl").c_str());
     }
   } file_cleanup{log_path};
-  ScopedJevEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  // A standalone run defaults to the historic text protocol. Keep an
+  // explicitly requested semantic-v3 protocol for a retained source request.
+  std::optional<ScopedJevEnv> local_protocol;
+  if (std::getenv("NVFUSER_JEV_PROTOCOL") == nullptr) {
+    local_protocol.emplace("NVFUSER_JEV_PROTOCOL", "text-v1");
+  }
   // Keep the outer numeric harness's log path so it can compare the Record
   // and Remote requests. Standalone GTest runs use a temporary local log.
   std::optional<ScopedJevEnv> local_log;
@@ -6359,7 +6364,8 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   const auto tensor = at::randn(
       {4, 32, 128}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
   SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
-  auto scheduler = SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
   std::unique_ptr<HeuristicParams> native;
   {
     ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
@@ -6374,10 +6380,10 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
   EXPECT_EQ(
       reduction::non_tma::nativeLaunchFields(native->lparams),
-      reduction::non_tma::nativeLaunchFields(results.heuristic_params->lparams));
+      reduction::non_tma::nativeLaunchFields(
+          results.heuristic_params->lparams));
   EXPECT_EQ(
-      native->lparams.toString(),
-      results.heuristic_params->lparams.toString());
+      native->lparams.toString(), results.heuristic_params->lparams.toString());
   EXPECT_EQ(native->toString(), results.heuristic_params->toString());
   EXPECT_TRUE(results.heuristic_params->as<ReductionParams>()->schedule_3d);
   auto reference = tensor.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
@@ -6393,6 +6399,7 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
 
   std::ifstream decision_log(decision_log_path);
   std::string row;
+  bool saw_parent_first_rd4 = false;
   bool saw_wave_request = false;
   bool saw_iter_unroll_request = false;
   std::vector<std::string> choice_sites;
@@ -6401,10 +6408,17 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
       const auto end = row.find('"', 9);
       ASSERT_NE(end, std::string::npos);
       const auto site = row.substr(9, end - 9);
-      EXPECT_EQ(std::find(choice_sites.begin(), choice_sites.end(), site),
-                choice_sites.end())
+      EXPECT_EQ(
+          std::find(choice_sites.begin(), choice_sites.end(), site),
+          choice_sites.end())
           << site << " was emitted twice by the native preview";
       choice_sites.push_back(site);
+      if (site == "RD4") {
+        saw_parent_first_rd4 |=
+            row.find("reduction.inner_mapping.v2") != std::string::npos &&
+            row.find("\"selected\":\"3d\"") != std::string::npos &&
+            row.find("\"compute_event_index\":1") != std::string::npos;
+      }
     }
     saw_wave_request |=
         row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
@@ -6422,8 +6436,7 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
         row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
         row.find("\"kind\":\"no_choice\"") != std::string::npos;
     iter_unroll_no_choice_count +=
-        row.find("\"site\":\"RD5.iter_unroll\"") !=
-            std::string::npos &&
+        row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos &&
         row.find("\"kind\":\"no_choice\"") != std::string::npos;
     saw_wave_no_choice |=
         row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
@@ -6443,6 +6456,145 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   EXPECT_EQ(iter_unroll_no_choice_count, 1);
   EXPECT_FALSE(saw_wave_request);
   EXPECT_FALSE(saw_iter_unroll_request);
+  ASSERT_FALSE(choice_sites.empty());
+  EXPECT_EQ(choice_sites.front(), "RD4");
+  EXPECT_TRUE(saw_parent_first_rd4);
+}
+
+// The same supported 3D fusion can be flattened before any RD5 child choice.
+// Check either legal Remote answer; a local Choice server separately forces
+// flat2d. Record keeps 3D and both branches must reduce numerically to ATen.
+TEST_F(Gpu1Test, JevInnerMappingFlat2D_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->multiProcessorCount != 128 ||
+      device->maxThreadsPerMultiProcessor != 1536 ||
+      device->maxThreadsPerBlock != 1024) {
+    GTEST_SKIP() << "The retained RD4 carrier needs SM128 and 1536 threads/SM";
+  }
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(3);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input));
+  const auto tensor = at::randn(
+      {4, 32, 128}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  const auto jev_mode = scheduler::jev::mode();
+  const char* log_path = nullptr;
+  std::streampos log_start = 0;
+  std::streampos outcome_start = 0;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    log_path = std::getenv("NVFUSER_JEV_LOG");
+    ASSERT_NE(log_path, nullptr);
+    std::ifstream existing_log(log_path, std::ios::ate);
+    if (existing_log.good()) {
+      log_start = existing_log.tellg();
+    }
+    std::ifstream existing_outcomes(
+        std::string(log_path) + ".outcome.jsonl", std::ios::ate);
+    if (existing_outcomes.good()) {
+      outcome_start = existing_outcomes.tellg();
+    }
+  }
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  ASSERT_NE(native, nullptr);
+  EXPECT_TRUE(native->as<ReductionParams>()->schedule_3d);
+  auto results = scheduleAndRun(&fusion, SchedulerType::Reduction, {tensor});
+  ASSERT_NE(results.heuristic_params, nullptr);
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    EXPECT_TRUE(rparams->schedule_3d);
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(
+        reduction::non_tma::nativeLaunchFields(native->lparams),
+        reduction::non_tma::nativeLaunchFields(
+            results.heuristic_params->lparams));
+  }
+  auto reference = tensor.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::ifstream decision_log(log_path);
+    ASSERT_TRUE(decision_log.good());
+    decision_log.seekg(log_start);
+    std::vector<std::string> sites;
+    std::string row;
+    std::string selected_rd4;
+    bool saw_parent_first_rd4 = false;
+    while (std::getline(decision_log, row)) {
+      if (row.rfind("{\"site\":\"", 0) != 0) {
+        continue;
+      }
+      const auto end = row.find('"', 9);
+      ASSERT_NE(end, std::string::npos);
+      const auto site = row.substr(9, end - 9);
+      sites.push_back(site);
+      if (site == "RD4") {
+        saw_parent_first_rd4 |=
+            row.find("reduction.inner_mapping.v2") != std::string::npos &&
+            row.find("\"compute_event_index\":1") != std::string::npos;
+        if (row.find("\"selected\":\"flat2d\"") != std::string::npos) {
+          selected_rd4 = "flat2d";
+        } else if (row.find("\"selected\":\"3d\"") != std::string::npos) {
+          selected_rd4 = "3d";
+        }
+      }
+    }
+    ASSERT_FALSE(sites.empty());
+    EXPECT_EQ(sites.front(), "RD4");
+    EXPECT_EQ(std::count(sites.begin(), sites.end(), "RD4"), 1);
+    EXPECT_TRUE(saw_parent_first_rd4);
+    ASSERT_TRUE(selected_rd4 == "3d" || selected_rd4 == "flat2d");
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      EXPECT_EQ(selected_rd4, "3d");
+    }
+    if (selected_rd4 == "flat2d") {
+      EXPECT_FALSE(rparams->schedule_3d);
+    }
+    for (const auto& site : sites) {
+      if (selected_rd4 == "flat2d") {
+        EXPECT_NE(site.rfind("RD5.", 0), 0) << site;
+      } else if (rparams->schedule_3d) {
+        EXPECT_NE(site.rfind("RD3.", 0), 0) << site;
+      }
+    }
+    EXPECT_TRUE(std::any_of(sites.begin(), sites.end(), [&](const auto& site) {
+      return site.rfind(selected_rd4 == "flat2d" ? "RD3." : "RD5.", 0) == 0;
+    }));
+    std::ifstream outcome_log(std::string(log_path) + ".outcome.jsonl");
+    ASSERT_TRUE(outcome_log.good());
+    outcome_log.seekg(outcome_start);
+    bool saw_selected_3d_fallback = false;
+    while (std::getline(outcome_log, row)) {
+      if (selected_rd4 == "flat2d") {
+        EXPECT_EQ(row.find("\"site\":\"RD5."), std::string::npos);
+      } else if (rparams->schedule_3d) {
+        EXPECT_EQ(row.find("\"site\":\"RD3."), std::string::npos);
+      }
+      saw_selected_3d_fallback |=
+          row.find("\"site\":\"RD4.realized_topology\"") != std::string::npos &&
+          row.find("selected_3d_descendants_hit_hard_fallback") !=
+              std::string::npos;
+    }
+    if (selected_rd4 == "3d" && !rparams->schedule_3d) {
+      EXPECT_TRUE(saw_selected_3d_fallback);
+    }
+  }
 }
 
 // The wave cap changes the complete CTA: four waves target five outer

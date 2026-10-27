@@ -27,6 +27,7 @@
 #include "scheduler/debug_utils.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
+#include "scheduler/native_diagnostic_jsonl.h"
 #include "scheduler/reduction.h"
 #include "scheduler/reduction_inner3d_iter_unroll_continuation.h"
 #include "scheduler/reduction_inner_remainder_choice.h"
@@ -2248,65 +2249,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     }
   }
 
-  // The same flattened 2D constructor above is also a legal alternative to a
-  // supported 3D plan: scheduleReduction canonicalizes all reduction axes to
-  // one axis when schedule_3d is false. Limit the alternative to shapes where
-  // even a 2D cross-grid plan cannot exceed BIDy, and to the native RD3
-  // Choice implementation's physical CTA and dtype bounds. The 3D default
-  // remains available outside that conservative subset.
   const auto jev_mode = scheduler::jev::mode();
-  if (rparams->schedule_3d && jev_mode != scheduler::jev::Mode::Off) {
-    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
-    const int64_t max_threads_per_block = dev_prop->maxThreadsPerBlock;
-    const int64_t max_threads_per_sm = dev_prop->maxThreadsPerMultiProcessor;
-    const int64_t sm_count = dev_prop->multiProcessorCount;
-    const bool flat2d_legal = flat2DAlternativeLegal(
-        total_reduction_numel,
-        total_iteration_numel,
-        n_tensor_inputs,
-        max_dtype_size_bit_for_vectorization,
-        vectorize_factor,
-        *dev_prop);
-    std::vector<scheduler::jev::ChoiceOption> options = {
-        {"3d", "Keep the native inner and outer reduction axes"}};
-    if (flat2d_legal) {
-      options.push_back(
-          {"flat2d", "Merge reduction axes into one native 2D plan"});
-    }
-    const std::string state =
-        "reduction.inner_mapping.v1\nreduction_numel=" +
-        std::to_string(total_reduction_numel) +
-        "\niteration_numel=" + std::to_string(total_iteration_numel) +
-        "\ninner_numel=" + std::to_string(inner_most_dimension_numel) +
-        "\nlayout_width=" + std::to_string(vectorize_factor) +
-        "\nmax_dtype_bits=" +
-        std::to_string(max_dtype_size_bit_for_vectorization) +
-        "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
-        "\nhas_mufu=" + std::to_string(has_mufu_computation ? 1 : 0) +
-        "\nsm_count=" + std::to_string(sm_count) +
-        "\nmax_threads_per_sm=" +
-        std::to_string(max_threads_per_sm) +
-        "\nmax_threads_per_block=" +
-        std::to_string(max_threads_per_block) +
-        "\ny_grid_limit=" +
-        std::to_string(scheduler_utils::y_grid_limit);
-    const auto selected = scheduler::jev::chooseDecision(
-        "RD4", state, options,
-        jev_mode == scheduler::jev::Mode::Record ? "3d" : "");
-    NVF_ERROR(
-        selected == "3d" || (flat2d_legal && selected == "flat2d"),
-        "RD4 response is outside the native mapping set");
-    if (selected == "flat2d") {
-      return inner2dReductionHeuristic(
-          total_reduction_numel,
-          total_iteration_numel,
-          n_tensor_inputs,
-          max_dtype_size_bit_for_vectorization,
-          static_cast<int64_t>(vectorize_factor),
-          has_mufu_computation,
-          suppress_scheduler_debug);
-    }
-  }
 
   // RD5.width changes only the split of the fixed inner work between a
   // contiguous vector load and ordinary unrolling. CTA dimensions, grid
@@ -2451,8 +2394,40 @@ bool sameNativeReductionPlan(
   }
   return preview_copy.sameAs(&selected_copy) &&
       nativeLaunchFields(preview.lparams) ==
-          nativeLaunchFields(selected.lparams) &&
+      nativeLaunchFields(selected.lparams) &&
       preview.toString() == selected.toString();
+}
+
+std::string innerMappingBaselineConsequence(
+    const ReductionParams& params,
+    std::string_view pending_choices) {
+  scheduler::native_diagnostic::Object plan;
+  plan.add("baseline_kind", "source_native_projection");
+  plan.add("pending_choices_kind", "possible_descendant_sites");
+  plan.add("schedule_3d", params.schedule_3d);
+  plan.add("cross_block_inner_reduction", params.cross_block_inner_reduction);
+  plan.add("cross_grid_inner_reduction", params.cross_grid_inner_reduction);
+  plan.add("cross_block_outer_reduction", params.cross_block_outer_reduction);
+  plan.add("cross_grid_outer_reduction", params.cross_grid_outer_reduction);
+  plan.add("multiple_reds_per_blk", params.multiple_reds_per_blk);
+  plan.add("vectorize_inner_reduction", params.vectorize_inner_reduction);
+  plan.add(
+      "unroll_factor_inner_reduction", params.unroll_factor_inner_reduction);
+  plan.add(
+      "unroll_factor_outer_reduction", params.unroll_factor_outer_reduction);
+  plan.add("unroll_factor_iter_dom", params.unroll_factor_iter_dom);
+  const auto launch_fields = nativeLaunchFields(params.lparams);
+  scheduler::native_diagnostic::Object launch;
+  launch.add("grid_x", launch_fields[0]);
+  launch.add("grid_y", launch_fields[1]);
+  launch.add("grid_z", launch_fields[2]);
+  launch.add("block_x", launch_fields[3]);
+  launch.add("block_y", launch_fields[4]);
+  launch.add("block_z", launch_fields[5]);
+  launch.add("smem_bytes", launch_fields[6]);
+  plan.addRaw("launch", launch.str());
+  plan.addRaw("pending_choices", pending_choices);
+  return plan.str();
 }
 
 struct OuterReductionParams {
@@ -3822,7 +3797,7 @@ std::unique_ptr<ReductionParams> reductionHeuristic(
           (int64_t)prop.vectorize_factor,
           prop.has_mufu_computation);
     } else {
-      if (scheduler::jev::mode() != scheduler::jev::Mode::Record) {
+      const auto live3d = [&] {
         return inner3dReductionHeuristic(
             prop.total_reduction_numel,
             prop.total_iteration_numel,
@@ -3831,25 +3806,106 @@ std::unique_ptr<ReductionParams> reductionHeuristic(
             (int64_t)prop.max_dtype_size_bit_for_vectorization,
             prop.vectorize_factor,
             prop.has_mufu_computation);
+      };
+      const auto live2d = [&] {
+        return inner2dReductionHeuristic(
+            prop.total_reduction_numel,
+            prop.total_iteration_numel,
+            (int64_t)prop.n_tensor_inputs,
+            (int64_t)prop.max_dtype_size_bit_for_vectorization,
+            (int64_t)prop.vectorize_factor,
+            prop.has_mufu_computation);
+      };
+      const auto jev_mode = scheduler::jev::mode();
+      if (jev_mode == scheduler::jev::Mode::Off) {
+        return live3d();
       }
       const auto previews = previewNativeInnerMapping(prop);
+      // If the source-native 3D constructor has already hit its hard support
+      // fallback, do not offer RD4 or run abandoned RD5 child choices.
+      if (!previews.three_d->schedule_3d) {
+        scheduler::jev::recordNoChoiceDecision(
+            "RD4", "flat2d", "native_3d_hard_fallback", "source_hard_topology");
+        auto selected = live2d();
+        if (jev_mode == scheduler::jev::Mode::Record) {
+          NVF_ERROR(
+              sameNativeReductionPlan(*previews.three_d, *selected),
+              "RD4 native fallback preview differs from the live Record 2D "
+              "result");
+        }
+        return selected;
+      }
       if (previews.flat2d != nullptr) {
         NVF_ERROR(
             !previews.flat2d->schedule_3d,
             "RD4 native flat2D preview retained a 3D topology");
       }
-      auto selected = inner3dReductionHeuristic(
-          prop.total_reduction_numel,
-          prop.total_iteration_numel,
-          prop.inner_most_dimension_numel,
-          (int64_t)prop.n_tensor_inputs,
-          (int64_t)prop.max_dtype_size_bit_for_vectorization,
-          prop.vectorize_factor,
-          prop.has_mufu_computation);
+      const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+      const std::string state = "reduction.inner_mapping.v2\nreduction_numel=" +
+          std::to_string(prop.total_reduction_numel) +
+          "\niteration_numel=" + std::to_string(prop.total_iteration_numel) +
+          "\ninner_numel=" + std::to_string(prop.inner_most_dimension_numel) +
+          "\nlayout_width=" + std::to_string(prop.vectorize_factor) +
+          "\nmax_dtype_bits=" +
+          std::to_string(prop.max_dtype_size_bit_for_vectorization) +
+          "\nn_tensor_inputs=" + std::to_string(prop.n_tensor_inputs) +
+          "\nhas_mufu=" + std::to_string(prop.has_mufu_computation ? 1 : 0) +
+          "\nsm_count=" + std::to_string(dev_prop->multiProcessorCount) +
+          "\nmax_threads_per_sm=" +
+          std::to_string(dev_prop->maxThreadsPerMultiProcessor) +
+          "\nmax_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) +
+          "\ny_grid_limit=" + std::to_string(scheduler_utils::y_grid_limit) +
+          "\nwarp_size=" + std::to_string(dev_prop->warpSize) +
+          "\nl2_cache_bytes=" + std::to_string(dev_prop->l2CacheSize) +
+          "\nflat2d_preview=" +
+          std::to_string(previews.flat2d != nullptr ? 1 : 0);
+      constexpr std::string_view k3DPending =
+          "[\"RD5.warp\",\"RD5.work_split\",\"RD5.waves\",\"RD5.cta\","
+          "\"RD5.outer_unroll\",\"RD5.iter_unroll\",\"RD5.grid\","
+          "\"RD5.width\"]";
+      constexpr std::string_view k2DPending =
+          "[\"RD3.width\",\"RD3.unroll\",\"RD3.cta\",\"RD3.warp\","
+          "\"RD3.remainder_x\",\"RD3.remainder_u\",\"RD3.grid\","
+          "\"RD3.iter_unroll\"]";
+      std::vector<scheduler::jev::ChoiceOption> options = {
+          {"3d",
+           "Keep 3D inner and outer reduction axes; source-native projection "
+           "shown with possible RD5 choices pending",
+           innerMappingBaselineConsequence(*previews.three_d, k3DPending)}};
+      if (previews.flat2d != nullptr) {
+        options.push_back(
+            {"flat2d",
+             "Merge reduction axes into one 2D reduction; source-native "
+             "projection shown with possible RD3 choices pending",
+             innerMappingBaselineConsequence(*previews.flat2d, k2DPending)});
+      }
+      const auto selected = scheduler::jev::chooseDecision(
+          "RD4",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "3d" : "");
       NVF_ERROR(
-          sameNativeReductionPlan(*previews.three_d, *selected),
-          "RD4 native 3D preview differs from the live Record result");
-      return selected;
+          selected == "3d" ||
+              (selected == "flat2d" && previews.flat2d != nullptr),
+          "RD4 response is outside the previewed topology candidates");
+      if (selected == "flat2d") {
+        return live2d();
+      }
+      auto realized = live3d();
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        NVF_ERROR(
+            sameNativeReductionPlan(*previews.three_d, *realized),
+            "RD4 native 3D preview differs from the live Record result");
+      }
+      if (!realized->schedule_3d) {
+        scheduler::jev::recordNoChoiceDecision(
+            "RD4.realized_topology",
+            "flat2d",
+            "selected_3d_descendants_hit_hard_fallback",
+            "source_hard_fallback");
+      }
+      return realized;
     }
 
   } else {
