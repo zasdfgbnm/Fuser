@@ -23,6 +23,8 @@ def load_report() -> tuple[dict, list, dict]:
     options = {
         "site": "RD9.warp", "alternate": "warp32",
         "case_key": manifest["case_key"], "require_grid": True,
+        "trace_paths": tuple(Path(run["decision_log"])
+                             for run in manifest["runs"]),
     }
     return report, events, options
 
@@ -32,6 +34,13 @@ def remote_row(report: dict, site: str) -> dict:
             if row["site"] == site and row["remote"] and not row["record"]]
     if len(rows) != 1:
         raise ValueError(f"expected one remote-only {site} row: {rows}")
+    return rows[0]
+
+
+def shared_parent(report: dict) -> dict:
+    rows = [row for row in report["multiplicity"] if row["site"] == "RD8"]
+    if len(rows) != 1 or rows[0]["record"] != rows[0]["remote"]:
+        raise ValueError(f"expected one shared RD8 parent request: {rows}")
     return rows[0]
 
 
@@ -65,12 +74,14 @@ class OuterWarpReportTest(unittest.TestCase):
                 ("RD9.unroll", "warp=32", "warp=16"),
                 ("RD9.ragged", "base_grdim=16", "base_grdim=8"),
                 ("RD9.stride", "min_warp_size=32", "min_warp_size=16"),
-                ("RD8", "grid_grdim=15", "grid_grdim=16")):
+                ("RD8", "grid_grdim=7", "grid_grdim=16")):
             broken = deepcopy(report)
-            row = remote_row(broken, site)
+            row = shared_parent(broken) if site == "RD8" else remote_row(
+                broken, site)
             row["request"]["state"] = row["request"]["state"].replace(old, new)
             self.assertNotEqual(row["request"]["state"],
-                                remote_row(report, site)["request"]["state"])
+                                (shared_parent(report) if site == "RD8" else
+                                 remote_row(report, site))["request"]["state"])
             with self.subTest(site=site), self.assertRaises(ValueError):
                 check_alternate_report(broken, events, **options)
 

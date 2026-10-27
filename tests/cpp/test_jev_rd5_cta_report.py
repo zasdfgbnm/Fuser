@@ -22,7 +22,9 @@ def load_warp_report() -> tuple[dict, list[dict], dict]:
     events = json.loads(Path(manifest["forced_choice_log"]).read_text())
     options = {"site": "RD5.warp", "alternate": "m4",
                "case_key": manifest["case_key"],
-               "require_inner3d_warp_target": True}
+               "require_inner3d_warp_target": True,
+               "trace_paths": tuple(Path(run["decision_log"])
+                                    for run in manifest["runs"])}
     return report, events, options
 
 
@@ -34,9 +36,9 @@ class Rd5WarpDependentCtaReportTest(unittest.TestCase):
     def test_replays_real_numeric_report(self) -> None:
         report, events, options = load_warp_report()
         summary = check_alternate_report(report, events, **options)
-        self.assertEqual(summary["record_events"], 6)
-        self.assertEqual(summary["remote_events"], 6)
-        self.assertEqual(summary["server_successes"], 6)
+        self.assertEqual(summary["record_events"], 4)
+        self.assertEqual(summary["remote_events"], 4)
+        self.assertEqual(summary["server_successes"], 4)
 
     def test_missing_duplicate_or_wrong_cta_plan_is_rejected(self) -> None:
         report, events, options = load_warp_report()

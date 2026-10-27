@@ -57,7 +57,13 @@ def fixture() -> tuple[dict, list[dict]]:
     report = {"multiplicity": rows, "issues": issues,
               "summary": {"record_events": 5, "remote_events": 5,
                           "server_successes": 5},
-              "case_coverage": {CASE: {}}}
+              "case_coverage": {CASE: {}},
+              "site_coverage": {
+                  site: {"record_events": 1, "remote_events": 1,
+                         "server_events": 1}
+                  for site in ("IOP3.min_batch", "IOP3.tmp_read_width",
+                               "IOP3.grid_rows", "IOP3.cta",
+                               "IOP3.tmp_write_width")}}
     event = {"site": "IOP3.min_batch", "native": "b2",
              "candidates": ["b1", "b2", "b3", "b4"], "forced": True,
              "state": batch_state, "request_sha256": "batch"}

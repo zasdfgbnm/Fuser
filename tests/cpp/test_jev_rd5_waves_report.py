@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""Replay RD5.waves dependencies in the forced warp and work-split reports."""
+"""Replay equivalent RD5 wave caps after forced warp and work split."""
 
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from jev_alternate_numeric import check_alternate_report
 
 CASES = (
     ("JEV_RD5_WARP_MANIFEST", "RD5.warp", "m4",
-     "require_inner3d_warp_target", 6),
+     "require_inner3d_warp_target", 4),
     ("JEV_RD5_WORK_SPLIT_MANIFEST", "RD5.work_split", "iter_first",
-     "require_reduction_inner3d_work_split", 7),
+     "require_reduction_inner3d_work_split", 5),
 )
 
 
@@ -31,7 +31,9 @@ def load_case(case: tuple[str, str, str, str, int]
     report = json.loads(Path(manifest["decision_comparison"]).read_text())
     events = json.loads(Path(manifest["forced_choice_log"]).read_text())
     options = {"site": site, "alternate": alternate,
-               "case_key": manifest["case_key"], required: True}
+               "case_key": manifest["case_key"], required: True,
+               "trace_paths": tuple(Path(run["decision_log"])
+                                    for run in manifest["runs"])}
     return report, events, options, count
 
 
@@ -41,7 +43,7 @@ def wave_rows(report: dict) -> list[dict]:
 
 
 class Rd5WaveDependentReportTest(unittest.TestCase):
-    def test_replays_both_complete_dependent_wave_plans(self) -> None:
+    def test_replays_both_suppressed_equivalent_wave_plans(self) -> None:
         for case in CASES:
             with self.subTest(site=case[1]):
                 report, events, options, count = load_case(case)
@@ -50,38 +52,42 @@ class Rd5WaveDependentReportTest(unittest.TestCase):
                 self.assertEqual(summary["remote_events"], count)
                 self.assertEqual(summary["server_successes"], count)
 
-    def test_forged_dependent_state_menu_or_winner_is_rejected(self) -> None:
+    def test_forged_wave_request_or_missing_cta_issue_is_rejected(self) -> None:
         for case in CASES:
             report, events, options, _ = load_case(case)
-            for defect in ("state", "menu", "winner"):
+            self.assertEqual(wave_rows(report), [])
+            for defect in ("extra_wave_request", "extra_wave_issue",
+                           "missing_cta_issue"):
                 with self.subTest(site=case[1], defect=defect):
                     broken = deepcopy(report)
-                    remote = next(row for row in wave_rows(broken)
-                                  if row["remote"])
-                    if defect == "state":
-                        state = remote["request"]["state"]
-                        remote["request"]["state"] = (
-                            state.replace("logical_warp=4", "logical_warp=8")
-                            if case[1] == "RD5.warp" else
-                            state.replace("work_split=iter_first",
-                                          "work_split=unroll_first"))
-                    elif defect == "menu":
-                        remote["request"]["questions"]["RD5.waves"][
-                            "criteria"].pop("waves2")
+                    if defect == "extra_wave_request":
+                        broken["multiplicity"].append({
+                            "site": "RD5.waves", "record": {},
+                            "remote": {"waves4": 1},
+                            "request_sha256": "forged-wave",
+                            "request": {"state": "forged"},
+                        })
+                    elif defect == "extra_wave_issue":
+                        broken["issues"].append({
+                            "kind": "remote_only_state", "site": "RD5.waves",
+                            "request_sha256": "forged-wave",
+                        })
                     else:
-                        remote["remote"] = {"waves8": 1}
+                        broken["issues"] = [
+                            issue for issue in broken["issues"]
+                            if not (issue["site"] == "RD5.cta" and
+                                    issue["kind"] == "remote_only_state")]
                     with self.assertRaises(ValueError):
                         check_alternate_report(broken, events, **options)
 
-    def test_missing_dependent_state_issue_is_rejected(self) -> None:
+    def test_selected_cta_request_is_required(self) -> None:
         for case in CASES:
             with self.subTest(site=case[1]):
                 report, events, options, _ = load_case(case)
                 broken = deepcopy(report)
-                broken["issues"] = [
-                    issue for issue in broken["issues"]
-                    if not (issue["site"] == "RD5.waves" and
-                            issue["kind"] == "remote_only_state")]
+                broken["multiplicity"] = [
+                    row for row in broken["multiplicity"]
+                    if not (row["site"] == "RD5.cta" and row["remote"])]
                 with self.assertRaises(ValueError):
                     check_alternate_report(broken, events, **options)
 

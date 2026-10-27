@@ -34,7 +34,9 @@ def load_case(kind: str) -> tuple[dict, list, dict]:
     report = json.loads(Path(manifest["decision_comparison"]).read_text())
     events = json.loads(Path(manifest["forced_choice_log"]).read_text())
     options = {"site": site, "alternate": alternate,
-               "case_key": manifest["case_key"], flag: True}
+               "case_key": manifest["case_key"], flag: True,
+               "trace_paths": tuple(Path(run["decision_log"])
+                                    for run in manifest["runs"])}
     return report, events, options
 
 
@@ -122,8 +124,10 @@ class OuterAlternateReportTest(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         check_alternate_report(broken, events, **options)
             broken = deepcopy(report)
+            dependent = "RD8" if kind == "width" else "RD9.stride"
             broken["issues"].remove(next(issue for issue in broken["issues"]
-                if issue["site"] == "RD8" and issue["kind"] == "remote_only_state"))
+                if issue["site"] == dependent and
+                issue["kind"] == "remote_only_state"))
             with self.subTest(kind=kind, defect="missing_pair_issue"):
                 with self.assertRaises(ValueError):
                     check_alternate_report(broken, events, **options)
