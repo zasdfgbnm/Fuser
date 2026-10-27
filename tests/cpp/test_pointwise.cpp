@@ -25,6 +25,7 @@
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/compile_time_info.h"
+#include "scheduler/compute_invocation_input.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
@@ -134,6 +135,108 @@ TEST_F(PointwiseTest, JevSemanticGraphEligibility) {
       pointwise_utils::semanticPointwiseEligibilityReason(
           &fusion, std::string(8193, 'x')),
       "semantic_graph_snapshot_too_large");
+}
+
+TEST_F(PointwiseTest, JevIrMetadataV2CapturesPointwiseEligibilityFacts) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  auto* other = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addInput(other);
+  auto* broadcasted = broadcast(input, {true, false});
+  fusion.addOutput(add(broadcasted, other));
+
+  const auto metadata =
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion);
+  ASSERT_TRUE(metadata.available());
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr("\"schema\":\"nvfuser.compute_ir_meta.v2\""));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"memory_type\":\"global\""));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"dtype\":\"float\""));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"in_fusion_vals\":true"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"has_device_mesh\":false"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_cpu_scalar\":false"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"domain_expr_count\":0"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_iteration\":true"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_broadcast\":true"));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"kind\":\"broadcast\",\"op\":null,\"cache\":null"));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"kind\":\"binary\",\"op\":\"add\",\"cache\":null"));
+  Fusion clone(fusion);
+  EXPECT_EQ(
+      metadata.text,
+      scheduler::compute_invocation_input::captureIrMetadata(&clone).text);
+}
+
+TEST_F(PointwiseTest, JevIrMetadataV2ExposesUnsupportedPointwiseFeatures) {
+  using scheduler::compute_invocation_input::captureIrMetadata;
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    auto* intermediate = add(input, input);
+    intermediate->setMemoryType(MemoryType::Shared);
+    fusion.addOutput(add(intermediate, input));
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(
+        metadata.text, testing::HasSubstr("\"memory_type\":\"shared\""));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_memory_type");
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(add(input, input));
+    input->split(0, 4);
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(metadata.text, testing::HasSubstr("\"domain_expr_count\":1"));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_hidden_domain_transform");
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(add(input, input));
+    input->axis(0)->parallelize(ParallelType::TIDx);
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_parallelized\":true"));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_unsupported_axis");
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(exp(input));
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(
+        metadata.text,
+        testing::HasSubstr(
+            "\"kind\":\"unary\",\"op\":\"exp\",\"cache\":null"));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_unsupported_operator");
+  }
 }
 
 TEST_F(PointwiseTest, JevSemanticGraphRejectsHiddenTransformsAndOps) {

@@ -43,6 +43,8 @@ enum class UnavailableReason {
   TooManyIrValues,
   TooManyTensorViews,
   TooManyAxes,
+  TooManyExpressions,
+  UnknownExpressionVal,
   IrMetadataContainsPointerLikeValue,
   SnapshotTooLarge,
   FormattingFailed,
@@ -63,6 +65,9 @@ inline const char* reasonName(UnavailableReason reason) noexcept {
     case UnavailableReason::TooManyIrValues: return "too_many_ir_values";
     case UnavailableReason::TooManyTensorViews: return "too_many_tensor_views";
     case UnavailableReason::TooManyAxes: return "too_many_axes";
+    case UnavailableReason::TooManyExpressions: return "too_many_expressions";
+    case UnavailableReason::UnknownExpressionVal:
+      return "unknown_expression_val";
     case UnavailableReason::IrMetadataContainsPointerLikeValue:
       return "ir_metadata_contains_pointer_like_value";
     case UnavailableReason::SnapshotTooLarge: return "snapshot_too_large";
@@ -115,7 +120,7 @@ inline void appendDoubleBits(std::ostream& out, double value) {
   }
 }
 
-// The v2 suffix describes domains that Fusion::print(false) does not show.
+// The v2 suffix describes IR facts that Fusion::print(false) does not show.
 // IDs come from the fusion's own deterministic IR numbering, never addresses.
 // This is a transport snapshot, not a proof that every scheduler continuation
 // can be reconstructed from the metadata alone.
@@ -126,6 +131,7 @@ inline Snapshot captureIrMetadata(Fusion* fusion) noexcept {
   constexpr size_t kMaxAxesPerDomain = 128;
   constexpr size_t kMaxAxisEntries = 32768;
   constexpr size_t kMaxAxisPrintBytes = 8192;
+  constexpr size_t kMaxExpressions = 65536;
   if (fusion == nullptr) {
     return {{}, UnavailableReason::NullFusion};
   }
@@ -153,11 +159,41 @@ inline Snapshot captureIrMetadata(Fusion* fusion) noexcept {
     if (tvs.size() > kMaxTensorViews) {
       return {{}, UnavailableReason::TooManyTensorViews};
     }
+    // IrPrinter renders exactly this output-reachable, topologically sorted
+    // sequence. Other deterministic expressions may be dead and are not part
+    // of the printed PointWise graph.
+    const auto exprs = fusion->exprs();
+    if (exprs.size() > kMaxExpressions) {
+      return {{}, UnavailableReason::TooManyExpressions};
+    }
+    // The container keeps zero/one and other special scalar Vals outside
+    // deterministic_vals(). They may still be operands of a printed Expr.
+    // Admit only such scalar references, with the same collision check as
+    // owned Vals; an unregistered TV would leave the TV table incomplete.
+    for (const Expr* expr : exprs) {
+      const auto register_expr_vals = [&](const std::vector<Val*>& refs) {
+        for (const Val* val : refs) {
+          const uint64_t key =
+              (static_cast<uint64_t>(val->vtype()) << 32) | val->name();
+          const auto [found, inserted] = val_keys.emplace(key, val);
+          if (!inserted && found->second != val) return false;
+          if (inserted && val->isA<TensorView>()) return false;
+        }
+        return true;
+      };
+      if (!register_expr_vals(expr->inputs()) ||
+          !register_expr_vals(expr->outputs())) {
+        return {{}, UnavailableReason::UnknownExpressionVal};
+      }
+    }
+    if (val_keys.size() > kMaxValues) {
+      return {{}, UnavailableReason::TooManyIrValues};
+    }
 
     BoundedSnapshotBuffer metadata_buffer(kMaxTextBytes);
     std::ostream out(&metadata_buffer);
     out.imbue(std::locale::classic());
-    out << "{\"schema\":\"nvfuser.compute_ir_meta.v1\",\"tvs\":[";
+    out << "{\"schema\":\"nvfuser.compute_ir_meta.v2\",\"tvs\":[";
     const auto append_val_key = [&](const Val* val) {
       out << '[' << static_cast<int64_t>(val->vtype()) << ',' << val->name()
           << ']';
@@ -168,9 +204,15 @@ inline Snapshot captureIrMetadata(Fusion* fusion) noexcept {
       const auto found = val_keys.find(key);
       return found != val_keys.end() && found->second == val;
     };
+    const auto enum_text = [](const auto& value) {
+      std::ostringstream text_stream;
+      text_stream.imbue(std::locale::classic());
+      text_stream << value;
+      return text_stream.str();
+    };
     size_t axis_entries = 0;
     bool first_tv = true;
-    for (const TensorView* tv : tvs) {
+    for (TensorView* tv : tvs) {
       const auto& logical = tv->getLogicalDomain();
       const auto& loop = tv->getLoopDomain();
       const auto& allocation = tv->getMaybeAllocationDomain();
@@ -190,6 +232,24 @@ inline Snapshot captureIrMetadata(Fusion* fusion) noexcept {
       first_tv = false;
       out << "{\"id\":\"T" << tv->name() << "\",\"val_key\":";
       append_val_key(tv);
+      out << ",\"memory_type\":";
+      switch (tv->getMemoryType()) {
+        case MemoryType::Local: out << "\"local\""; break;
+        case MemoryType::Shared: out << "\"shared\""; break;
+        case MemoryType::Global: out << "\"global\""; break;
+        case MemoryType::Tensor: out << "\"tensor\""; break;
+        case MemoryType::Symmetric: out << "\"symmetric\""; break;
+        default: return {{}, UnavailableReason::FormattingFailed};
+      }
+      out << ",\"dtype\":"
+          << native_diagnostic::quote(enum_text(tv->dtype()))
+          << ",\"in_fusion_vals\":"
+          << (fusion->vals().count(tv) != 0 ? "true" : "false")
+          << ",\"has_device_mesh\":"
+          << (tv->hasDeviceMesh() ? "true" : "false")
+          << ",\"is_cpu_scalar\":"
+          << (tv->isCpuScalar() ? "true" : "false")
+          << ",\"domain_expr_count\":" << tv->domain()->allExprs().size();
       out << ",\"logical\":";
       const auto append_axes = [&](const std::vector<IterDomain*>& axes) {
         out << '[';
@@ -229,7 +289,23 @@ inline Snapshot captureIrMetadata(Fusion* fusion) noexcept {
           if (!first_axis) out << ',';
           first_axis = false;
           out << "{\"id\":" << axis->name() << ",\"print\":"
-              << native_diagnostic::quote(axis_print) << '}';
+              << native_diagnostic::quote(axis_print)
+              << ",\"is_reduction\":"
+              << (axis->isReduction() ? "true" : "false")
+              << ",\"is_stride\":"
+              << (axis->isStride() ? "true" : "false")
+              << ",\"is_symbolic\":"
+              << (axis->isSymbolic() ? "true" : "false")
+              << ",\"is_device_dim\":"
+              << (axis->isDeviceDim() ? "true" : "false")
+              << ",\"has_expanded_extent\":"
+              << (axis->hasExpandedExtent() ? "true" : "false")
+              << ",\"is_parallelized\":"
+              << (axis->isParallelized() ? "true" : "false")
+              << ",\"is_iteration\":"
+              << (axis->isIteration() ? "true" : "false")
+              << ",\"is_broadcast\":"
+              << (axis->isBroadcast() ? "true" : "false") << '}';
         }
       }
       out << "]}";
@@ -290,6 +366,66 @@ inline Snapshot captureIrMetadata(Fusion* fusion) noexcept {
         default: return {{}, UnavailableReason::FormattingFailed};
       }
       out << "}}";
+    }
+    out << "],\"exprs\":[";
+    bool first_expr = true;
+    for (const Expr* expr : exprs) {
+      if (!first_expr) out << ',';
+      first_expr = false;
+      out << "{\"kind\":";
+      if (expr->isA<BroadcastOp>()) {
+        out << "\"broadcast\",\"op\":null,\"cache\":null";
+      } else if (expr->isA<LoadStoreOp>()) {
+        const auto* op = expr->as<LoadStoreOp>();
+        out << "\"load_store\",\"op\":"
+            << native_diagnostic::quote(enum_text(op->opType()))
+            << ",\"cache\":"
+            << native_diagnostic::quote(enum_text(op->cacheOp()));
+      } else if (expr->isA<UnaryOp>()) {
+        out << "\"unary\",\"op\":"
+            << native_diagnostic::quote(
+                   enum_text(expr->as<UnaryOp>()->getUnaryOpType()))
+            << ",\"cache\":null";
+      } else if (expr->isA<BinaryOp>()) {
+        out << "\"binary\",\"op\":"
+            << native_diagnostic::quote(
+                   enum_text(expr->as<BinaryOp>()->getBinaryOpType()))
+            << ",\"cache\":null";
+      } else {
+        // Represent unsupported operators too, so the server can reject the
+        // complete graph instead of treating an omitted node as eligible.
+        out << "\"other\",\"op\":null,\"cache\":null";
+      }
+      const auto append_expr_vals = [&](const std::vector<Val*>& expr_vals) {
+        out << '[';
+        for (size_t i = 0; i < expr_vals.size(); ++i) {
+          const Val* val = expr_vals[i];
+          if (!known_val(val)) return false;
+          if (i != 0) out << ',';
+          out << "{\"val_key\":";
+          append_val_key(val);
+          out << ",\"dtype\":"
+              << native_diagnostic::quote(enum_text(val->dtype()))
+              << ",\"is_const_scalar\":"
+              << (val->isConstScalar() ? "true" : "false") << '}';
+        }
+        out << ']';
+        return true;
+      };
+      out << ",\"inputs\":";
+      if (!append_expr_vals(expr->inputs())) {
+        return {{}, UnavailableReason::UnknownExpressionVal};
+      }
+      out << ",\"outputs\":";
+      if (!append_expr_vals(expr->outputs())) {
+        return {{}, UnavailableReason::UnknownExpressionVal};
+      }
+      out << '}';
+      if (!out.good()) {
+        return {{}, metadata_buffer.truncated()
+                        ? UnavailableReason::SnapshotTooLarge
+                        : UnavailableReason::FormattingFailed};
+      }
     }
     out << "]}";
     if (metadata_buffer.truncated()) {

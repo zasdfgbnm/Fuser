@@ -127,8 +127,8 @@ TEST_F(ResizeTest, ComputeInvocationSnapshotV2_CUDA) {
   const auto v2 = capture(&fusion, runtime_info, Format::V2);
   const auto metadata = captureIrMetadata(&fusion);
   ASSERT_TRUE(v1.available());
-  ASSERT_TRUE(v2.available());
-  ASSERT_TRUE(metadata.available());
+  ASSERT_TRUE(v2.available()) << reasonName(v2.reason);
+  ASSERT_TRUE(metadata.available()) << reasonName(metadata.reason);
   EXPECT_EQ(v1.text, explicit_v1.text);
   constexpr std::string_view v1_magic =
       "nvfuser.compute_invocation_input.v1\nfusion ";
@@ -159,6 +159,11 @@ TEST_F(ResizeTest, ComputeInvocationSnapshotV2_CUDA) {
       testing::HasSubstr(
           "\"alias\":{\"type\":\"new\",\"target_val\":null,"
           "\"visibility\":\"visible\"}"));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"kind\":\"other\",\"op\":null,\"cache\":null"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_const_scalar\":true"));
 
   Fusion clone(fusion);
   SchedulerRuntimeInfo clone_runtime_info(&clone, {tensor});
