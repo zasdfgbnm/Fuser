@@ -45,11 +45,14 @@
 #include "kernel_ir_dispatch.h"
 #include "logical_domain_map.h"
 #include "ops/all_ops.h"
+#include "options.h"
 #include "runtime/executor.h"
 #include "runtime/executor_params.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/all_schedulers.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/normalization_inner_projection_route.h"
+#include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_non_tma.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -6876,6 +6879,197 @@ TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
       __FILE__,
       "",
       results.heuristic_params->lparams);
+}
+
+// The injected Hopper route checks the TMA fallback that this SM89 host
+// cannot execute. The numerical control below verifies the existing path.
+TEST_F(Gpu1Test, InnerPersistentProjectionRoute) {
+  using normalization_inner::projectionPropertyRoute;
+  using scheduler::jev::Mode;
+  const auto hopper_record_fallback =
+      projectionPropertyRoute(9, true, Mode::Record, true);
+  EXPECT_TRUE(hopper_record_fallback.may_attempt_tma);
+  EXPECT_FALSE(hopper_record_fallback.enable_projection_on_initial_properties);
+  EXPECT_TRUE(hopper_record_fallback.recompute_projection_on_non_tma_fallback);
+  const auto hopper_remote_tma =
+      projectionPropertyRoute(9, true, Mode::Remote, false);
+  EXPECT_TRUE(hopper_remote_tma.may_attempt_tma);
+  EXPECT_FALSE(hopper_remote_tma.enable_projection_on_initial_properties);
+  EXPECT_FALSE(hopper_remote_tma.recompute_projection_on_non_tma_fallback);
+  const auto hopper_off_fallback =
+      projectionPropertyRoute(9, true, Mode::Off, true);
+  EXPECT_FALSE(hopper_off_fallback.enable_projection_on_initial_properties);
+  EXPECT_FALSE(hopper_off_fallback.recompute_projection_on_non_tma_fallback);
+  const auto pre_hopper_record =
+      projectionPropertyRoute(8, true, Mode::Record, true);
+  EXPECT_FALSE(pre_hopper_record.may_attempt_tma);
+  EXPECT_TRUE(pre_hopper_record.enable_projection_on_initial_properties);
+  EXPECT_FALSE(pre_hopper_record.recompute_projection_on_non_tma_fallback);
+  const auto hopper_option_off =
+      projectionPropertyRoute(9, false, Mode::Remote, true);
+  EXPECT_FALSE(hopper_option_off.may_attempt_tma);
+  EXPECT_TRUE(hopper_option_off.enable_projection_on_initial_properties);
+  EXPECT_FALSE(hopper_option_off.recompute_projection_on_non_tma_fallback);
+}
+
+// Reproduce the SM90 fallback's two property passes with one cache on this
+// SM89 host. The first pass cannot ask IP1; the second may ask it exactly once.
+TEST_F(Gpu1Test, InnerPersistentProjectionTwoPassCache_CUDA) {
+  char log_path[] = "/tmp/nvfuser-ip1-two-pass-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedJevEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedJevEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedJevEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto* exponentials = exp(maybeCastOp(DataType::Float, input));
+  auto* sums = sum(exponentials, {1});
+  auto* sums_bcast = broadcast(sums, {false, true});
+  fusion.addOutput(maybeCastOp(
+      DataType::Half, div(exponentials, sums_bcast)));
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const at::Tensor aten_input = at::randn({128, 256}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  HeuristicDataCache cache;
+  const auto first =
+      normalization_scheduler_utils::getPersistentKernelProperties(
+          &fusion,
+          runtime_info,
+          &cache,
+          SchedulerType::InnerPersistent,
+          /*enable_jev_projection=*/false);
+  {
+    std::ifstream request_log(log_path);
+    std::stringstream rows;
+    rows << request_log.rdbuf();
+    EXPECT_TRUE(rows.str().empty());
+  }
+  const auto second =
+      normalization_scheduler_utils::getPersistentKernelProperties(
+          &fusion,
+          runtime_info,
+          &cache,
+          SchedulerType::InnerPersistent,
+          /*enable_jev_projection=*/true);
+  EXPECT_EQ(first.inner_most_dimension_numel, second.inner_most_dimension_numel);
+  EXPECT_EQ(first.total_reduction_numel, second.total_reduction_numel);
+  EXPECT_EQ(first.total_iteration_numel, second.total_iteration_numel);
+  EXPECT_EQ(first.vectorize_factor, second.vectorize_factor);
+  EXPECT_EQ(first.index_type, second.index_type);
+  EXPECT_EQ(first.n_tensor_inputs, second.n_tensor_inputs);
+  EXPECT_EQ(first.max_dtype_size_bit, second.max_dtype_size_bit);
+  EXPECT_EQ(first.has_exp_op, second.has_exp_op);
+  normalization_scheduler_utils::PersistentKernelProperties fresh;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    fresh = normalization_scheduler_utils::getPersistentKernelProperties(
+        &fusion,
+        runtime_info,
+        nullptr,
+        SchedulerType::InnerPersistent,
+        /*enable_jev_projection=*/true);
+  }
+  EXPECT_EQ(
+      second.project_persistent_buffers, fresh.project_persistent_buffers);
+  EXPECT_EQ(
+      second.max_persistent_buffer_size_bit,
+      fresh.max_persistent_buffer_size_bit);
+  EXPECT_EQ(
+      second.disable_project_to_avoid_recompute,
+      fresh.disable_project_to_avoid_recompute);
+  EXPECT_EQ(second.persistent_buffers, fresh.persistent_buffers);
+  std::ifstream request_log(log_path);
+  std::stringstream rows;
+  rows << request_log.rdbuf();
+  const std::string marker = "\"site\":\"IP1.projection\"";
+  const auto first_choice = rows.str().find(marker);
+  ASSERT_NE(first_choice, std::string::npos);
+  EXPECT_EQ(
+      rows.str().find(marker, first_choice + marker.size()),
+      std::string::npos);
+}
+
+TEST_F(Gpu1Test, InnerPersistentProjectionPreHopperControl_CUDA) {
+  if (at::cuda::getCurrentDeviceProperties()->major >= 9) {
+    GTEST_SKIP() << "The numerical control requires a pre-Hopper GPU";
+  }
+  char log_path[] = "/tmp/nvfuser-ip1-route-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  EnableOptionsGuard::getCurOptions().set(EnableOption::TmaInnerPersistent);
+  ScopedJevEnv log("NVFUSER_JEV_LOG", log_path);
+  ScopedJevEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto* exponentials = exp(maybeCastOp(DataType::Float, input));
+  auto* sums = sum(exponentials, {1});
+  auto* sums_bcast = broadcast(sums, {false, true});
+  fusion.addOutput(maybeCastOp(
+      DataType::Half, div(exponentials, sums_bcast)));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const at::Tensor aten_input = at::randn({128, 256}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::InnerPersistent);
+  std::unique_ptr<HeuristicParams> off_params;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    off_params = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  ScopedJevEnv record_mode("NVFUSER_JEV_MODE", "record");
+  auto result =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  ASSERT_NE(off_params, nullptr);
+  ASSERT_NE(result.heuristic_params, nullptr);
+  const auto* off = off_params->as<ReductionParams>();
+  const auto* recorded = result.heuristic_params->as<ReductionParams>();
+  EXPECT_TRUE(recorded->sameAs(off));
+  const at::Tensor e = at::exp(aten_input.to(at::kFloat));
+  const at::Tensor reference = (e / e.sum(1, true)).to(at::kHalf);
+  testValidate(
+      &fusion,
+      result.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      result.heuristic_params->lparams);
+  std::ifstream request_log(log_path);
+  std::stringstream requests;
+  requests << request_log.rdbuf();
+  const std::string rows = requests.str();
+  const std::string marker = "\"site\":\"IP1.projection\"";
+  const auto first = rows.find(marker);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(rows.find(marker, first + marker.size()), std::string::npos);
+  EXPECT_THAT(rows, ::testing::HasSubstr("inner_persistent.projection.v1"));
 }
 
 // Exercise a register-backed 3D persistent reduction with an alternate
