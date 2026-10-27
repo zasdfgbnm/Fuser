@@ -3,6 +3,7 @@
 #include <scheduler/jev_client.h>
 #include <scheduler/inner_outer_mode_preflight.h>
 #include <scheduler/matmul_hopper_tile_menu.h>
+#include <scheduler/normalization_inner_smem_cta_choice.h>
 #include <scheduler/normalization_inner_outer_grid_rows_admission.h>
 #include <scheduler/normalization_inner_outer_tma_tmp_width.h>
 #include <scheduler/normalization_tma_prefetch_choice.h>
@@ -67,6 +68,34 @@ void testHopperLowStageMenu() {
   require(
       !legacy.has_native_config && legacy.candidates.empty(),
       "Off/Record tile admission changed under the injected budget");
+}
+
+void testInnerSmemCtaNativeSeedGate() {
+  using namespace nvfuser::normalization_inner::non_tma::smem_cta_choice;
+  // A 4100-element FP32 persistent buffer fits when seed 512 selects b3,
+  // although the native max-CTA seed 1024 selects b2 and exceeds this cap.
+  const Input input{
+      4100, 4, 1024, 32, 4100 * 32, 21400 * 8, 4096 * 8,
+      128 * 8, 128 * 8, 128, {{"T0", 4100 * 32, 32}}};
+  const auto native = preview(input, 1024);
+  const auto alternative = preview(input, 512);
+  const auto menu = enumerate(input);
+  require(
+      native.has_value() && alternative.has_value() &&
+          native->batch == 2 && native->actual_threads == 513 &&
+          native->padded_threads == 544 &&
+          native->roundup_overhead_bits == 1024 * 8 &&
+          native->required_smem_bits == 21648 * 8 && !native->legal &&
+          alternative->batch == 3 && alternative->actual_threads == 342 &&
+          alternative->padded_threads == 352 &&
+          alternative->roundup_overhead_bits == 512 * 8 &&
+          alternative->required_smem_bits == 21136 * 8 &&
+          alternative->legal && !menu.hasNativeSeed(1024) &&
+          !menu.candidates.empty() &&
+          menu.geometry.front().seed == 1024 &&
+          menu.candidates.front().seed == 512 &&
+          menu.candidates.front().batch == 3,
+      "IP8 native seed was treated as shared-memory legality");
 }
 
 void testTmaTemporaryReadWidthContinuation() {
@@ -463,6 +492,7 @@ void testInnerOuterGridRowsAdmission() {
 
 int main() {
   testHopperLowStageMenu();
+  testInnerSmemCtaNativeSeedGate();
   testTmaTemporaryReadWidthContinuation();
   testInner3dIterUnrollContinuation();
   testInnerRemainderPlateauScan();

@@ -24,6 +24,7 @@
 #include "options.h"
 #include "scheduler/debug_utils.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/normalization_inner_smem_cta_choice.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
@@ -1470,59 +1471,61 @@ void innerPersistentHeuristicSharedMemory(
               });
       const auto& persistent_buffer_info = persistent_buffer_info_entry.get();
       auto reduction_tvs = scheduler_utils::getReductionTvs(fusion);
-      struct BatchPlan {
-        int64_t seed;
-        int64_t batch;
-        int64_t padded_threads;
-      };
-      std::vector<BatchPlan> plans;
-      std::vector<scheduler::jev::ChoiceOption> options;
-      const int64_t after_vectorize =
-          properties.total_reduction_numel / vectorize_factor;
-      for (int64_t seed = bdimx; seed >= warp_size; seed /= 2) {
-        const int64_t batch = ceilDiv(after_vectorize, seed);
-        const int64_t actual_threads = ceilDiv(after_vectorize, batch);
-        const int64_t padded_threads = ceilDiv(actual_threads, warp_size) *
-            warp_size;
-        if (actual_threads < 1 || padded_threads > bdimx ||
-            padded_threads > seed) {
-          continue;
-        }
-        // This repeats the native per-buffer roundup calculation with the
-        // candidate batch and keeps its max-thread reduction workspace and
-        // static shared-memory reserve. The original topology gate and buffer
-        // projection remain native.
-        const int64_t available_bits = normalization_scheduler_utils::
+      const auto& buffers = properties.project_persistent_buffers
+          ? persistent_buffer_info.projectable_buffer_inputs
+          : persistent_buffer_info.persistent_buffers;
+      std::vector<smem_cta_choice::Buffer> buffer_facts;
+      buffer_facts.reserve(buffers.size());
+      for (auto* buffer : buffers) {
+        buffer_facts.push_back(
+            {"T" + std::to_string(buffer->name()),
+             scheduler_utils::getPersistentBufferSizeBitOfTensor(
+                 buffer, runtime_info, persistent_buffer_info),
+             dataTypeSizeBit(buffer->getDataType())});
+      }
+      const smem_cta_choice::Input resource_input{
+          properties.total_reduction_numel,
+          vectorize_factor,
+          bdimx,
+          warp_size,
+          properties.max_persistent_buffer_size_bit,
+          static_cast<int64_t>(dev_prop->sharedMemPerBlockOptin) * 8,
+          scheduler_utils::getReductionSmemWorkspaceBit(fusion, reduction_tvs),
+          scheduler_utils::static_smem_usage_in_bits,
+          kSharedMemoryAlignmentBytes * 8,
+          getMaxVectorizationSizeInBit(),
+          std::move(buffer_facts)};
+      const auto menu = smem_cta_choice::enumerate(resource_input);
+      for (const auto& candidate : menu.geometry) {
+        // The pure preview is the production admission calculation. Keep an
+        // exact cross-check against the existing fusion-aware analyzer while
+        // moving the resource operands into the versioned text contract.
+        const int64_t source_available_bits = normalization_scheduler_utils::
             getMaxSharedMemorySizeBitForPersistentBuffer(
                 fusion,
                 runtime_info,
                 reduction_tvs,
                 persistent_buffer_info,
                 properties.project_persistent_buffers,
-                batch,
-                padded_threads);
-        if (properties.max_persistent_buffer_size_bit > available_bits) {
-          continue;
-        }
-        const std::string id = "b" + std::to_string(batch);
-        if (std::any_of(
-                options.begin(),
-                options.end(),
-                [&](const auto& option) { return option.id == id; })) {
-          continue;
-        }
-        plans.push_back({seed, batch, padded_threads});
+                candidate.batch,
+                candidate.padded_threads);
+        NVF_ERROR(
+            candidate.available_persistent_bits == source_available_bits,
+            "IP8.cta pure capacity preview disagrees with source analysis");
+      }
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (const auto& candidate : menu.candidates) {
+        const std::string id = "b" + std::to_string(candidate.batch);
         options.push_back({
             id,
-            "Use persistent batch " + std::to_string(batch) +
-                " from CTA target " + std::to_string(seed) +
+            "Use persistent batch " + std::to_string(candidate.batch) +
+                " from CTA target " + std::to_string(candidate.seed) +
                 "; derived warp-padded TIDx=" +
-                std::to_string(padded_threads)});
+                std::to_string(candidate.padded_threads)});
       }
-      // If the conservative candidate estimate cannot prove even the native
-      // plan, off/record retain the original calculation; remote fails closed.
-      const bool native_is_legal =
-          !plans.empty() && plans.front().seed == bdimx;
+      // Preserve the native answer for Record when its seed fails capacity;
+      // Remote may still choose a separately proved smaller CTA target.
+      const bool native_is_legal = menu.hasNativeSeed(bdimx);
       if (native_is_legal) {
         const std::string state =
             "inner_persistent.smem_cta.v1\nreduction_numel=" +
@@ -1545,11 +1548,84 @@ void innerPersistentHeuristicSharedMemory(
         NVF_ERROR(
             option_it != options.end(), "Unknown inner persistent CTA plan");
         persistent_batch =
-            plans.at(std::distance(options.begin(), option_it)).batch;
-      } else {
+            menu.candidates.at(std::distance(options.begin(), option_it)).batch;
+      } else if (
+          jev_mode == scheduler::jev::Mode::Remote &&
+          !menu.candidates.empty()) {
+        std::string state =
+            "inner_persistent.smem_cta.v2\nreduction_numel=" +
+            std::to_string(properties.total_reduction_numel) +
+            "\nvector_width=" + std::to_string(vectorize_factor) +
+            "\nmax_threads_per_block=" + std::to_string(bdimx) +
+            "\nwarp_size=" + std::to_string(warp_size) +
+            "\npersistent_buffer_bits=" +
+            std::to_string(properties.max_persistent_buffer_size_bit) +
+            "\nsmem_per_block_bytes=" +
+            std::to_string(dev_prop->sharedMemPerBlockOptin) +
+            "\nworkspace_bits=" +
+            std::to_string(resource_input.workspace_bits) +
+            "\nstatic_reserve_bits=" +
+            std::to_string(resource_input.static_reserve_bits) +
+            "\nalignment_bits=" +
+            std::to_string(resource_input.alignment_bits) +
+            "\nmax_vector_bits=" +
+            std::to_string(resource_input.max_vector_bits) +
+            "\nproject_to_inputs=" +
+            std::to_string(properties.project_persistent_buffers) +
+            "\ninner_numel=" +
+            std::to_string(properties.inner_most_dimension_numel) +
+            "\ndevice_major=" + std::to_string(dev_prop->major) +
+            "\nmax_cluster_size=" +
+            std::to_string(scheduler_utils::getMaxClusterSize());
+        for (const auto& buffer : resource_input.buffers) {
+          state += "\nbuffer=" + buffer.tv + ':' +
+              std::to_string(buffer.logical_bits) + ':' +
+              std::to_string(buffer.dtype_bits);
+        }
+        std::vector<scheduler::jev::ChoiceOption> v2_options;
+        v2_options.reserve(menu.candidates.size());
+        for (const auto& plan : menu.candidates) {
+          v2_options.push_back({
+              "b" + std::to_string(plan.batch),
+              "Use persistent batch " + std::to_string(plan.batch) +
+                  " from CTA target " + std::to_string(plan.seed) +
+                  "; derived warp-padded TIDx=" +
+                  std::to_string(plan.padded_threads) +
+                  "; required shared memory " +
+                  std::to_string(plan.required_smem_bits) + " bits of " +
+                  std::to_string(resource_input.smem_cap_bits) + " bits",
+              "{\"cta_seed\":" + std::to_string(plan.seed) +
+                  ",\"persistent_batch\":" +
+                  std::to_string(plan.batch) +
+                  ",\"actual_threads\":" +
+                  std::to_string(plan.actual_threads) +
+                  ",\"padded_threads\":" +
+                  std::to_string(plan.padded_threads) +
+                  ",\"roundup_overhead_bits\":" +
+                  std::to_string(plan.roundup_overhead_bits) +
+                  ",\"available_persistent_bits\":" +
+                  std::to_string(plan.available_persistent_bits) +
+                  ",\"required_smem_bits\":" +
+                  std::to_string(plan.required_smem_bits) +
+                  ",\"pending_choices\":[]}"});
+        }
+        const std::string selected = scheduler::jev::chooseDecision(
+            "IP8.cta", state, v2_options, "");
+        const auto selected_it = std::find_if(
+            v2_options.begin(),
+            v2_options.end(),
+            [&](const auto& option) { return option.id == selected; });
         NVF_ERROR(
-            jev_mode != scheduler::jev::Mode::Remote,
-            "Unable to prove native shared-memory persistent CTA capacity");
+            selected_it != v2_options.end(),
+            "Unknown inner persistent CTA plan");
+        persistent_batch =
+            menu.candidates.at(std::distance(v2_options.begin(), selected_it))
+                .batch;
+      } else if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IP8.cta", "Native CTA seed exceeds proved shared-memory budget");
+      } else {
+        NVF_ERROR(false, "No hard-valid shared-memory persistent CTA plan");
       }
     } else {
       NVF_ERROR(
