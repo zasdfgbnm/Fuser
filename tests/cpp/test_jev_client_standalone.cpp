@@ -128,7 +128,7 @@ void testInner3dIterUnrollContinuation() {
   // Record and Remote menus must both use the canonical IDs u1 and u3;
   // Record maps native u2 to u1 without leaking its preference in the menu.
   const StateFields mixed_classes{
-      257, 1, 257, 32, 1, 1, 1, 128, 1024, 128, 32, 1, 4, 32,
+      257, 1, 257, 32, 1, 1, 1, 128, 512, 256, 32, 2, 1, 32,
       8,   8, 2147483647, 65535, 65535};
   const auto record_request = buildRequest(mixed_classes, 3, 2);
   const auto remote_request = buildRequest(mixed_classes, 3, std::nullopt);
