@@ -74,6 +74,12 @@ std::pair<TensorView*, int64_t> getLargestTensor(
 struct DirectPadReorderConsequences {
   std::string skip;
   std::string keep;
+  std::string reference_tv;
+  std::string input_tv;
+  std::array<int64_t, 3> read_strides;
+  std::array<int64_t, 3> write_strides;
+  int64_t read_elements;
+  int64_t write_elements;
 };
 
 // Bind the two local reorder effects to a deliberately small graph subset.
@@ -283,7 +289,14 @@ std::optional<DirectPadReorderConsequences> directPadReorderConsequencesUnchecke
         ",\"write_stride_by_loop\":" + three(write) + '}';
   };
   return DirectPadReorderConsequences{
-      effect({0, 1, 2}), effect({1, 0, 2})};
+      effect({0, 1, 2}),
+      effect({1, 0, 2}),
+      "T" + std::to_string(reference->name()),
+      "T" + std::to_string(largest_input->name()),
+      read_strides,
+      write_strides,
+      *read_elements,
+      *write_elements};
 }
 
 std::optional<DirectPadReorderConsequences> directPadReorderConsequences(
@@ -300,6 +313,58 @@ std::optional<DirectPadReorderConsequences> directPadReorderConsequences(
     // when runtime geometry or graph mapping cannot be proved here.
     return std::nullopt;
   }
+}
+
+// RS1.cta is terminal in computeHeuristics. Describe the exact candidate
+// ResizeParams and the no-split launch produced by the selected width and
+// reorder branch. The source owns index-type analysis; the other values are
+// independently reconstructible from the v2 invocation snapshot.
+std::string directPadCtaConsequence(
+    const DirectPadReorderConsequences& pad,
+    const ResizeParams& candidate) {
+  NVF_ERROR(
+      !candidate.split_grid_x_dim && candidate.cta_threads > 0 &&
+          candidate.vectorization_factor > 0 &&
+          candidate.cparams.index_type.has_value() &&
+          (candidate.largest_input == -1 || candidate.largest_input == 0),
+      "Direct Pad CTA preview requires a complete no-split Resize plan");
+  const std::array<int64_t, 3> order =
+      candidate.largest_input == 0 ? std::array<int64_t, 3>{1, 0, 2}
+                                   : std::array<int64_t, 3>{0, 1, 2};
+  const auto three = [](const std::array<int64_t, 3>& values) {
+    return '[' + std::to_string(values[0]) + ',' +
+        std::to_string(values[1]) + ',' + std::to_string(values[2]) + ']';
+  };
+  const auto in_loop_order = [&](const std::array<int64_t, 3>& strides) {
+    return three(
+        {strides.at(order[0]), strides.at(order[1]), strides.at(order[2])});
+  };
+  const int64_t vector_iterations =
+      ceilDiv(pad.write_elements, candidate.vectorization_factor);
+  const int64_t grid_x =
+      ceilDiv(vector_iterations, candidate.cta_threads);
+  return "{\"final_resize_plan\":{\"index_type\":" +
+      std::to_string(static_cast<int64_t>(*candidate.cparams.index_type)) +
+      ",\"largest_input\":" + std::to_string(candidate.largest_input) +
+      ",\"vectorization_factor\":" +
+      std::to_string(candidate.vectorization_factor) +
+      ",\"cta_threads\":" + std::to_string(candidate.cta_threads) +
+      ",\"split_grid_x_dim\":false},"
+      "\"index_type_provenance\":\"source_hard_analysis\","
+      "\"reference_tv\":\"" + pad.reference_tv +
+      "\",\"input_tv\":\"" + pad.input_tv +
+      "\",\"loop_axis_order\":" + three(order) +
+      ",\"read_stride_by_loop\":" + in_loop_order(pad.read_strides) +
+      ",\"write_stride_by_loop\":" + in_loop_order(pad.write_strides) +
+      ",\"read_elements\":" + std::to_string(pad.read_elements) +
+      ",\"write_elements\":" + std::to_string(pad.write_elements) +
+      ",\"pad_fill_elements\":" +
+      std::to_string(pad.write_elements - pad.read_elements) +
+      ",\"output_vector_iterations\":" +
+      std::to_string(vector_iterations) +
+      ",\"block_x\":" + std::to_string(candidate.cta_threads) +
+      ",\"grid_x\":" + std::to_string(grid_x) +
+      ",\"grid_y\":1,\"pending_choices\":[]}";
 }
 
 } // namespace
@@ -477,6 +542,10 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
 
   const auto jev_mode = scheduler::jev::mode();
   std::string input_elements;
+  const bool semantic_v3_resize =
+      jev_mode != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticV3Enabled();
+
   if (jev_mode != scheduler::jev::Mode::Off) {
     // Preserve original fusion-input indices: scalar inputs have no layout.
     for (size_t input_index = 0; input_index < fusion->inputs().size();
@@ -566,36 +635,36 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
     NVF_ERROR(matched, "RS1.width response is outside native hard bounds");
   }
 
+  const auto direct_pad = semantic_v3_resize
+      ? directPadReorderConsequences(
+            fusion,
+            ref_tv,
+            largest_input,
+            runtime_info,
+            params->vectorization_factor)
+      : std::nullopt;
+
   if (jev_mode != scheduler::jev::Mode::Off) {
     // The target remains the first largest TensorView input selected above.
     // Reordering only changes the outer loop-axis order in schedule(), so
     // skipping it leaves the reference and innermost vectorized axis intact.
-    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
-    const auto consequences = semantic_v3
-        ? directPadReorderConsequences(
-              fusion,
-              ref_tv,
-              largest_input,
-              runtime_info,
-              params->vectorization_factor)
-        : std::nullopt;
-    if (semantic_v3 && !consequences) {
+    if (semantic_v3_resize && !direct_pad) {
       scheduler::jev::recordCoverageSkip(
           "RS1.reorder", "direct rank-3 right Pad preview is unavailable");
     } else {
       std::vector<scheduler::jev::ChoiceOption> options{
           {"skip",
            "Keep the reference tensor's outer loop-axis order",
-           consequences ? consequences->skip : ""}};
+           direct_pad ? direct_pad->skip : ""}};
       if (largest_input != nullptr) {
         options.push_back({
             "keep",
             "Reorder outer loop axes like the largest input",
-            consequences ? consequences->keep : ""});
+            direct_pad ? direct_pad->keep : ""});
       }
       const std::string state =
-          (consequences ? "resize.reorder.v2\ninput_elements="
-                        : "resize.reorder.v1\ninput_elements=") +
+          (direct_pad ? "resize.reorder.v2\ninput_elements="
+                      : "resize.reorder.v1\ninput_elements=") +
           input_elements + '\n';
       const std::string native_choice =
           jev_mode == scheduler::jev::Mode::Record
@@ -617,6 +686,15 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
     // Native analysis fixes the reference and bounds the already selected
     // vector width. A CTA candidate only changes the final flattened split
     // and its derived grid split.
+    if (semantic_v3_resize &&
+        (!direct_pad || largest_output != ref_tv ||
+         direct_pad->write_elements != max_num_elms ||
+         !params->cparams.index_type.has_value() ||
+         (params->largest_input != -1 && params->largest_input != 0))) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.cta", "direct rank-3 right Pad final plan is unavailable");
+      return params;
+    }
     const auto* device = at::cuda::getCurrentDeviceProperties();
     const int64_t warp_size = device->warpSize;
     const int64_t max_threads_x = device->maxThreadsDim[0];
@@ -639,16 +717,36 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
                       : grid_blocks <= max_grid_x);
     };
     NVF_ERROR(legal(128), "RS1.cta native CTA is outside physical bounds");
+    bool has_split_grid_choice = false;
+    if (semantic_v3_resize) {
+      for (int64_t threads : {64, 128, 256}) {
+        has_split_grid_choice |= legal(threads) &&
+            ceilDiv(max_num_elms, threads) > ResizeParams::max_gdimx;
+      }
+    }
+    if (has_split_grid_choice) {
+      // The terminal preview below describes a single physical grid-X.
+      // A split-grid schedule has an additional serial outer loop.
+      scheduler::jev::recordCoverageSkip(
+          "RS1.cta", "direct Pad CTA has a split-grid continuation");
+      return params;
+    }
     std::vector<scheduler::jev::ChoiceOption> options;
     for (int64_t threads : {64, 128, 256}) {
       if (legal(threads)) {
+        ResizeParams candidate(*params);
+        candidate.cta_threads = threads;
+        candidate.split_grid_x_dim =
+            ceilDiv(max_num_elms, threads) > ResizeParams::max_gdimx;
         options.push_back({
             "t" + std::to_string(threads),
-            "Use " + std::to_string(threads) + " threads per Resize CTA"});
+            "Use " + std::to_string(threads) + " threads per Resize CTA",
+            direct_pad ? directPadCtaConsequence(*direct_pad, candidate) : ""});
       }
     }
     const std::string state =
-        "resize.cta.v1\nmax_output_elements=" +
+        (direct_pad ? "resize.cta.v2\nmax_output_elements="
+                    : "resize.cta.v1\nmax_output_elements=") +
         std::to_string(max_num_elms) + "\nlayout_max=" +
         std::to_string(layout_max) + "\nvector_width=" +
         std::to_string(params->vectorization_factor) + "\nwarp_size=" +

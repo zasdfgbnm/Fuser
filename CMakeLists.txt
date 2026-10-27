@@ -1204,6 +1204,16 @@ if(BUILD_TEST)
     "Gpu2Test.FusionPointwiseBroadcast_CUDA" "PW")
   add_jev_remote_numeric_test(resize
     "ResizeTest.JevAlternateCta_CUDA" "RS" "RS1.cta")
+  foreach(RS1_CTA_THREADS IN ITEMS 64 256)
+    add_test(NAME jev_rs1_terminal_t${RS1_CTA_THREADS}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+        --binary "$<TARGET_FILE:test_nvfuser>"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+        --threads ${RS1_CTA_THREADS})
+    set_tests_properties(jev_rs1_terminal_t${RS1_CTA_THREADS}
+      PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  endforeach()
   add_test(NAME jev_alternate_numeric_resize_cta
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

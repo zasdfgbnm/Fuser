@@ -8,6 +8,9 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <string_view>
+
 #include "exceptions.h"
 #include "fusion.h"
 #include "ops/all_ops.h"
@@ -291,6 +294,53 @@ TEST_F(ResizeTest, JevAlternateOuterReorder_CUDA) {
       exact.toGroup(outer_merge->inner()),
       exact.toGroup(output->getLogicalDomain().at(skip ? 1 : 0)));
 
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {0, 8})},
+      __LINE__,
+      __FILE__);
+}
+
+// The direct rank-three right Pad is the semantic-v3 terminal RS1.cta
+// fixture. Its complete t64/t128/t256 plans share the same selected width and
+// keep reorder, but compile with distinct physical CTA and grid dimensions.
+TEST_F(ResizeTest, JevDirectPadTerminalCta_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  ASSERT_EQ(tensor.sizes(), (at::IntArrayRef{5, 7, 64}));
+  ASSERT_EQ(tensor.strides(), (at::IntArrayRef{64, 320, 1}));
+
+  int64_t expected_threads = 128;
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+    ASSERT_NE(case_key, nullptr);
+    const std::string_view key(case_key);
+    ASSERT_TRUE(key.ends_with("_t64") || key.ends_with("_t256"));
+    expected_threads = key.ends_with("_t64") ? 64 : 256;
+  }
+
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->largest_input, 0);
+  EXPECT_EQ(params->vectorization_factor, 4);
+  EXPECT_EQ(params->cta_threads, expected_threads);
+  EXPECT_FALSE(params->split_grid_x_dim);
+  const auto launch = result.kernel_executor->lastLaunchParams();
+  EXPECT_EQ(launch.bdimx(), expected_threads);
+  EXPECT_EQ(launch.gdimx(), (630 + expected_threads - 1) / expected_threads);
   testValidate(
       &fusion,
       result.outputs,
