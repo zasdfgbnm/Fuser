@@ -6343,6 +6343,8 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   if (std::getenv("NVFUSER_JEV_PROTOCOL") == nullptr) {
     local_protocol.emplace("NVFUSER_JEV_PROTOCOL", "text-v1");
   }
+  const bool semantic_v3 =
+      std::string_view(std::getenv("NVFUSER_JEV_PROTOCOL")) == "semantic-v3";
   // Keep the outer numeric harness's log path so it can compare the Record
   // and Remote requests. Standalone GTest runs use a temporary local log.
   std::optional<ScopedJevEnv> local_log;
@@ -6400,6 +6402,7 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   std::ifstream decision_log(decision_log_path);
   std::string row;
   bool saw_parent_first_rd4 = false;
+  bool saw_versioned_hardware = false;
   bool saw_wave_request = false;
   bool saw_iter_unroll_request = false;
   std::vector<std::string> choice_sites;
@@ -6418,6 +6421,22 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
             row.find("reduction.inner_mapping.v2") != std::string::npos &&
             row.find("\"selected\":\"3d\"") != std::string::npos &&
             row.find("\"compute_event_index\":1") != std::string::npos;
+        saw_versioned_hardware |=
+            row.find("\"schema\":\"nvfuser.hardware.v2\"") !=
+                std::string::npos &&
+            row.find(
+                "\"l2_cache_bytes\":" + std::to_string(device->l2CacheSize)) !=
+                std::string::npos &&
+            row.find(
+                "\"shared_memory_per_block_optin_bytes\":" +
+                std::to_string(device->sharedMemPerBlockOptin)) !=
+                std::string::npos &&
+            row.find(
+                "\"registers_per_block\":" +
+                std::to_string(device->regsPerBlock)) != std::string::npos &&
+            row.find(
+                "\"max_grid_z\":" + std::to_string(device->maxGridSize[2])) !=
+                std::string::npos;
       }
     }
     saw_wave_request |=
@@ -6459,6 +6478,9 @@ TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   ASSERT_FALSE(choice_sites.empty());
   EXPECT_EQ(choice_sites.front(), "RD4");
   EXPECT_TRUE(saw_parent_first_rd4);
+  if (semantic_v3) {
+    EXPECT_TRUE(saw_versioned_hardware);
+  }
 }
 
 // The same supported 3D fusion can be flattened before any RD5 child choice.

@@ -30,8 +30,13 @@ namespace nvfuser {
 namespace {
 std::string jevHardwareSnapshot() {
   const auto* device = at::cuda::getCurrentDeviceProperties();
-  if (device == nullptr) return {};
+  if (device == nullptr)
+    return {};
   scheduler::native_diagnostic::Object hardware;
+  // The v3 decision envelope carries a separately versioned hardware object.
+  // Its resource limits let the server verify local hard menus without
+  // changing the fusion/runtime snapshot or historical text protocols.
+  hardware.add("schema", "nvfuser.hardware.v2");
   hardware.add("sm_count", static_cast<int64_t>(device->multiProcessorCount));
   hardware.add("device_name", device->name);
   hardware.add("compute_capability_major", static_cast<int64_t>(device->major));
@@ -43,14 +48,22 @@ std::string jevHardwareSnapshot() {
   hardware.add(
       "max_threads_per_sm",
       static_cast<int64_t>(device->maxThreadsPerMultiProcessor));
-  hardware.add("registers_per_sm", static_cast<int64_t>(device->regsPerMultiprocessor));
+  hardware.add(
+      "registers_per_sm", static_cast<int64_t>(device->regsPerMultiprocessor));
+  hardware.add(
+      "registers_per_block", static_cast<int64_t>(device->regsPerBlock));
   hardware.add(
       "shared_memory_per_sm_bytes",
       static_cast<int64_t>(device->sharedMemPerMultiprocessor));
+  hardware.add(
+      "shared_memory_per_block_optin_bytes",
+      static_cast<int64_t>(device->sharedMemPerBlockOptin));
+  hardware.add("l2_cache_bytes", static_cast<int64_t>(device->l2CacheSize));
   hardware.add("max_threads_x", static_cast<int64_t>(device->maxThreadsDim[0]));
   hardware.add("max_threads_y", static_cast<int64_t>(device->maxThreadsDim[1]));
   hardware.add("max_grid_x", static_cast<int64_t>(device->maxGridSize[0]));
   hardware.add("max_grid_y", static_cast<int64_t>(device->maxGridSize[1]));
+  hardware.add("max_grid_z", static_cast<int64_t>(device->maxGridSize[2]));
   return hardware.str();
 }
 
