@@ -679,6 +679,34 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
   return params;
 }
 
+std::string_view tmaBreakPointRemoteRouteabilityReason(
+    std::size_t loop_axes,
+    int64_t n_elems,
+    int64_t break_point,
+    int64_t layout_width,
+    int64_t min_dtype_bits) {
+  if (loop_axes > 32) {
+    return "more than 32 loop dimensions";
+  }
+  if (break_point == 0 && n_elems > (1LL << 40)) {
+    return "extent exceeds bounded divisor replay";
+  }
+  // The Off materialization uses the uncapped layout factor: its optional
+  // register and wave limits are disabled. This is the later PW4.width menu's
+  // layout_max, so checking it here does not compute another preference.
+  if (layout_width < 1 || layout_width > 128 ||
+      scheduler_utils::lastPow2(layout_width) != layout_width ||
+      min_dtype_bits <= 0 ||
+      (min_dtype_bits < 8 && 8 % min_dtype_bits != 0)) {
+    return "PW4.width layout and byte bounds must be powers of two in 1..128";
+  }
+  const int64_t byte_min = min_dtype_bits < 8 ? 8 / min_dtype_bits : 1;
+  if (scheduler_utils::lastPow2(byte_min) != byte_min) {
+    return "PW4.width layout and byte bounds must be powers of two in 1..128";
+  }
+  return {};
+}
+
 namespace {
 
 TmaBreakPointAvailability materializeTmaBreakPointAvailability(
@@ -739,6 +767,18 @@ TmaBreakPointAvailability materializeTmaBreakPointAvailability(
              : "Split before loop axis " +
                    std::to_string(candidate.break_point)});
     result.plans.push_back(candidate);
+    // Native Off materialization with hard_valid=true already proves the
+    // preferred domain/tile fits resource bounds. PW4.domain_inner retains
+    // that t512 option; PW4.tile_inner and PW4.tile_outer each retain at
+    // least one compatible candidate. PW4.width then has a nonempty menu if
+    // its source layout and byte constraints have the required form.
+    result.remote_unavailability_reasons.emplace_back(
+        tmaBreakPointRemoteRouteabilityReason(
+            prop.elem_counts.size(),
+            prop.n_elems,
+            candidate.break_point,
+            materialized->vectorization_factor,
+            min_dtype_bits));
   }
   return result;
 }

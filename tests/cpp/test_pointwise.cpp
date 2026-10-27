@@ -2333,14 +2333,47 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   }
   EXPECT_EQ(preview.state, structural.state);
   ASSERT_EQ(preview.options.size(), preview.plans.size());
+  ASSERT_EQ(
+      preview.options.size(), preview.remote_unavailability_reasons.size());
   ASSERT_EQ(preview.options.size(), 2);
   EXPECT_EQ(preview.options[0].id, "bp0");
   EXPECT_EQ(preview.options[1].id, "bp1");
+  EXPECT_EQ(
+      preview.options[0].description,
+      "Flatten to the one-dimensional TMA domain");
+  EXPECT_EQ(preview.options[1].description, "Split before loop axis 1");
   for (size_t i = 0; i < preview.options.size(); ++i) {
     EXPECT_EQ(
         preview.options[i].id,
         "bp" + std::to_string(preview.plans[i].break_point));
+    EXPECT_TRUE(preview.remote_unavailability_reasons[i].empty());
   }
+  // The same source-used routeability gate separates a materializable bp0
+  // from a Remote-reachable continuation at the divisor replay boundary.
+  EXPECT_TRUE(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 1LL << 40, 0, 4, 32)
+          .empty());
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, (1LL << 40) + 1, 0, 4, 32),
+      "extent exceeds bounded divisor replay");
+  EXPECT_TRUE(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, (1LL << 40) + 1, 1, 4, 32)
+          .empty());
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          33, 131072, 1, 4, 32),
+      "more than 32 loop dimensions");
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 131072, 1, 3, 32),
+      "PW4.width layout and byte bounds must be powers of two in 1..128");
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 131072, 1, 4, 3),
+      "PW4.width layout and byte bounds must be powers of two in 1..128");
   EXPECT_TRUE(preview_debug.str().empty());
   std::ifstream preview_log(log_path);
   std::stringstream preview_rows;
@@ -2397,6 +2430,9 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   }
   ASSERT_EQ(remote_preview.options.size(), preview.options.size());
   ASSERT_EQ(remote_preview.plans.size(), preview.plans.size());
+  ASSERT_EQ(
+      remote_preview.remote_unavailability_reasons.size(),
+      preview.remote_unavailability_reasons.size());
   for (size_t i = 0; i < preview.options.size(); ++i) {
     EXPECT_EQ(remote_preview.options[i].id, preview.options[i].id);
     EXPECT_EQ(
@@ -2404,6 +2440,9 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
         preview.options[i].description);
     EXPECT_EQ(
         remote_preview.plans[i].break_point, preview.plans[i].break_point);
+    EXPECT_EQ(
+        remote_preview.remote_unavailability_reasons[i],
+        preview.remote_unavailability_reasons[i]);
   }
   EXPECT_TRUE(remote_preview_debug.str().empty());
   std::ifstream remote_preview_log(log_path);
