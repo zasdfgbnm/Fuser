@@ -9,6 +9,7 @@
 #include "scheduler/pointwise_non_tma.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -21,6 +22,7 @@
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
+#include "scheduler/native_diagnostic_jsonl.h"
 #include "scheduler/pointwise_unroll_envelope.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -34,6 +36,129 @@ namespace {
 // constexpr int64_t x_grid_limit = ((int64_t)1 << (int64_t)31) - (int64_t)1;
 // Unused at the moment, commenting for clang tidy
 constexpr int64_t kThreadX = 128;
+
+struct PointwiseUnrollTerminalInput {
+  const PointwiseParams& base;
+  int64_t n_elems;
+  int64_t right_elems;
+  int64_t break_point;
+  int64_t bdimx;
+  int64_t bdimy;
+  int64_t gdim_left;
+  int64_t gdim_right;
+  bool flip_grid_binding;
+  bool outer_broadcast_dominated;
+};
+
+// Describe the completed ordinary branch after one PW3.unroll leaf. Raw
+// LaunchParams grid dimensions remain unset; effective_launch instead follows
+// the grid dimensions materialized by the scheduled kernel.
+std::string pointwiseUnrollTerminalConsequence(
+    const PointwiseUnrollTerminalInput& input,
+    int64_t factor) {
+  NVF_ERROR(factor > 0 && input.bdimx > 0 && input.bdimy > 0);
+  PointwiseParams candidate(input.base);
+  candidate.break_point = input.break_point;
+  candidate.flip_grid_binding = input.flip_grid_binding;
+  candidate.split_block = input.bdimy > 1;
+  candidate.unroll_factor_outer =
+      input.outer_broadcast_dominated ? factor : 1;
+  candidate.unroll_factor_inner =
+      input.outer_broadcast_dominated ? 1 : factor;
+  const int64_t final_left =
+      ceilDiv(input.gdim_left, candidate.unroll_factor_outer);
+  const int64_t final_right =
+      ceilDiv(input.gdim_right, candidate.unroll_factor_inner);
+  const int64_t logical_grid_y = input.break_point > 0
+      ? (input.flip_grid_binding ? final_right : final_left)
+      : 1;
+  candidate.split_grid_y_dim = logical_grid_y > 65535;
+  candidate.lparams.bind(input.bdimx, ParallelType::TIDx);
+  if (candidate.split_block) {
+    candidate.lparams.bind(input.bdimy, ParallelType::TIDy);
+  }
+  const int64_t grid_x = input.break_point > 0
+      ? (input.flip_grid_binding ? final_left : final_right)
+      : ceilDiv(
+            ceilDiv(
+                ceilDiv(input.n_elems, candidate.vectorization_factor),
+                input.bdimx),
+            candidate.unroll_factor_inner);
+  const int64_t grid_y = std::min<int64_t>(logical_grid_y, 65535);
+
+  using scheduler::native_diagnostic::Object;
+  Object plan;
+  plan.add("tag", candidate.tag);
+  plan.add("break_point", candidate.break_point);
+  plan.add("split_block", candidate.split_block);
+  plan.add("symbolic_1d_cta", candidate.symbolic_1d_cta);
+  plan.add("split_grid_y_dim", candidate.split_grid_y_dim);
+  plan.add("flip_grid_binding", candidate.flip_grid_binding);
+  plan.add("vectorization_factor", candidate.vectorization_factor);
+  plan.add("vectorize_casts", candidate.vectorize_casts);
+  plan.add("unroll_factor_outer", candidate.unroll_factor_outer);
+  plan.add("unroll_factor_inner", candidate.unroll_factor_inner);
+  plan.add("use_tma_load", candidate.use_tma_load);
+  plan.add("use_tma_store", candidate.use_tma_store);
+  plan.add("tma_domain_inner", candidate.tma_domain_inner);
+  plan.add("tma_tile_outer", candidate.tma_tile_outer);
+  plan.add("tma_tile_inner", candidate.tma_tile_inner);
+  if (candidate.cparams.index_type.has_value()) {
+    plan.add(
+        "index_type", static_cast<int64_t>(*candidate.cparams.index_type));
+  } else {
+    plan.addRaw("index_type", "null");
+  }
+
+  Object raw_launch;
+  raw_launch.add("grid_x", candidate.lparams.getRawVal(ParallelType::BIDx));
+  raw_launch.add("grid_y", candidate.lparams.getRawVal(ParallelType::BIDy));
+  raw_launch.add("grid_z", candidate.lparams.getRawVal(ParallelType::BIDz));
+  raw_launch.add("block_x", candidate.lparams.getRawVal(ParallelType::TIDx));
+  raw_launch.add("block_y", candidate.lparams.getRawVal(ParallelType::TIDy));
+  raw_launch.add("block_z", candidate.lparams.getRawVal(ParallelType::TIDz));
+  raw_launch.add(
+      "dynamic_smem_bytes", static_cast<int64_t>(candidate.lparams.smem()));
+
+  Object effective_launch;
+  effective_launch.add("grid_x", grid_x);
+  effective_launch.add("grid_y", grid_y);
+  effective_launch.add("grid_z", int64_t{1});
+  effective_launch.add("block_x", input.bdimx);
+  effective_launch.add("block_y", input.bdimy);
+  effective_launch.add("block_z", int64_t{1});
+
+  const int64_t right_positions_per_cta = input.bdimx *
+      candidate.vectorization_factor * candidate.unroll_factor_inner;
+  const int64_t right_ctas = input.break_point > 0 ? final_right : grid_x;
+  Object right_work;
+  right_work.add("right_elems", input.right_elems);
+  right_work.add("right_positions_per_cta", right_positions_per_cta);
+  right_work.add("right_ctas", right_ctas);
+  if (right_ctas <=
+      std::numeric_limits<int64_t>::max() / right_positions_per_cta) {
+    const int64_t covered = right_ctas * right_positions_per_cta;
+    right_work.add("covered_right_positions", covered);
+    if (covered >= input.right_elems) {
+      right_work.add("tail_right_positions", covered - input.right_elems);
+    } else {
+      right_work.addRaw("tail_right_positions", "null");
+    }
+  } else {
+    right_work.addRaw("covered_right_positions", "null");
+    right_work.addRaw("tail_right_positions", "null");
+  }
+
+  Object consequence;
+  consequence.add("plan_scope", "ordinary_pointwise_branch");
+  consequence.addRaw("final_pointwise_plan", plan.str());
+  consequence.add("index_type_provenance", "source_hard_analysis");
+  consequence.addRaw("raw_launch", raw_launch.str());
+  consequence.addRaw("effective_launch", effective_launch.str());
+  consequence.addRaw("right_work", right_work.str());
+  consequence.addRaw("pending_choices", "[]");
+  return consequence.str();
+}
 
 std::vector<TensorView*> getUniqueVectorizableInputs(
     const std::vector<TensorView*>& vectorizable_io_tvs) {
@@ -806,16 +931,35 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
 
       int64_t range_low = 1;
       int64_t range_high = model_max;
+      const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+      const PointwiseUnrollTerminalInput terminal_input{
+          *params,
+          n_elems,
+          break_point > 0 ? right_elem_count : n_elems,
+          break_point,
+          bdimx,
+          bdimy,
+          gdim_left,
+          gdim_right,
+          flip_grid_binding,
+          is_outer_broadcast_dominated};
       for (;;) {
         const auto ranges = getUnrollRanges(range_low, range_high);
         std::vector<scheduler::jev::ChoiceOption> options;
         options.reserve(ranges.size());
         std::string native_choice;
         for (const auto& range : ranges) {
-          options.push_back(
-              {range.id,
-               "Unroll factor in [" + std::to_string(range.low) + ", " +
-                   std::to_string(range.high) + "]"});
+          scheduler::jev::ChoiceOption option{
+              range.id,
+              "Unroll factor in [" + std::to_string(range.low) + ", " +
+                  std::to_string(range.high) + "]"};
+          // Current bounded leaves are singletons. Keep any future internal
+          // hierarchy node free of a misleading terminal-plan claim.
+          if (semantic_v3 && range.low == range.high) {
+            option.consequence_json =
+                pointwiseUnrollTerminalConsequence(terminal_input, range.low);
+          }
+          options.push_back(std::move(option));
           if (jev_mode == scheduler::jev::Mode::Record &&
               range.low <= unroll_factor && unroll_factor <= range.high) {
             native_choice = range.id;

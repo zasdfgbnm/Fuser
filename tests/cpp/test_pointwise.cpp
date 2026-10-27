@@ -1920,6 +1920,7 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     decision_log.seekg(log_start);
     std::string row;
     std::string pw2_row;
+    std::string unroll_row;
     bool saw_unroll_choice = false;
     while (std::getline(decision_log, row)) {
       if (row.rfind("{\"site\":\"PW2\",", 0) == 0) {
@@ -1928,6 +1929,9 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       }
       saw_unroll_choice |=
           row.rfind("{\"site\":\"PW3.unroll\",", 0) == 0;
+      if (row.rfind("{\"site\":\"PW3.unroll\",", 0) == 0) {
+        unroll_row = row;
+      }
     }
     ASSERT_FALSE(pw2_row.empty());
     EXPECT_THAT(pw2_row, ::testing::HasSubstr("pointwise.breakpoint.v3"));
@@ -1982,6 +1986,78 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     } else {
       EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
       EXPECT_EQ(params->break_point, 0);
+    }
+
+    // The forced bp1_normal/w1/x1 path makes PW3.unroll terminal for this
+    // ordinary branch. Compare its selected effect with the physical launch,
+    // since the heuristic's raw grid dimensions are intentionally unset.
+    if (jev_mode == scheduler::jev::Mode::Remote &&
+        params->break_point == 1 && !params->flip_grid_binding &&
+        params->vectorization_factor == 1 && params->lparams.bdimx() == 1 &&
+        params->lparams.bdimy() == 128) {
+      ASSERT_FALSE(unroll_row.empty());
+      const int64_t unroll = params->unroll_factor_inner;
+      const int64_t grid_x = (16 + unroll - 1) / unroll;
+      EXPECT_EQ(params->unroll_factor_outer, 1);
+      EXPECT_THAT(
+          unroll_row,
+          ::testing::HasSubstr(
+              "\"selected\":\"u" + std::to_string(unroll) + "\""));
+      ASSERT_NE(results.kernel_executor, nullptr);
+      const auto launch = results.kernel_executor->lastLaunchParams();
+      EXPECT_EQ(launch.gdimx(), grid_x);
+      EXPECT_EQ(launch.gdimy(), 1);
+      EXPECT_EQ(launch.gdimz(), 1);
+      EXPECT_EQ(launch.bdimx(), 1);
+      EXPECT_EQ(launch.bdimy(), 128);
+      EXPECT_EQ(launch.bdimz(), 1);
+      const std::string candidate_id =
+          "\"id\":\"u" + std::to_string(unroll) + "\"";
+      const auto begin = unroll_row.find(candidate_id);
+      ASSERT_NE(begin, std::string::npos);
+      const auto next = unroll_row.find("\"id\":\"u", begin + candidate_id.size());
+      const std::string candidate = unroll_row.substr(begin, next - begin);
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"plan_scope\":\"ordinary_pointwise_branch\","
+              "\"final_pointwise_plan\":{\"tag\":\"Pointwise heuristics\","
+              "\"break_point\":1,"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"tma_domain_inner\":-1,\"tma_tile_outer\":-1,"
+              "\"tma_tile_inner\":-1,\"index_type\":11}"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"index_type_provenance\":\"source_hard_analysis\","
+              "\"raw_launch\":{\"grid_x\":-1,\"grid_y\":-1,"
+              "\"grid_z\":-1,\"block_x\":1,\"block_y\":128,"
+              "\"block_z\":-1,\"dynamic_smem_bytes\":0}"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"effective_launch\":{\"grid_x\":" +
+              std::to_string(grid_x) +
+              ",\"grid_y\":1,\"grid_z\":1,\"block_x\":1,\"block_y\":128,"
+              "\"block_z\":1}"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"unroll_factor_outer\":1,\"unroll_factor_inner\":" +
+              std::to_string(unroll)));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"right_work\":{\"right_elems\":16,"
+              "\"right_positions_per_cta\":" +
+              std::to_string(unroll) + ",\"right_ctas\":" +
+              std::to_string(grid_x) + ",\"covered_right_positions\":" +
+              std::to_string(grid_x * unroll) +
+              ",\"tail_right_positions\":" +
+              std::to_string(grid_x * unroll - 16) + "}"));
+      EXPECT_THAT(candidate, ::testing::HasSubstr("\"pending_choices\":[]"));
     }
   }
 }
