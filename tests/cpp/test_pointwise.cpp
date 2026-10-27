@@ -1760,6 +1760,125 @@ TEST_F(PointwiseTest, PointwiseCandidatePreviewsMatchSemanticV2_CUDA) {
   }
 }
 
+// A logical right side just beyond the device's grid-X limit filters x1 but
+// retains the native CTA. No tensor allocation is needed to exercise the
+// exact hard menu and its conditional 2D preview.
+TEST_F(PointwiseTest, PointwiseLaunchPartialMenuSemanticV3_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  ASSERT_GT(device->maxGridSize[0], 128);
+  char log_path[] = "/tmp/nvfuser-pw3-launch-preview-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  const int64_t right_elems =
+      (static_cast<int64_t>(device->maxGridSize[0]) + 1) * 4 + 2;
+  pointwise_utils::FusionRuntimeProperties prop;
+  prop.n_elems = right_elems * 2;
+  prop.device_multiprocessor_count = device->multiProcessorCount;
+  pointwise_utils::BreakPointInfo bp;
+  bp.break_point = 1;
+  bp.right_elem_count = right_elems;
+  const std::string hardware =
+      "{\"sm_count\":" + std::to_string(prop.device_multiprocessor_count) +
+      "}";
+  auto read_log = [&]() {
+    std::ifstream stream(log_path);
+    std::stringstream contents;
+    contents << stream.rdbuf();
+    return contents.str();
+  };
+  auto run_record = [&](const char* protocol) {
+    ScopedTestEnv protocol_env("NVFUSER_JEV_PROTOCOL", protocol);
+    const std::string before = read_log();
+    scheduler::jev::ComputeHeuristicsScope scope(
+        "synthetic large two-dimensional pointwise", {}, hardware);
+    const auto config =
+        pointwise_utils::getBlockGridConfig(prop, bp, 4, 128, false);
+    scope.complete("PointWise");
+    return std::pair{read_log().substr(before.size()), config};
+  };
+  const auto [text_records, text_config] = run_record("text-v1");
+  const auto [v2_records, v2_config] = run_record("semantic-v2");
+  const auto [v3_records, v3_config] = run_record("semantic-v3");
+  const std::string before_off = read_log();
+  pointwise_utils::BlockGridConfig off_config;
+  {
+    ScopedTestEnv off_mode("NVFUSER_JEV_MODE", "off");
+    off_config = pointwise_utils::getBlockGridConfig(prop, bp, 4, 128, false);
+  }
+  EXPECT_EQ(off_config.bdimx, v3_config.bdimx);
+  EXPECT_EQ(read_log(), before_off);
+  EXPECT_EQ(text_config.bdimx, v2_config.bdimx);
+  EXPECT_EQ(text_config.bdimx, v3_config.bdimx);
+  EXPECT_EQ(text_config.bdimy, v3_config.bdimy);
+  EXPECT_THAT(
+      text_records,
+      ::testing::HasSubstr("text_v1_requires_full_hard_cta_menu"));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("pointwise.launch.v2"));
+  EXPECT_THAT(
+      v3_records,
+      ::testing::HasSubstr(
+          "max_grid_x=" + std::to_string(device->maxGridSize[0])));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("unroll_status=pending"));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("grid_split_status=pending"));
+
+  const auto site_row = [](const std::string& records) {
+    std::istringstream stream(records);
+    std::string row;
+    while (std::getline(stream, row)) {
+      if (row.find("\"site\":\"PW3.launch\"") != std::string::npos &&
+          row.find("\"kind\":\"coverage_skip\"") == std::string::npos) {
+        return row;
+      }
+    }
+    return std::string();
+  };
+  const std::string v2_row = site_row(v2_records);
+  const std::string v3_row = site_row(v3_records);
+  ASSERT_FALSE(v2_row.empty());
+  ASSERT_FALSE(v3_row.empty());
+  EXPECT_EQ(v2_row.find("{\"id\":\"x1\""), std::string::npos);
+  EXPECT_EQ(v3_row.find("{\"id\":\"x1\""), std::string::npos);
+  const auto preview_fields = [](const std::string& row, const char* id,
+                                 bool semantic_v3) {
+    const std::string marker = "{\"id\":\"" + std::string(id) + "\"";
+    const size_t candidate = row.find(marker);
+    NVF_CHECK(candidate != std::string::npos, "missing 2D CTA candidate ", id);
+    if (semantic_v3) {
+      const std::string key = "\"consequence\":{";
+      const size_t start = row.find(key, candidate);
+      NVF_CHECK(start != std::string::npos, "missing 2D CTA consequence ", id);
+      const size_t fields = start + key.size();
+      const size_t end = row.find(",\"unroll_status\":\"pending\"", fields);
+      NVF_CHECK(end != std::string::npos, "missing pending 2D CTA unroll ", id);
+      return row.substr(fields, end - fields);
+    }
+    const size_t fields = candidate + marker.size() + 1;
+    const size_t end = row.find('}', fields);
+    NVF_CHECK(end != std::string::npos, "incomplete v2 2D CTA preview ", id);
+    return row.substr(fields, end - fields);
+  };
+  for (const char* id : {"x2", "x32", "x128"}) {
+    EXPECT_EQ(
+        preview_fields(v2_row, id, false),
+        preview_fields(v3_row, id, true)) << id;
+  }
+  EXPECT_THAT(
+      v3_row,
+      ::testing::HasSubstr(
+          "\"unroll_status\":\"pending\",\"grid_split_status\":\"pending\""));
+}
+
 // Call the TMA heuristic directly so this checks candidate analysis on any
 // CUDA device without compiling or executing a Hopper kernel.
 TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {

@@ -718,15 +718,18 @@ BlockGridConfig getBlockGridConfig(
              "Use " + std::to_string(candidate) + " TIDx threads"});
       }
       const bool semantic = scheduler::jev::semanticProtocolEnabled();
+      const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
       const bool native_in_menu =
           std::any_of(options.begin(), options.end(), [&](const auto& option) {
             return option.id == "x" + std::to_string(result.bdimx);
           });
       // The legacy text-v1 server has no device-axis fields for a partial
-      // menu. Keep it active only when its original full menu is hard-safe.
+      // menu. The v3 state below carries the exact limits needed to replay
+      // the hard filter; v2 already carries them in its structured workload.
       const char* skip_reason = options.empty() ? "empty_hard_cta_menu"
           : !native_in_menu                     ? "native_2d_cta_preflight"
-          : !semantic && options.size() != static_cast<size_t>(kThreadX)
+          : !semantic && !semantic_v3 &&
+                  options.size() != static_cast<size_t>(kThreadX)
           ? "text_v1_requires_full_hard_cta_menu"
           : nullptr;
       if (skip_reason != nullptr) {
@@ -734,6 +737,49 @@ BlockGridConfig getBlockGridConfig(
           scheduler::jev::recordCoverageSkip("PW3.launch", skip_reason);
         }
       } else {
+        if (semantic_v3) {
+          // Match the conditional v2 per-candidate preview. The later unroll
+          // and grid split remain decisions, not properties of this CTA menu.
+          for (auto& option : options) {
+            const int64_t candidate = std::stoll(option.id.substr(1));
+            const int64_t threads_y = kThreadX / candidate;
+            const int64_t grid_left = ceilDiv(cur_left_elem_count, threads_y);
+            const int64_t grid_right = ceilDiv(after_vect, candidate);
+            const int64_t idle_right =
+                (candidate - after_vect % candidate) % candidate;
+            const int64_t idle_left =
+                (threads_y - cur_left_elem_count % threads_y) % threads_y;
+            const int64_t tail_elements =
+                (max_vect_factor - result.right_elem_count % max_vect_factor) %
+                max_vect_factor;
+            option.consequence_json =
+                "{\"threads_x\":" + std::to_string(candidate) +
+                ",\"threads_y\":" + std::to_string(threads_y) +
+                ",\"actual_cta_threads\":" +
+                std::to_string(candidate * threads_y) +
+                ",\"right_vector_iterations\":" + std::to_string(after_vect) +
+                ",\"preliminary_grid_left\":" + std::to_string(grid_left) +
+                ",\"preliminary_grid_right\":" + std::to_string(grid_right) +
+                ",\"preliminary_grid_x\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_left : grid_right) +
+                ",\"preliminary_grid_y\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_right : grid_left) +
+                ",\"preliminary_grid_y_exceeds_split_threshold\":" +
+                std::string(
+                    (result.flip_grid_binding ? grid_right : grid_left) > 65535
+                        ? "true"
+                        : "false") +
+                ",\"idle_right_vector_lanes_last_cta\":" +
+                std::to_string(idle_right) +
+                ",\"idle_left_rows_last_cta\":" + std::to_string(idle_left) +
+                ",\"right_tail_elements_last_vector\":" +
+                std::to_string(tail_elements) +
+                ",\"unroll_status\":\"pending\","
+                "\"grid_split_status\":\"pending\"}";
+          }
+        }
         std::string state;
         if (semantic) {
           state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
@@ -807,6 +853,30 @@ BlockGridConfig getBlockGridConfig(
                 std::to_string(tail_elements) + '}';
           }
           state += "]}}";
+        } else if (semantic_v3) {
+          state = "pointwise.launch.v2\n";
+          state += "n_elems=" + std::to_string(n_elems) + '\n';
+          state +=
+              "right_elems=" + std::to_string(result.right_elem_count) + '\n';
+          state += "vector_width=" + std::to_string(max_vect_factor) + '\n';
+          state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
+          state += "cta_threads=" + std::to_string(kThreadX) + '\n';
+          state += "break_point=" + std::to_string(result.break_point) + '\n';
+          state += "flip_grid_binding=" +
+              std::to_string(static_cast<int>(result.flip_grid_binding)) + '\n';
+          state += "max_threads_x=" +
+              std::to_string(device->maxThreadsDim[0]) + '\n';
+          state += "max_threads_y=" +
+              std::to_string(device->maxThreadsDim[1]) + '\n';
+          state += "max_threads_per_block=" +
+              std::to_string(device->maxThreadsPerBlock) + '\n';
+          state += "max_threads_per_sm=" +
+              std::to_string(device->maxThreadsPerMultiProcessor) + '\n';
+          state += "max_grid_x=" + std::to_string(device->maxGridSize[0]) + '\n';
+          state += "max_grid_y=" + std::to_string(device->maxGridSize[1]) + '\n';
+          state += "grid_y_split_threshold=65535\n";
+          state += "unroll_status=pending\n";
+          state += "grid_split_status=pending\n";
         } else {
           state = "pointwise.launch.v1\n";
           state += "n_elems=" + std::to_string(n_elems) + '\n';
