@@ -323,18 +323,26 @@ TEST_F(ResizeTest, JevDirectPadTerminalCta_CUDA) {
   ASSERT_EQ(tensor.strides(), (at::IntArrayRef{64, 320, 1}));
 
   int64_t expected_threads = 128;
+  int64_t expected_largest_input = 0;
   if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
     const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
     ASSERT_NE(case_key, nullptr);
     const std::string_view key(case_key);
-    ASSERT_TRUE(key.ends_with("_t64") || key.ends_with("_t256"));
-    expected_threads = key.ends_with("_t64") ? 64 : 256;
+    ASSERT_TRUE(
+        key.ends_with("_t64") || key.ends_with("_t128") ||
+        key.ends_with("_t256"));
+    expected_threads = key.ends_with("_t64")
+        ? 64
+        : key.ends_with("_t128") ? 128 : 256;
+    expected_largest_input = key.find("_skip_") != std::string_view::npos
+        ? -1
+        : 0;
   }
 
   auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
   const auto* params = result.heuristic_params->as<ResizeParams>();
   ASSERT_NE(params, nullptr);
-  EXPECT_EQ(params->largest_input, 0);
+  EXPECT_EQ(params->largest_input, expected_largest_input);
   EXPECT_EQ(params->vectorization_factor, 4);
   EXPECT_EQ(params->cta_threads, expected_threads);
   EXPECT_FALSE(params->split_grid_x_dim);

@@ -928,8 +928,9 @@ std::string chooseDecisionImpl(
           ? "Choose the alternative expected to minimize fusion kernel "
             "runtime. The state contains the full invocation snapshot, "
             "hardware, prior choices, and local analysis inputs. "
-            "Candidate final plans are not yet independently verified; "
-            "do not assume missing effects. Return one listed ID."
+            "Candidate consequences describe source-computed effects when "
+            "present and are subject to server validation. Do not assume "
+            "missing effects. Return one listed ID."
           : "Choose nvFuser scheduler decision " + std::string(site);
 
   // Keep the exact model-visible question in both local logs. In record mode

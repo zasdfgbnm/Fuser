@@ -1215,6 +1215,14 @@ if(BUILD_TEST)
     set_tests_properties(jev_rs1_terminal_t${RS1_CTA_THREADS}
       PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   endforeach()
+  add_test(NAME jev_rs1_reorder_terminal_skip
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+      --threads 128 --reorder skip)
+  set_tests_properties(jev_rs1_reorder_terminal_skip
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_resize_cta
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

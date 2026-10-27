@@ -367,6 +367,95 @@ std::string directPadCtaConsequence(
       ",\"grid_y\":1,\"pending_choices\":[]}";
 }
 
+struct DirectPadCtaLimits {
+  int64_t max_output_elements;
+  int64_t layout_max;
+  int64_t vector_width;
+  int64_t warp_size;
+  int64_t max_threads_x;
+  int64_t max_threads_per_block;
+  int64_t max_grid_x;
+};
+
+// The same physical CTA admission is used by the reorder preview and the
+// actual terminal CTA Choice. It depends only on fixed source analysis and
+// the candidate thread count, never on the native CTA preference.
+bool directPadCtaLegal(const DirectPadCtaLimits& limits, int64_t threads) {
+  if (threads < limits.warp_size || threads % limits.warp_size != 0 ||
+      threads > limits.max_threads_x ||
+      threads > limits.max_threads_per_block || limits.max_grid_x < 1) {
+    return false;
+  }
+  const int64_t grid_blocks = ceilDiv(limits.max_output_elements, threads);
+  const bool split_grid = grid_blocks > ResizeParams::max_gdimx;
+  return limits.max_output_elements >= 0 && limits.layout_max >= 1 &&
+      limits.vector_width >= 1 &&
+      limits.layout_max % limits.vector_width == 0 &&
+      (split_grid ? ResizeParams::max_gdimx <= limits.max_grid_x
+                  : grid_blocks <= limits.max_grid_x);
+}
+
+struct DirectPadTerminalPlans {
+  std::string skip;
+  std::string keep;
+  std::vector<int64_t> cta_threads;
+};
+
+// Each reorder alternative has the same hard-valid CTA domain but a
+// different final largest_input and loop-axis order. Build complete terminal
+// Resize plans without issuing any descendant model request.
+std::optional<DirectPadTerminalPlans> directPadTerminalPlans(
+    const DirectPadReorderConsequences& pad,
+    const ResizeParams& base,
+    const DirectPadCtaLimits& limits) {
+  if (!base.cparams.index_type.has_value() ||
+      base.vectorization_factor != limits.vector_width) {
+    return std::nullopt;
+  }
+  DirectPadTerminalPlans plans;
+  const auto branch = [&](bool keep) {
+    std::string result = "{\"reorder_effect\":" +
+        (keep ? pad.keep : pad.skip) + ",\"terminal_continuations\":[";
+    bool first = true;
+    for (int64_t threads : {64, 128, 256}) {
+      if (!directPadCtaLegal(limits, threads)) {
+        continue;
+      }
+      if (ceilDiv(limits.max_output_elements, threads) >
+          ResizeParams::max_gdimx) {
+        // The existing terminal CTA preview describes only a physical BIDx
+        // grid. Keep the whole strict path in native coverage for split grids.
+        return std::string();
+      }
+      ResizeParams candidate(base);
+      candidate.largest_input = keep ? 0 : -1;
+      candidate.cta_threads = threads;
+      candidate.split_grid_x_dim = false;
+      if (!first) {
+        result += ',';
+      }
+      first = false;
+      result += "{\"cta_choice\":\"t" + std::to_string(threads) +
+          "\",\"plan\":" + directPadCtaConsequence(pad, candidate) + '}';
+    }
+    if (first) {
+      return std::string();
+    }
+    return result + "],\"pending_choices\":[\"RS1.cta\"]}";
+  };
+  plans.skip = branch(false);
+  plans.keep = branch(true);
+  if (plans.skip.empty() || plans.keep.empty()) {
+    return std::nullopt;
+  }
+  for (int64_t threads : {64, 128, 256}) {
+    if (directPadCtaLegal(limits, threads)) {
+      plans.cta_threads.push_back(threads);
+    }
+  }
+  return plans;
+}
+
 } // namespace
 
 bool ResizeScheduler::canScheduleCompileTime(Fusion* fusion) {
@@ -643,28 +732,48 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
             runtime_info,
             params->vectorization_factor)
       : std::nullopt;
+  std::optional<DirectPadCtaLimits> cta_limits;
+  std::optional<DirectPadTerminalPlans> direct_pad_terminal;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    cta_limits = DirectPadCtaLimits{
+        max_num_elms,
+        layout_max,
+        params->vectorization_factor,
+        device->warpSize,
+        device->maxThreadsDim[0],
+        device->maxThreadsPerBlock,
+        device->maxGridSize[0]};
+    if (semantic_v3_resize && direct_pad && largest_output == ref_tv &&
+        direct_pad->write_elements == max_num_elms &&
+        params->largest_input == 0) {
+      direct_pad_terminal =
+          directPadTerminalPlans(*direct_pad, *params, *cta_limits);
+    }
+  }
 
   if (jev_mode != scheduler::jev::Mode::Off) {
     // The target remains the first largest TensorView input selected above.
     // Reordering only changes the outer loop-axis order in schedule(), so
     // skipping it leaves the reference and innermost vectorized axis intact.
-    if (semantic_v3_resize && !direct_pad) {
+    if (semantic_v3_resize && !direct_pad_terminal) {
       scheduler::jev::recordCoverageSkip(
-          "RS1.reorder", "direct rank-3 right Pad preview is unavailable");
+          "RS1.reorder",
+          "direct rank-3 right Pad terminal continuation is unavailable");
     } else {
       std::vector<scheduler::jev::ChoiceOption> options{
           {"skip",
            "Keep the reference tensor's outer loop-axis order",
-           direct_pad ? direct_pad->skip : ""}};
+           direct_pad_terminal ? direct_pad_terminal->skip : ""}};
       if (largest_input != nullptr) {
         options.push_back({
             "keep",
             "Reorder outer loop axes like the largest input",
-            direct_pad ? direct_pad->keep : ""});
+            direct_pad_terminal ? direct_pad_terminal->keep : ""});
       }
       const std::string state =
-          (direct_pad ? "resize.reorder.v2\ninput_elements="
-                      : "resize.reorder.v1\ninput_elements=") +
+          (direct_pad_terminal ? "resize.reorder.v3\ninput_elements="
+                               : "resize.reorder.v1\ninput_elements=") +
           input_elements + '\n';
       const std::string native_choice =
           jev_mode == scheduler::jev::Mode::Record
@@ -687,36 +796,28 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
     // vector width. A CTA candidate only changes the final flattened split
     // and its derived grid split.
     if (semantic_v3_resize &&
-        (!direct_pad || largest_output != ref_tv ||
-         direct_pad->write_elements != max_num_elms ||
-         !params->cparams.index_type.has_value() ||
+        (!direct_pad_terminal || !direct_pad ||
          (params->largest_input != -1 && params->largest_input != 0))) {
       scheduler::jev::recordCoverageSkip(
           "RS1.cta", "direct rank-3 right Pad final plan is unavailable");
       return params;
     }
-    const auto* device = at::cuda::getCurrentDeviceProperties();
-    const int64_t warp_size = device->warpSize;
-    const int64_t max_threads_x = device->maxThreadsDim[0];
-    const int64_t max_threads_per_block = device->maxThreadsPerBlock;
-    const int64_t max_grid_x = device->maxGridSize[0];
+    const int64_t warp_size = cta_limits->warp_size;
+    const int64_t max_threads_x = cta_limits->max_threads_x;
+    const int64_t max_threads_per_block = cta_limits->max_threads_per_block;
+    const int64_t max_grid_x = cta_limits->max_grid_x;
     auto legal = [&](int64_t threads) {
-      if (threads < warp_size || threads % warp_size != 0 ||
-          threads > max_threads_x || threads > max_threads_per_block ||
-          max_grid_x < 1) {
-        return false;
-      }
-      const int64_t grid_blocks = ceilDiv(max_num_elms, threads);
-      const bool split_grid = grid_blocks > ResizeParams::max_gdimx;
-      // Split-grid always creates a max_gdimx-wide BIDx dimension; otherwise
-      // the exact unsplit grid must fit the hardware's x dimension.
-      return max_num_elms >= 0 && layout_max >= 1 &&
-          params->vectorization_factor >= 1 &&
-          layout_max % params->vectorization_factor == 0 &&
-          (split_grid ? ResizeParams::max_gdimx <= max_grid_x
-                      : grid_blocks <= max_grid_x);
+      return directPadCtaLegal(*cta_limits, threads);
     };
-    NVF_ERROR(legal(128), "RS1.cta native CTA is outside physical bounds");
+    if (semantic_v3_resize && jev_mode == scheduler::jev::Mode::Record &&
+        !legal(128)) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.cta", "native CTA is outside the hard-valid terminal menu");
+      return params;
+    }
+    if (!semantic_v3_resize) {
+      NVF_ERROR(legal(128), "RS1.cta native CTA is outside physical bounds");
+    }
     bool has_split_grid_choice = false;
     if (semantic_v3_resize) {
       for (int64_t threads : {64, 128, 256}) {
@@ -731,18 +832,26 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
           "RS1.cta", "direct Pad CTA has a split-grid continuation");
       return params;
     }
-    std::vector<scheduler::jev::ChoiceOption> options;
-    for (int64_t threads : {64, 128, 256}) {
-      if (legal(threads)) {
-        ResizeParams candidate(*params);
-        candidate.cta_threads = threads;
-        candidate.split_grid_x_dim =
-            ceilDiv(max_num_elms, threads) > ResizeParams::max_gdimx;
-        options.push_back({
-            "t" + std::to_string(threads),
-            "Use " + std::to_string(threads) + " threads per Resize CTA",
-            direct_pad ? directPadCtaConsequence(*direct_pad, candidate) : ""});
+    std::vector<int64_t> offered_threads;
+    if (direct_pad_terminal) {
+      offered_threads = direct_pad_terminal->cta_threads;
+    } else {
+      for (int64_t threads : {64, 128, 256}) {
+        if (legal(threads)) {
+          offered_threads.push_back(threads);
+        }
       }
+    }
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t threads : offered_threads) {
+      ResizeParams candidate(*params);
+      candidate.cta_threads = threads;
+      candidate.split_grid_x_dim =
+          ceilDiv(max_num_elms, threads) > ResizeParams::max_gdimx;
+      options.push_back({
+          "t" + std::to_string(threads),
+          "Use " + std::to_string(threads) + " threads per Resize CTA",
+          direct_pad ? directPadCtaConsequence(*direct_pad, candidate) : ""});
     }
     const std::string state =
         (direct_pad ? "resize.cta.v2\nmax_output_elements="
