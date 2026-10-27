@@ -64,6 +64,157 @@ def request_hash(request: dict[str, Any]) -> str:
     return hashlib.sha256(wire.encode("utf-8")).hexdigest()
 
 
+def trace_rows(path: Path, *, outcome: bool = False) -> list[dict[str, Any]]:
+    """Read one numeric run's decision or source outcome events."""
+    source = Path(str(path) + ".outcome.jsonl") if outcome else path
+    return [json.loads(line) for line in source.read_text().splitlines() if line]
+
+
+def require_no_choice(
+        report: dict[str, Any], trace_paths: tuple[Path, Path] | None,
+        site: str, selected: str,
+        reasons: tuple[str, str] | None = None) -> None:
+    """Check a suppressed Choice in both source outcome streams."""
+    choices = [row for row in report["multiplicity"] if row["site"] == site]
+    if choices:
+        raise ValueError(f"suppressed {site} still reached HTTP: {choices}")
+    if trace_paths is None:
+        return
+    for index, (mode, path) in enumerate(zip(("record", "remote"), trace_paths)):
+        outcomes = trace_rows(path, outcome=True)
+        rows = [row for row in outcomes if row.get("site") == site]
+        if (len(rows) != 1 or rows[0].get("kind") != "no_choice" or
+                rows[0].get("mode") != mode or
+                rows[0].get("selected") != selected or
+                (reasons is not None and
+                 rows[0].get("reason") != reasons[index])):
+            raise ValueError(f"expected {mode} {site} no-choice {selected}: {rows}")
+        if site == "RD5.iter_unroll":
+            final = [row for row in outcomes if
+                     row.get("schema") == "nvfuser.native_outcome.v2"]
+            if (len(final) != 1 or
+                    final[0]["scheduler_fields"]
+                    ["unroll_factor_iter_dom"] != 1):
+                raise ValueError(f"{mode} final plan did not keep RD5 u1")
+
+
+OUTER_PARENT_ORDER = (
+    "RD9.reg_budget", "RD9.width", "RD8", "RD9.waves", "RD9.warp",
+    "RD9.cta", "RD9.grid_base", "RD9.unroll", "RD9.ragged",
+    "RD9.stride",
+)
+
+DEPENDENT_DECISION_ORDER = {
+    "jev_alternate_numeric_inner3d_warp_target":
+        ("RD4", "RD5.warp", "RD5.cta", "RD5.width"),
+    "jev_alternate_numeric_inner3d_cta_target":
+        ("RD4", "RD5.warp", "RD5.cta", "RD5.width"),
+    "jev_alternate_numeric_inner3d_cta_full":
+        ("RD4", "RD5.warp", "RD5.cta", "RD5.width"),
+    "jev_alternate_numeric_inner3d_work_split":
+        ("RD4", "RD5.warp", "RD5.work_split", "RD5.cta", "RD5.width"),
+    "jev_alternate_numeric_inner3d_waves":
+        ("RD4", "RD5.warp", "RD5.waves", "RD5.cta", "RD5.width"),
+    "jev_alternate_numeric_inner3d_outer_unroll":
+        ("RD4", "RD5.outer_unroll"),
+    **{f"jev_alternate_numeric_{name}": OUTER_PARENT_ORDER for name in (
+        "outer_warp", "outer_width", "outer_unroll", "outer_cta",
+        "reduction_outer_grid_base")},
+}
+
+
+FINAL_PLAN_DELTAS = {
+    "jev_alternate_numeric_inner3d_warp_target": {
+        "scheduler_fields.cross_grid_outer_reduction": (False, True),
+        "scheduler_fields.grid_dim_outer_reduction": ("S", "blockIdx.z"),
+        "scheduler_fields.pad_inner_reduction_to_warp": (True, False),
+        "scheduler_fields.split_grid_dim_outer_reduction": (False, True),
+        "launch.block_x_raw": (32, 16),
+        "launch.grid_z_raw": (-1, 2),
+    },
+    "jev_alternate_numeric_inner3d_cta_target": {
+        "scheduler_fields.block_dim_outer_reduction": ("S", "threadIdx.z"),
+        "scheduler_fields.cross_block_outer_reduction": (False, True),
+        "launch.block_z_raw": (-1, 2),
+    },
+    "jev_alternate_numeric_inner3d_cta_full": {
+        "scheduler_fields.block_dim_outer_reduction": ("S", "threadIdx.z"),
+        "scheduler_fields.cross_block_outer_reduction": (False, True),
+        "launch.block_z_raw": (-1, 4),
+    },
+    "jev_alternate_numeric_inner3d_work_split": {
+        "scheduler_fields.pad_inner_reduction_to_warp": (False, True),
+        "launch.block_x_raw": (16, 32),
+        "launch.grid_z_raw": (8, 2),
+    },
+    "jev_alternate_numeric_inner3d_waves": {
+        "launch.block_z_raw": (5, 4),
+    },
+    "jev_alternate_numeric_inner3d_outer_unroll": {
+        "scheduler_fields.unroll_factor_outer_reduction": (4, 1),
+        "launch.grid_z_raw": (2, 8),
+    },
+    "jev_alternate_numeric_outer_warp": {
+        "launch.block_x_raw": (16, 32),
+        "launch.block_y_raw": (32, 16),
+        "launch.grid_y_raw": (7, 15),
+    },
+    "jev_alternate_numeric_outer_width": {
+        "scheduler_fields.unroll_factor_inner_reduction": (8, 32),
+        "scheduler_fields.unroll_factor_iter_dom": (4, 1),
+        "scheduler_fields.vectorize_iter_dom": (True, False),
+        "launch.grid_y_raw": (32, 8),
+    },
+    "jev_alternate_numeric_outer_unroll": {
+        "scheduler_fields.unroll_factor_inner_reduction": (8, 32),
+        "scheduler_fields.unroll_factor_iter_dom": (4, 1),
+        "scheduler_fields.vectorize_iter_dom": (True, False),
+        "launch.grid_y_raw": (32, 8),
+    },
+    "jev_alternate_numeric_outer_cta": {
+        "launch.block_y_raw": (32, 16),
+        "launch.grid_y_raw": (32, 64),
+        "compile.maxrregcount": (128, 80),
+    },
+    "jev_alternate_numeric_reduction_outer_grid_base": {
+        "launch.grid_y_raw": (7, 3),
+    },
+}
+
+
+def check_dependent_trace(
+        case_key: str, trace_paths: tuple[Path, Path] | None) -> None:
+    """Check parent order and every final typed field for dependent cases."""
+    if trace_paths is None or case_key not in DEPENDENT_DECISION_ORDER:
+        return
+    finals = []
+    for mode, path in zip(("record", "remote"), trace_paths):
+        choices = trace_rows(path)
+        ordered = tuple(row["site"] for row in choices if "site" in row)
+        event_indices = [row["compute_event_index"] for row in choices if
+                         "site" in row]
+        if (ordered != DEPENDENT_DECISION_ORDER[case_key] or
+                not event_indices or event_indices[0] != 1 or
+                any(left >= right for left, right in
+                    zip(event_indices, event_indices[1:]))):
+            raise ValueError(f"{mode} parent/child decision order changed: {ordered}")
+        final = [row for row in trace_rows(path, outcome=True) if
+                 row.get("schema") == "nvfuser.native_outcome.v2"]
+        if len(final) != 1 or final[0].get("kind") != "final":
+            raise ValueError(f"{mode} typed final plan is missing: {final}")
+        finals.append(final[0])
+    differences = {}
+    for section in ("scheduler_fields", "launch", "compile"):
+        left, right = (final[section] for final in finals)
+        if set(left) != set(right):
+            raise ValueError(f"final {section} field set changed")
+        differences.update({f"{section}.{key}": (left[key], right[key])
+                            for key in left if left[key] != right[key]})
+    if differences != FINAL_PLAN_DELTAS[case_key]:
+        raise ValueError(f"unexpected final plan delta for {case_key}: "
+                         f"{differences}")
+
+
 class AlternateChoice:
     """Wrap a strict evaluator and record every target request exactly."""
 
@@ -147,55 +298,47 @@ def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
     return fields
 
 
-RD5_WAVE_BASE_KEYS = (
-    "reduction_numel", "iteration_numel", "inner_numel", "n_tensor_inputs",
-    "max_dtype_bits", "vector_width", "sm_count", "max_threads_per_sm",
-    "max_threads_per_block",
-)
-
-
 def check_rd5_wave_dependency(
-        report: dict[str, Any], raw: dict[str, int | str],
-        logical_warps: tuple[int, int],
-        iteration_first: tuple[bool, bool]) -> list[dict[str, str]]:
-    """Validate wave requests rebuilt after an upstream RD5 decision."""
-    from jev_shim import (ValidationProblem, analyze_rd5_waves,
-                          parse_rd5_waves_state)
+        report: dict[str, Any],
+        trace_paths: tuple[Path, Path] | None = None) -> list[dict[str, str]]:
+    """Validate equivalent wave targets after an upstream RD5 decision."""
 
-    before, after, issues = paired_state_rows(report, "RD5.waves")
-    expected_raw = {key: int(raw[key]) for key in RD5_WAVE_BASE_KEYS}
-    for row, side, warp, first in (
-            (before, "record", logical_warps[0], iteration_first[0]),
-            (after, "remote", logical_warps[1], iteration_first[1])):
-        try:
-            state = parse_rd5_waves_state(row["request"]["state"])
-        except ValidationProblem as exc:
-            raise ValueError(f"invalid dependent RD5.waves state: {exc}") from exc
-        criteria = row["request"]["questions"]["RD5.waves"]["criteria"]
-        expected_criteria = {
-            f"waves{waves}": (
-                f"Cap target blocks at {waves} SM waves and target "
-                f"SM threads / {waves} per CTA")
-            for waves in state["hard_valid_waves"]}
-        native = analyze_rd5_waves(state)
-        if (row[side] != {"waves4": 1} or
-                state["logical_warp"] != warp or
-                state["iteration_first"] != first or
-                state["hard_valid_waves"] != (2, 4, 8) or
-                {key: state[key] for key in RD5_WAVE_BASE_KEYS} != expected_raw or
-                criteria != expected_criteria or
-                native.selected != "waves4" or native.native_waves != 4):
-            raise ValueError(f"RD5.waves omitted the selected upstream plan: {row}")
-    return issues
+    # These upstream choices now collapse all wave caps to the same realized
+    # block/thread target. The source records the retained native wave cap
+    # rather than sending a redundant model request.
+    require_no_choice(
+        report, trace_paths, "RD5.waves", "waves4",
+        ("wave caps have equal block and thread targets",) * 2)
+    return []
 
 
-def check_transpose_tile_dependency(report: dict[str, Any]
-                                    ) -> list[dict[str, str]]:
+def check_transpose_tile_dependency(
+        report: dict[str, Any],
+        trace_paths: tuple[Path, Path] | None = None
+        ) -> list[dict[str, str]]:
     """Require the chosen tile to reach every downstream TR2 calculation."""
     tr1 = [row for row in report["multiplicity"] if row["site"] == "TR1"]
-    if (len(tr1) != 1 or tr1[0]["record"] != tr1[0]["remote"] or
-            sum(tr1[0]["record"].values()) != 1):
+    if tr1:
         raise ValueError(f"tile changed the native virtual-axis plan: {tr1}")
+    if trace_paths is not None:
+        for mode, path in zip(("record", "remote"), trace_paths):
+            outcomes = trace_rows(path, outcome=True)
+            no_choice = [row for row in outcomes if row.get("site") == "TR1"]
+            final = [row for row in outcomes if
+                     row.get("schema") == "nvfuser.native_outcome.v2"]
+            if (len(no_choice) != 1 or
+                    any(no_choice[0].get(key) != value for key, value in {
+                        "kind": "no_choice", "mode": mode,
+                        "selected": "original",
+                        "reason": "virtual_axis_constructor_no_effect",
+                        "selection_source": "native_axis_plan",
+                    }.items()) or len(final) != 1 or
+                    any(final[0]["scheduler_fields"].get(key) != [] for key in (
+                        "split_before_tiling", "dims_merged_with_1",
+                        "dims_merged_with_2"))):
+                raise ValueError(
+                    f"TR1 did not preserve the original virtual-axis plan: "
+                    f"{mode} {no_choice}")
 
     versions = {"TR2.unroll": "transpose.unroll_cap.v1",
                 "TR2.width1": "transpose.group_width.v1",
@@ -698,20 +841,66 @@ def clean_outer_grid_waves(raw_grid: int, output_grid: int, sms: int) -> int:
     return raw_grid
 
 
+OUTER_PARENT_BASELINES = {
+    ("513", "1"): ((65, 1, 1, 8, 128, 32, 1),
+                   (33, 7, 1, 16, 32, 32, 1)),
+    ("512", "4"): ((32, 1, 2, 8, 128, 16, 1),
+                   (8, 32, 4, 16, 32, 8, 1)),
+    ("512", "1"): ((64, 1, 1, 8, 128, 32, 1),
+                   (32, 8, 1, 16, 32, 32, 1)),
+}
+
+OUTER_PARENT_FIELDS = (
+    "gidim", "grdim", "iter_unroll", "bdimx", "bdimy",
+    "redu_unroll", "redu_serial",
+)
+
+
+def check_outer_parent_baseline(row: dict[str, Any]) -> dict[str, str]:
+    """Validate RD8's native projections before grid-only child choices."""
+    plan = state_fields(row, "reduction.outer_plan.v2")
+    key = (plan.get("iteration_numel"), plan.get("vector_width"))
+    if key not in OUTER_PARENT_BASELINES:
+        raise ValueError(f"unexpected RD8 parent fixture: {key}")
+    block, grid = OUTER_PARENT_BASELINES[key]
+    pending = ("RD9.waves,RD9.warp,RD9.cta,RD9.grid_base,RD9.unroll,"
+               "RD9.ragged,RD9.stride")
+    criteria = row["request"]["questions"]["RD8"]["criteria"]
+    actual_block = tuple(int(plan[f"block_{field}"]) for field in
+                         OUTER_PARENT_FIELDS)
+    actual_grid = tuple(int(plan[f"grid_{field}"]) for field in
+                        OUTER_PARENT_FIELDS)
+    if (actual_block != block or actual_grid != grid or
+            plan.get("grid_pending_choices") != pending or
+            criteria != {
+                "block": ("Use completed block reduction plan after shared "
+                          "register budget and width"),
+                "grid": ("Use native grid baseline; seven grid-only RD9 "
+                         "choices remain pending"),
+            }):
+        raise ValueError(f"RD8 parent baseline changed: {plan}")
+    return plan
+
+
 def check_outer_grid_plan(record: dict[str, Any], remote: dict[str, Any],
                           record_stride: dict[str, Any],
                           remote_stride: dict[str, Any]) -> None:
+    # RD8 is now chosen before RD9.stride. Its grid projection is a baseline,
+    # while the selected final grid is checked through stride and typed outcome.
+    del record_stride, remote_stride
     if record["record"] != {"grid": 1} or remote["remote"] != {"grid": 1}:
         raise ValueError("selected grid plan changed the RD8 winner")
-    for rd8, stride in ((record, record_stride), (remote, remote_stride)):
-        plan = state_fields(rd8, "reduction.outer_plan.v1")
-        selected = outer_stride_fields(stride)
-        for plan_key, stride_key in (("grid_gidim", "gidim"),
-                                     ("grid_grdim", "base_grdim"),
-                                     ("grid_iter_unroll", "iter_unroll")):
-            if (plan_key not in plan or stride_key not in selected or
-                    plan[plan_key] != selected[stride_key]):
-                raise ValueError(f"RD8 omitted selected stride plan: {plan}, {selected}")
+    check_outer_parent_baseline(record)
+    check_outer_parent_baseline(remote)
+
+
+def shared_outer_parent(report: dict[str, Any]) -> dict[str, Any]:
+    rows = [row for row in report["multiplicity"] if row["site"] == "RD8"]
+    if (len(rows) != 1 or rows[0]["record"] != {"grid": 1} or
+            rows[0]["remote"] != {"grid": 1}):
+        raise ValueError(f"RD8 parent request was not shared: {rows}")
+    check_outer_parent_baseline(rows[0])
+    return rows[0]
 
 
 def check_outer_unroll_dependency(
@@ -777,7 +966,9 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_storage: bool = False,
                            require_transpose_tile: bool = False,
                            require_pointwise_1d_cta: bool = False,
-                           require_resize_reorder: bool = False) -> dict[str, Any]:
+                           require_resize_reorder: bool = False,
+                           trace_paths: tuple[Path, Path] | None = None
+                           ) -> dict[str, Any]:
     if (len(events) != expected_site_calls or
             not all(event["forced"] and event == events[0] for event in events)):
         raise ValueError(
@@ -830,16 +1021,61 @@ def check_alternate_report(report: dict[str, Any],
                     "pad_fill_elements": 280, "innermost_axis": 2, "width": 4,
                 },
             }
+            reorder_tag = decision["analysis_inputs_text"].splitlines()[0]
+            if reorder_tag == "resize.reorder.v3":
+                expected_consequences = {}
+                for choice, effect in expected.items():
+                    largest_input = 0 if choice == "keep" else -1
+                    terminals = []
+                    for threads in (64, 128, 256):
+                        terminals.append({
+                            "cta_choice": f"t{threads}",
+                            "plan": {
+                                "final_resize_plan": {
+                                    "index_type": 11,
+                                    "largest_input": largest_input,
+                                    "vectorization_factor": 4,
+                                    "cta_threads": threads,
+                                    "split_grid_x_dim": False,
+                                },
+                                "index_type_provenance": "source_hard_analysis",
+                                "reference_tv": effect["reference_tv"],
+                                "input_tv": effect["input_tv"],
+                                "loop_axis_order": effect["loop_axis_order"],
+                                "read_stride_by_loop": effect["read_stride_by_loop"],
+                                "write_stride_by_loop": effect["write_stride_by_loop"],
+                                "read_elements": effect["read_elements"],
+                                "write_elements": effect["write_elements"],
+                                "pad_fill_elements": effect["pad_fill_elements"],
+                                "output_vector_iterations": 630,
+                                "block_x": threads,
+                                "grid_x": (630 + threads - 1) // threads,
+                                "grid_y": 1,
+                                "pending_choices": [],
+                            },
+                        })
+                    expected_consequences[choice] = {
+                        "reorder_effect": effect,
+                        "terminal_continuations": terminals,
+                        "pending_choices": ["RS1.cta"],
+                    }
+                expected_verification = "bounded_continuation_verified"
+            elif reorder_tag == "resize.reorder.v2":
+                expected_consequences = expected
+                expected_verification = "conditional_preview_verified"
+            else:
+                raise ValueError(f"unexpected Resize reorder state: {reorder_tag}")
             if (event["candidates"] != ["keep", "skip"] or
                     context["schema"] != "nvfuser.systemone.context.v3" or
                     decision["analysis_inputs_text"] !=
-                    "resize.reorder.v2\ninput_elements=0:2240\n" or
+                    f"{reorder_tag}\ninput_elements=0:2240\n" or
                     context["current_schedule"]["prior_choices"] !=
                     [{"site": "RS1.width", "choice": "w4"}] or
                     {candidate["id"]: candidate.get("consequence")
-                     for candidate in decision["candidates"]} != expected or
+                     for candidate in decision["candidates"]} !=
+                    expected_consequences or
                     validate_request(entry["request"]).preview_verification !=
-                    "conditional_preview_verified"):
+                    expected_verification):
                 raise ValueError("Resize v3 reorder consequences are not bound to c19")
         elif (event["candidates"] != ["skip", "keep"] or
               event["state"] !=
@@ -859,16 +1095,48 @@ def check_alternate_report(report: dict[str, Any],
             remote_state = after["request"]["state"]
             record_prior = record_state["current_schedule"]["prior_choices"]
             remote_prior = remote_state["current_schedule"]["prior_choices"]
+            record_cta_consequences = {
+                candidate["id"]: candidate.get("consequence")
+                for candidate in record_state["decision"]["candidates"]}
+            remote_cta_consequences = {
+                candidate["id"]: candidate.get("consequence")
+                for candidate in remote_state["decision"]["candidates"]}
+            expected_cta = {
+                branch: {
+                    terminal["cta_choice"]: terminal["plan"]
+                    for terminal in expected_consequences[branch]
+                    ["terminal_continuations"]}
+                for branch in ("keep", "skip")
+            } if reorder_tag == "resize.reorder.v3" else None
+            record_common = {key: value for key, value in
+                             record_state.items() if key not in
+                             ("current_schedule", "decision")}
+            remote_common = {key: value for key, value in
+                             remote_state.items() if key not in
+                             ("current_schedule", "decision")}
+            record_decision = {key: value for key, value in
+                               record_state["decision"].items() if key !=
+                               "candidates"}
+            remote_decision = {key: value for key, value in
+                               remote_state["decision"].items() if key !=
+                               "candidates"}
             if (record_prior != [
                     {"site": "RS1.width", "choice": "w4"},
                     {"site": "RS1.reorder", "choice": "keep"}] or
                     remote_prior != [
                         {"site": "RS1.width", "choice": "w4"},
                         {"site": "RS1.reorder", "choice": "skip"}] or
-                    {key: value for key, value in record_state.items()
-                     if key != "current_schedule"} !=
-                    {key: value for key, value in remote_state.items()
-                     if key != "current_schedule"} or
+                    record_common != remote_common or
+                    record_decision != remote_decision or
+                    ({candidate["id"]: candidate["description"] for candidate
+                      in record_state["decision"]["candidates"]} !=
+                     {candidate["id"]: candidate["description"] for candidate
+                      in remote_state["decision"]["candidates"]}) or
+                    (expected_cta is None and
+                     record_cta_consequences != remote_cta_consequences) or
+                    (expected_cta is not None and
+                     (record_cta_consequences != expected_cta["keep"] or
+                      remote_cta_consequences != expected_cta["skip"])) or
                     before["record"] != after["remote"]):
                 raise ValueError("Resize CTA changed beyond its v3 prior-choice context")
             expected_issues.extend(replacements)
@@ -879,7 +1147,8 @@ def check_alternate_report(report: dict[str, Any],
                 alternate != "tile16" or
                 set(event["candidates"]) != {"tile32", "tile16"}):
             raise ValueError("transpose fixture lacks its complete tile menu")
-        expected = [intended, *check_transpose_tile_dependency(report)]
+        expected = [intended, *check_transpose_tile_dependency(
+            report, trace_paths)]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected tile-dependent decisions: {issues}")
     elif require_pointwise_1d_cta:
@@ -1179,7 +1448,8 @@ def check_alternate_report(report: dict[str, Any],
             report, "RD9.ragged")
         record_stride, remote_stride, stride_issues = paired_state_rows(
             report, "RD9.stride")
-        record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
+        shared_plan = shared_outer_parent(report)
+        record_plan, remote_plan, plan_issues = shared_plan, shared_plan, []
         expected_factors = (("4", "8", "8", "32"),
                             ("1", "32", "32", "8"))
         for row, factors in zip((record_ragged, remote_ragged), expected_factors):
@@ -1197,11 +1467,8 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("outer unroll did not select its complete grid")
         check_outer_grid_plan(
             record_plan, remote_plan, record_stride, remote_stride)
-        before = state_fields(record_plan, "reduction.outer_plan.v1")
-        after = state_fields(remote_plan, "reduction.outer_plan.v1")
-        for field in ("block_gidim", "block_grdim", "block_iter_unroll"):
-            if before[field] != after[field]:
-                raise ValueError("outer unroll changed the block plan")
+        # The selected grid child can change the final grid without changing
+        # the already-issued parent baseline or completed block alternative.
         expected = [intended, *ragged_issues, *stride_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer unroll dependencies: {issues}")
@@ -1263,20 +1530,9 @@ def check_alternate_report(report: dict[str, Any],
                 {key: value for key, value in stride_after.items()
                  if key != "base_grdim"}):
             raise ValueError("stride grid did not follow selected baseline")
-        record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
-        plan_before = state_fields(record_plan, "reduction.outer_plan.v1")
-        plan_after = state_fields(remote_plan, "reduction.outer_plan.v1")
-        if (record_plan["record"] != {"grid": 1} or
-                remote_plan["remote"] != {"grid": 1} or
-                plan_before.get("grid_grdim") != str(record_clean) or
-                plan_after.get("grid_grdim") != str(remote_clean) or
-                {key: value for key, value in plan_before.items()
-                 if key != "grid_grdim"} !=
-                {key: value for key, value in plan_after.items()
-                 if key != "grid_grdim"}):
-            raise ValueError("RD8 did not receive selected baseline grid")
+        shared_outer_parent(report)
         expected = [intended, *unroll_issues, *ragged_issues,
-                    *stride_issues, *plan_issues]
+                    *stride_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent baseline issues: {issues}")
     elif require_outer_cta:
@@ -1318,19 +1574,9 @@ def check_alternate_report(report: dict[str, Any],
                 record_stride["record"] != {"g32": 1} or
                 remote_stride["remote"] != {"g64": 1}):
             raise ValueError(f"outer CTA did not reshape the grid plan: {before}, {after}")
-        record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
-        check_outer_grid_plan(record_plan, remote_plan, record_stride, remote_stride)
-        plan_before = state_fields(record_plan, "reduction.outer_plan.v1")
-        plan_after = state_fields(remote_plan, "reduction.outer_plan.v1")
-        if (plan_before.get("grid_grdim") != "32" or
-                plan_after.get("grid_grdim") != "64" or
-                {key: value for key, value in plan_before.items()
-                 if key != "grid_grdim"} !=
-                {key: value for key, value in plan_after.items()
-                 if key != "grid_grdim"}):
-            raise ValueError("CTA target changed more than the RD8 grid size")
+        shared_outer_parent(report)
         expected = [intended, *base_issues, *unroll_issues, *ragged_issues,
-                    *stride_issues, *plan_issues]
+                    *stride_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer CTA comparison issues: {issues}")
     elif require_outer_width:
@@ -1426,12 +1672,15 @@ def check_alternate_report(report: dict[str, Any],
                      "sm_count", "max_threads_per_sm",
                      "max_threads_per_block", "logical_warp"))):
             raise ValueError("selected wave cap did not reach dependent CTA")
-        for unchanged in ("RD4", "RD5.warp", "RD5.iter_unroll", "RD5.width"):
+        for unchanged in ("RD4", "RD5.warp", "RD5.width"):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == unchanged]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"unexpected {unchanged} dependency: {rows}")
+        require_no_choice(
+            report, trace_paths, "RD5.iter_unroll", "u1",
+            ("only one hard-legal iteration unroll factor",) * 2)
         if sorted(issues, key=str) != sorted([intended, *dependent], key=str):
             raise ValueError(f"unexpected 3D wave dependencies: {issues}")
     elif require_reduction_inner3d_work_split:
@@ -1457,8 +1706,7 @@ def check_alternate_report(report: dict[str, Any],
                 (4, 2, 2, 4) or
                 (plan.native_block_x, plan.alternate_block_x) != (16, 32)):
             raise ValueError("3D split did not reshape the complete CTA plan")
-        wave_issues = check_rd5_wave_dependency(
-            report, state, (8, 8), (False, True))
+        wave_issues = check_rd5_wave_dependency(report, trace_paths)
         before, after, dependent = paired_state_rows(report, "RD5.cta")
         left = parse_inner3d_cta_target_state(before["request"]["state"])
         right = parse_inner3d_cta_target_state(after["request"]["state"])
@@ -1479,12 +1727,15 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed: {rows}")
-        for downstream in ("RD5.iter_unroll", "RD5.width"):
+        for downstream in ("RD5.width",):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == downstream]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"unexpected {downstream} dependency: {rows}")
+        require_no_choice(
+            report, trace_paths, "RD5.iter_unroll", "u1",
+            ("only one hard-legal iteration unroll factor",) * 2)
         if sorted(issues, key=str) != sorted(
                 [intended, *wave_issues, *dependent], key=str):
             raise ValueError(f"unexpected 3D split dependencies: {issues}")
@@ -1525,12 +1776,15 @@ def check_alternate_report(report: dict[str, Any],
                 "hard_valid_targets": ",".join(map(str, expected_targets))
                 }.items()):
             raise ValueError(f"3D CTA fixture escaped the proved shape: {fields}")
-        for dependent_site in ("RD4", "RD5.iter_unroll", "RD5.width"):
+        for dependent_site in ("RD4", "RD5.width"):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == dependent_site]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"3D CTA changed {dependent_site}: {rows}")
+        require_no_choice(
+            report, trace_paths, "RD5.iter_unroll", "u1",
+            ("only one hard-legal iteration unroll factor",) * 2)
         if issues != [intended]:
             raise ValueError(f"unexpected 3D CTA comparison issues: {issues}")
     elif require_inner3d_warp_target:
@@ -1553,8 +1807,7 @@ def check_alternate_report(report: dict[str, Any],
             "reduction_numel", "iteration_numel", "inner_numel",
             "n_tensor_inputs", "max_dtype_bits", "vector_width",
             "sm_count", "max_threads_per_sm", "max_threads_per_block")}
-        wave_issues = check_rd5_wave_dependency(
-            report, common, (8, 4), (False, False))
+        wave_issues = check_rd5_wave_dependency(report, trace_paths)
         for row, side, choice, logical_warp, targets in (
                 (cta_record, "record", "t32", "8", range(8, 249, 8)),
                 (cta_remote, "remote", "t16", "4", range(4, 253, 4))):
@@ -1565,12 +1818,15 @@ def check_alternate_report(report: dict[str, Any],
             if (row[side] != {choice: 1} or cta_fields != expected_fields or
                     set(criteria) != {f"t{target}" for target in targets}):
                 raise ValueError(f"3D warp changed the dependent CTA plan: {row}")
-        for dependent_site in ("RD4", "RD5.iter_unroll", "RD5.width"):
+        for dependent_site in ("RD4", "RD5.width"):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == dependent_site]
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"3D warp changed {dependent_site}: {rows}")
+        require_no_choice(
+            report, trace_paths, "RD5.iter_unroll", "u1",
+            ("only one hard-legal iteration unroll factor",) * 2)
         if sorted(issues, key=str) != sorted(
                 [intended, *wave_issues, *cta_issues], key=str):
             raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
@@ -1744,15 +2000,14 @@ def check_alternate_report(report: dict[str, Any],
             report, "RD9.ragged")
         stride_record, stride_remote, stride_issues = paired_state_rows(
             report, "RD9.stride")
-        plan_record, plan_remote, plan_issues = paired_state_rows(report, "RD8")
-        for rag, stride, plan, side, warp, block, output, raw in (
-                (rag_record, stride_record, plan_record,
+        shared_outer_parent(report)
+        for rag, stride, side, warp, block, output, raw in (
+                (rag_record, stride_record,
                  "record", "16", (16, 32), 33, 8),
-                (rag_remote, stride_remote, plan_remote,
+                (rag_remote, stride_remote,
                  "remote", "32", (32, 16), 17, 16)):
             rag_fields = state_fields(rag, "reduction.outer_ragged.v1")
             stride_fields = outer_stride_fields(stride)
-            plan_fields = state_fields(plan, "reduction.outer_plan.v1")
             cleaned = clean_outer_grid_waves(raw, output, int(rag_fields["sm_count"]))
             if (rag[side] != {"clean": 1} or
                     set(rag["request"]["questions"]["RD9.ragged"]
@@ -1764,23 +2019,10 @@ def check_alternate_report(report: dict[str, Any],
                     stride_fields.get("min_warp_size") != warp or
                     any(rag_fields[key] != stride_fields[key]
                         for key in OUTER_RAGGED_FORWARD_KEYS) or
-                    stride[side] != {f"g{cleaned}": 1} or
-                    plan[side] != {"grid": 1} or
-                    plan_fields.get("grid_gidim") != str(output) or
-                    plan_fields.get("grid_grdim") != str(cleaned) or
-                    plan_fields.get("grid_iter_unroll") !=
-                    stride_fields["iter_unroll"]):
+                    stride[side] != {f"g{cleaned}": 1}):
                 raise ValueError("dependent grid plan ignored selected warp")
-        before_plan = state_fields(plan_record, "reduction.outer_plan.v1")
-        after_plan = state_fields(plan_remote, "reduction.outer_plan.v1")
-        if ({key: value for key, value in before_plan.items()
-             if key not in {"grid_gidim", "grid_grdim"}} !=
-                {key: value for key, value in after_plan.items()
-                 if key not in {"grid_gidim", "grid_grdim"}}):
-            raise ValueError("warp changed unrelated RD8 plan measurements")
         expected = [intended, *cta_issues, *base_issues, *unroll_issues,
-                    *rag_issues,
-                    *stride_issues, *plan_issues]
+                    *rag_issues, *stride_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer warp issues: {issues}")
     elif require_inner_storage:
@@ -2427,23 +2669,31 @@ def check_alternate_report(report: dict[str, Any],
                 state["iteration_numel"] != 32 or
                 analyze_rd5_outer_unroll(state).native_factor != 4):
             raise ValueError("3D reduction outer-unroll fixture changed")
-        before, after, dependent = paired_state_rows(report, "RD5.iter_unroll")
-        left = state_fields(before, "reduction.inner3d_iter_unroll.v1")
-        right = state_fields(after, "reduction.inner3d_iter_unroll.v1")
-        if (left.get("outer_unroll") != "4" or
-                right.get("outer_unroll") != "1" or
-                before["record"] != {"u1": 1} or
-                after["remote"] != {"u1": 1} or
-                any(left[key] != right[key] for key in left if key != "outer_unroll") or
-                sorted(issues, key=str) !=
-                sorted([intended, *dependent], key=str)):
-            raise ValueError("outer unroll did not rebuild dependent output plan")
+        require_no_choice(
+            report, trace_paths, "RD5.iter_unroll", "u1",
+            ("only one hard-legal iteration unroll factor",
+             "all iteration unroll factors realize the same grid plan"))
+        if trace_paths is not None:
+            final_outer = []
+            for path in trace_paths:
+                final = [row for row in trace_rows(path, outcome=True) if
+                         row.get("schema") == "nvfuser.native_outcome.v2"]
+                if len(final) != 1:
+                    raise ValueError("missing final 3D outer-unroll plan")
+                final_outer.append(final[0]["scheduler_fields"]
+                                   ["unroll_factor_outer_reduction"])
+            if final_outer != [4, 1]:
+                raise ValueError(f"outer unroll did not reach final plan: "
+                                 f"{final_outer}")
+        if issues != [intended]:
+            raise ValueError(f"unexpected outer-unroll dependencies: {issues}")
     elif issues != [intended]:
         raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
         raise ValueError("remote and server request counts differ")
     if set(report["case_coverage"]) != {case_key}:
         raise ValueError("decision logs contain unexpected case keys")
+    check_dependent_trace(case_key, trace_paths)
     return {"site": site, "native": event["native"], "alternate": alternate,
             "candidates": event["candidates"],
             "request_sha256": event["request_sha256"],
@@ -2669,7 +2919,9 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_storage=args.require_iop3_storage,
             require_transpose_tile=args.require_transpose_tile,
             require_pointwise_1d_cta=args.require_pointwise_1d_cta,
-            require_resize_reorder=args.require_resize_reorder)
+            require_resize_reorder=args.require_resize_reorder,
+            trace_paths=(Path(record["decision_log"]),
+                         Path(remote["decision_log"])))
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)
