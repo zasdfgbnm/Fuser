@@ -2334,6 +2334,8 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   EXPECT_EQ(preview.state, structural.state);
   ASSERT_EQ(preview.options.size(), preview.plans.size());
   ASSERT_EQ(
+      preview.options.size(), preview.materialized_layout_widths.size());
+  ASSERT_EQ(
       preview.options.size(), preview.remote_unavailability_reasons.size());
   ASSERT_EQ(preview.options.size(), 2);
   EXPECT_EQ(preview.options[0].id, "bp0");
@@ -2342,6 +2344,20 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
       preview.options[0].description,
       "Flatten to the one-dimensional TMA domain");
   EXPECT_EQ(preview.options[1].description, "Split before loop axis 1");
+  const auto positive_menu = pointwise::tma::remoteRouteableTmaBreakPoints(
+      preview,
+      prop->n_elems,
+      prop->elem_counts.size(),
+      prop->min_dtype_size_bit_for_vectorization);
+  EXPECT_FALSE(positive_menu.remote_filter_applied);
+  EXPECT_EQ(positive_menu.state, preview.state);
+  ASSERT_EQ(positive_menu.options.size(), preview.options.size());
+  for (size_t i = 0; i < preview.options.size(); ++i) {
+    EXPECT_EQ(positive_menu.options[i].id, preview.options[i].id);
+    EXPECT_EQ(
+        positive_menu.options[i].description,
+        preview.options[i].description);
+  }
   for (size_t i = 0; i < preview.options.size(); ++i) {
     EXPECT_EQ(
         preview.options[i].id,
@@ -2374,6 +2390,10 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
       pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
           2, 131072, 1, 4, 3),
       "PW4.width layout and byte bounds must be powers of two in 1..128");
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 131072, 1, 1, 4),
+      "PW4.width layout is below the required byte floor");
   EXPECT_TRUE(preview_debug.str().empty());
   std::ifstream preview_log(log_path);
   std::stringstream preview_rows;
@@ -2406,6 +2426,13 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   std::stringstream log_output;
   log_output << log_file.rdbuf();
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.breakpoint\""));
+  EXPECT_THAT(
+      log_output.str(),
+      ::testing::HasSubstr("pointwise.tma_breakpoint.v1"));
+  EXPECT_THAT(
+      log_output.str(),
+      ::testing::Not(
+          ::testing::HasSubstr("pointwise.tma_breakpoint.v2")));
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.tile_inner\""));
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.tile_outer\""));
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.width\""));
@@ -2460,6 +2487,107 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   }
   EXPECT_FALSE(cache.hasEntry(
       HeuristicCompileTime::ResizeVectorizationFactors::EntryType));
+}
+
+// Inject route operands above the bp0 divisor-replay cap without allocating a
+// terabyte tensor. This exercises the same filter used by live PW4.breakpoint
+// and retains an exact v2 request for the matching server parser.
+TEST_F(PointwiseTest, TmaBreakpointRemoteMenuFiltering) {
+  constexpr int64_t right_elems = 1LL << 38;
+  constexpr int64_t n_elems = 5 * right_elems;
+  pointwise::tma::TmaBreakPointAvailability materialized;
+  materialized.state =
+      "pointwise.tma_breakpoint.v1\n"
+      "elements=5," +
+      std::to_string(right_elems) +
+      "\ndisjoint=1,1\nlhs_bit_multiples=0,32\nrhs_bit_multiples=32,32\n";
+  materialized.options = {
+      {"bp0", "Flatten to the one-dimensional TMA domain"},
+      {"bp1", "Split before loop axis 1"}};
+  materialized.plans = {{}, {1, false, right_elems, false}};
+  materialized.materialized_layout_widths = {4, 4};
+  for (const auto& plan : materialized.plans) {
+    materialized.remote_unavailability_reasons.emplace_back(
+        pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+            2, n_elems, plan.break_point, 4, 32));
+  }
+  const auto filtered = pointwise::tma::remoteRouteableTmaBreakPoints(
+      materialized, n_elems, 2, 32);
+  EXPECT_TRUE(filtered.remote_filter_applied);
+  ASSERT_EQ(filtered.options.size(), 1);
+  EXPECT_EQ(filtered.options[0].id, "bp1");
+  EXPECT_EQ(filtered.options[0].description, "Split before loop axis 1");
+  ASSERT_EQ(filtered.plans.size(), 1);
+  EXPECT_EQ(filtered.plans[0].break_point, 1);
+  EXPECT_EQ(
+      pointwise::tma::tmaRecordBreakPointCoverageReason(
+          materialized, filtered, "bp0"),
+      "native TMA breakpoint has no Remote-reachable PW4 continuation");
+  EXPECT_TRUE(
+      pointwise::tma::tmaRecordBreakPointCoverageReason(
+          materialized, filtered, "bp1")
+          .empty());
+  EXPECT_THAT(
+      filtered.state,
+      ::testing::HasSubstr(
+          "pointwise.tma_breakpoint.v2\nelements=5," +
+          std::to_string(right_elems)));
+  EXPECT_THAT(
+      filtered.state,
+      ::testing::HasSubstr(
+          "n_elems=" + std::to_string(n_elems) +
+          "\nloop_axes=2\nmin_dtype_bits=32\n"
+          "materialized_layout_widths=bp0:4,bp1:4\n"
+          "remote_max_loop_axes=32\n"
+          "bp0_replay_max_elems=1099511627776\nwidth_max=128\n"));
+
+  auto all_excluded = materialized;
+  for (auto& reason : all_excluded.remote_unavailability_reasons) {
+    reason = "more than 32 loop dimensions";
+  }
+  const auto empty_menu = pointwise::tma::remoteRouteableTmaBreakPoints(
+      all_excluded, n_elems, 33, 32);
+  EXPECT_TRUE(empty_menu.remote_filter_applied);
+  EXPECT_TRUE(empty_menu.options.empty());
+  EXPECT_TRUE(empty_menu.plans.empty());
+  EXPECT_EQ(
+      pointwise::tma::tmaRecordBreakPointCoverageReason(
+          materialized, empty_menu, "bp1"),
+      "native TMA breakpoint has no Remote-reachable PW4 continuation");
+
+  char local_path[] = "/tmp/nvfuser-pw4-route-XXXXXX";
+  const char* log_path = std::getenv("NVFUSER_JEV_ROUTE_FIXTURE_LOG");
+  bool cleanup = false;
+  if (log_path == nullptr || *log_path == '\0') {
+    const int fd = ::mkstemp(local_path);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    log_path = local_path;
+    cleanup = true;
+  }
+  struct FileCleanup {
+    const char* path;
+    bool cleanup;
+    ~FileCleanup() {
+      if (cleanup) {
+        ::unlink(path);
+      }
+    }
+  } file_cleanup{log_path, cleanup};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+  EXPECT_EQ(
+      scheduler::jev::chooseDecision(
+          "PW4.breakpoint", filtered.state, filtered.options, "bp1"),
+      "bp1");
+  std::ifstream request_log(log_path);
+  std::stringstream records;
+  records << request_log.rdbuf();
+  EXPECT_THAT(records.str(), ::testing::HasSubstr("pointwise.tma_breakpoint.v2"));
+  EXPECT_THAT(
+      records.str(),
+      ::testing::HasSubstr("\"candidates\":[\"bp1\"]"));
 }
 
 // Exercise the 1D target menu without compiling a Hopper-only TMA kernel.

@@ -704,6 +704,9 @@ std::string_view tmaBreakPointRemoteRouteabilityReason(
   if (scheduler_utils::lastPow2(byte_min) != byte_min) {
     return "PW4.width layout and byte bounds must be powers of two in 1..128";
   }
+  if (layout_width < byte_min) {
+    return "PW4.width layout is below the required byte floor";
+  }
   return {};
 }
 
@@ -767,6 +770,8 @@ TmaBreakPointAvailability materializeTmaBreakPointAvailability(
              : "Split before loop axis " +
                    std::to_string(candidate.break_point)});
     result.plans.push_back(candidate);
+    result.materialized_layout_widths.push_back(
+        materialized->vectorization_factor);
     // Native Off materialization with hard_valid=true already proves the
     // preferred domain/tile fits resource bounds. PW4.domain_inner retains
     // that t512 option; PW4.tile_inner and PW4.tile_outer each retain at
@@ -794,6 +799,74 @@ TmaBreakPointAvailability getTmaBreakPointAvailability(
   const auto search = pointwise_utils::getTmaBreakPointSearch(prop, nullptr);
   return materializeTmaBreakPointAvailability(
       fusion, runtime_info, prop, search);
+}
+
+TmaBreakPointAvailability remoteRouteableTmaBreakPoints(
+    const TmaBreakPointAvailability& materialized,
+    int64_t n_elems,
+    std::size_t loop_axes,
+    int64_t min_dtype_bits) {
+  NVF_ERROR(
+      materialized.options.size() == materialized.plans.size() &&
+          materialized.options.size() ==
+              materialized.materialized_layout_widths.size() &&
+          materialized.options.size() ==
+              materialized.remote_unavailability_reasons.size(),
+      "PW4.breakpoint availability vectors must remain aligned");
+  TmaBreakPointAvailability result;
+  std::string widths;
+  for (size_t i = 0; i < materialized.options.size(); ++i) {
+    if (i != 0) {
+      widths += ',';
+    }
+    widths += materialized.options[i].id + ':' +
+        std::to_string(materialized.materialized_layout_widths[i]);
+    if (!materialized.remote_unavailability_reasons[i].empty()) {
+      result.remote_filter_applied = true;
+      continue;
+    }
+    result.options.push_back(materialized.options[i]);
+    result.plans.push_back(materialized.plans[i]);
+    result.materialized_layout_widths.push_back(
+        materialized.materialized_layout_widths[i]);
+    result.remote_unavailability_reasons.emplace_back();
+  }
+  if (!result.remote_filter_applied) {
+    return materialized;
+  }
+  constexpr std::string_view v1_tag = "pointwise.tma_breakpoint.v1\n";
+  NVF_ERROR(
+      materialized.state.rfind(v1_tag, 0) == 0,
+      "PW4.breakpoint filtered menu requires the v1 base state");
+  result.state = "pointwise.tma_breakpoint.v2\n" +
+      materialized.state.substr(v1_tag.size());
+  result.state += "n_elems=" + std::to_string(n_elems) + '\n';
+  result.state += "loop_axes=" + std::to_string(loop_axes) + '\n';
+  result.state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+  result.state += "materialized_layout_widths=" + widths + '\n';
+  result.state += "remote_max_loop_axes=32\n";
+  result.state += "bp0_replay_max_elems=" +
+      std::to_string(1LL << 40) + '\n';
+  result.state += "width_max=128\n";
+  return result;
+}
+
+std::string_view tmaRecordBreakPointCoverageReason(
+    const TmaBreakPointAvailability& materialized,
+    const TmaBreakPointAvailability& remote_menu,
+    std::string_view native_id) {
+  const auto contains = [native_id](const auto& options) {
+    return std::any_of(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == native_id;
+        });
+  };
+  if (contains(remote_menu.options)) {
+    return {};
+  }
+  return contains(materialized.options)
+      ? "native TMA breakpoint has no Remote-reachable PW4 continuation"
+      : "native TMA plan is outside the conservative complete-plan menu";
 }
 
 std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
@@ -836,28 +909,35 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
 
   const auto availability =
       materializeTmaBreakPointAvailability(fusion, runtime_info, prop, search);
-  const auto& options = availability.options;
-  const auto& plans = availability.plans;
+  const auto menu = remoteRouteableTmaBreakPoints(
+      availability,
+      prop.n_elems,
+      prop.elem_counts.size(),
+      prop.min_dtype_size_bit_for_vectorization);
+  const auto& options = menu.options;
+  const auto& plans = menu.plans;
 
   if (mode == scheduler::jev::Mode::Record) {
     const auto native_id = "bp" + std::to_string(native.break_point);
-    if (std::none_of(
-            options.begin(), options.end(), [&](const auto& option) {
-              return option.id == native_id;
-            })) {
+    const auto skip_reason =
+        tmaRecordBreakPointCoverageReason(availability, menu, native_id);
+    if (!skip_reason.empty()) {
       scheduler::jev::recordCoverageSkip(
-          "PW4.breakpoint",
-          "native TMA plan is outside the conservative complete-plan menu");
+          "PW4.breakpoint", skip_reason);
       return native_params;
     }
     (void)scheduler::jev::chooseDecision(
-        "PW4.breakpoint", search.state, options, native_id);
+        "PW4.breakpoint", menu.state, options, native_id);
     return native_params;
   }
 
-  NVF_ERROR(!options.empty(), "PW4.breakpoint has no native-valid TMA plan");
+  NVF_ERROR(
+      !options.empty(),
+      menu.remote_filter_applied
+          ? "PW4.breakpoint has no Remote-routeable TMA plan"
+          : "PW4.breakpoint has no native-valid TMA plan");
   const auto selected = scheduler::jev::chooseDecision(
-      "PW4.breakpoint", search.state, options);
+      "PW4.breakpoint", menu.state, options);
   for (size_t i = 0; i < options.size(); ++i) {
     if (options[i].id != selected) {
       continue;
