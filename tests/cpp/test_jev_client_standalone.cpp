@@ -2,6 +2,7 @@
 // Standalone, CPU-only protocol test: build with jev_client.cpp and -pthread.
 #include <scheduler/jev_client.h>
 #include <scheduler/pointwise_unroll_envelope.h>
+#include <scheduler/reduction_tma_unroll_choice.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -181,6 +182,45 @@ int main() {
   require(
       readFile(path).find("\"case_key\":\"case-1\"") != std::string::npos,
       "record lacks case key");
+  {
+    // An fp32 reduction with MUFU can prefer u4 even when 128 elements and a
+    // 256-thread CTA leave only u1 in the per-thread Choice menu.
+    const std::vector<ChoiceOption> short_reduction{
+        {"u1", "Unroll 1 reduction element per thread"}};
+    const std::string before = readFile(path);
+    int64_t native_unroll = 4;
+    const auto selected =
+        nvfuser::reduction::tma::chooseInnerUnrollIfRepresentable(
+            "reduction.tma_inner_unroll.v1\nreduction_numel=128\n"
+            "threads_per_block=256\n",
+            short_reduction,
+            native_unroll);
+    if (selected) {
+      native_unroll = std::stoll(selected->substr(1));
+    }
+    require(
+        !selected && native_unroll == 4,
+        "RD2 Record changed an unrepresentable native unroll");
+    const std::string delta = readFile(path).substr(before.size());
+    require(
+        delta.find("\"kind\":\"coverage_skip\",\"site\":\"RD2.unroll\"") !=
+                std::string::npos &&
+            delta.find("native unroll exceeds per-thread reduction menu") !=
+                std::string::npos &&
+            delta.find("\"kind\":\"choice\"") == std::string::npos,
+        "RD2 Record did not log only a coverage skip");
+    const auto offered =
+        nvfuser::reduction::tma::chooseInnerUnrollIfRepresentable(
+            "reduction.tma_inner_unroll.v1\nreduction_numel=1024\n"
+            "threads_per_block=256\n",
+            {{"u1", "Unroll 1 reduction element per thread"},
+             {"u2", "Unroll 2 reduction elements per thread"},
+             {"u4", "Unroll 4 reduction elements per thread"}},
+            4);
+    require(
+        offered && *offered == "u4",
+        "RD2 Record failed to retain an offered native unroll");
+  }
   require(
       readFile(path).find("\"request\":{\"model\":\"jev-latest\"") !=
           std::string::npos,
@@ -419,6 +459,24 @@ int main() {
   }
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,
           "Remote native scope did not restore the configured mode");
+  {
+    FakeServer server(
+        "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"RD2.unroll\":{"
+        "\"type\":\"choice\",\"choice\":\"u1\",\"confidence\":1.0,"
+        "\"probabilities\":{\"u1\":1.0}}},"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}");
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    const auto selected =
+        nvfuser::reduction::tma::chooseInnerUnrollIfRepresentable(
+            "reduction.tma_inner_unroll.v2\nreduction_numel=128\n"
+            "threads_per_block=256\n",
+            {{"u1", "Unroll 1 reduction element per thread"}},
+            0);
+    require(
+        selected && *selected == "u1" &&
+            server.request().find("\"criteria\":{\"u1\":") != std::string::npos,
+        "RD2 Remote did not retain the structural menu");
+  }
   {
     nvfuser::scheduler::jev::PointwiseRecordScope scope;
     require(!scope.recording(), "remote mode enabled Pointwise Record diagnostics");

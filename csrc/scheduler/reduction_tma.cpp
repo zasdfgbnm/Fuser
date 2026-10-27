@@ -16,6 +16,7 @@
 
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/reduction_tma_unroll_choice.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -176,23 +177,21 @@ std::unique_ptr<TmaInnerReductionParams> getReductionHeuristics(
         std::to_string(max_threads_per_sm) + '\n';
     state += "memory_bus_bits=" + std::to_string(memory_bus_bits) + '\n';
     state += "memory_clock_khz=" + std::to_string(memory_clock_khz) + '\n';
-    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
-        ? "u" + std::to_string(unroll_factor)
-        : std::string();
-    const auto selected = scheduler::jev::chooseDecision(
-        "RD2.unroll", state, options, native_choice);
-    bool matched = false;
-    for (int64_t factor = 1;; factor *= 2) {
-      if (selected == "u" + std::to_string(factor)) {
-        unroll_factor = factor;
-        matched = true;
-        break;
+    if (const auto selected =
+            chooseInnerUnrollIfRepresentable(state, options, unroll_factor)) {
+      bool matched = false;
+      for (int64_t factor = 1;; factor *= 2) {
+        if (*selected == "u" + std::to_string(factor)) {
+          unroll_factor = factor;
+          matched = true;
+          break;
+        }
+        if (factor > hard_max / 2) {
+          break;
+        }
       }
-      if (factor > hard_max / 2) {
-        break;
-      }
+      NVF_ERROR(matched, "RD2.unroll response exceeds hard reduction bounds");
     }
-    NVF_ERROR(matched, "RD2.unroll response exceeds hard reduction bounds");
   }
 
   auto params = std::make_unique<TmaInnerReductionParams>();
