@@ -12,10 +12,14 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "fusion.h"
 #include "scheduler/bounded_snapshot_stream.h"
+#include "scheduler/native_diagnostic_jsonl.h"
 #include "scheduler/runtime_info.h"
 
 // A passive, deterministic description of the inputs visible at the entry to
@@ -23,6 +27,8 @@
 // failed or oversized description is unavailable in its entirety; callers must
 // not use a partial description as an invocation identity.
 namespace nvfuser::scheduler::compute_invocation_input {
+
+enum class Format { V1, V2 };
 
 enum class UnavailableReason {
   None,
@@ -34,6 +40,10 @@ enum class UnavailableReason {
   UndefinedTensor,
   InputKindMismatch,
   UnsupportedScalar,
+  TooManyIrValues,
+  TooManyTensorViews,
+  TooManyAxes,
+  IrMetadataContainsPointerLikeValue,
   SnapshotTooLarge,
   FormattingFailed,
 };
@@ -50,6 +60,11 @@ inline const char* reasonName(UnavailableReason reason) noexcept {
     case UnavailableReason::UndefinedTensor: return "undefined_tensor";
     case UnavailableReason::InputKindMismatch: return "input_kind_mismatch";
     case UnavailableReason::UnsupportedScalar: return "unsupported_scalar";
+    case UnavailableReason::TooManyIrValues: return "too_many_ir_values";
+    case UnavailableReason::TooManyTensorViews: return "too_many_tensor_views";
+    case UnavailableReason::TooManyAxes: return "too_many_axes";
+    case UnavailableReason::IrMetadataContainsPointerLikeValue:
+      return "ir_metadata_contains_pointer_like_value";
     case UnavailableReason::SnapshotTooLarge: return "snapshot_too_large";
     case UnavailableReason::FormattingFailed: return "formatting_failed";
   }
@@ -100,7 +115,203 @@ inline void appendDoubleBits(std::ostream& out, double value) {
   }
 }
 
-inline Snapshot capture(Fusion* fusion, SchedulerRuntimeInfo& runtime_info)
+// The v2 suffix describes domains that Fusion::print(false) does not show.
+// IDs come from the fusion's own deterministic IR numbering, never addresses.
+// This is a transport snapshot, not a proof that every scheduler continuation
+// can be reconstructed from the metadata alone.
+inline Snapshot captureIrMetadata(Fusion* fusion) noexcept {
+  constexpr size_t kMaxTextBytes = 1024 * 1024;
+  constexpr size_t kMaxValues = 65536;
+  constexpr size_t kMaxTensorViews = 4096;
+  constexpr size_t kMaxAxesPerDomain = 128;
+  constexpr size_t kMaxAxisEntries = 32768;
+  constexpr size_t kMaxAxisPrintBytes = 8192;
+  if (fusion == nullptr) {
+    return {{}, UnavailableReason::NullFusion};
+  }
+  try {
+    // A copied Fusion may add special scalar values. Per-type IR names, unlike
+    // insertion ordinals, remain stable across equivalent copies.
+    const auto vals = fusion->deterministic_vals();
+    if (vals.size() > kMaxValues) {
+      return {{}, UnavailableReason::TooManyIrValues};
+    }
+    std::vector<TensorView*> tvs;
+    std::unordered_map<uint64_t, const Val*> val_keys;
+    val_keys.reserve(vals.size());
+    for (Val* val : vals) {
+      const uint64_t key =
+          (static_cast<uint64_t>(val->vtype()) << 32) | val->name();
+      const auto [found, inserted] = val_keys.emplace(key, val);
+      if (!inserted && found->second != val) {
+        return {{}, UnavailableReason::FormattingFailed};
+      }
+      if (val->isA<TensorView>()) {
+        tvs.push_back(val->as<TensorView>());
+      }
+    }
+    if (tvs.size() > kMaxTensorViews) {
+      return {{}, UnavailableReason::TooManyTensorViews};
+    }
+
+    BoundedSnapshotBuffer metadata_buffer(kMaxTextBytes);
+    std::ostream out(&metadata_buffer);
+    out.imbue(std::locale::classic());
+    out << "{\"schema\":\"nvfuser.compute_ir_meta.v1\",\"tvs\":[";
+    const auto append_val_key = [&](const Val* val) {
+      out << '[' << static_cast<int64_t>(val->vtype()) << ',' << val->name()
+          << ']';
+    };
+    const auto known_val = [&](const Val* val) {
+      const uint64_t key =
+          (static_cast<uint64_t>(val->vtype()) << 32) | val->name();
+      const auto found = val_keys.find(key);
+      return found != val_keys.end() && found->second == val;
+    };
+    size_t axis_entries = 0;
+    bool first_tv = true;
+    for (const TensorView* tv : tvs) {
+      const auto& logical = tv->getLogicalDomain();
+      const auto& loop = tv->getLoopDomain();
+      const auto& allocation = tv->getMaybeAllocationDomain();
+      const auto& contiguity = tv->getContiguity();
+      if (logical.size() > kMaxAxesPerDomain ||
+          loop.size() > kMaxAxesPerDomain ||
+          allocation.size() > kMaxAxesPerDomain) {
+        return {{}, UnavailableReason::TooManyAxes};
+      }
+      if (contiguity.size() != allocation.size()) {
+        return {{}, UnavailableReason::FormattingFailed};
+      }
+      if (!tv->hasAllocation() && logical != allocation) {
+        return {{}, UnavailableReason::FormattingFailed};
+      }
+      if (!first_tv) out << ',';
+      first_tv = false;
+      out << "{\"id\":\"T" << tv->name() << "\",\"val_key\":";
+      append_val_key(tv);
+      out << ",\"logical\":";
+      const auto append_axes = [&](const std::vector<IterDomain*>& axes) {
+        out << '[';
+        for (size_t i = 0; i < axes.size(); ++i) {
+          if (i != 0) out << ',';
+          out << axes[i]->name();
+        }
+        out << ']';
+      };
+      append_axes(logical);
+      out << ",\"loop\":";
+      append_axes(loop);
+      out << ",\"allocation\":";
+      append_axes(allocation);
+      out << ",\"allocation_explicit\":"
+          << (tv->hasAllocation() ? "true" : "false")
+          << ",\"contiguity\":[";
+      for (size_t i = 0; i < contiguity.size(); ++i) {
+        if (i != 0) out << ',';
+        out << (contiguity[i].has_value()
+                    ? (*contiguity[i] ? "true" : "false")
+                    : "null");
+      }
+      out << "],\"axes\":[";
+      std::unordered_set<int64_t> seen_axes;
+      bool first_axis = true;
+      for (const auto* domain : {&logical, &loop, &allocation}) {
+        for (const IterDomain* axis : *domain) {
+          if (!seen_axes.insert(axis->name()).second) continue;
+          if (++axis_entries > kMaxAxisEntries) {
+            return {{}, UnavailableReason::TooManyAxes};
+          }
+          const std::string axis_print = axis->toString();
+          if (axis_print.size() > kMaxAxisPrintBytes) {
+            return {{}, UnavailableReason::SnapshotTooLarge};
+          }
+          if (!first_axis) out << ',';
+          first_axis = false;
+          out << "{\"id\":" << axis->name() << ",\"print\":"
+              << native_diagnostic::quote(axis_print) << '}';
+        }
+      }
+      out << "]}";
+      if (!out.good()) {
+        return {{}, metadata_buffer.truncated()
+                        ? UnavailableReason::SnapshotTooLarge
+                        : UnavailableReason::FormattingFailed};
+      }
+    }
+    out << "],\"input_tvs\":[";
+    for (size_t i = 0; i < fusion->inputs().size(); ++i) {
+      if (i != 0) out << ',';
+      const Val* input = fusion->inputs()[i];
+      if (input->isA<TensorView>()) {
+        out << "\"T" << input->name() << '"';
+      } else {
+        out << "null";
+      }
+    }
+    out << "],\"input_vals\":[";
+    for (size_t i = 0; i < fusion->inputs().size(); ++i) {
+      if (i != 0) out << ',';
+      append_val_key(fusion->inputs()[i]);
+    }
+    out << "],\"outputs\":[";
+    for (size_t i = 0; i < fusion->outputs().size(); ++i) {
+      if (i != 0) out << ',';
+      const Val* output = fusion->outputs()[i];
+      const AliasInfo& alias = fusion->getOutputAlias(output);
+      out << "{\"val_key\":";
+      append_val_key(output);
+      out << ",\"tv\":";
+      if (output->isA<TensorView>()) {
+        out << "\"T" << output->name() << '"';
+      } else {
+        out << "null";
+      }
+      out << ",\"alias\":{\"type\":";
+      switch (alias.type) {
+        case AllocationType::New: out << "\"new\""; break;
+        case AllocationType::ReuseBuffer: out << "\"reuse_buffer\""; break;
+        case AllocationType::Evaluate: out << "\"evaluate\""; break;
+        default: return {{}, UnavailableReason::FormattingFailed};
+      }
+      out << ",\"target_val\":";
+      if (alias.aliased_io == nullptr) {
+        out << "null";
+      } else {
+        if (!known_val(alias.aliased_io)) {
+          return {{}, UnavailableReason::FormattingFailed};
+        }
+        append_val_key(alias.aliased_io);
+      }
+      out << ",\"visibility\":";
+      switch (alias.visibility) {
+        case OutputVisibility::kVisible: out << "\"visible\""; break;
+        case OutputVisibility::kHidden: out << "\"hidden\""; break;
+        default: return {{}, UnavailableReason::FormattingFailed};
+      }
+      out << "}}";
+    }
+    out << "]}";
+    if (metadata_buffer.truncated()) {
+      return {{}, UnavailableReason::SnapshotTooLarge};
+    }
+    if (!out.good()) {
+      return {{}, UnavailableReason::FormattingFailed};
+    }
+    std::string text = std::move(metadata_buffer).take();
+    if (containsPointerLikeValue(text)) {
+      return {{}, UnavailableReason::IrMetadataContainsPointerLikeValue};
+    }
+    return {std::move(text), UnavailableReason::None};
+  } catch (...) {
+    return {{}, UnavailableReason::FormattingFailed};
+  }
+}
+
+inline Snapshot capture(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    Format format = Format::V1)
     noexcept {
   constexpr size_t kMaxInputs = 128;
   constexpr size_t kMaxTextBytes = 1024 * 1024;
@@ -130,7 +341,8 @@ inline Snapshot capture(Fusion* fusion, SchedulerRuntimeInfo& runtime_info)
     BoundedSnapshotBuffer snapshot_buffer(kMaxTextBytes);
     std::ostream out(&snapshot_buffer);
     out.imbue(std::locale::classic());
-    out << "nvfuser.compute_invocation_input.v1\nfusion ";
+    out << (format == Format::V2 ? "nvfuser.compute_invocation_input.v2\nfusion "
+                                 : "nvfuser.compute_invocation_input.v1\nfusion ");
     appendSized(out, fusion_text);
     out << "\nindex_type "
         << static_cast<int64_t>(runtime_info.getIndexType()) << "\ninputs "
@@ -204,6 +416,14 @@ inline Snapshot capture(Fusion* fusion, SchedulerRuntimeInfo& runtime_info)
         }
         return {{}, UnavailableReason::FormattingFailed};
       }
+    }
+    if (format == Format::V2) {
+      const Snapshot metadata = captureIrMetadata(fusion);
+      if (!metadata.available()) {
+        return {{}, metadata.reason};
+      }
+      out << "\nir_meta ";
+      appendSized(out, metadata.text);
     }
     if (snapshot_buffer.truncated()) {
       return {{}, UnavailableReason::SnapshotTooLarge};

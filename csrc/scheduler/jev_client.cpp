@@ -837,13 +837,20 @@ std::string semanticV3State(
     fail("semantic-v3 hardware snapshot must be a JSON object");
   }
 
+  // Historical standalone scopes and v1 outcome logs remain readable. Real
+  // semantic-v3 compute scopes capture v2 and advertise that exact format.
+  const std::string_view snapshot_format = snapshot.starts_with(
+      "nvfuser.compute_invocation_input.v2\nfusion ")
+      ? "nvfuser.compute_invocation_input.v2"
+      : "nvfuser.compute_invocation_input.v1";
+
   std::string result =
       "{\"schema\":\"nvfuser.systemone.context.v3\","
       "\"verification_status\":\"analysis_summary_only\","
       "\"objective\":\"Choose the listed schedule alternative expected "
       "to minimize fusion kernel runtime on the described GPU.\","
-      "\"workload\":{\"snapshot_format\":"
-      "\"nvfuser.compute_invocation_input.v1\",\"fusion_and_runtime\":";
+      "\"workload\":{\"snapshot_format\":";
+  result += quote(snapshot_format) + ",\"fusion_and_runtime\":";
   result += quote(snapshot) + ",\"hardware\":" + std::string(hardware);
   result += "},\"current_schedule\":{\"prior_choices\":" +
       active_compute_scope->priorChoicesJson() + "},\"decision\":{\"site\":" +

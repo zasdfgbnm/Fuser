@@ -16,8 +16,10 @@
 #include "runtime/executor.h"
 #include "runtime/executor_utils.h"
 #include "runtime/fusion_executor_cache.h"
+#include "scheduler/compute_invocation_input.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/resize_heuristic.h"
+#include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/tools/loop_domain_scheduler.h"
 #include "scheduler/tools/resize_utils.h"
@@ -57,6 +59,139 @@ void checkLoopDomainEquivalence(
 } // namespace
 
 using ResizeTest = NVFuserTest;
+
+TEST(ComputeInvocationIrMetadata, OutputAliasUsesStableValKey) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({2, 3});
+  fusion.addInput(input);
+  auto* output = set(input);
+  fusion.addOutput(output);
+  fusion.aliasOutputToInput(output, input, AllocationType::ReuseBuffer);
+
+  const auto metadata =
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion);
+  ASSERT_TRUE(metadata.available());
+  const std::string input_key =
+      "[" + std::to_string(static_cast<int64_t>(input->vtype())) + "," +
+      std::to_string(input->name()) + "]";
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"alias\":{\"type\":\"reuse_buffer\",\"target_val\":" +
+          input_key + ",\"visibility\":\"visible\"}"));
+  EXPECT_EQ(
+      metadata.text,
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion).text);
+  Fusion clone(fusion);
+  EXPECT_EQ(
+      metadata.text,
+      scheduler::compute_invocation_input::captureIrMetadata(&clone).text);
+}
+
+TEST(ComputeInvocationIrMetadata, EvaluateOutputMayHaveNoAliasTarget) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({2, 3});
+  fusion.addInput(input);
+  auto* output = set(input);
+  fusion.addOutput(output);
+  fusion.aliasOutputToInput(output, nullptr, AllocationType::Evaluate);
+
+  const auto metadata =
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion);
+  ASSERT_TRUE(metadata.available());
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"alias\":{\"type\":\"evaluate\",\"target_val\":null,"
+          "\"visibility\":\"visible\"}"));
+}
+
+TEST_F(ResizeTest, ComputeInvocationSnapshotV2_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+
+  using namespace scheduler::compute_invocation_input;
+  const auto v1 = capture(&fusion, runtime_info);
+  const auto explicit_v1 = capture(&fusion, runtime_info, Format::V1);
+  const auto v2 = capture(&fusion, runtime_info, Format::V2);
+  const auto metadata = captureIrMetadata(&fusion);
+  ASSERT_TRUE(v1.available());
+  ASSERT_TRUE(v2.available());
+  ASSERT_TRUE(metadata.available());
+  EXPECT_EQ(v1.text, explicit_v1.text);
+  constexpr std::string_view v1_magic =
+      "nvfuser.compute_invocation_input.v1\nfusion ";
+  constexpr std::string_view v2_magic =
+      "nvfuser.compute_invocation_input.v2\nfusion ";
+  ASSERT_EQ(v1.text.substr(0, v1_magic.size()), v1_magic);
+  ASSERT_EQ(v2.text.substr(0, v2_magic.size()), v2_magic);
+  const std::string expected_suffix =
+      "\nir_meta " + std::to_string(metadata.text.size()) + ':' + metadata.text;
+  EXPECT_EQ(
+      v2.text.substr(v2_magic.size()),
+      v1.text.substr(v1_magic.size()) + expected_suffix);
+
+  const std::string input_axes =
+      "\"logical\":[" + std::to_string(input->axis(0)->name()) + ',' +
+      std::to_string(input->axis(1)->name()) + ',' +
+      std::to_string(input->axis(2)->name()) + "],\"loop\":[" +
+      std::to_string(input->axis(0)->name()) + ',' +
+      std::to_string(input->axis(1)->name()) + ',' +
+      std::to_string(input->axis(2)->name()) + "],\"allocation\":[" +
+      std::to_string(input->axis(1)->name()) + ',' +
+      std::to_string(input->axis(0)->name()) + ',' +
+      std::to_string(input->axis(2)->name()) +
+      "],\"allocation_explicit\":true,\"contiguity\":[true,true,true]";
+  EXPECT_THAT(metadata.text, testing::HasSubstr(input_axes));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"alias\":{\"type\":\"new\",\"target_val\":null,"
+          "\"visibility\":\"visible\"}"));
+
+  Fusion clone(fusion);
+  SchedulerRuntimeInfo clone_runtime_info(&clone, {tensor});
+  const auto clone_v2 = capture(&clone, clone_runtime_info, Format::V2);
+  ASSERT_TRUE(clone_v2.available());
+  EXPECT_EQ(v2.text, clone_v2.text);
+}
+
+TEST_F(ResizeTest, ComputeInvocationAliasedSnapshotV2_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({2, 3});
+  fusion.addInput(input);
+  auto* output = set(input);
+  fusion.addOutput(output);
+  fusion.aliasOutputToInput(output, input, AllocationType::ReuseBuffer);
+  const auto tensor = at::randn(
+      {2, 3}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto v2 = scheduler::compute_invocation_input::capture(
+      &fusion, runtime_info, scheduler::compute_invocation_input::Format::V2);
+  ASSERT_TRUE(v2.available());
+
+  Fusion clone(fusion);
+  SchedulerRuntimeInfo clone_runtime_info(&clone, {tensor});
+  const auto clone_v2 = scheduler::compute_invocation_input::capture(
+      &clone,
+      clone_runtime_info,
+      scheduler::compute_invocation_input::Format::V2);
+  ASSERT_TRUE(clone_v2.available());
+  EXPECT_EQ(v2.text, clone_v2.text);
+  EXPECT_THAT(v2.text, testing::HasSubstr("\"type\":\"reuse_buffer\""));
+}
 
 TEST_F(ResizeTest, JevAlternateCta_CUDA) {
   Fusion fusion;

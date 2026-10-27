@@ -174,7 +174,12 @@ std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
   const bool semantic_enabled = semantic_v2_enabled || semantic_v3_enabled;
   if (trace_enabled || semantic_enabled) {
     input_snapshot =
-        scheduler::compute_invocation_input::capture(fusion, runtime_info);
+        scheduler::compute_invocation_input::capture(
+            fusion,
+            runtime_info,
+            semantic_v3_enabled
+                ? scheduler::compute_invocation_input::Format::V2
+                : scheduler::compute_invocation_input::Format::V1);
   }
   std::string hardware_json;
   if (semantic_v3_enabled && input_snapshot.available()) {

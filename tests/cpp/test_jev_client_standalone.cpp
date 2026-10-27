@@ -823,6 +823,20 @@ int main() {
   require(v3_record.find("\"consequence\"") == std::string::npos,
           "semantic-v3 emitted an absent consequence");
   {
+    const std::string before_v2_snapshot = readFile(path);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "nvfuser.compute_invocation_input.v2\nfusion 0:", {}, v3_hardware);
+    require(chooseDecision("PW2", state, reverse_options, "bp0") == "bp0",
+            "semantic-v3 changed the choice with a v2 snapshot");
+    const std::string request =
+        loggedRequest(readFile(path).substr(before_v2_snapshot.size()));
+    require(
+        request.find(
+            "\"snapshot_format\":\"nvfuser.compute_invocation_input.v2\"") !=
+            std::string::npos,
+        "semantic-v3 did not advertise the actual v2 snapshot format");
+  }
+  {
     const std::vector<ChoiceOption> enriched_reverse{
         {"bp1", "split", "{\"break_point\":128,\"tiles\":[64,128],\"legal\":true}"},
         {"bp0", "one dimensional", "{\"break_point\":null,\"tiles\":[256],\"legal\":true}"}};
