@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Standalone, CPU-only protocol test: build with jev_client.cpp and -pthread.
 #include <scheduler/jev_client.h>
+#include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
 #include <scheduler/reduction_tma_unroll_choice.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -34,7 +37,13 @@ class FakeServer {
       std::string body,
       int status = 200,
       std::chrono::milliseconds reply_delay = std::chrono::milliseconds(0))
-      : body_(std::move(body)), status_(status), reply_delay_(reply_delay) {
+      : FakeServer(
+            std::vector<std::string>{std::move(body)}, status, reply_delay) {}
+  explicit FakeServer(
+      std::vector<std::string> bodies,
+      int status = 200,
+      std::chrono::milliseconds reply_delay = std::chrono::milliseconds(0))
+      : bodies_(std::move(bodies)), status_(status), reply_delay_(reply_delay) {
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     require(fd_ >= 0, "socket failed");
     sockaddr_in address{};
@@ -56,39 +65,48 @@ class FakeServer {
 
  private:
   void serve() {
-    int client = ::accept(fd_, nullptr, nullptr);
-    if (client < 0) return;
-    char buffer[4096];
-    size_t expected = 0;
-    while (true) {
-      ssize_t n = ::recv(client, buffer, sizeof(buffer), 0);
-      if (n <= 0) break;
-      request_.append(buffer, static_cast<size_t>(n));
-      const size_t split = request_.find("\r\n\r\n");
-      if (split != std::string::npos) {
-        if (expected == 0) {
-          const std::string header = "Content-Length: ";
-          size_t index = request_.find(header);
-          if (index != std::string::npos) {
-            expected = static_cast<size_t>(std::stoul(request_.substr(index + header.size())));
-          }
-        }
-        if (request_.size() >= split + 4 + expected) break;
+    for (const auto& body : bodies_) {
+      if (bodies_.size() > 1) {
+        pollfd ready{fd_, POLLIN, 0};
+        if (::poll(&ready, 1, 3000) <= 0) return;
       }
+      int client = ::accept(fd_, nullptr, nullptr);
+      if (client < 0) return;
+      std::string current_request;
+      char buffer[4096];
+      size_t expected = 0;
+      while (true) {
+        ssize_t n = ::recv(client, buffer, sizeof(buffer), 0);
+        if (n <= 0) break;
+        current_request.append(buffer, static_cast<size_t>(n));
+        const size_t split = current_request.find("\r\n\r\n");
+        if (split != std::string::npos) {
+          if (expected == 0) {
+            const std::string header = "Content-Length: ";
+            size_t index = current_request.find(header);
+            if (index != std::string::npos) {
+              expected = static_cast<size_t>(
+                  std::stoul(current_request.substr(index + header.size())));
+            }
+          }
+          if (current_request.size() >= split + 4 + expected) break;
+        }
+      }
+      request_ += current_request;
+      std::this_thread::sleep_for(reply_delay_);
+      const std::string reply = "HTTP/1.0 " + std::to_string(status_) +
+          (status_ == 200 ? " OK" : " Failure") + "\r\nContent-Type: application/json\r\n"
+          "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+      size_t offset = 0;
+      while (offset < reply.size()) {
+        ssize_t n = ::send(client, reply.data() + offset, reply.size() - offset, MSG_NOSIGNAL);
+        if (n <= 0) break;
+        offset += static_cast<size_t>(n);
+      }
+      ::close(client);
     }
-    std::this_thread::sleep_for(reply_delay_);
-    const std::string reply = "HTTP/1.0 " + std::to_string(status_) +
-        (status_ == 200 ? " OK" : " Failure") + "\r\nContent-Type: application/json\r\n"
-        "Content-Length: " + std::to_string(body_.size()) + "\r\n\r\n" + body_;
-    size_t offset = 0;
-    while (offset < reply.size()) {
-      ssize_t n = ::send(client, reply.data() + offset, reply.size() - offset, MSG_NOSIGNAL);
-      if (n <= 0) break;
-      offset += static_cast<size_t>(n);
-    }
-    ::close(client);
   }
-  std::string body_;
+  std::vector<std::string> bodies_;
   int status_;
   std::chrono::milliseconds reply_delay_;
   int fd_ = -1;
@@ -103,6 +121,23 @@ std::string answer(
   return "{\"model\":\"" + model + "\",\"answers\":{\"PW2\":{\"type\":\"choice\","
       "\"choice\":\"" + choice + "\",\"confidence\":1.0,\"probabilities\":{\"bp0\":0.0,"
       "\"bp1\":1.0}}},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}";
+}
+
+std::string prefetchAnswer(
+    const std::string& choice,
+    const std::vector<nvfuser::normalization_inner::tma::PrefetchDistanceRange>&
+        ranges) {
+  std::string probabilities = "{";
+  for (const auto& range : ranges) {
+    if (probabilities.size() > 1) probabilities += ',';
+    probabilities += "\"" + range.id() + "\":" +
+        (range.id() == choice ? "1.0" : "0.0");
+  }
+  probabilities += '}';
+  return "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"IP3.prefetch\":{"
+      "\"type\":\"choice\",\"choice\":\"" + choice +
+      "\",\"confidence\":1.0,\"probabilities\":" + probabilities +
+      "}},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}";
 }
 
 } // namespace
@@ -448,6 +483,52 @@ int main() {
   require(device_rejected, "non-regular device log path was accepted");
   ::setenv("NVFUSER_JEV_LOG", path, 1);
 
+  // Every positive distance remains reachable, including both endpoints of
+  // an interval and a range near the int64 limit.
+  for (const int64_t stage_count : {int64_t{257}, int64_t{100000},
+                                    std::numeric_limits<int64_t>::max()}) {
+    for (const int64_t distance :
+         {int64_t{1}, (stage_count - 1) / 2, stage_count - 1}) {
+      int64_t low = 1;
+      int64_t high = stage_count - 1;
+      for (int depth = 0; low != high; ++depth) {
+        require(depth < 10, "IP3.prefetch hierarchy did not converge");
+        const auto ranges =
+            nvfuser::normalization_inner::tma::prefetchDistanceRanges(low, high);
+        require(!ranges.empty() && ranges.size() <= 255 &&
+                    ranges.front().low == low && ranges.back().high == high,
+                "IP3.prefetch range partition omitted a boundary");
+        int64_t covered = low;
+        bool found = false;
+        for (const auto& range : ranges) {
+          require(range.low == covered && range.high >= range.low,
+                  "IP3.prefetch ranges overlap or leave a gap");
+          covered = range.high + 1;
+          if (range.low <= distance && distance <= range.high) {
+            low = range.low;
+            high = range.high;
+            found = true;
+          }
+        }
+        require(found, "IP3.prefetch cannot reach a positive distance");
+      }
+      require(low == distance, "IP3.prefetch ended at the wrong distance");
+    }
+  }
+  const std::string before_large_record = readFile(path);
+  require(
+      nvfuser::normalization_inner::tma::chooseLargePrefetchDistance(257) == 256,
+      "IP3.prefetch Record did not follow the native distance");
+  const std::string large_record = readFile(path).substr(before_large_record.size());
+  require(
+      large_record.find("inner_persistent.tma_prefetch.v2\\nstage_count=257\\nrange_low=1\\nrange_high=256") !=
+              std::string::npos &&
+          large_record.find("\"selected\":\"r255_256\"") !=
+              std::string::npos &&
+          large_record.find("\"selected\":\"p256\"") !=
+              std::string::npos,
+      "IP3.prefetch Record omitted a native hierarchy level");
+
   ::setenv("NVFUSER_JEV_MODE", "remote", 1);
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,
           "mode() did not report remote");
@@ -459,6 +540,29 @@ int main() {
   }
   require(nvfuser::scheduler::jev::mode() == nvfuser::scheduler::jev::Mode::Remote,
           "Remote native scope did not restore the configured mode");
+  {
+    const auto first =
+        nvfuser::normalization_inner::tma::prefetchDistanceRanges(1, 256);
+    const auto second =
+        nvfuser::normalization_inner::tma::prefetchDistanceRanges(1, 2);
+    FakeServer server(std::vector<std::string>{
+        prefetchAnswer("r1_2", first), prefetchAnswer("p1", second)});
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    const std::string before_large_remote = readFile(path);
+    require(
+        nvfuser::normalization_inner::tma::chooseLargePrefetchDistance(257) == 1,
+        "IP3.prefetch Remote could not choose a non-native small distance");
+    const std::string large_remote =
+        readFile(path).substr(before_large_remote.size());
+    require(
+        large_remote.find("\"selected\":\"r1_2\"") !=
+                std::string::npos &&
+            large_remote.find("\"selected\":\"p1\"") !=
+                std::string::npos &&
+            server.request().find("Prefetch TMA in [1, 2] iteration(s) ahead") !=
+                std::string::npos,
+        "IP3.prefetch Remote lost a hierarchy request or continuation");
+  }
   {
     FakeServer server(
         "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"RD2.unroll\":{"

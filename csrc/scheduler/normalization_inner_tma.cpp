@@ -24,6 +24,7 @@
 #include "runtime/executor_params.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/normalization_tma_prefetch_choice.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -237,14 +238,8 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
           "two stages have one positive prefetch distance",
           "native_two_stage_prefetch");
     } else if (selected_n_stages > 256) {
-      // chooseDecision accepts at most 255 options. Keep the native distance
-      // instead of hiding any other positive distance from the model.
-      if (jev_mode == scheduler::jev::Mode::Record) {
-        scheduler::jev::recordCoverageSkip(
-            "IP3.prefetch", "positive distance menu exceeds Choice limit");
-      } else {
-        NVF_ERROR(false, "IP3.prefetch exceeds the 255-option Choice limit");
-      }
+      selected_prefetch_distance =
+          chooseLargePrefetchDistance(selected_n_stages);
     } else {
       std::vector<scheduler::jev::ChoiceOption> prefetch_options;
       auto add_prefetch = [&](int64_t distance) {
