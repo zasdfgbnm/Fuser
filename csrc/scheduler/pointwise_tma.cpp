@@ -679,6 +679,83 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
   return params;
 }
 
+namespace {
+
+TmaBreakPointAvailability materializeTmaBreakPointAvailability(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise_utils::TmaBreakPointSearch& search) {
+  TmaBreakPointAvailability result;
+  result.state = search.state;
+  const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+  const int64_t reference_dtype_bits =
+      dataTypeSizeBit(prop.largest_out->getDataType(), prop.index_type);
+  for (const auto& candidate : search.candidates) {
+    // The structural guards precede full native parameter construction.
+    if (candidate.break_point == 0) {
+      if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
+          prop.n_elems % (256 / min_dtype_bits) != 0) {
+        continue;
+      }
+      const auto inner = scheduler_utils::getTmaDomainInner(
+          prop.n_elems, 512, min_dtype_bits);
+      if (inner <= 1 || inner >= prop.n_elems) {
+        continue;
+      }
+    } else if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
+               candidate.right_elem_count < 256 / min_dtype_bits ||
+               prop.n_elems % candidate.right_elem_count != 0 ||
+               ((candidate.right_elem_count % 128) *
+                (reference_dtype_bits % 128)) % 128 != 0) {
+      continue;
+    }
+    bool hard_valid = false;
+    std::unique_ptr<PointwiseParams> materialized;
+    try {
+      // ResizeVectorizationFactors depends on break_point. Never seed a
+      // shared cache while inspecting alternatives, and emit no child Choice
+      // or SchedulerDebug output for a plan that may not be selected.
+      materialized = getPointwiseHeuristicsForBreakPoint(
+          fusion,
+          runtime_info,
+          nullptr,
+          prop,
+          candidate,
+          scheduler::jev::Mode::Off,
+          &hard_valid,
+          /*emit_debug=*/false);
+    } catch (const nvfError&) {
+      continue;
+    }
+    if (materialized == nullptr || !hard_valid) {
+      continue;
+    }
+    const auto id = "bp" + std::to_string(candidate.break_point);
+    result.options.push_back(
+        {id,
+         candidate.break_point == 0
+             ? "Flatten to the one-dimensional TMA domain"
+             : "Split before loop axis " +
+                   std::to_string(candidate.break_point)});
+    result.plans.push_back(candidate);
+  }
+  return result;
+}
+
+} // namespace
+
+TmaBreakPointAvailability getTmaBreakPointAvailability(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop) {
+  // This public preview is for a future parent-first PW1 comparison. Both
+  // structural search and candidate materialization are cache independent.
+  const auto search = pointwise_utils::getTmaBreakPointSearch(prop, nullptr);
+  return materializeTmaBreakPointAvailability(
+      fusion, runtime_info, prop, search);
+}
+
 std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
@@ -717,64 +794,10 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     NVF_ERROR(false, "PW4.breakpoint supports at most 32 loop dimensions");
   }
 
-  std::vector<scheduler::jev::ChoiceOption> options;
-  std::vector<pointwise_utils::BreakPointInfo> plans;
-  const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
-  const int64_t reference_dtype_bits =
-      dataTypeSizeBit(prop.largest_out->getDataType(), prop.index_type);
-  for (const auto& candidate : search.candidates) {
-    // These are structural TMA guards. The complete native parameter builder
-    // below checks tile alignment, shared memory, CTA/grid limits and width.
-    if (candidate.break_point == 0) {
-      if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
-          prop.n_elems % (256 / min_dtype_bits) != 0) {
-        continue;
-      }
-      const auto inner = scheduler_utils::getTmaDomainInner(
-          prop.n_elems, 512, min_dtype_bits);
-      if (inner <= 1 || inner >= prop.n_elems) {
-        continue;
-      }
-    } else if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
-               candidate.right_elem_count < 256 / min_dtype_bits ||
-               prop.n_elems % candidate.right_elem_count != 0 ||
-               ((candidate.right_elem_count % 128) *
-                (reference_dtype_bits % 128)) % 128 != 0) {
-      continue;
-    }
-    bool hard_valid = false;
-    std::unique_ptr<PointwiseParams> materialized;
-    try {
-      // Materialize every candidate for the hard guards, but only the final
-      // plan should appear in SchedulerDebug output. Do not use the shared
-      // cache: ResizeVectorizationFactors depends on break_point, so a
-      // preflight must not seed another candidate's or final plan's entry.
-      materialized = getPointwiseHeuristicsForBreakPoint(
-          fusion,
-          runtime_info,
-          nullptr,
-          prop,
-          candidate,
-          scheduler::jev::Mode::Off,
-          &hard_valid,
-          /*emit_debug=*/false);
-    } catch (const nvfError&) {
-      // A candidate that cannot complete the native plan is outside the
-      // Choice menu. The original plan is built separately above in record.
-      continue;
-    }
-    if (materialized == nullptr || !hard_valid) {
-      continue;
-    }
-    const auto id = "bp" + std::to_string(candidate.break_point);
-    options.push_back(
-        {id,
-         candidate.break_point == 0
-             ? "Flatten to the one-dimensional TMA domain"
-             : "Split before loop axis " +
-                   std::to_string(candidate.break_point)});
-    plans.push_back(candidate);
-  }
+  const auto availability =
+      materializeTmaBreakPointAvailability(fusion, runtime_info, prop, search);
+  const auto& options = availability.options;
+  const auto& plans = availability.plans;
 
   if (mode == scheduler::jev::Mode::Record) {
     const auto native_id = "bp" + std::to_string(native.break_point);

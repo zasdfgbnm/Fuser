@@ -2302,6 +2302,7 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
     const char* path;
     ~FileCleanup() {
       ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
     }
   } file_cleanup{log_path};
   ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
@@ -2318,12 +2319,38 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   const auto prop = pointwise_utils::getFusionRuntimeProperties(
       &fusion, runtime_info, nullptr);
   ASSERT_TRUE(prop.has_value());
-  EXPECT_EQ(
-      pointwise_utils::getTmaBreakPointSearch(*prop, nullptr).candidates.size(),
-      2);
+  const auto structural = pointwise_utils::getTmaBreakPointSearch(*prop, nullptr);
+  EXPECT_EQ(structural.candidates.size(), 2);
 
   DebugDumpOptionsGuard debug_options;
   DebugDumpOptionsGuard::getCurOptions().set(DebugDumpOption::SchedulerDebug);
+  std::stringstream preview_debug;
+  pointwise::tma::TmaBreakPointAvailability preview;
+  {
+    DebugStreamGuard debug_guard(preview_debug);
+    preview = pointwise::tma::getTmaBreakPointAvailability(
+        &fusion, runtime_info, *prop);
+  }
+  EXPECT_EQ(preview.state, structural.state);
+  ASSERT_EQ(preview.options.size(), preview.plans.size());
+  ASSERT_EQ(preview.options.size(), 2);
+  EXPECT_EQ(preview.options[0].id, "bp0");
+  EXPECT_EQ(preview.options[1].id, "bp1");
+  for (size_t i = 0; i < preview.options.size(); ++i) {
+    EXPECT_EQ(
+        preview.options[i].id,
+        "bp" + std::to_string(preview.plans[i].break_point));
+  }
+  EXPECT_TRUE(preview_debug.str().empty());
+  std::ifstream preview_log(log_path);
+  std::stringstream preview_rows;
+  preview_rows << preview_log.rdbuf();
+  EXPECT_TRUE(preview_rows.str().empty());
+  std::ifstream preview_outcome(std::string(log_path) + ".outcome.jsonl");
+  std::stringstream preview_events;
+  preview_events << preview_outcome.rdbuf();
+  EXPECT_TRUE(preview_events.str().empty());
+
   std::stringstream debug_output;
   std::unique_ptr<PointwiseParams> params;
   {
@@ -2351,6 +2378,9 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.width\""));
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp0\""));
   EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp1\""));
+  EXPECT_THAT(
+      log_output.str(),
+      ::testing::HasSubstr("\"candidates\":[\"bp0\",\"bp1\"]"));
 
   // In remote mode a deliberately invalid port stops after candidate
   // preflight. This checks that the preflight did not seed the shared
@@ -2358,6 +2388,28 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   HeuristicDataCache cache;
   ScopedTestEnv remote_mode("NVFUSER_JEV_MODE", "remote");
   ScopedTestEnv invalid_port("NVFUSER_JEV_PORT", "0");
+  std::stringstream remote_preview_debug;
+  pointwise::tma::TmaBreakPointAvailability remote_preview;
+  {
+    DebugStreamGuard debug_guard(remote_preview_debug);
+    remote_preview = pointwise::tma::getTmaBreakPointAvailability(
+        &fusion, runtime_info, *prop);
+  }
+  ASSERT_EQ(remote_preview.options.size(), preview.options.size());
+  ASSERT_EQ(remote_preview.plans.size(), preview.plans.size());
+  for (size_t i = 0; i < preview.options.size(); ++i) {
+    EXPECT_EQ(remote_preview.options[i].id, preview.options[i].id);
+    EXPECT_EQ(
+        remote_preview.options[i].description,
+        preview.options[i].description);
+    EXPECT_EQ(
+        remote_preview.plans[i].break_point, preview.plans[i].break_point);
+  }
+  EXPECT_TRUE(remote_preview_debug.str().empty());
+  std::ifstream remote_preview_log(log_path);
+  std::stringstream remote_preview_rows;
+  remote_preview_rows << remote_preview_log.rdbuf();
+  EXPECT_EQ(remote_preview_rows.str(), log_output.str());
   try {
     (void)pointwise::tma::getPointwiseHeuristics(
         &fusion, runtime_info, &cache, *prop);
