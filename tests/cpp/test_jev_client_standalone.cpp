@@ -2,6 +2,7 @@
 // Standalone, CPU-only protocol test: build with jev_client.cpp and -pthread.
 #include <scheduler/jev_client.h>
 #include <scheduler/inner_outer_mode_preflight.h>
+#include <scheduler/normalization_inner_outer_grid_rows_admission.h>
 #include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
 #include <scheduler/reduction_inner_remainder_choice.h>
@@ -264,10 +265,43 @@ void testInnerRemainderPlateauScan() {
       "RD3 high-factor plateau scan did not complete");
 }
 
+void testInnerOuterGridRowsAdmission() {
+  using nvfuser::inner_outer_multi_wave::GridRowsAdmission;
+  using nvfuser::inner_outer_multi_wave::gridRowsAdmission;
+  using nvfuser::scheduler::jev::Mode;
+  // The producer has already excluded r8 after its full CTA preflight, while
+  // one complete r4 search survives. Remote may use it; Record keeps Off's r8.
+  require(
+      gridRowsAdmission(Mode::Remote, 1, false, true) ==
+              GridRowsAdmission::OfferWithoutNative &&
+          gridRowsAdmission(Mode::Record, 1, false, true) ==
+              GridRowsAdmission::PreserveNative,
+      "IOP3 rows admission treated the soft r8 target as hard legality");
+  require(
+      gridRowsAdmission(Mode::Remote, 2, false, true) ==
+              GridRowsAdmission::OfferWithoutNative &&
+          gridRowsAdmission(Mode::Remote, 1, true, true) ==
+              GridRowsAdmission::OfferWithNative &&
+          gridRowsAdmission(Mode::Record, 1, true, true) ==
+              GridRowsAdmission::OfferWithNative,
+      "IOP3 rows admission lost a fully preflighted Choice menu");
+  require(
+      gridRowsAdmission(Mode::Remote, 0, false, true) ==
+              GridRowsAdmission::RejectRemote &&
+          gridRowsAdmission(Mode::Remote, 1, false, false) ==
+              GridRowsAdmission::RejectRemote &&
+          gridRowsAdmission(Mode::Record, 1, true, false) ==
+              GridRowsAdmission::PreserveNative &&
+          gridRowsAdmission(Mode::Off, 1, true, true) ==
+              GridRowsAdmission::PreserveNative,
+      "IOP3 rows admission accepted an empty/oversized request or changed Off");
+}
+
 } // namespace
 
 int main() {
   testInnerRemainderPlateauScan();
+  testInnerOuterGridRowsAdmission();
   using nvfuser::inner_outer_mode_preflight::Action;
   using nvfuser::inner_outer_mode_preflight::actionForValidWs;
   using nvfuser::scheduler::jev::Mode;

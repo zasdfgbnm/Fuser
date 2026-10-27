@@ -11,6 +11,7 @@
 
 #include "options.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/normalization_inner_outer_grid_rows_admission.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -540,8 +541,10 @@ void getHeuristics(
         hp_threads_per_block_max <= dev_prop->maxThreadsPerBlock &&
         threads_per_block_max <= dev_prop->maxThreadsPerBlock;
     std::vector<scheduler::jev::ChoiceOption> options;
+    constexpr char kGridRowsV1Tag[] = "inner_outer_multi_wave.grid_rows.v1";
+    constexpr char kGridRowsV2Tag[] = "inner_outer_multi_wave.grid_rows.v2";
     std::string state =
-        "inner_outer_multi_wave.grid_rows.v1\ninner_dim=" +
+        std::string(kGridRowsV1Tag) + "\ninner_dim=" +
         std::to_string(inner_dim_numel) + "\nouter_dim=" +
         std::to_string(outer_dim_numel) + "\nvector_width=" +
         std::to_string(vect_factor) + "\nselected_min_batch=" +
@@ -616,13 +619,21 @@ void getHeuristics(
         std::any_of(options.begin(), options.end(), [](const auto& option) {
           return option.id == "r8";
         });
-    if (!native_offered || state.size() >= 48 * 1024) {
-      NVF_ERROR(
-          jev_mode != scheduler::jev::Mode::Remote,
-          "IOP3 rows threshold lacks complete safe CTA plans");
+    const auto admission = gridRowsAdmission(
+        jev_mode, options.size(), native_offered, state.size() < 48 * 1024);
+    NVF_ERROR(
+        admission != GridRowsAdmission::RejectRemote,
+        "IOP3 rows threshold lacks complete safe CTA plans");
+    if (admission == GridRowsAdmission::PreserveNative) {
       scheduler::jev::recordCoverageSkip(
           "IOP3.grid_rows", "native rows lack complete safe CTA plans");
     } else {
+      // A missing r8 is a soft preference miss. The complete r4/r16 plans
+      // remain legal, and v2 tells the stateless service that the native
+      // eight-row preference is intentionally absent from this Remote menu.
+      if (admission == GridRowsAdmission::OfferWithoutNative) {
+        state.replace(0, sizeof(kGridRowsV1Tag) - 1, kGridRowsV2Tag);
+      }
       const std::string selected = scheduler::jev::chooseDecision(
           "IOP3.grid_rows",
           state,
