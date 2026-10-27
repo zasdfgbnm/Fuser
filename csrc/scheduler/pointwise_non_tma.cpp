@@ -9,6 +9,7 @@
 #include "scheduler/pointwise_non_tma.h"
 
 #include <algorithm>
+#include <utility>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
@@ -399,6 +400,40 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     // singleton preserves that existing behavior until the source TODO is
     // resolved. In the normal case all options satisfy both hard constraints.
     const bool semantic = scheduler::jev::semanticProtocolEnabled();
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    if (semantic_v3) {
+      // Keep the deterministic text state, but give the stateless model the
+      // same conditional work and launch preview already present in v2.
+      const int64_t right_elems =
+          bp_info.break_point > 0 ? bp_info.right_elem_count : n_elems;
+      NVF_ERROR(
+          n_elems > 0 && right_elems > 0 && n_elems % right_elems == 0,
+          "PW3.width semantic-v3 preview needs a valid partial schedule");
+      const auto ceil_quotient = [](int64_t numerator, int64_t denominator) {
+        return numerator / denominator + (numerator % denominator != 0);
+      };
+      size_t option_index = 0;
+      for (int64_t width = first_width; width <= layout_max; width *= 2) {
+        const int64_t total_vectors = ceil_quotient(n_elems, width);
+        const int64_t right_vectors = ceil_quotient(right_elems, width);
+        std::string consequence =
+            "{\"width\":" + std::to_string(width) +
+            ",\"total_vector_iterations\":" + std::to_string(total_vectors) +
+            ",\"right_vector_iterations\":" + std::to_string(right_vectors) +
+            ",\"block_x_if_128\":128";
+        if (bp_info.break_point == 0) {
+          consequence += ",\"coverage_ctas_if_128\":" +
+              std::to_string(ceil_quotient(total_vectors, kThreadX));
+        } else {
+          consequence +=
+              ",\"grid_left_if_128\":" + std::to_string(n_elems / right_elems) +
+              ",\"grid_right_if_128\":" +
+              std::to_string(ceil_quotient(right_elems, width * kThreadX));
+        }
+        consequence += ",\"unroll_status\":\"pending\"}";
+        options.at(option_index++).consequence_json = std::move(consequence);
+      }
+    }
     std::string state;
     if (semantic) {
       // The client rejects a complete request exceeding 64 KiB; no snapshot
@@ -565,6 +600,38 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
              "Use " + std::to_string(candidate) + " threads per 1D CTA"});
       }
       const bool semantic = scheduler::jev::semanticProtocolEnabled();
+      const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+      if (semantic_v3) {
+        NVF_ERROR(
+            vectorization_factor > 0 && n_elems > 0 &&
+                device_multiprocessor_count > 0,
+            "PW3.cta_1d semantic-v3 preview needs a valid partial schedule");
+        const int64_t vector_iterations =
+            ceilDiv(n_elems, vectorization_factor);
+        for (auto& option : options) {
+          const int64_t threads = std::stoll(option.id.substr(1));
+          const int64_t grid_x = ceilDiv(vector_iterations, threads);
+          const int64_t blocks_per_sm =
+              dev_prop->maxThreadsPerMultiProcessor / threads;
+          option.consequence_json =
+              "{\"threads\":" + std::to_string(threads) +
+              ",\"vector_iterations\":" +
+              std::to_string(vector_iterations) +
+              ",\"grid_x_if_unrolled_one\":" + std::to_string(grid_x) +
+              ",\"floor_divided_unroll_blocks\":" +
+              std::to_string(ceilDiv(n_elems / vectorization_factor, threads)) +
+              ",\"blocks_per_sm_thread_limit\":" +
+              std::to_string(blocks_per_sm) +
+              ",\"thread_limit_waves_if_unrolled_one\":" +
+              std::to_string(ceilDiv(
+                  grid_x, blocks_per_sm * device_multiprocessor_count)) +
+              ",\"tail_elements\":" +
+              std::to_string(n_elems % (vectorization_factor * threads)) +
+              ",\"symbolic_thread_split\":" +
+              std::string(threads == kThreadX ? "false" : "true") +
+              ",\"unroll_status\":\"pending\"}";
+        }
+      }
       std::string state;
       if (semantic) {
         NVF_ERROR(

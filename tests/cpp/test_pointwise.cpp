@@ -25,6 +25,7 @@
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/compile_time_info.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
 #include "scheduler/pointwise_utils.h"
@@ -1648,6 +1649,115 @@ TEST_F(PointwiseTest, SmallPointwiseDirectBreakpointChoiceRecord) {
   EXPECT_THAT(records, ::testing::HasSubstr("\"bp1_normal\""));
   EXPECT_THAT(
       records, ::testing::Not(::testing::HasSubstr("\"site\":\"PW2.entry\"")));
+}
+
+// The two structured protocols must describe the same conditional work for
+// each offered width and 1D CTA. The v3 wrapper retains the text state used
+// by the deterministic API parser and carries these previews per candidate.
+TEST_F(PointwiseTest, PointwiseCandidatePreviewsMatchSemanticV2_CUDA) {
+  char log_path[] = "/tmp/nvfuser-pw3-preview-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {16388}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+  const std::string hardware =
+      "{\"sm_count\":" + std::to_string(prop->device_multiprocessor_count) + "}";
+
+  auto read_log = [&]() {
+    std::ifstream stream(log_path);
+    std::stringstream contents;
+    contents << stream.rdbuf();
+    return contents.str();
+  };
+  auto run_record = [&](const char* protocol) {
+    ScopedTestEnv protocol_env("NVFUSER_JEV_PROTOCOL", protocol);
+    const std::string before = read_log();
+    scheduler::jev::ComputeHeuristicsScope scope(
+        "one-dimensional add with 16388 float elements", {}, hardware);
+    auto params = pointwise::non_tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop);
+    NVF_CHECK(params != nullptr);
+    NVF_CHECK(params->break_point == 0);
+    const std::pair<int64_t, int64_t> plan{
+        params->vectorization_factor, params->lparams.bdimx()};
+    scope.complete("PointWise");
+    return std::pair{read_log().substr(before.size()), plan};
+  };
+  const auto [v2_records, v2_plan] = run_record("semantic-v2");
+  const auto [v3_records, v3_plan] = run_record("semantic-v3");
+  EXPECT_EQ(v2_plan, v3_plan);
+  EXPECT_EQ(v2_plan, (std::pair<int64_t, int64_t>{4, 128}));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("pointwise.width.v1"));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("pointwise.launch_1d.v1"));
+
+  const auto site_row = [](const std::string& records, const std::string& site) {
+    std::istringstream stream(records);
+    std::string row;
+    while (std::getline(stream, row)) {
+      if (row.find("\"site\":\"" + site + "\"") != std::string::npos) {
+        return row;
+      }
+    }
+    return std::string();
+  };
+  for (const auto& [site, ids] : {
+           std::pair<const char*, std::vector<const char*>>{
+               "PW3.width", {"w1", "w2", "w4"}},
+           {"PW3.cta_1d", {"x32", "x64", "x128"}}}) {
+    const std::string v2_row = site_row(v2_records, site);
+    const std::string v3_row = site_row(v3_records, site);
+    ASSERT_FALSE(v2_row.empty()) << site;
+    ASSERT_FALSE(v3_row.empty()) << site;
+    for (const char* id : ids) {
+      const std::string marker = "{\"id\":\"" + std::string(id) + "\"";
+      const size_t v2_start = v2_row.find(marker);
+      const size_t v3_start = v3_row.find(marker);
+      ASSERT_NE(v2_start, std::string::npos) << site << ' ' << id;
+      ASSERT_NE(v3_start, std::string::npos) << site << ' ' << id;
+      const size_t v2_fields = v2_start + marker.size() + 1;
+      const size_t v2_end = v2_row.find('}', v2_fields);
+      const std::string consequence = "\"consequence\":{";
+      const size_t v3_fields = v3_row.find(consequence, v3_start);
+      ASSERT_NE(v3_fields, std::string::npos) << site << ' ' << id;
+      const size_t v3_values = v3_fields + consequence.size();
+      const size_t v3_end = v3_row.find('}', v3_values);
+      ASSERT_NE(v2_end, std::string::npos);
+      ASSERT_NE(v3_end, std::string::npos);
+      const std::string pending = ",\"unroll_status\":\"pending\"";
+      const std::string v3_fields_without_status =
+          v3_row.substr(v3_values, v3_end - v3_values);
+      ASSERT_GE(v3_fields_without_status.size(), pending.size());
+      EXPECT_EQ(
+          v3_fields_without_status.substr(
+              v3_fields_without_status.size() - pending.size()),
+          pending);
+      EXPECT_EQ(
+          v2_row.substr(v2_fields, v2_end - v2_fields),
+          v3_fields_without_status.substr(
+              0, v3_fields_without_status.size() - pending.size()))
+          << site << ' ' << id;
+    }
+  }
 }
 
 // Call the TMA heuristic directly so this checks candidate analysis on any
