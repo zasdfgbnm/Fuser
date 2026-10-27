@@ -6319,12 +6319,31 @@ TEST(ReductionNativeLaunchFields, IncludesBothZDimensionsAndRawBindings) {
       reduction::non_tma::nativeLaunchFields(unbound_z));
 }
 
+TEST(ReductionOuterCtaMenu, OffersValidQ8WhenNativeQ4FailsPreflight) {
+  // Injected resource state, independent of the host GPU. The q4 soft seed
+  // exceeds the complete CTA bound, while q8 remains a legal grid plan.
+  const reduction::non_tma::OuterCtaState state{/*reduction_numel=*/1024,
+                                                /*iteration_numel=*/1,
+                                                /*max_dtype_bits=*/32,
+                                                /*sm_count=*/1,
+                                                /*max_threads_per_sm=*/512,
+                                                /*max_threads_per_block=*/64,
+                                                /*max_unroll=*/1,
+                                                /*vector_width=*/1,
+                                                /*waves=*/4,
+                                                /*logical_warp=*/16};
+  EXPECT_EQ(
+      reduction::non_tma::hardValidOuterCtaShares(state),
+      std::vector<int64_t>{8});
+}
+
 TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
   const auto* device = at::cuda::getCurrentDeviceProperties();
   if (device->multiProcessorCount != 128 ||
       device->maxThreadsPerMultiProcessor != 1536 ||
       device->maxThreadsPerBlock != 1024) {
-    GTEST_SKIP() << "The retained no-op witness needs SM128 and 1536 threads/SM";
+    GTEST_SKIP()
+        << "The retained no-op witness needs SM128 and 1536 threads/SM";
   }
   char log_path[] = "/tmp/nvfuser-rd5-wave-dedup-XXXXXX";
   const int fd = ::mkstemp(log_path);

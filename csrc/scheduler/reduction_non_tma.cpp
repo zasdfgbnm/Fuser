@@ -3168,8 +3168,7 @@ OuterReductionParams getGridOuterReduction(
     const auto selected = scheduler::jev::chooseDecision(
         "RD9.warp", state, options, native_choice);
     NVF_ERROR(
-        (selected == "warp16" && valid16) ||
-            (selected == "warp32" && valid32),
+        (selected == "warp16" && valid16) || (selected == "warp32" && valid32),
         "RD9 warp target is outside hard-valid candidates");
     min_warp_size = selected == "warp16" ? 16 : 32;
   }
@@ -3178,9 +3177,36 @@ OuterReductionParams getGridOuterReduction(
     // The quarter-SM CTA target is an empirical performance preference. Build
     // both complete reduction-grid plans for each alternative before offering
     // it; their block, vector, grid, and unroll bounds remain native checks.
+    const OuterCtaState cta_state{
+        total_reduction_numel,
+        total_iteration_numel,
+        max_dtype_size_bit_for_vectorization,
+        sm_count,
+        max_threads_per_sm,
+        max_threads_per_block,
+        max_unroll,
+        vectorize_factor,
+        n_waves,
+        min_warp_size};
+    const auto hard_valid_shares = hardValidOuterCtaShares(cta_state);
     std::vector<scheduler::jev::ChoiceOption> options;
-    for (int64_t share : {2, 4, 8}) {
-      const auto candidate = buildOuterGridWarpPlans(
+    for (int64_t share : hard_valid_shares) {
+      options.push_back(
+          {"q" + std::to_string(share),
+           "Target approximately SM thread capacity / " +
+               std::to_string(share) + " threads per CTA"});
+    }
+    const bool native_hard_valid =
+        std::find(hard_valid_shares.begin(), hard_valid_shares.end(), 4) !=
+        hard_valid_shares.end();
+    if (jev_mode == scheduler::jev::Mode::Record && !native_hard_valid) {
+      // The conservative Choice preflight must not reject the original q4
+      // schedule in Record. Its later child menus also rely on that preflight,
+      // so return the same source-native plan as Off without speculative child
+      // Choices on an unadvertised q4 branch.
+      scheduler::jev::recordCoverageSkip(
+          "RD9.cta", "native_q4_outside_complete_plan_menu");
+      const auto native_plans = buildOuterGridWarpPlans(
           total_reduction_numel,
           total_iteration_numel,
           max_dtype_size_bit_for_vectorization,
@@ -3190,36 +3216,20 @@ OuterReductionParams getGridOuterReduction(
           max_threads_per_sm,
           n_waves,
           min_warp_size,
-          share);
-      if (outerGridWarpPlansHardValid(
-              candidate,
-              total_reduction_numel,
-              total_iteration_numel,
-              vectorize_factor,
-              max_unroll,
-              max_threads_per_block)) {
-        options.push_back(
-            {"q" + std::to_string(share),
-             "Target approximately SM thread capacity / " +
-                 std::to_string(share) + " threads per CTA"});
-      }
+          4);
+      return native_plans.native_use_stride ? native_plans.stride_capped
+                                            : native_plans.baseline;
     }
-    const auto native = std::find_if(
-        options.begin(), options.end(), [](const auto& option) {
-          return option.id == "q4";
-        });
-    NVF_ERROR(
-        native != options.end(), "Native RD9 CTA plan violates hard bounds");
+    NVF_ERROR(!options.empty(), "RD9 CTA has no hard-valid alternative");
     const std::string state =
-        "reduction.outer_cta.v1\nreduction_numel=" +
+        (native_hard_valid ? "reduction.outer_cta.v1\nreduction_numel="
+                           : "reduction.outer_cta.v2\nreduction_numel=") +
         std::to_string(total_reduction_numel) +
         "\niteration_numel=" + std::to_string(total_iteration_numel) +
-        "\ndtype_bits=" +
-        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\ndtype_bits=" + std::to_string(max_dtype_size_bit_for_vectorization) +
         "\nsm_count=" + std::to_string(sm_count) +
         "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
-        "\nmax_threads_per_block=" +
-        std::to_string(max_threads_per_block) +
+        "\nmax_threads_per_block=" + std::to_string(max_threads_per_block) +
         "\nmax_unroll=" + std::to_string(max_unroll) +
         "\nvector_width=" + std::to_string(vectorize_factor) +
         "\nwaves=" + std::to_string(n_waves) +
@@ -3229,8 +3239,8 @@ OuterReductionParams getGridOuterReduction(
         state,
         options,
         jev_mode == scheduler::jev::Mode::Record ? "q4" : "");
-    const auto found = std::find_if(
-        options.begin(), options.end(), [&](const auto& option) {
+    const auto found =
+        std::find_if(options.begin(), options.end(), [&](const auto& option) {
           return option.id == selected;
         });
     NVF_ERROR(found != options.end(), "RD9 CTA target is outside hard bounds");
@@ -3921,6 +3931,33 @@ std::unique_ptr<ReductionParams> reductionHeuristic(
 }
 
 } // namespace
+
+std::vector<int64_t> hardValidOuterCtaShares(const OuterCtaState& state) {
+  std::vector<int64_t> shares;
+  for (int64_t share : {2, 4, 8}) {
+    const auto candidate = buildOuterGridWarpPlans(
+        state.reduction_numel,
+        state.iteration_numel,
+        state.max_dtype_bits,
+        state.vector_width,
+        state.max_unroll,
+        state.sm_count,
+        state.max_threads_per_sm,
+        state.waves,
+        state.logical_warp,
+        share);
+    if (outerGridWarpPlansHardValid(
+            candidate,
+            state.reduction_numel,
+            state.iteration_numel,
+            state.vector_width,
+            state.max_unroll,
+            state.max_threads_per_block)) {
+      shares.push_back(share);
+    }
+  }
+  return shares;
+}
 
 std::array<int64_t, 7> nativeLaunchFields(const LaunchParams& params) {
   return {

@@ -23,6 +23,23 @@ namespace non_tma {
 // compare the complete launch, including shared-memory bytes.
 std::array<int64_t, 7> nativeLaunchFields(const LaunchParams& params);
 
+// Inputs to the pure outer-grid CTA admission check. The same complete
+// baseline and stride-capped plans are checked by production and CPU tests.
+struct OuterCtaState {
+  int64_t reduction_numel;
+  int64_t iteration_numel;
+  int64_t max_dtype_bits;
+  int64_t sm_count;
+  int64_t max_threads_per_sm;
+  int64_t max_threads_per_block;
+  int64_t max_unroll;
+  int64_t vector_width;
+  int64_t waves;
+  int64_t logical_warp;
+};
+
+std::vector<int64_t> hardValidOuterCtaShares(const OuterCtaState& state);
+
 // Preview the two wave-dependent targets consumed by the remaining bounded
 // inner 3D planner. Equal targets give identical descendant CTA and grid menus.
 struct Inner3DWaveTarget {
