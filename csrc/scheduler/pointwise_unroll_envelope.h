@@ -39,15 +39,17 @@ inline PointwiseUnrollEnvelope getPointwiseUnrollEnvelope(
           std::max<int64_t>(1, vector_width));
   const int64_t model_limit =
       std::min({std::max<int64_t>(1, total_blocks), kMaxUnroll, budget_limit});
-  const bool offer_choice = native_factor <= model_limit;
+  const bool offer_choice = native_factor <= model_limit && model_limit > 1;
   if (!offer_choice) {
-    // This branch runs in both Record and Remote. It records the actual
-    // unchanged native factor without sending an incomplete Choice menu.
+    // This branch runs in both Record and Remote. A one-element menu cannot
+    // change the answer; an over-budget native factor must remain unchanged.
     scheduler::jev::recordNoChoiceDecision(
         "PW3.unroll",
         "u" + std::to_string(native_factor),
-        "native factor exceeds bounded model resource envelope",
-        "native_unroll");
+        native_factor > model_limit
+            ? "native factor exceeds bounded model resource envelope"
+            : "bounded model menu contains only u1",
+        native_factor > model_limit ? "native_unroll" : "bounded_model_menu");
   }
   return {model_limit, native_factor, offer_choice};
 }

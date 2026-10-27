@@ -1863,10 +1863,20 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     log_path = local_path;
   }
   std::streampos log_start = 0;
+  std::streampos outcome_start = 0;
+  std::string outcome_path;
   if (log_path != nullptr) {
     std::ifstream existing_log(log_path, std::ios::ate);
     if (existing_log.good()) {
       log_start = existing_log.tellg();
+    }
+    const char* outcome_override = std::getenv("NVFUSER_JEV_OUTCOME_LOG");
+    outcome_path = outcome_override != nullptr && *outcome_override != '\0'
+        ? outcome_override
+        : std::string(log_path) + ".outcome.jsonl";
+    std::ifstream existing_outcomes(outcome_path, std::ios::ate);
+    if (existing_outcomes.good()) {
+      outcome_start = existing_outcomes.tellg();
     }
   }
   ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
@@ -1910,11 +1920,14 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     decision_log.seekg(log_start);
     std::string row;
     std::string pw2_row;
+    bool saw_unroll_choice = false;
     while (std::getline(decision_log, row)) {
       if (row.rfind("{\"site\":\"PW2\",", 0) == 0) {
         ASSERT_TRUE(pw2_row.empty());
         pw2_row = row;
       }
+      saw_unroll_choice |=
+          row.rfind("{\"site\":\"PW3.unroll\",", 0) == 0;
     }
     ASSERT_FALSE(pw2_row.empty());
     EXPECT_THAT(pw2_row, ::testing::HasSubstr("pointwise.breakpoint.v3"));
@@ -1946,6 +1959,19 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     if (jev_mode == scheduler::jev::Mode::Record) {
       EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
       EXPECT_EQ(params->break_point, 0);
+      EXPECT_FALSE(saw_unroll_choice);
+      std::ifstream outcome_log(outcome_path);
+      ASSERT_TRUE(outcome_log.good());
+      outcome_log.seekg(outcome_start);
+      bool saw_singleton = false;
+      while (std::getline(outcome_log, row)) {
+        saw_singleton |=
+            row.find("\"site\":\"PW3.unroll\"") != std::string::npos &&
+            row.find("\"selected\":\"u1\"") != std::string::npos &&
+            row.find("bounded model menu contains only u1") !=
+                std::string::npos;
+      }
+      EXPECT_TRUE(saw_singleton);
     } else if (
         pw2_row.find("\"selected\":\"bp1_normal\"") != std::string::npos) {
       EXPECT_EQ(params->break_point, 1);
