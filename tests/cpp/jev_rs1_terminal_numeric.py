@@ -227,6 +227,8 @@ def main() -> int:
                         required=True)
     parser.add_argument("--reorder", choices=("keep", "skip"), default="keep")
     parser.add_argument("--width", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument(
+        "--gtest", default="ResizeTest.JevDirectPadTerminalCta_CUDA")
     args = parser.parse_args()
     assert args.binary.is_absolute() and args.binary.is_file()
     assert args.artifacts_root.is_absolute()
@@ -242,13 +244,14 @@ def main() -> int:
                 "binary_sha256": file_hash(args.binary),
                 "target_width": args.width,
                 "target_threads": args.threads,
+                "gtest": args.gtest,
                 "runs": [], "status": "started"}
     write_manifest(manifest_path, manifest)
     print(f"RS1 terminal numeric artifacts: {directory}", flush=True)
     try:
         record = run_numeric(
             mode="record", binary=args.binary,
-            names=["ResizeTest.JevDirectPadTerminalCta_CUDA"],
+            names=[args.gtest],
             case_key=case_key, loader=loader, libraries=libraries,
             directory=directory, port=None, protocol="semantic-v3")
         manifest["runs"].append(record)
@@ -263,7 +266,7 @@ def main() -> int:
         try:
             remote = run_numeric(
                 mode="remote", binary=args.binary,
-                names=["ResizeTest.JevDirectPadTerminalCta_CUDA"],
+                names=[args.gtest],
                 case_key=case_key, loader=loader, libraries=libraries,
                 directory=directory, port=server.server_port,
                 protocol="semantic-v3")

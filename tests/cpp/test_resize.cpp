@@ -365,6 +365,54 @@ TEST_F(ResizeTest, JevDirectPadTerminalCta_CUDA) {
       __FILE__);
 }
 
+// Keep the c19 graph and runtime fixed while allowing a real model to choose
+// any hard-valid width, reorder branch, and CTA. The resulting launch must
+// agree with the selected terminal Resize plan and the padded ATen output.
+TEST_F(ResizeTest, JevDirectPadAnyTerminalChoice_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  ASSERT_EQ(tensor.sizes(), (at::IntArrayRef{5, 7, 64}));
+  ASSERT_EQ(tensor.strides(), (at::IntArrayRef{64, 320, 1}));
+
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  ASSERT_TRUE(params->cparams.index_type.has_value());
+  ASSERT_TRUE(
+      params->vectorization_factor == 1 ||
+      params->vectorization_factor == 2 ||
+      params->vectorization_factor == 4);
+  EXPECT_TRUE(params->largest_input == -1 || params->largest_input == 0);
+  ASSERT_TRUE(
+      params->cta_threads == 64 || params->cta_threads == 128 ||
+      params->cta_threads == 256);
+  EXPECT_FALSE(params->split_grid_x_dim);
+
+  const auto launch = result.kernel_executor->lastLaunchParams();
+  EXPECT_EQ(launch.bdimx(), params->cta_threads);
+  EXPECT_EQ(
+      launch.gdimx(),
+      (2520 + params->vectorization_factor * params->cta_threads - 1) /
+          (params->vectorization_factor * params->cta_threads));
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {0, 8})},
+      __LINE__,
+      __FILE__);
+}
+
 using ResizeSchedulerTest = NVFuserFixtureParamTest<bool>;
 
 using testing::HasSubstr;

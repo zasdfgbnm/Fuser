@@ -1239,6 +1239,15 @@ if(BUILD_TEST)
       --width 2 --reorder skip --threads 256)
   set_tests_properties(jev_rs1_width_terminal_w2
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_rs1_any_terminal_choice_smoke
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+      --width 2 --reorder skip --threads 256
+      --gtest ResizeTest.JevDirectPadAnyTerminalChoice_CUDA)
+  set_tests_properties(jev_rs1_any_terminal_choice_smoke
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_resize_cta
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
