@@ -433,7 +433,7 @@ BreakPointInfo getBreakPoint(
   };
   auto make_jev_request = [&]() {
     JevBreakpointRequest request;
-    request.state = "pointwise.breakpoint.v1\n";
+    request.state = "pointwise.breakpoint.v2\n";
     std::vector<int64_t> disjoint;
     std::vector<int64_t> lhs;
     std::vector<int64_t> rhs;
@@ -466,7 +466,15 @@ BreakPointInfo getBreakPoint(
     request.state += "warp_size=" +
         std::to_string(at::cuda::getCurrentDeviceProperties()->warpSize) + '\n';
     request.state += "l2_cache_bytes=" +
-        std::to_string(at::cuda::getCurrentDeviceProperties()->l2CacheSize);
+        std::to_string(at::cuda::getCurrentDeviceProperties()->l2CacheSize) +
+        '\n';
+    // The ordinary scheduler's small-workload preference is part of PW2's
+    // native answer after PW2.entry was removed. Expose every operand so a
+    // stateless service can replay that preference from this request alone.
+    request.state += "n_elems=" + std::to_string(n_elems) + '\n';
+    request.state += "sm_count=" +
+        std::to_string(prop.device_multiprocessor_count) + '\n';
+    request.state += "default_cta_threads=" + std::to_string(kThreadX);
 
     request.options.push_back({"bp0", "Use one-dimensional scheduling"});
     request.plans.emplace_back();

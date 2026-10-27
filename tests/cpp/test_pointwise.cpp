@@ -25,6 +25,7 @@
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/compile_time_info.h"
+#include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
 #include "scheduler/pointwise_utils.h"
 #include "scheduler/runtime_info.h"
@@ -1596,6 +1597,58 @@ int64_t getVectorizationFactor(const FusionExecutorCache& executor_cache) {
       ->vectorization_factor;
 }
 } // namespace tma_check
+
+// The native small-workload rule still selects bp0, but its choice is now
+// recorded at PW2 with the raw threshold inputs and legal 2D alternatives.
+TEST_F(PointwiseTest, SmallPointwiseDirectBreakpointChoiceRecord) {
+  char log_path[] = "/tmp/nvfuser-pw2-direct-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {2, 16}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  const auto params = pointwise::non_tma::getPointwiseHeuristics(
+      &fusion, runtime_info, nullptr, *prop);
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->break_point, 0);
+
+  std::ifstream log_file(log_path);
+  std::stringstream log_output;
+  log_output << log_file.rdbuf();
+  const std::string records = log_output.str();
+  EXPECT_THAT(records, ::testing::HasSubstr("\"site\":\"PW2\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"selected\":\"bp0\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("pointwise.breakpoint.v2"));
+  EXPECT_THAT(records, ::testing::HasSubstr("n_elems=32"));
+  EXPECT_THAT(
+      records,
+      ::testing::HasSubstr(
+          "sm_count=" + std::to_string(prop->device_multiprocessor_count)));
+  EXPECT_THAT(records, ::testing::HasSubstr("default_cta_threads=128"));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"bp1_normal\""));
+  EXPECT_THAT(
+      records, ::testing::Not(::testing::HasSubstr("\"site\":\"PW2.entry\"")));
+}
 
 // Call the TMA heuristic directly so this checks candidate analysis on any
 // CUDA device without compiling or executing a Hopper kernel.
