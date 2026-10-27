@@ -108,15 +108,18 @@ TmaBreakPointSearch getTmaBreakPointSearch(
     const FusionRuntimeProperties& prop,
     HeuristicDataCache* data_cache);
 
-// Calculate optimal break point for 2D scheduling
-// Returns just the break point information without thread/grid dimensions
+// Calculate optimal break point for 2D scheduling. In Record mode,
+// native_default_1d preserves the ordinary scheduler's small-workload bp0
+// preference while the request still exposes the legal 2D alternatives.
+// Returns just the break point information without thread/grid dimensions.
 BreakPointInfo getBreakPoint(
     Fusion* fusion,
     const FusionRuntimeProperties& prop,
     HeuristicDataCache* data_cache,
     bool is_tma,
     int64_t max_vect_factor = 1,
-    int64_t kThreadX = 128);
+    int64_t kThreadX = 128,
+    bool native_default_1d = false);
 
 // Structure to hold complete block and grid configuration
 struct BlockGridConfig {

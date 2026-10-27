@@ -385,7 +385,8 @@ BreakPointInfo getBreakPoint(
     HeuristicDataCache* data_cache,
     bool is_tma,
     int64_t max_vect_factor,
-    int64_t kThreadX) {
+    int64_t kThreadX,
+    bool native_default_1d) {
   BreakPointInfo result;
 
   // Calculate dtype_sum_bit from fusion inputs/outputs
@@ -511,6 +512,17 @@ BreakPointInfo getBreakPoint(
       return plan;
     }
     NVF_ERROR(false, "Remote PW2 choice is not in its candidate set");
+  }
+
+  // The original ordinary scheduler skips 2D analysis for small workloads.
+  // Record its resulting bp0 directly, while still presenting the same legal
+  // 1D and 2D alternatives that Remote can choose among. Off mode keeps the
+  // call-site's original early return and TMA never uses this preference.
+  if (jev_mode == scheduler::jev::Mode::Record && native_default_1d) {
+    auto request = make_jev_request();
+    (void)scheduler::jev::chooseDecision(
+        "PW2", request.state, request.options, "bp0");
+    return result;
   }
 
   // Figure out break point position

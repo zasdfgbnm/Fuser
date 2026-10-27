@@ -322,35 +322,17 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // break point.
   int64_t gdim_right = 1;
 
-  // PW2.entry is the performance choice to search for a 2D break point at all.
-  // Both choices are legal: the default 1D plan requires no view split, while
-  // getBreakPoint keeps the view-disjointness checks for every 2D candidate.
+  // The native small-workload threshold is only a performance preference.
+  // Off keeps the original early return. Record preserves its bp0 outcome,
+  // and Remote asks PW2 directly to rank bp0 against legal 2D plans.
   const auto jev_mode = scheduler::jev::mode();
-  bool analyze_2d_break_point = false;
-  if (jev_mode != scheduler::jev::Mode::Remote) {
-    analyze_2d_break_point =
-        n_elems * 2 > device_multiprocessor_count * kThreadX;
-  }
-  if (jev_mode != scheduler::jev::Mode::Off) {
-    const std::string state =
-        "pointwise.entry.v1\nn_elems=" + std::to_string(n_elems) +
-        "\nsm_count=" + std::to_string(device_multiprocessor_count);
-    const std::vector<scheduler::jev::ChoiceOption> options = {
-        {"analyze", "Analyze hard-legal two-dimensional break points"},
-        {"default_1d",
-         "Use the one-dimensional default without split analysis"}};
-    std::string native_choice;
-    if (jev_mode == scheduler::jev::Mode::Record) {
-      native_choice = analyze_2d_break_point ? "analyze" : "default_1d";
-    }
-    const auto selected = scheduler::jev::chooseDecision(
-        "PW2.entry", state, options, native_choice);
-    analyze_2d_break_point = selected == "analyze";
-  }
+  const bool native_analyze_2d = jev_mode != scheduler::jev::Mode::Remote &&
+      n_elems * 2 > device_multiprocessor_count * kThreadX;
 
-  // Only calculate break point if its performance choice requests analysis.
+  // Only Off skips the breakpoint analysis. Record and Remote always build the
+  // direct PW2 candidate menu; Record retains the native threshold's bp0.
   pointwise_utils::BreakPointInfo bp_info;
-  if (analyze_2d_break_point) {
+  if (native_analyze_2d || jev_mode != scheduler::jev::Mode::Off) {
     bp_info = pointwise_utils::getBreakPoint(
         fusion,
         prop,
@@ -358,13 +340,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
         /*is_tma =*/false,
         max_vectorization_size_in_bit /
             prop.max_dtype_size_bit_for_vectorization,
-        kThreadX);
-  } else {
-    // Use default 1D scheduling (break_point = 0)
-    bp_info.break_point = 0;
-    bp_info.flip_grid_binding = false;
-    bp_info.right_elem_count = 0;
-    bp_info.is_outer_broadcast_dominated = false;
+        kThreadX,
+        /*native_default_1d=*/!native_analyze_2d);
   }
 
   const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
@@ -445,8 +422,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
           pointwise_utils::semanticPointwiseWorkload(
                    device_multiprocessor_count, device);
       state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
-      state += ",\"breakpoint_analysis_requested\":" +
-          std::string(analyze_2d_break_point ? "true" : "false");
+      state += ",\"breakpoint_analysis_requested\":true";
       state += ",\"break_point\":" + std::to_string(bp_info.break_point) +
           ",\"flip_grid_binding\":" +
           std::string(bp_info.flip_grid_binding ? "true" : "false") +
@@ -604,8 +580,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
             pointwise_utils::semanticPointwiseWorkload(
                      device_multiprocessor_count, dev_prop);
         state += ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
-        state += ",\"breakpoint_analysis_requested\":" +
-            std::string(analyze_2d_break_point ? "true" : "false") +
+        state += ",\"breakpoint_analysis_requested\":true"
             ",\"break_point\":0,\"right_elems\":" + std::to_string(n_elems) +
             ",\"vector_width\":" + std::to_string(vectorization_factor) +
             ",\"vector_width_already_selected\":true,\"unroll\":\"pending\"}";

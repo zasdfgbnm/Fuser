@@ -44,19 +44,19 @@ class PointwiseRecordContractTest(unittest.TestCase):
         # A valid TMA plan can return without PW1. The ordinary PW2/PW3 work
         # is still logged while trying to materialize a second plan.
         decisions = [choice("1", "PW4.width", "w4", 1),
-                     choice("1", "PW2.entry", "analyze", 2),
+                     choice("1", "PW2", "bp1_normal", 2),
                      choice("1", "PW3.width", "w8", 3)]
         grouped = group_record_invocations(decisions, outcome("1", event_count=3))
         self.assertEqual([row["site"] for row in grouped["1"]["realized_choices"]],
                          ["PW4.width"])
         self.assertEqual([row["site"] for row in grouped["1"]["speculative_choices"]],
-                         ["PW2.entry", "PW3.width"])
+                         ["PW2", "PW3.width"])
         self.assertEqual(grouped["1"]["backend"], "tma")
 
     def test_repeated_case_key_is_segmented_by_invocation(self):
         rows = outcome("1", event_count=1) + outcome("2", "ordinary", 1)
         decisions = [choice("1", "PW1", "tma"),
-                     choice("2", "PW2.entry", "default_1d")]
+                     choice("2", "PW2", "bp0")]
         grouped = group_record_invocations(decisions, rows)
         self.assertEqual({key: value["backend"] for key, value in grouped.items()},
                          {"1": "tma", "2": "ordinary"})

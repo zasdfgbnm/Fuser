@@ -677,10 +677,7 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
       skip("PW4.width");
       skip("PW4.breakpoint");
     } else {
-      skip("PW2.entry");
-      if (pointwise->break_point > 0) {
-        skip("PW2");
-      }
+      skip("PW2");
       skip("PW3.width");
       skip(pointwise->break_point > 0 ? "PW3.launch" : "PW3.cta_1d");
       skip("PW3.unroll");
