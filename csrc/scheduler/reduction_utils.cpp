@@ -7,6 +7,7 @@
 // clang-format on
 #include "scheduler/reduction_utils.h"
 
+#include <limits>
 #include <ranges>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -1207,7 +1208,10 @@ int64_t getL1L2WarpSize(
     const int64_t total_iteration_numel,
     const int64_t n_tensor_inputs,
     const int64_t max_dtype_size_bit_for_vectorization) {
-  const int64_t n_elems = total_reduction_numel * total_iteration_numel;
+  NVF_ERROR(
+      total_reduction_numel > 0 && total_iteration_numel > 0 &&
+          n_tensor_inputs > 0 && max_dtype_size_bit_for_vectorization > 0,
+      "inner reduction warp sizing requires positive dimensions");
   // Conservative value, could be set to larger based on arch if necessary.
   constexpr int64_t l1_cache_bit = (int64_t)32 * 1024 * 8;
   // Could change per generation, but for l1 we want to consider active threads,
@@ -1217,11 +1221,20 @@ int64_t getL1L2WarpSize(
   // if data fits in l2 and we need more parallelization in the reduction dim,
   // we can use a smaller warp size. While thread local data fits in l1, and
   // reduction dim is really small, we can use <32 threads per warp.
+  const bool input_bits_fit =
+      n_tensor_inputs <= std::numeric_limits<int64_t>::max() /
+          max_dtype_size_bit_for_vectorization;
+  const int64_t input_bits = input_bits_fit
+      ? n_tensor_inputs * max_dtype_size_bit_for_vectorization
+      : std::numeric_limits<int64_t>::max();
+  const int64_t l2_bits =
+      static_cast<int64_t>(at::cuda::getCurrentDeviceProperties()->l2CacheSize) *
+      8;
+  const int64_t max_l2_elements =
+      input_bits_fit && l2_bits > 0 ? (l2_bits - 1) / input_bits : 0;
   const bool fits_in_l2 =
-      n_elems * max_dtype_size_bit_for_vectorization * n_tensor_inputs <
-      static_cast<int64_t>(
-          at::cuda::getCurrentDeviceProperties()->l2CacheSize) *
-          8;
+      total_iteration_numel <= max_l2_elements &&
+      total_reduction_numel <= max_l2_elements / total_iteration_numel;
 
   // If it fits in l2, we just want to make sure each warp uses 256 bits. Set
   // minimum warp as 16 threads instead of 32 as if we have a small reduction
@@ -1231,14 +1244,13 @@ int64_t getL1L2WarpSize(
 
   // Check how many elements it would take per thread to start thrashing l1
   // set that to minimum number we want to reduce per thread.
+  const int64_t l1_elements_per_thread =
+      input_bits > l1_cache_bit / active_threads
+      ? 1
+      : std::max(l1_cache_bit / (input_bits * active_threads), (int64_t)1);
   const int64_t warp_size_based_on_l1 = std::min(
-      ceilDiv(
-          total_reduction_numel,
-          std::max(
-              l1_cache_bit /
-                  (n_tensor_inputs * max_dtype_size_bit_for_vectorization *
-                   active_threads),
-              (int64_t)1)),
+      total_reduction_numel / l1_elements_per_thread +
+          (total_reduction_numel % l1_elements_per_thread != 0),
       (int64_t)16);
   return std::min(warp_size_based_on_l1, warp_size_based_on_l2);
 }

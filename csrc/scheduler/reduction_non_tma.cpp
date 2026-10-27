@@ -26,6 +26,7 @@
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/reduction.h"
+#include "scheduler/reduction_inner_remainder_choice.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/runtime_info.h"
@@ -61,12 +62,6 @@ int64_t roundDownPow2OrMultipleOf(const int64_t x, const int64_t multiple) {
 int64_t clamp(const int64_t val, const int64_t min_val, const int64_t max_val) {
   return std::min(std::max(val, min_val), max_val);
 }
-
-struct InnerUnrollRange {
-  int64_t low;
-  int64_t high;
-  std::string id;
-};
 
 // A short 2D reduction is wholly covered by its CTA x dimension. Rebuild the
 // complete block and output-grid plan for an enlarged CTA target. The native
@@ -120,7 +115,7 @@ std::optional<ShortInnerCtaPlan> shortInnerCtaPlan(
   if (padded_x * block_y > max_threads_per_block) {
     return std::nullopt;
   }
-  const int64_t godim = ceilDiv(iteration_numel, block_y);
+  const int64_t godim = positiveCeilDiv(iteration_numel, block_y);
   if (godim < 1 || scheduler_utils::x_grid_limit < 1) {
     return std::nullopt;
   }
@@ -131,73 +126,6 @@ std::optional<ShortInnerCtaPlan> shortInnerCtaPlan(
       godim,
       std::min(godim, scheduler_utils::x_grid_limit),
       godim > scheduler_utils::x_grid_limit};
-}
-
-std::vector<InnerUnrollRange> innerUnrollRanges(int64_t low, int64_t high) {
-  NVF_ERROR(low >= 1 && high >= low);
-  constexpr int64_t kMaxChoices = 255;
-  const int64_t span = high - low + 1;
-  const int64_t stride = span / kMaxChoices + (span % kMaxChoices != 0);
-  std::vector<InnerUnrollRange> ranges;
-  for (int64_t first = low;;) {
-    const int64_t last = first + std::min(stride - 1, high - first);
-    const std::string id = first == last
-        ? "u" + std::to_string(first)
-        : "r" + std::to_string(first) + "_" + std::to_string(last);
-    ranges.push_back({first, last, id});
-    if (last == high) {
-      break;
-    }
-    first = last + 1;
-  }
-  return ranges;
-}
-
-// Each request has at most 255 options. The same bounded range protocol is
-// used for both a candidate index and an unroll factor below.
-int64_t chooseInnerRemainderRange(
-    std::string_view site,
-    const std::string& state_base,
-    int64_t low,
-    int64_t high,
-    int64_t native_value,
-    scheduler::jev::Mode jev_mode) {
-  NVF_ERROR(jev_mode != scheduler::jev::Mode::Off && low >= 1 && high >= low);
-  for (;;) {
-    const auto ranges = innerUnrollRanges(low, high);
-    std::vector<scheduler::jev::ChoiceOption> options;
-    options.reserve(ranges.size());
-    std::string native_choice;
-    for (const auto& range : ranges) {
-      options.push_back(
-          {range.id,
-           "Choose integer in [" + std::to_string(range.low) + ", " +
-               std::to_string(range.high) + "]"});
-      if (jev_mode == scheduler::jev::Mode::Record &&
-          range.low <= native_value && native_value <= range.high) {
-        native_choice = range.id;
-      }
-    }
-    const std::string state = state_base +
-        "range_low=" + std::to_string(low) + '\n' +
-        "range_high=" + std::to_string(high) + '\n';
-    const auto selected = scheduler::jev::chooseDecision(
-        site, state, options, native_choice);
-    const auto selected_range = std::find_if(
-        ranges.begin(), ranges.end(), [&](const InnerUnrollRange& range) {
-          return range.id == selected;
-        });
-    NVF_ERROR(
-        selected_range != ranges.end(),
-        "RD3 remainder response is outside the candidate range");
-    if (selected_range->low == selected_range->high) {
-      return jev_mode == scheduler::jev::Mode::Record
-          ? native_value
-          : selected_range->low;
-    }
-    low = selected_range->low;
-    high = selected_range->high;
-  }
 }
 
 // Reduce x, y, z until it's product is less than max value, reduce round robin
@@ -316,8 +244,9 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // redu = [i-remainder, i-Unroll, TIDx, Vect]
   int64_t inner_unroll = 1, bdimx = 1, vect_factor = 1;
   auto getInnerRemainder = [&]() {
-    return ceilDiv(
-        ceilDiv(total_reduction_numel / vect_factor, bdimx), inner_unroll);
+    return positiveCeilDiv(
+        positiveCeilDiv(total_reduction_numel / vect_factor, bdimx),
+        inner_unroll);
   };
 
   // Max vectorization factor
@@ -342,80 +271,49 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
         jev_mode != scheduler::jev::Mode::Record || target_inner_unroll >= 1,
         "RD3.unroll native target must be positive");
 
-    // A factor above after_vect cannot improve the remainder search below:
-    // the per-thread remainder is then smaller than the factor. This is a
-    // structural range, independent of getVectUnroll's preferred factor.
+    // The model's structural range is independent of getVectUnroll's native
+    // preference. Record must preserve an original native quotient above the
+    // reduction extent instead of replacing it with a menu endpoint.
     const int64_t hard_max = after_vect;
-    int memory_clock_khz = 0;
-    const int64_t memory_bus_bits = has_mufu_computation
-        ? 0
-        : static_cast<int64_t>(dev_prop->memoryBusWidth);
-    if (!has_mufu_computation) {
-      NVF_ERROR(
-          cudaDeviceGetAttribute(
-              &memory_clock_khz,
-              cudaDevAttrMemoryClockRate,
-              at::cuda::current_device()) == cudaSuccess,
-          "RD3.unroll could not read CUDA memory clock");
-    }
-    std::string state_base = "reduction.inner_unroll.v1\n";
-    state_base += "reduction_numel=" +
-        std::to_string(total_reduction_numel) + '\n';
-    state_base += "vector_width=" + std::to_string(vect_factor) + '\n';
-    state_base += "layout_max=" + std::to_string(max_vectorize_factor) + '\n';
-    state_base += "max_dtype_bits=" +
-        std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
-    state_base += "n_tensor_inputs=" + std::to_string(n_tensor_inputs) + '\n';
-    state_base += "has_mufu=" +
-        std::to_string(has_mufu_computation ? 1 : 0) + '\n';
-    state_base += "sm_count=" + std::to_string(sm_count) + '\n';
-    state_base += "max_threads_per_sm=" +
-        std::to_string(max_threads_per_sm) + '\n';
-    state_base += "memory_bus_bits=" + std::to_string(memory_bus_bits) + '\n';
-    state_base += "memory_clock_khz=" +
-        std::to_string(memory_clock_khz) + '\n';
+    if (jev_mode == scheduler::jev::Mode::Record &&
+        target_inner_unroll > hard_max) {
+      scheduler::jev::recordCoverageSkip(
+          "RD3.unroll", "native_target_exceeds_reduction_extent");
+    } else {
+      int memory_clock_khz = 0;
+      const int64_t memory_bus_bits = has_mufu_computation
+          ? 0
+          : static_cast<int64_t>(dev_prop->memoryBusWidth);
+      if (!has_mufu_computation) {
+        NVF_ERROR(
+            cudaDeviceGetAttribute(
+                &memory_clock_khz,
+                cudaDevAttrMemoryClockRate,
+                at::cuda::current_device()) == cudaSuccess,
+            "RD3.unroll could not read CUDA memory clock");
+      }
+      std::string state_base = "reduction.inner_unroll.v1\n";
+      state_base += "reduction_numel=" +
+          std::to_string(total_reduction_numel) + '\n';
+      state_base += "vector_width=" + std::to_string(vect_factor) + '\n';
+      state_base += "layout_max=" + std::to_string(max_vectorize_factor) + '\n';
+      state_base += "max_dtype_bits=" +
+          std::to_string(max_dtype_size_bit_for_vectorization) + '\n';
+      state_base += "n_tensor_inputs=" + std::to_string(n_tensor_inputs) + '\n';
+      state_base += "has_mufu=" +
+          std::to_string(has_mufu_computation ? 1 : 0) + '\n';
+      state_base += "sm_count=" + std::to_string(sm_count) + '\n';
+      state_base += "max_threads_per_sm=" +
+          std::to_string(max_threads_per_sm) + '\n';
+      state_base += "memory_bus_bits=" + std::to_string(memory_bus_bits) + '\n';
+      state_base += "memory_clock_khz=" +
+          std::to_string(memory_clock_khz) + '\n';
 
-    int64_t range_low = 1;
-    int64_t range_high = hard_max;
-    for (;;) {
-      const auto ranges = innerUnrollRanges(range_low, range_high);
-      std::vector<scheduler::jev::ChoiceOption> options;
-      options.reserve(ranges.size());
-      std::string native_choice;
-      const int64_t capped_native_target = jev_mode == scheduler::jev::Mode::Record
-          ? std::min(target_inner_unroll, hard_max)
-          : 0;
-      for (const auto& range : ranges) {
-        options.push_back(
-            {range.id,
-             "Inner unroll target in [" + std::to_string(range.low) +
-                 ", " + std::to_string(range.high) + "]"});
-        if (jev_mode == scheduler::jev::Mode::Record &&
-            range.low <= capped_native_target &&
-            capped_native_target <= range.high) {
-          native_choice = range.id;
-        }
-      }
-      const std::string state = state_base +
-          "range_low=" + std::to_string(range_low) + '\n' +
-          "range_high=" + std::to_string(range_high) + '\n';
-      const auto selected = scheduler::jev::chooseDecision(
-          "RD3.unroll", state, options, native_choice);
-      const auto selected_range = std::find_if(
-          ranges.begin(), ranges.end(), [&](const InnerUnrollRange& range) {
-            return range.id == selected;
-          });
-      NVF_ERROR(
-          selected_range != ranges.end(),
-          "RD3.unroll response is outside reduction bounds");
-      if (selected_range->low == selected_range->high) {
-        // Both decision modes must use the selected, bounded singleton for
-        // subsequent CTA and warp choices.
-        target_inner_unroll = selected_range->low;
-        break;
-      }
-      range_low = selected_range->low;
-      range_high = selected_range->high;
+      target_inner_unroll = chooseInnerUnrollTarget(
+          state_base,
+          hard_max,
+          jev_mode == scheduler::jev::Mode::Record ? target_inner_unroll : 0,
+          jev_mode);
     }
   }
 
@@ -434,7 +332,7 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // communication cost and allow more than 1 block per SM.
   int64_t max_blocks = total_iteration_numel;
   int64_t min_threads_per_block = scheduler_utils::roundUpPow2(
-      ceilDiv(target_threads_per_sm * sm_count, max_blocks));
+      positiveCeilDiv(target_threads_per_sm * sm_count, max_blocks));
   min_threads_per_block =
       std::min(min_threads_per_block, max_threads_per_block / 2);
   // Only off/record need the native empirical starting target. Remote mode
@@ -550,6 +448,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // unroll >= 1, and the remainder scan has at most one seed plus
   // (CTA - four_warps + 1) widths. Warp padding is less than 2x x, while
   // CTA <= half the physical block limit. Native grid bounds remain in force.
+  // The remaining integer guards protect shape arithmetic representability;
+  // neither factor count nor width-times-factor work is a legality limit.
   int64_t min_warp_size = 0;
   const int64_t l2_cache_bytes = dev_prop->l2CacheSize;
   const bool bounded_warp_plan =
@@ -565,7 +465,7 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
       total_reduction_numel <=
           std::numeric_limits<int64_t>::max() / total_iteration_numel &&
       target_inner_unroll >= 1 && target_inner_unroll <= after_vect &&
-      target_inner_unroll <= 65536 && target_threads_per_block >= four_warps &&
+      target_threads_per_block >= four_warps &&
       target_threads_per_block <= max_threads_per_block / 2 &&
       target_threads_per_block <= 32768 && l2_cache_bytes >= 1 &&
       l2_cache_bytes <= std::numeric_limits<int64_t>::max() / 8;
@@ -574,13 +474,9 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     const int64_t input_bits =
         n_tensor_inputs * max_dtype_size_bit_for_vectorization;
     const int64_t n_elems = total_reduction_numel * total_iteration_numel;
-    const int64_t max_remainder_widths =
-        1 + target_threads_per_block - four_warps + 1;
     choose_warp =
         input_bits <= std::numeric_limits<int64_t>::max() / 1024 &&
-        n_elems <= std::numeric_limits<int64_t>::max() / input_bits &&
-        max_remainder_widths <= 32768 &&
-        target_inner_unroll <= 2000000 / max_remainder_widths;
+        n_elems <= std::numeric_limits<int64_t>::max() / input_bits;
   }
   if (jev_mode != scheduler::jev::Mode::Remote || !choose_warp) {
     min_warp_size = reduction_scheduler_utils::getL1L2WarpSize(
@@ -637,7 +533,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   inner_unroll = std::min(getInnerRemainder(), target_inner_unroll);
 
   // Put inner remainder to bdimx, but don't go over target_threads_per_block
-  bdimx = std::min(ceilDiv(after_vect, inner_unroll), target_threads_per_block);
+  bdimx = std::min(
+      positiveCeilDiv(after_vect, inner_unroll), target_threads_per_block);
 
   // if unroll can't cover the whole reduction, adjust bdimx and unroll to
   // remove quantization effect. e.g. at 20736, vect = 8, bdimx = 512, unroll =
@@ -648,24 +545,39 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   if (remainder_scan_needed) {
     const int64_t seed_bdimx = bdimx;
     if (jev_mode != scheduler::jev::Mode::Remote) {
-      int64_t after_vect_bdimx = ceilDiv(after_vect, bdimx);
+      int64_t after_vect_bdimx = positiveCeilDiv(after_vect, bdimx);
       int64_t current_remainder = after_vect_bdimx % inner_unroll;
-      for (auto tmp_bdimx = four_warps; tmp_bdimx <= target_threads_per_block;
-           tmp_bdimx += min_warp_size) {
-        after_vect_bdimx = ceilDiv(after_vect, tmp_bdimx);
-        for (auto factor = target_inner_unroll; factor > 1; factor--) {
-          int64_t remainder = after_vect_bdimx % factor;
-          if (remainder == 0) {
-            inner_unroll = factor;
-            bdimx = tmp_bdimx;
-            break;
-          }
-          if (remainder < current_remainder) {
-            current_remainder = remainder;
-            inner_unroll = factor;
-            bdimx = tmp_bdimx;
+      if (jev_mode == scheduler::jev::Mode::Off) {
+        // Preserve the original native scan in Off mode.
+        for (auto tmp_bdimx = four_warps; tmp_bdimx <= target_threads_per_block;
+             tmp_bdimx += min_warp_size) {
+          after_vect_bdimx = positiveCeilDiv(after_vect, tmp_bdimx);
+          for (auto factor = target_inner_unroll; factor > 1; factor--) {
+            int64_t remainder = after_vect_bdimx % factor;
+            if (remainder == 0) {
+              inner_unroll = factor;
+              bdimx = tmp_bdimx;
+              break;
+            }
+            if (remainder < current_remainder) {
+              current_remainder = remainder;
+              inner_unroll = factor;
+              bdimx = tmp_bdimx;
+            }
           }
         }
+      } else {
+        InnerRemainderScanState scan{bdimx, inner_unroll, current_remainder};
+        for (auto tmp_bdimx = four_warps; tmp_bdimx <= target_threads_per_block;
+             tmp_bdimx += min_warp_size) {
+          scanInnerRemainderWidthByPlateaus(
+              positiveCeilDiv(after_vect, tmp_bdimx),
+              target_inner_unroll,
+              tmp_bdimx,
+              scan);
+        }
+        bdimx = scan.block_x;
+        inner_unroll = scan.unroll;
       }
     }
 
@@ -680,11 +592,6 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
           widths.push_back(x);
         }
       }
-      NVF_ERROR(
-          jev_mode != scheduler::jev::Mode::Remote ||
-              (widths.size() <= 32768 && target_inner_unroll <= 65536 &&
-               widths.size() * target_inner_unroll <= 2000000),
-          "RD3.remainder exceeds bounded remote candidate analysis");
       if (widths.size() > 1) {
         std::string fields;
         fields += "after_vect=" + std::to_string(after_vect) + '\n';
@@ -773,7 +680,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   bdimy = std::min(total_iteration_numel, target_threads_per_block / bdimx);
 
   // Put what is left to godim
-  godim = ceilDiv(ceilDiv(total_iteration_numel, bdimy), outer_unroll);
+  godim = positiveCeilDiv(
+      positiveCeilDiv(total_iteration_numel, bdimy), outer_unroll);
   if (selected_short_cta_plan) {
     NVF_ERROR(
         bdimx == selected_short_cta_plan->block_x &&
@@ -790,7 +698,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // needs to shift from block reduction to grid reduction.
   int64_t grdim = 1;
   if (jev_mode != scheduler::jev::Mode::Remote) {
-    while (godim * grdim * 2 <= sm_count && getInnerRemainder() / grdim >= 2) {
+    while (grdim <= sm_count / godim / 2 &&
+           getInnerRemainder() / grdim >= 2) {
       grdim *= 2;
     }
   }
@@ -862,7 +771,7 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     // set. Recalculate godim.
     if (outer_unroll) {
       outer_unroll = 1;
-      godim = ceilDiv(total_iteration_numel, bdimy * outer_unroll);
+      godim = positiveCeilDiv(total_iteration_numel, bdimy * outer_unroll);
     }
     // This could mess up parallelization which could be redone, but that would
     // require iterating over this entire function.
@@ -905,7 +814,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
         found != options.end(),
         "RD3.iter_unroll response exceeds the native block-plan bounds");
     outer_unroll = std::stoll(selected.substr(1));
-    godim = ceilDiv(ceilDiv(total_iteration_numel, bdimy), outer_unroll);
+    godim = positiveCeilDiv(
+        positiveCeilDiv(total_iteration_numel, bdimy), outer_unroll);
     NVF_ERROR(godim >= 1, "RD3.iter_unroll produced an invalid output grid");
   }
 

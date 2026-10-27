@@ -3,6 +3,7 @@
 #include <scheduler/jev_client.h>
 #include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
+#include <scheduler/reduction_inner_remainder_choice.h>
 #include <scheduler/reduction_tma_unroll_choice.h>
 
 #include <arpa/inet.h>
@@ -12,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <limits>
@@ -150,9 +152,121 @@ std::string prefetchAnswer(
       "}},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}";
 }
 
+std::vector<std::string> innerRangeReplies(
+    std::string_view site,
+    int64_t high,
+    int64_t target) {
+  using nvfuser::reduction::non_tma::innerUnrollRanges;
+  std::vector<std::string> replies;
+  int64_t low = 1;
+  while (true) {
+    const auto ranges = innerUnrollRanges(low, high);
+    std::string selected;
+    std::string probabilities = "{";
+    for (const auto& range : ranges) {
+      if (!selected.empty() && range.low <= target && target <= range.high) {
+        throw std::runtime_error("RD3 target matched two ranges");
+      }
+      if (range.low <= target && target <= range.high) {
+        selected = range.id;
+      }
+      if (probabilities.size() > 1) probabilities += ',';
+      probabilities += "\"" + range.id + "\":" +
+          (range.low <= target && target <= range.high ? "1.0" : "0.0");
+    }
+    require(!selected.empty(), "RD3 target is outside range hierarchy");
+    probabilities += '}';
+    replies.push_back(
+        "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"" +
+        std::string(site) + "\":{\"type\":\"choice\",\"choice\":\"" +
+        selected + "\",\"confidence\":1.0,\"probabilities\":" +
+        probabilities +
+        "}},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}");
+    const auto found = std::find_if(
+        ranges.begin(), ranges.end(), [&](const auto& range) {
+          return range.id == selected;
+        });
+    if (found->low == found->high) break;
+    low = found->low;
+    high = found->high;
+  }
+  return replies;
+}
+
+void testInnerRemainderPlateauScan() {
+  using nvfuser::reduction::non_tma::InnerRemainderScanState;
+  using nvfuser::reduction::non_tma::positiveCeilDiv;
+  using nvfuser::reduction::non_tma::scanInnerRemainderWidthByPlateaus;
+  const auto reference = [](int64_t after_block,
+                            int64_t target_unroll,
+                            int64_t candidate_x,
+                            InnerRemainderScanState& state) {
+    for (int64_t factor = target_unroll; factor > 1; --factor) {
+      const int64_t remainder = after_block % factor;
+      if (remainder == 0) {
+        state.block_x = candidate_x;
+        state.unroll = factor;
+        break;
+      }
+      if (remainder < state.current_remainder) {
+        state.current_remainder = remainder;
+        state.block_x = candidate_x;
+        state.unroll = factor;
+      }
+    }
+  };
+  const auto compare = [&](int64_t after_vect,
+                           int64_t target_unroll,
+                           int64_t initial_remainder,
+                           int64_t first_x,
+                           int64_t last_x) {
+    InnerRemainderScanState expected{3, 1, initial_remainder};
+    InnerRemainderScanState actual = expected;
+    for (int64_t x = first_x; x <= last_x; ++x) {
+      const int64_t after_block = positiveCeilDiv(after_vect, x);
+      reference(after_block, target_unroll, x, expected);
+      scanInnerRemainderWidthByPlateaus(
+          after_block, target_unroll, x, actual);
+      require(
+          expected.block_x == actual.block_x &&
+              expected.unroll == actual.unroll &&
+              expected.current_remainder == actual.current_remainder,
+          "RD3 Record plateau scan differs from descending native scan");
+    }
+  };
+  for (int64_t after_vect = 1; after_vect <= 128; ++after_vect) {
+    for (int64_t target_unroll = 2; target_unroll <= 64; ++target_unroll) {
+      for (int64_t initial_remainder = 0; initial_remainder <= 4;
+           ++initial_remainder) {
+        compare(after_vect, target_unroll, initial_remainder, 1, 4);
+      }
+    }
+  }
+  // A zero at the first width leaves current_remainder unchanged, so a later
+  // nonzero remainder can overwrite the pair chosen by that zero.
+  compare(2, 2, 2, 1, 2);
+  // Both old replay limits are exceeded: target > 65,536 and 32 widths times
+  // target > 2,000,000. The exact scan still agrees with the native loop.
+  compare(3'141'592, 70'000, 17, 128, 159);
+  require(
+      positiveCeilDiv(std::numeric_limits<int64_t>::max(), 2) ==
+          4'611'686'018'427'387'904LL &&
+          positiveCeilDiv(std::numeric_limits<int64_t>::max(), 3) ==
+              3'074'457'345'618'258'603LL,
+      "positive RD3 ceil division overflowed at int64 limit");
+  InnerRemainderScanState huge{128, 1, 5};
+  scanInnerRemainderWidthByPlateaus(
+      1'234'567'891, 1'000'000'000, 256, huge);
+  require(
+      huge.block_x == 256 && huge.unroll >= 2 &&
+          huge.unroll <= 1'000'000'000,
+      "RD3 high-factor plateau scan did not complete");
+}
+
 } // namespace
 
 int main() {
+  testInnerRemainderPlateauScan();
   using nvfuser::scheduler::jev::ChoiceOption;
   using nvfuser::scheduler::jev::chooseDecision;
   const std::vector<ChoiceOption> options{{"bp0", "one dimensional"}, {"bp1", "split"}};
@@ -589,6 +703,44 @@ int main() {
             server.request().find("Prefetch TMA in [1, 2] iteration(s) ahead") !=
                 std::string::npos,
         "IP3.prefetch Remote lost a hierarchy request or continuation");
+  }
+  {
+    // Exercise the exact RD3 helpers used by the scheduler with a target
+    // above the former 65,536 cap, then choose a small downstream unroll.
+    auto replies = innerRangeReplies("RD3.unroll", 70'000, 70'000);
+    const size_t unroll_requests = replies.size();
+    auto remainder_replies = innerRangeReplies("RD3.remainder_u", 70'000, 1);
+    replies.insert(
+        replies.end(), remainder_replies.begin(), remainder_replies.end());
+    FakeServer server(std::move(replies));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    const std::string before = readFile(path);
+    const int64_t target =
+        nvfuser::reduction::non_tma::chooseInnerUnrollTarget(
+            "reduction.inner_unroll.v1\nreduction_numel=70000\n",
+            70'000,
+            0,
+            nvfuser::scheduler::jev::Mode::Remote);
+    require(target == 70'000, "RD3 Remote lost high target continuation");
+    const int64_t remainder =
+        nvfuser::reduction::non_tma::chooseInnerRemainderRange(
+            "RD3.remainder_u",
+            "reduction.inner_remainder_u.v1\nafter_vect=70000\n"
+            "target_inner_unroll=70000\n",
+            1,
+            target,
+            0,
+            nvfuser::scheduler::jev::Mode::Remote);
+    require(remainder == 1, "RD3 Remote lost a small downstream factor");
+    const std::string delta = readFile(path).substr(before.size());
+    require(
+        unroll_requests >= 2 && remainder_replies.size() >= 2 &&
+            delta.find("\"selected\":\"u70000\"") != std::string::npos &&
+            delta.find("\"selected\":\"u1\"") != std::string::npos &&
+            server.request().find("RD3.unroll") != std::string::npos &&
+            server.request().find("RD3.remainder_u") != std::string::npos &&
+            server.request().find("range_high=70000") != std::string::npos,
+        "RD3 Remote omitted a high-range or downstream request");
   }
   {
     FakeServer server(
