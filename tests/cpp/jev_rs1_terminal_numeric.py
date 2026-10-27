@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""Exercise c19's reorder continuations and terminal CTA plans.
+"""Exercise c19's width/reorder continuations and terminal CTA plans.
 
-The server reuses the strict workspace evaluator for RS1.width. It checks the
-new reorder continuations and terminal CTA consequences before forcing a
-legal branch and CTA. The independent service parser is a separate workspace
-change; this test proves the producer and numerical path.
+The bounded local server verifies every source-produced c19 continuation,
+then forces a legal width, reorder branch, and CTA. The independent service
+parser is a separate workspace change; this tests producer and numerical paths.
 """
 
 from __future__ import annotations
 
 import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import importlib
 import json
 from pathlib import Path
 import re
-import sys
 import tempfile
 from threading import Thread
 import traceback
@@ -32,24 +29,26 @@ def rows(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def c19_effect(keep: bool) -> dict:
+def c19_effect(keep: bool, width: int) -> dict:
     return {
         "reference_tv": "T1", "input_tv": "T0",
         "read_elements": 2240, "write_elements": 2520,
-        "pad_fill_elements": 280, "innermost_axis": 2, "width": 4,
+        "pad_fill_elements": 280, "innermost_axis": 2, "width": width,
         "loop_axis_order": [1, 0, 2] if keep else [0, 1, 2],
         "read_stride_by_loop": [320, 64, 1] if keep else [64, 320, 1],
         "write_stride_by_loop": [72, 504, 1] if keep else [504, 72, 1],
     }
 
 
-def c19_terminal_plan(index_type: int, keep: bool, threads: int) -> dict:
-    effect = c19_effect(keep)
+def c19_terminal_plan(index_type: int, keep: bool, threads: int,
+                      width: int) -> dict:
+    effect = c19_effect(keep, width)
+    vector_iterations = (2520 + width - 1) // width
     return {
         "final_resize_plan": {
             "index_type": index_type,
             "largest_input": 0 if keep else -1,
-            "vectorization_factor": 4,
+            "vectorization_factor": width,
             "cta_threads": threads,
             "split_grid_x_dim": False,
         },
@@ -59,8 +58,10 @@ def c19_terminal_plan(index_type: int, keep: bool, threads: int) -> dict:
         "read_stride_by_loop": effect["read_stride_by_loop"],
         "write_stride_by_loop": effect["write_stride_by_loop"],
         "read_elements": 2240, "write_elements": 2520,
-        "pad_fill_elements": 280, "output_vector_iterations": 630,
-        "block_x": threads, "grid_x": (630 + threads - 1) // threads,
+        "pad_fill_elements": 280,
+        "output_vector_iterations": vector_iterations,
+        "block_x": threads,
+        "grid_x": (vector_iterations + threads - 1) // threads,
         "grid_y": 1, "pending_choices": [],
     }
 
@@ -77,10 +78,37 @@ def c19_snapshot(request: dict) -> tuple[dict, int]:
     return state, int(match.group(1))
 
 
-def validate_reorder(request: dict) -> None:
+def validate_width(request: dict) -> None:
+    state, index_type = c19_snapshot(request)
+    assert state["current_schedule"]["prior_choices"] == []
+    decision = state["decision"]
+    assert decision["site"] == "RS1.width"
+    assert decision["analysis_inputs_text"] == (
+        "resize.width.v2\nlayout_max=4\ninput_elements=0:2240\n"
+        "max_output_elements=2520\n")
+    assert [candidate["id"] for candidate in decision["candidates"]] == [
+        "w1", "w2", "w4"]
+    for candidate in decision["candidates"]:
+        width = int(candidate["id"][1:])
+        assert candidate["description"] == (
+            f"Vectorize {width} element(s) per thread")
+        assert candidate["consequence"] == {
+            "selected_width": width,
+            "terminal_continuations": [
+                {"reorder_choice": reorder,
+                 "cta_choice": f"t{threads}",
+                 "plan": c19_terminal_plan(
+                     index_type, reorder == "keep", threads, width)}
+                for reorder in ("skip", "keep")
+                for threads in (64, 128, 256)],
+            "pending_choices": ["RS1.reorder", "RS1.cta"],
+        }
+
+
+def validate_reorder(request: dict, width: int) -> None:
     state, index_type = c19_snapshot(request)
     assert state["current_schedule"]["prior_choices"] == [
-        {"site": "RS1.width", "choice": "w4"}]
+        {"site": "RS1.width", "choice": f"w{width}"}]
     decision = state["decision"]
     assert decision["site"] == "RS1.reorder"
     assert decision["analysis_inputs_text"] == (
@@ -93,10 +121,11 @@ def validate_reorder(request: dict) -> None:
             "Reorder outer loop axes like the largest input" if keep else
             "Keep the reference tensor's outer loop-axis order")
         assert candidate["consequence"] == {
-            "reorder_effect": c19_effect(keep),
+            "reorder_effect": c19_effect(keep, width),
             "terminal_continuations": [
                 {"cta_choice": f"t{threads}",
-                 "plan": c19_terminal_plan(index_type, keep, threads)}
+                 "plan": c19_terminal_plan(index_type, keep, threads,
+                                           width)}
                 for threads in (64, 128, 256)],
             "pending_choices": ["RS1.cta"],
         }
@@ -104,10 +133,10 @@ def validate_reorder(request: dict) -> None:
         request["questions"]["RS1.reorder"]["instructions"])
 
 
-def validate_cta(request: dict, reorder: str) -> None:
+def validate_cta(request: dict, reorder: str, width: int) -> None:
     state, index_type = c19_snapshot(request)
     assert state["current_schedule"]["prior_choices"] == [
-        {"site": "RS1.width", "choice": "w4"},
+        {"site": "RS1.width", "choice": f"w{width}"},
         {"site": "RS1.reorder", "choice": reorder},
     ]
     decision = state["decision"]
@@ -120,7 +149,8 @@ def validate_cta(request: dict, reorder: str) -> None:
         "max_threads_x", "max_threads_per_block", "max_grid_x",
     ]
     assert [int(fields[key]) for key in
-            ("max_output_elements", "layout_max", "vector_width")] == [2520, 4, 4]
+            ("max_output_elements", "layout_max", "vector_width")] == [
+                2520, 4, width]
     hardware = state["workload"]["hardware"]
     for key in ("warp_size", "max_threads_x", "max_threads_per_block",
                 "max_grid_x"):
@@ -134,10 +164,10 @@ def validate_cta(request: dict, reorder: str) -> None:
         assert candidate["description"] == (
             f"Use {threads} threads per Resize CTA")
         assert candidate["consequence"] == c19_terminal_plan(
-            index_type, reorder == "keep", threads)
+            index_type, reorder == "keep", threads, width)
 
 
-def make_handler(evaluator, target: str, reorder: str,
+def make_handler(width: int, target: str, reorder: str,
                  events: list[dict], errors: list[str]):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -147,29 +177,29 @@ def make_handler(evaluator, target: str, reorder: str,
                 assert 0 < length < 8 * 1024 * 1024
                 request = json.loads(self.rfile.read(length))
                 site = request["state"]["decision"]["site"]
-                if site in ("RS1.reorder", "RS1.cta"):
-                    if site == "RS1.reorder":
-                        validate_reorder(request)
-                        selected = reorder
-                    else:
-                        validate_cta(request, reorder)
-                        selected = target
-                    ids = [candidate["id"] for candidate in
-                           request["state"]["decision"]["candidates"]]
-                    response = {
-                        "model": "nvfuser-analysis-v1",
-                        "answers": {site: {
-                            "type": "choice", "choice": selected,
-                            "confidence": 1.0,
-                            "probabilities": {
-                                choice: float(choice == selected)
-                                for choice in ids},
-                        }},
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    }
+                if site == "RS1.width":
+                    validate_width(request)
+                    selected = f"w{width}"
+                elif site == "RS1.reorder":
+                    validate_reorder(request, width)
+                    selected = reorder
                 else:
-                    assert site == "RS1.width"
-                    response, _ = evaluator(request)
+                    assert site == "RS1.cta"
+                    validate_cta(request, reorder, width)
+                    selected = target
+                ids = [candidate["id"] for candidate in
+                       request["state"]["decision"]["candidates"]]
+                response = {
+                    "model": "nvfuser-analysis-v1",
+                    "answers": {site: {
+                        "type": "choice", "choice": selected,
+                        "confidence": 1.0,
+                        "probabilities": {
+                            choice: float(choice == selected)
+                            for choice in ids},
+                    }},
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }
                 events.append({"site": site, "request": request,
                                "response": response})
                 body = json.dumps(response, separators=(",", ":")).encode()
@@ -196,21 +226,23 @@ def main() -> int:
     parser.add_argument("--threads", type=int, choices=(64, 128, 256),
                         required=True)
     parser.add_argument("--reorder", choices=("keep", "skip"), default="keep")
+    parser.add_argument("--width", type=int, choices=(1, 2, 4), default=4)
     args = parser.parse_args()
     assert args.binary.is_absolute() and args.binary.is_file()
     assert args.artifacts_root.is_absolute()
-    module_dir, loader, libraries = checked_environment()
-    sys.path.insert(0, str(module_dir))
-    evaluator = importlib.import_module("jev_shim").evaluate
+    _, loader, libraries = checked_environment()
     args.artifacts_root.mkdir(parents=True, exist_ok=True)
-    case_key = f"jev_rs_one_terminal_{args.reorder}_t{args.threads}"
+    case_key = (
+        f"jev_rs_one_terminal_w{args.width}_{args.reorder}_t{args.threads}")
     directory = Path(tempfile.mkdtemp(prefix=case_key + "-",
                                       dir=args.artifacts_root))
     manifest_path = directory / "manifest.json"
     manifest = {"schema": "nvfuser-jev-rs1-terminal-source-test-v1",
                 "case_key": case_key, "binary": str(args.binary),
                 "binary_sha256": file_hash(args.binary),
-                "target_threads": args.threads, "runs": [], "status": "started"}
+                "target_width": args.width,
+                "target_threads": args.threads,
+                "runs": [], "status": "started"}
     write_manifest(manifest_path, manifest)
     print(f"RS1 terminal numeric artifacts: {directory}", flush=True)
     try:
@@ -223,7 +255,7 @@ def main() -> int:
         events: list[dict] = []
         errors: list[str] = []
         server = HTTPServer(("127.0.0.1", 0),
-                make_handler(evaluator, f"t{args.threads}", args.reorder,
+                make_handler(args.width, f"t{args.threads}", args.reorder,
                                          events, errors))
         thread = Thread(target=server.serve_forever,
                         kwargs={"poll_interval": 0.05}, daemon=True)
@@ -252,16 +284,19 @@ def main() -> int:
         assert [row["selected"] for row in record_rows] == [
             "w4", "keep", "t128"]
         assert [row["selected"] for row in remote_rows] == [
-            "w4", args.reorder, f"t{args.threads}"]
-        for row in (record_rows[1], remote_rows[1]):
-            validate_reorder(row["request"])
-        assert record_rows[1]["request"] == remote_rows[1]["request"]
-        for row in (record_rows[-1], remote_rows[-1]):
-            validate_cta(row["request"], row["request"]["state"][
-                "current_schedule"]["prior_choices"][-1]["choice"])
-        if args.reorder == "keep":
+            f"w{args.width}", args.reorder, f"t{args.threads}"]
+        validate_width(record_rows[0]["request"])
+        validate_width(remote_rows[0]["request"])
+        assert record_rows[0]["request"] == remote_rows[0]["request"]
+        validate_reorder(record_rows[1]["request"], 4)
+        validate_reorder(remote_rows[1]["request"], args.width)
+        if args.width == 4:
+            assert record_rows[1]["request"] == remote_rows[1]["request"]
+        validate_cta(record_rows[-1]["request"], "keep", 4)
+        validate_cta(remote_rows[-1]["request"], args.reorder, args.width)
+        if args.width == 4 and args.reorder == "keep":
             assert record_rows[-1]["request"] == remote_rows[-1]["request"]
-        if args.threads == 64 and args.reorder == "keep":
+        if args.width == 4 and args.threads == 64 and args.reorder == "keep":
             # A symbolic rank-two Pad is outside the direct rank-three proof.
             # Record must run its native CTA and log both unsupported sites.
             unsupported_dir = directory / "unsupported"
@@ -274,9 +309,8 @@ def main() -> int:
                 protocol="semantic-v3")
             unsupported_rows = rows(Path(unsupported["decision_log"]))
             assert [row["site"] for row in unsupported_rows] == SITES
-            assert unsupported_rows[0]["selected"] == "w4"
             assert all(row["kind"] == "coverage_skip" and
-                       "request" not in row for row in unsupported_rows[1:])
+                       "request" not in row for row in unsupported_rows)
             manifest["unsupported_record"] = unsupported
         manifest["server_log"] = str(server_log)
         manifest["server_log_sha256"] = file_hash(server_log)

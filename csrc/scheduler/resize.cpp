@@ -16,6 +16,7 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "debug.h"
@@ -395,10 +396,17 @@ bool directPadCtaLegal(const DirectPadCtaLimits& limits, int64_t threads) {
                   : grid_blocks <= limits.max_grid_x);
 }
 
+struct DirectPadTerminalLeaf {
+  std::string reorder_choice;
+  int64_t cta_threads;
+  std::string plan;
+};
+
 struct DirectPadTerminalPlans {
   std::string skip;
   std::string keep;
   std::vector<int64_t> cta_threads;
+  std::vector<DirectPadTerminalLeaf> leaves;
 };
 
 // Each reorder alternative has the same hard-valid CTA domain but a
@@ -413,48 +421,71 @@ std::optional<DirectPadTerminalPlans> directPadTerminalPlans(
     return std::nullopt;
   }
   DirectPadTerminalPlans plans;
+  for (int64_t threads : {64, 128, 256}) {
+    if (!directPadCtaLegal(limits, threads)) {
+      continue;
+    }
+    if (ceilDiv(limits.max_output_elements, threads) >
+        ResizeParams::max_gdimx) {
+      // The terminal CTA preview describes only a physical BIDx grid.
+      // Preserve native coverage when any candidate needs a split grid.
+      return std::nullopt;
+    }
+    plans.cta_threads.push_back(threads);
+  }
+  if (plans.cta_threads.empty()) {
+    return std::nullopt;
+  }
   const auto branch = [&](bool keep) {
     std::string result = "{\"reorder_effect\":" +
         (keep ? pad.keep : pad.skip) + ",\"terminal_continuations\":[";
     bool first = true;
-    for (int64_t threads : {64, 128, 256}) {
-      if (!directPadCtaLegal(limits, threads)) {
-        continue;
-      }
-      if (ceilDiv(limits.max_output_elements, threads) >
-          ResizeParams::max_gdimx) {
-        // The existing terminal CTA preview describes only a physical BIDx
-        // grid. Keep the whole strict path in native coverage for split grids.
-        return std::string();
-      }
+    for (int64_t threads : plans.cta_threads) {
       ResizeParams candidate(base);
       candidate.largest_input = keep ? 0 : -1;
       candidate.cta_threads = threads;
       candidate.split_grid_x_dim = false;
+      const std::string plan = directPadCtaConsequence(pad, candidate);
+      plans.leaves.push_back({keep ? "keep" : "skip", threads, plan});
       if (!first) {
         result += ',';
       }
       first = false;
       result += "{\"cta_choice\":\"t" + std::to_string(threads) +
-          "\",\"plan\":" + directPadCtaConsequence(pad, candidate) + '}';
-    }
-    if (first) {
-      return std::string();
+          "\",\"plan\":" + plan + '}';
     }
     return result + "],\"pending_choices\":[\"RS1.cta\"]}";
   };
   plans.skip = branch(false);
   plans.keep = branch(true);
-  if (plans.skip.empty() || plans.keep.empty()) {
-    return std::nullopt;
-  }
-  for (int64_t threads : {64, 128, 256}) {
-    if (directPadCtaLegal(limits, threads)) {
-      plans.cta_threads.push_back(threads);
-    }
-  }
   return plans;
 }
+
+std::string directPadWidthConsequence(
+    int64_t width,
+    const DirectPadTerminalPlans& terminal) {
+  std::string result = "{\"selected_width\":" + std::to_string(width) +
+      ",\"terminal_continuations\":[";
+  bool first = true;
+  for (const auto& leaf : terminal.leaves) {
+    if (!first) {
+      result += ',';
+    }
+    first = false;
+    result += "{\"reorder_choice\":\"" + leaf.reorder_choice +
+        "\",\"cta_choice\":\"t" + std::to_string(leaf.cta_threads) +
+        "\",\"plan\":" + leaf.plan + '}';
+  }
+  return result +
+      "],\"pending_choices\":[\"RS1.reorder\",\"RS1.cta\"]}";
+}
+
+struct DirectPadWidthPreview {
+  int64_t width;
+  DirectPadReorderConsequences pad;
+  DirectPadTerminalPlans terminal;
+  std::string consequence;
+};
 
 } // namespace
 
@@ -683,68 +714,136 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
       data_cache,
       (int64_t)ref_tv->getLogicalDomain().size() - 1);
   params->vectorization_factor = layout_max;
+  std::optional<DirectPadCtaLimits> cta_limits;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    cta_limits = DirectPadCtaLimits{
+        max_num_elms,
+        layout_max,
+        layout_max,
+        device->warpSize,
+        device->maxThreadsDim[0],
+        device->maxThreadsPerBlock,
+        device->maxGridSize[0]};
+  }
+
+  // A strict width preview includes every reachable reorder and no-split CTA
+  // leaf. If any width lacks that proof, keep v3 in native coverage instead of
+  // asking a stateless model to infer the missing descendant effects.
+  std::optional<std::vector<DirectPadWidthPreview>> direct_pad_widths;
+  if (semantic_v3_resize && layout_max >= 1 && layout_max <= 128 &&
+      largest_output == ref_tv &&
+      params->largest_input == 0) {
+    std::vector<DirectPadWidthPreview> previews;
+    bool complete = true;
+    for (int64_t width = 1; width <= layout_max; ++width) {
+      if (layout_max % width != 0) {
+        continue;
+      }
+      auto pad = directPadReorderConsequences(
+          fusion, ref_tv, largest_input, runtime_info, width);
+      if (!pad || pad->write_elements != max_num_elms) {
+        complete = false;
+        break;
+      }
+      ResizeParams candidate(*params);
+      candidate.vectorization_factor = width;
+      auto limits = *cta_limits;
+      limits.vector_width = width;
+      auto terminal = directPadTerminalPlans(*pad, candidate, limits);
+      if (!terminal) {
+        complete = false;
+        break;
+      }
+      const std::string consequence =
+          directPadWidthConsequence(width, *terminal);
+      previews.push_back(
+          {width, std::move(*pad), std::move(*terminal), consequence});
+    }
+    if (complete && !previews.empty()) {
+      direct_pad_widths = std::move(previews);
+    }
+  }
 
   if (jev_mode != scheduler::jev::Mode::Off) {
     NVF_ERROR(
         layout_max >= 1 && layout_max <= 128,
         "RS1.width layout limit must be in 1..128");
 
-    // Workload measurements are sent as text with the hard width bound. No
-    // separate native winner is transmitted.
-    std::vector<scheduler::jev::ChoiceOption> options;
-    for (int64_t width = 1; width <= layout_max; ++width) {
-      if (layout_max % width != 0) {
-        continue;
+    if (semantic_v3_resize && !direct_pad_widths) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.width",
+          "direct rank-3 right Pad width continuations are unavailable");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t width = 1; width <= layout_max; ++width) {
+        if (layout_max % width != 0) {
+          continue;
+        }
+        std::string consequence;
+        if (direct_pad_widths) {
+          const auto& preview = direct_pad_widths->at(options.size());
+          NVF_ERROR(
+              preview.width == width,
+              "RS1.width strict candidate order disagrees with hard widths");
+          consequence = preview.consequence;
+        }
+        options.push_back({
+            "w" + std::to_string(width),
+            "Vectorize " + std::to_string(width) + " element(s) per thread",
+            consequence});
       }
-      options.push_back({
-          "w" + std::to_string(width),
-          "Vectorize " + std::to_string(width) + " element(s) per thread"});
+      const std::string state =
+          (direct_pad_widths ? "resize.width.v2\nlayout_max="
+                             : "resize.width.v1\nlayout_max=") +
+          std::to_string(layout_max) + "\ninput_elements=" + input_elements +
+          "\nmax_output_elements=" + std::to_string(max_num_elms) + '\n';
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? "w" + std::to_string(layout_max)
+          : std::string();
+      const std::string selected = scheduler::jev::chooseDecision(
+          "RS1.width", state, options, native_choice);
+      bool matched = false;
+      for (int64_t width = 1; width <= layout_max; ++width) {
+        if (layout_max % width != 0) {
+          continue;
+        }
+        if (selected == "w" + std::to_string(width)) {
+          params->vectorization_factor = width;
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "RS1.width response is outside native hard bounds");
     }
-    const std::string state =
-        "resize.width.v1\nlayout_max=" + std::to_string(layout_max) +
-        "\ninput_elements=" + input_elements +
-        "\nmax_output_elements=" + std::to_string(max_num_elms) + '\n';
-    const std::string native_choice =
-        jev_mode == scheduler::jev::Mode::Record
-        ? "w" + std::to_string(layout_max)
-        : std::string();
-    const std::string selected = scheduler::jev::chooseDecision(
-        "RS1.width", state, options, native_choice);
-    bool matched = false;
-    for (int64_t width = 1; width <= layout_max; ++width) {
-      if (layout_max % width != 0) {
-        continue;
-      }
-      if (selected == "w" + std::to_string(width)) {
-        params->vectorization_factor = width;
-        matched = true;
-        break;
-      }
-    }
-    NVF_ERROR(matched, "RS1.width response is outside native hard bounds");
   }
 
-  const auto direct_pad = semantic_v3_resize
-      ? directPadReorderConsequences(
-            fusion,
-            ref_tv,
-            largest_input,
-            runtime_info,
-            params->vectorization_factor)
-      : std::nullopt;
-  std::optional<DirectPadCtaLimits> cta_limits;
+  std::optional<DirectPadReorderConsequences> direct_pad;
   std::optional<DirectPadTerminalPlans> direct_pad_terminal;
-  if (jev_mode != scheduler::jev::Mode::Off) {
-    const auto* device = at::cuda::getCurrentDeviceProperties();
-    cta_limits = DirectPadCtaLimits{
-        max_num_elms,
-        layout_max,
-        params->vectorization_factor,
-        device->warpSize,
-        device->maxThreadsDim[0],
-        device->maxThreadsPerBlock,
-        device->maxGridSize[0]};
-    if (semantic_v3_resize && direct_pad && largest_output == ref_tv &&
+  if (cta_limits) {
+    cta_limits->vector_width = params->vectorization_factor;
+  }
+  if (semantic_v3_resize && direct_pad_widths) {
+    const auto preview = std::find_if(
+        direct_pad_widths->begin(),
+        direct_pad_widths->end(),
+        [&](const auto& candidate) {
+          return candidate.width == params->vectorization_factor;
+        });
+    NVF_ERROR(
+        preview != direct_pad_widths->end(),
+        "RS1.width selected width lacks a strict terminal continuation");
+    direct_pad = preview->pad;
+    direct_pad_terminal = preview->terminal;
+  } else if (semantic_v3_resize) {
+    direct_pad = directPadReorderConsequences(
+        fusion,
+        ref_tv,
+        largest_input,
+        runtime_info,
+        params->vectorization_factor);
+    if (direct_pad && largest_output == ref_tv &&
         direct_pad->write_elements == max_num_elms &&
         params->largest_input == 0) {
       direct_pad_terminal =
