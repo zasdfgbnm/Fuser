@@ -13,8 +13,11 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <unistd.h>
+
+#include <ATen/cuda/CUDAContext.h>
 
 #include "debug.h"
 #include "fusion.h"
@@ -27,6 +30,8 @@
 #include "scheduler/compile_time_info.h"
 #include "scheduler/compute_invocation_input.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/native_diagnostic_jsonl.h"
+#include "scheduler/pointwise_add_cta_continuation.h"
 #include "scheduler/pointwise_backend_route.h"
 #include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
@@ -1921,12 +1926,17 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     decision_log.seekg(log_start);
     std::string row;
     std::string pw2_row;
+    std::string cta_1d_row;
     std::string unroll_row;
     bool saw_unroll_choice = false;
     while (std::getline(decision_log, row)) {
       if (row.rfind("{\"site\":\"PW2\",", 0) == 0) {
         ASSERT_TRUE(pw2_row.empty());
         pw2_row = row;
+      }
+      if (row.rfind("{\"site\":\"PW3.cta_1d\",", 0) == 0) {
+        ASSERT_TRUE(cta_1d_row.empty());
+        cta_1d_row = row;
       }
       saw_unroll_choice |=
           row.rfind("{\"site\":\"PW3.unroll\",", 0) == 0;
@@ -1965,6 +1975,7 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
       EXPECT_EQ(params->break_point, 0);
       EXPECT_FALSE(saw_unroll_choice);
+      ASSERT_FALSE(cta_1d_row.empty());
       std::ifstream outcome_log(outcome_path);
       ASSERT_TRUE(outcome_log.good());
       outcome_log.seekg(outcome_start);
@@ -1987,6 +1998,122 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     } else {
       EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
       EXPECT_EQ(params->break_point, 0);
+    }
+
+    if (params->break_point == 0) {
+      ASSERT_FALSE(cta_1d_row.empty());
+      ASSERT_NE(results.kernel_executor, nullptr);
+      const auto launch = results.kernel_executor->lastLaunchParams();
+      const int64_t threads = params->lparams.bdimx();
+      const int64_t width = params->vectorization_factor;
+      EXPECT_EQ(launch.gdimx(), 1);
+      EXPECT_EQ(launch.gdimy(), 1);
+      EXPECT_EQ(launch.bdimx(), threads);
+      EXPECT_EQ(launch.bdimy(), 1);
+      EXPECT_EQ(params->unroll_factor_inner, 1);
+      EXPECT_THAT(
+          cta_1d_row,
+          ::testing::HasSubstr(
+              "\"tail_right_positions\":" +
+              std::to_string(threads * width - 32)));
+      const auto* device = at::cuda::getCurrentDeviceProperties();
+      const bool exact_carrier_device =
+          std::string_view(device->name) == "NVIDIA GeForce RTX 4090" &&
+          device->major == 8 && device->minor == 9 &&
+          device->multiProcessorCount == 128 && device->warpSize == 32;
+      if (exact_carrier_device) {
+        EXPECT_THAT(
+            cta_1d_row, ::testing::HasSubstr("pointwise.launch_1d.v2"));
+        for (const int64_t offered_threads : {32L, 64L, 128L}) {
+          const std::string option_id =
+              "\"id\":\"x" + std::to_string(offered_threads) + "\"";
+          const auto begin = cta_1d_row.find(option_id);
+          ASSERT_NE(begin, std::string::npos);
+          const auto next =
+              cta_1d_row.find("\"id\":\"x", begin + option_id.size());
+          const std::string candidate = cta_1d_row.substr(begin, next - begin);
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"final_pointwise_plan\":{\"tag\":\"Pointwise "
+                  "heuristics\",\"break_point\":0,\"split_block\":false,"
+                  "\"symbolic_1d_cta\":" +
+                  std::string(offered_threads == 128 ? "false" : "true")));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"vectorization_factor\":" + std::to_string(width)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"unroll_factor_outer\":1,\"unroll_factor_inner\":1"));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"raw_launch\":{\"grid_x\":-1,\"grid_y\":-1,"
+                  "\"grid_z\":-1,\"block_x\":" +
+                  std::to_string(offered_threads)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"effective_launch\":{\"grid_x\":1,\"grid_y\":1,"
+                  "\"grid_z\":1,\"block_x\":" +
+                  std::to_string(offered_threads) + ",\"block_y\":1,"));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"right_work\":{\"right_elems\":32,"
+                  "\"right_positions_per_cta\":" +
+                  std::to_string(offered_threads * width)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"tail_right_positions\":" +
+                  std::to_string(offered_threads * width - 32)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"pending_choices\":[],\"continuation\":{"
+                  "\"schema\":\"nvfuser.pw3.cta_1d.add2x16.v1\","));
+          EXPECT_THAT(
+              candidate, ::testing::HasSubstr("\"unroll_bound\":1"));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr("\"unroll_kind\":\"no_choice\""));
+          if (offered_threads == threads) {
+            scheduler::native_diagnostic::Object actual_plan;
+            actual_plan.add("tag", params->tag);
+            actual_plan.add("break_point", params->break_point);
+            actual_plan.add("split_block", params->split_block);
+            actual_plan.add("symbolic_1d_cta", params->symbolic_1d_cta);
+            actual_plan.add("split_grid_y_dim", params->split_grid_y_dim);
+            actual_plan.add("flip_grid_binding", params->flip_grid_binding);
+            actual_plan.add(
+                "vectorization_factor", params->vectorization_factor);
+            actual_plan.add("vectorize_casts", params->vectorize_casts);
+            actual_plan.add(
+                "unroll_factor_outer", params->unroll_factor_outer);
+            actual_plan.add(
+                "unroll_factor_inner", params->unroll_factor_inner);
+            actual_plan.add("use_tma_load", params->use_tma_load);
+            actual_plan.add("use_tma_store", params->use_tma_store);
+            actual_plan.add("tma_domain_inner", params->tma_domain_inner);
+            actual_plan.add("tma_tile_outer", params->tma_tile_outer);
+            actual_plan.add("tma_tile_inner", params->tma_tile_inner);
+            if (params->cparams.index_type.has_value()) {
+              actual_plan.add(
+                  "index_type",
+                  static_cast<int64_t>(*params->cparams.index_type));
+            } else {
+              actual_plan.addRaw("index_type", "null");
+            }
+            EXPECT_THAT(
+                candidate,
+                ::testing::HasSubstr(
+                    "\"final_pointwise_plan\":" + actual_plan.str()));
+          }
+        }
+      }
     }
 
     // The forced bp1_normal/w1/x1 path makes PW3.unroll terminal for this
@@ -2061,6 +2188,83 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       EXPECT_THAT(candidate, ::testing::HasSubstr("\"pending_choices\":[]"));
     }
   }
+}
+
+TEST_F(PointwiseTest, AddCtaBoundedContinuation) {
+  using pointwise::non_tma::addCtaContinuation;
+  for (const int64_t width : {1L, 2L, 4L}) {
+    for (const int64_t threads : {32L, 64L, 128L}) {
+      const auto c = addCtaContinuation(32, width, threads, 1);
+      ASSERT_TRUE(c.has_value()) << width << ',' << threads;
+      EXPECT_EQ(c->source_total_blocks, 1);
+      EXPECT_EQ(c->unroll_bound, 1);
+      EXPECT_EQ(c->effective_grid_x, 1);
+      EXPECT_EQ(c->covered_right_positions, threads * width);
+      EXPECT_EQ(c->tail_right_positions, threads * width - 32);
+    }
+  }
+  EXPECT_FALSE(addCtaContinuation(34, 1, 32, 1).has_value());
+  EXPECT_FALSE(addCtaContinuation(32, 8, 32, 1).has_value());
+  EXPECT_FALSE(addCtaContinuation(32, 1, 16, 1).has_value());
+  EXPECT_FALSE(addCtaContinuation(32, 1, 32, 2).has_value());
+}
+
+TEST_F(PointwiseTest, AddCtaNonzeroStorageOffsetKeepsConditionalPreview_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (std::string_view(device->name) != "NVIDIA GeForce RTX 4090" ||
+      device->major != 8 || device->minor != 9 ||
+      device->multiProcessorCount != 128 || device->warpSize != 32) {
+    GTEST_SKIP() << "The bounded Add continuation is scoped to RTX 4090";
+  }
+  char log_path[] = "/tmp/nvfuser-pw3-cta-offset-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto backing = at::randn(
+      {36}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  const auto tensor = backing.narrow(0, 4, 32).view({2, 16});
+  ASSERT_EQ(tensor.storage_offset(), 4);
+  ASSERT_EQ(tensor.stride(0), 16);
+  ASSERT_EQ(tensor.stride(1), 1);
+  auto results = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+
+  std::ifstream decisions(log_path);
+  ASSERT_TRUE(decisions.good());
+  std::string row;
+  bool saw_cta = false;
+  while (std::getline(decisions, row)) {
+    if (row.rfind("{\"site\":\"PW3.cta_1d\",", 0) != 0) {
+      continue;
+    }
+    saw_cta = true;
+    EXPECT_THAT(row, ::testing::HasSubstr("pointwise.launch_1d.v1"));
+    EXPECT_THAT(row, ::testing::Not(::testing::HasSubstr(
+                         "nvfuser.pw3.cta_1d.add2x16.v1")));
+  }
+  EXPECT_TRUE(saw_cta);
 }
 
 // The two structured protocols must describe the same conditional work for

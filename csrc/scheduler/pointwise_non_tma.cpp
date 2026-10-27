@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string_view>
 #include <utility>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -17,12 +18,14 @@
 
 #include "debug.h"
 #include "exceptions.h"
+#include "ir/internal_nodes.h"
 #include "ir/printer.h"
 #include "multidevice/utils.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/native_diagnostic_jsonl.h"
+#include "scheduler/pointwise_add_cta_continuation.h"
 #include "scheduler/pointwise_unroll_envelope.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -36,6 +39,87 @@ namespace {
 // constexpr int64_t x_grid_limit = ((int64_t)1 << (int64_t)31) - (int64_t)1;
 // Unused at the moment, commenting for clang tidy
 constexpr int64_t kThreadX = 128;
+
+bool isExactSm89Add2x16Carrier(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const cudaDeviceProp* device) {
+  if (device == nullptr ||
+      std::string_view(device->name) != "NVIDIA GeForce RTX 4090" ||
+      device->major != 8 || device->minor != 9 ||
+      device->multiProcessorCount != 128 || device->warpSize != 32 ||
+      prop.n_elems != 32 || prop.elem_counts != std::vector<int64_t>{2, 16} ||
+      prop.has_reshapes ||
+      prop.min_dtype_size_bit_for_vectorization != 32 ||
+      prop.max_dtype_size_bit_for_vectorization != 32 ||
+      fusion->inputs().size() != 1 || fusion->outputs().size() != 1 ||
+      fusion->exprs().size() != 1 || fusion->allTvs().size() != 2) {
+    return false;
+  }
+  auto* input = dynamic_cast<TensorView*>(fusion->inputs().front());
+  auto* output = dynamic_cast<TensorView*>(fusion->outputs().front());
+  auto* expr = dynamic_cast<BinaryOp*>(fusion->exprs().front());
+  if (input == nullptr || output == nullptr || expr == nullptr ||
+      input->getDataType() != DataType::Float ||
+      output->getDataType() != DataType::Float ||
+      expr->getBinaryOpType() != BinaryOpType::Add || expr->lhs() != input ||
+      expr->rhs() != input || expr->out() != output ||
+      fusion->getOutputAlias(output).type != AllocationType::New ||
+      fusion->getOutputAlias(output).aliased_io != nullptr ||
+      fusion->getOutputAlias(output).visibility !=
+          OutputVisibility::kVisible) {
+    return false;
+  }
+  const auto plain_tv = [](TensorView* tv) {
+    return tv->getMemoryType() == MemoryType::Global &&
+        !tv->hasDeviceMesh() && !tv->isCpuScalar() && !tv->hasAllocation() &&
+        tv->getLogicalDomain().size() == 2 &&
+        tv->getMaybeRootDomain() == tv->getLogicalDomain() &&
+        tv->getLoopDomain() == tv->getLogicalDomain() &&
+        tv->getMaybeAllocationDomain() == tv->getLogicalDomain() &&
+        tv->domain()->allExprs().empty() &&
+        tv->getContiguity().size() == 2 &&
+        std::ranges::all_of(tv->getContiguity(), [](const auto& contiguous) {
+          return contiguous.has_value() && *contiguous;
+        }) &&
+        std::ranges::all_of(tv->getLogicalDomain(), [](const IterDomain* axis) {
+          return axis->isIteration() && !axis->isReduction() &&
+              !axis->isBroadcast() && !axis->isStride() &&
+              !axis->isSymbolic() && !axis->isDeviceDim() &&
+              !axis->hasExpandedExtent() && !axis->isParallelized();
+        });
+  };
+  if (!plain_tv(input) || !plain_tv(output)) {
+    return false;
+  }
+  // SchedulerRuntimeInfo exposes effective input sizes, strides and pointer
+  // alignment, but not the original storage offset. The complete v3 snapshot
+  // has that raw fact; require its exact zero-offset input line here so this
+  // narrow source certificate matches the stateless server's carrier gate.
+  const std::string_view snapshot =
+      scheduler::jev::computeInvocationInputSnapshot();
+  if (!snapshot.starts_with("nvfuser.compute_invocation_input.v2\n")) {
+    return false;
+  }
+  const auto line_begin = snapshot.find("\ninput 0 ");
+  const auto line_end = line_begin == std::string_view::npos
+      ? std::string_view::npos
+      : snapshot.find('\n', line_begin + 1);
+  if (line_end == std::string_view::npos ||
+      snapshot.substr(line_begin, line_end - line_begin)
+              .find(
+                  "input 0 dtype 5:float tensor scalar_type 6 device "
+                  "6:cuda:0 storage_offset 0 sizes 2 2 16 strides 2 16 1 "
+                  "alignment_bits ") == std::string_view::npos) {
+    return false;
+  }
+  return runtime_info.getInputAllocationSizes(input) ==
+          std::vector<int64_t>{2, 16} &&
+      runtime_info.getInputAllocationStrides(input) ==
+          std::vector<int64_t>{16, 1} &&
+      runtime_info.getAlignmentSizeBit(input) >= 128;
+}
 
 struct PointwiseUnrollTerminalInput {
   const PointwiseParams& base;
@@ -55,7 +139,8 @@ struct PointwiseUnrollTerminalInput {
 // the grid dimensions materialized by the scheduled kernel.
 std::string pointwiseUnrollTerminalConsequence(
     const PointwiseUnrollTerminalInput& input,
-    int64_t factor) {
+    int64_t factor,
+    std::string_view continuation_json = {}) {
   NVF_ERROR(factor > 0 && input.bdimx > 0 && input.bdimy > 0);
   PointwiseParams candidate(input.base);
   candidate.break_point = input.break_point;
@@ -157,6 +242,9 @@ std::string pointwiseUnrollTerminalConsequence(
   consequence.addRaw("effective_launch", effective_launch.str());
   consequence.addRaw("right_work", right_work.str());
   consequence.addRaw("pending_choices", "[]");
+  if (!continuation_json.empty()) {
+    consequence.addRaw("continuation", continuation_json);
+  }
   return consequence.str();
 }
 
@@ -727,6 +815,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
       }
       const bool semantic = scheduler::jev::semanticProtocolEnabled();
       const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+      const bool exact_add_continuation = semantic_v3 &&
+          isExactSm89Add2x16Carrier(fusion, runtime_info, prop, dev_prop);
       if (semantic_v3) {
         NVF_ERROR(
             vectorization_factor > 0 && n_elems > 0 &&
@@ -739,23 +829,65 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
           const int64_t grid_x = ceilDiv(vector_iterations, threads);
           const int64_t blocks_per_sm =
               dev_prop->maxThreadsPerMultiProcessor / threads;
-          option.consequence_json =
-              "{\"threads\":" + std::to_string(threads) +
-              ",\"vector_iterations\":" +
-              std::to_string(vector_iterations) +
-              ",\"grid_x_if_unrolled_one\":" + std::to_string(grid_x) +
-              ",\"floor_divided_unroll_blocks\":" +
-              std::to_string(ceilDiv(n_elems / vectorization_factor, threads)) +
-              ",\"blocks_per_sm_thread_limit\":" +
-              std::to_string(blocks_per_sm) +
-              ",\"thread_limit_waves_if_unrolled_one\":" +
-              std::to_string(ceilDiv(
-                  grid_x, blocks_per_sm * device_multiprocessor_count)) +
-              ",\"tail_elements\":" +
-              std::to_string(n_elems % (vectorization_factor * threads)) +
-              ",\"symbolic_thread_split\":" +
-              std::string(threads == kThreadX ? "false" : "true") +
-              ",\"unroll_status\":\"pending\"}";
+          if (exact_add_continuation) {
+            const auto continuation = addCtaContinuation(
+                n_elems,
+                vectorization_factor,
+                threads,
+                fusion->exprs().size());
+            NVF_ERROR(
+                continuation.has_value(),
+                "PW3.cta_1d exact Add continuation lost its bounded u1 path");
+            PointwiseParams candidate_base(*params);
+            candidate_base.symbolic_1d_cta = threads != kThreadX;
+            const PointwiseUnrollTerminalInput terminal_input{
+                candidate_base,
+                n_elems,
+                n_elems,
+                /*break_point=*/0,
+                threads,
+                /*bdimy=*/1,
+                /*gdim_left=*/1,
+                grid_x,
+                /*flip_grid_binding=*/false,
+                /*outer_broadcast_dominated=*/false};
+            using scheduler::native_diagnostic::Object;
+            Object grammar;
+            grammar.add("schema", "nvfuser.pw3.cta_1d.add2x16.v1");
+            grammar.add(
+                "unroll_total_blocks", continuation->source_total_blocks);
+            grammar.add("unroll_bound", continuation->unroll_bound);
+            grammar.add("unroll_choice", "u1");
+            grammar.add("unroll_kind", "no_choice");
+            grammar.add(
+                "unroll_bound_formula",
+                "min(max(1,ceil(floor(N/W)/X)),64,max(1,floor(8192/E/W)))");
+            grammar.add(
+                "effective_grid_x_formula",
+                "ceil(ceil(ceil(N/W)/X)/U)");
+            grammar.add(
+                "right_tail_formula", "grid_x*X*W*U-N");
+            option.consequence_json = pointwiseUnrollTerminalConsequence(
+                terminal_input, /*factor=*/1, grammar.str());
+          } else {
+            option.consequence_json =
+                "{\"threads\":" + std::to_string(threads) +
+                ",\"vector_iterations\":" +
+                std::to_string(vector_iterations) +
+                ",\"grid_x_if_unrolled_one\":" + std::to_string(grid_x) +
+                ",\"floor_divided_unroll_blocks\":" +
+                std::to_string(ceilDiv(n_elems / vectorization_factor, threads)) +
+                ",\"blocks_per_sm_thread_limit\":" +
+                std::to_string(blocks_per_sm) +
+                ",\"thread_limit_waves_if_unrolled_one\":" +
+                std::to_string(ceilDiv(
+                    grid_x, blocks_per_sm * device_multiprocessor_count)) +
+                ",\"tail_elements\":" +
+                std::to_string(n_elems % (vectorization_factor * threads)) +
+                ",\"symbolic_thread_split\":" +
+                std::string(threads == kThreadX ? "false" : "true") +
+                ",\"unroll_status\":\"pending\"}";
+          }
         }
       }
       std::string state;
@@ -808,7 +940,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
         }
         state += "]}}";
       } else {
-        state = "pointwise.launch_1d.v1\n";
+        state = exact_add_continuation ? "pointwise.launch_1d.v2\n"
+                                       : "pointwise.launch_1d.v1\n";
         state += "n_elems=" + std::to_string(n_elems) + '\n';
         state += "vector_width=" + std::to_string(vectorization_factor) + '\n';
         state += "warp_size=" + std::to_string(warp_size) + '\n';
@@ -820,6 +953,13 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
             std::to_string(dev_prop->maxThreadsPerMultiProcessor) + '\n';
         state +=
             "max_grid_x=" + std::to_string(dev_prop->maxGridSize[0]) + '\n';
+        if (exact_add_continuation) {
+          state += "carrier=sm89_fp32_add_2x16\n";
+          state += "expr_count=1\n";
+          state += "unroll_max_cap=64\n";
+          state += "unroll_expr_width_budget=8192\n";
+          state += "right_elems=32\n";
+        }
       }
       const std::string native_choice =
           jev_mode == scheduler::jev::Mode::Record ? "x128" : "";
