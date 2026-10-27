@@ -107,4 +107,43 @@ constexpr std::optional<AddCtaContinuation> addCtaContinuation(
       covered - n_elems};
 }
 
+struct AddWidthContinuation {
+  int64_t cta_count;
+  int64_t terminal_leaf_count;
+  int64_t max_unroll_bound;
+};
+
+// Count the complete bounded descendants of one width without constructing
+// or scheduling any losing CTA branch. The exact carrier has three 1D CTA
+// leaves, or all 128 source-hard-valid 2D CTA splits with 1..B unroll leaves.
+constexpr std::optional<AddWidthContinuation> addWidthContinuation(
+    int64_t break_point,
+    int64_t width) {
+  if (break_point == 0) {
+    int64_t leaves = 0;
+    for (const int64_t x : {32L, 64L, 128L}) {
+      const auto c = addCtaContinuation(32, width, x, 1);
+      if (!c.has_value()) {
+        return std::nullopt;
+      }
+      leaves += c->unroll_bound;
+    }
+    return AddWidthContinuation{3, leaves, 1};
+  }
+  if (break_point == 1) {
+    int64_t leaves = 0;
+    int64_t max_bound = 0;
+    for (int64_t x = 1; x <= 128; ++x) {
+      const auto c = addLaunch2DContinuation(2, 16, width, x, 1);
+      if (!c.has_value()) {
+        return std::nullopt;
+      }
+      leaves += c->unroll_bound;
+      max_bound = std::max(max_bound, c->unroll_bound);
+    }
+    return AddWidthContinuation{128, leaves, max_bound};
+  }
+  return std::nullopt;
+}
+
 } // namespace nvfuser::pointwise::non_tma

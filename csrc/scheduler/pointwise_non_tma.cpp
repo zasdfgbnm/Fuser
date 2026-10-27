@@ -49,6 +49,10 @@ bool isExactSm89Add2x16Carrier(
       std::string_view(device->name) != "NVIDIA GeForce RTX 4090" ||
       device->major != 8 || device->minor != 9 ||
       device->multiProcessorCount != 128 || device->warpSize != 32 ||
+      device->maxThreadsPerBlock != 1024 ||
+      device->maxThreadsPerMultiProcessor != 1536 ||
+      device->maxThreadsDim[0] < 128 || device->maxThreadsDim[1] < 128 ||
+      device->maxGridSize[0] < 16 || device->maxGridSize[1] < 16 ||
       prop.n_elems != 32 || prop.elem_counts != std::vector<int64_t>{2, 16} ||
       prop.has_reshapes || prop.index_type != PrimDataType::Int32 ||
       prop.min_dtype_size_bit_for_vectorization != 32 ||
@@ -565,6 +569,19 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
 
   const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
       prop.largest_out, prop.has_reshapes, data_cache);
+  // The exact Add carrier can be certified from the input snapshot before a
+  // width is chosen. Reuse this fact for the later CTA continuation without
+  // speculatively executing any child heuristic.
+  bool exact_add_continuation =
+      jev_mode != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticV3Enabled() && isExactSm89Add2x16Carrier(
+          fusion,
+          runtime_info,
+          prop,
+          at::cuda::getCurrentDeviceProperties()) &&
+      (bp_info.break_point == 0 ||
+       (bp_info.break_point == 1 && bp_info.right_elem_count == 16 &&
+        !bp_info.is_outer_broadcast_dominated));
   int64_t vectorization_factor = 0;
   if (jev_mode != scheduler::jev::Mode::Remote || block_quantization) {
     // Block quantization retains the native width in Remote mode as well:
@@ -614,6 +631,11 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
           {"w" + std::to_string(width),
            "Vectorize " + std::to_string(width) + " element(s) per thread"});
     }
+    // The narrow source certificate and stateless verifier both require the
+    // complete dense FP32 width menu; decline its annotation if the layout
+    // analyzer ever returns a different hard bound for this runtime.
+    exact_add_continuation &=
+        layout_max == 4 && first_width == 1 && options.size() == 3;
     // Current nvFuser returns layout_max if the byte floor exceeds it; the
     // singleton preserves that existing behavior until the source TODO is
     // resolved. In the normal case all options satisfy both hard constraints.
@@ -648,7 +670,81 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
               ",\"grid_right_if_128\":" +
               std::to_string(ceil_quotient(right_elems, width * kThreadX));
         }
-        consequence += ",\"unroll_status\":\"pending\"}";
+        consequence += exact_add_continuation
+            ? ",\"unroll_status\":\"bounded_by_cta\"}"
+            : ",\"unroll_status\":\"pending\"}";
+        if (exact_add_continuation) {
+          const auto bounded =
+              addWidthContinuation(bp_info.break_point, width);
+          NVF_ERROR(
+              bounded.has_value(),
+              "PW3.width exact Add continuation lost its bounded CTA menu");
+          using scheduler::native_diagnostic::Object;
+          Object grammar;
+          const bool two_dimensional = bp_info.break_point == 1;
+          grammar.add("schema", "nvfuser.pw3.width.add2x16.v1");
+          grammar.add("plan_scope", "ordinary_pointwise_branch");
+          grammar.add("break_point", static_cast<int64_t>(bp_info.break_point));
+          grammar.add(
+              "grid_binding",
+              two_dimensional
+                  ? (bp_info.flip_grid_binding ? "flipped" : "normal")
+                  : "one_dimensional");
+          grammar.add("left_elems", two_dimensional ? int64_t{2} : int64_t{0});
+          grammar.add("right_elems", right_elems);
+          grammar.add("vector_width", width);
+          grammar.add(
+              "cta_choice_site",
+              two_dimensional ? "PW3.launch" : "PW3.cta_1d");
+          grammar.add(
+              "cta_choices_kind",
+              two_dimensional ? "integer_range" : "warp_powers_of_two");
+          grammar.add("cta_range_low", two_dimensional ? int64_t{1}
+                                                       : int64_t{32});
+          grammar.add("cta_range_high", int64_t{128});
+          grammar.add("cta_count", bounded->cta_count);
+          grammar.add("terminal_leaf_count", bounded->terminal_leaf_count);
+          grammar.add("max_unroll_bound", bounded->max_unroll_bound);
+          grammar.add("unroll_range_low", int64_t{1});
+          grammar.add(
+              "unroll_choices_kind",
+              two_dimensional ? "integer_1_to_B_or_no_choice"
+                              : "no_choice_u1");
+          grammar.add(
+              "cta_y_formula", two_dimensional ? "floor(128/X)" : "1");
+          if (two_dimensional) {
+            grammar.add("preliminary_left_formula", "ceil(2/Y)");
+            grammar.add("preliminary_right_formula", "ceil(ceil(16/W)/X)");
+            grammar.add(
+                "unroll_bound_formula",
+                "min(max(1,L*R),64,max(1,floor(8192/E/W)))");
+            grammar.add("post_unroll_right_formula", "ceil(R/U)");
+            grammar.add(
+                "effective_grid_x_formula",
+                bp_info.flip_grid_binding ? "L" : "ceil(R/U)");
+            grammar.add(
+                "effective_grid_y_formula",
+                bp_info.flip_grid_binding ? "ceil(R/U)" : "L");
+            grammar.add("right_coverage_formula", "ceil(R/U)*X*W*U");
+            grammar.add("right_tail_formula", "right_coverage-16");
+          } else {
+            grammar.add(
+                "unroll_bound_formula", "ceil(floor(32/W)/X)");
+            grammar.add(
+                "effective_grid_x_formula", "ceil(ceil(ceil(32/W)/X)/U)");
+            grammar.add("effective_grid_y_formula", "1");
+            grammar.add("right_coverage_formula", "grid_x*X*W*U");
+            grammar.add("right_tail_formula", "right_coverage-32");
+          }
+          grammar.add("grid_split_status", "none_for_carrier");
+          consequence.pop_back();
+          consequence +=
+              ",\"continuation\":" + grammar.str() +
+              ",\"pending_choices\":" +
+              (two_dimensional
+                   ? std::string("[\"PW3.launch\",\"PW3.unroll\"]}")
+                   : std::string("[\"PW3.cta_1d\"]}"));
+        }
         options.at(option_index++).consequence_json = std::move(consequence);
       }
     }
@@ -722,7 +818,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
       }
       state += "]}}";
     } else {
-      state = "pointwise.width.v1\n";
+      state = exact_add_continuation ? "pointwise.width.v2\n"
+                                     : "pointwise.width.v1\n";
       state += "layout_max=" + std::to_string(layout_max) + '\n';
       state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
       state += "max_dtype_bits=" +
@@ -731,6 +828,21 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
           std::to_string(vectorizable_inputs_outputs.size()) + '\n';
       state += "n_elems=" + std::to_string(n_elems) + '\n';
       state += "sm_count=" + std::to_string(device_multiprocessor_count) + '\n';
+      if (exact_add_continuation) {
+        state += "carrier=sm89_fp32_add_2x16\n";
+        state += "break_point=" + std::to_string(bp_info.break_point) + '\n';
+        state += "flip_grid_binding=" +
+            std::to_string(static_cast<int>(bp_info.flip_grid_binding)) + '\n';
+        state += "left_elems=" +
+            std::to_string(bp_info.break_point == 0 ? 0 : 2) + '\n';
+        state += "right_elems=" +
+            std::to_string(bp_info.break_point == 0 ? 32 : 16) + '\n';
+        state += "expr_count=1\n";
+        state += "cta_threads=128\n";
+        state += "unroll_max_cap=64\n";
+        state += "unroll_expr_width_budget=8192\n";
+        state += "grid_split_status=none_for_carrier\n";
+      }
     }
     const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
         ? "w" + std::to_string(vectorization_factor)
@@ -767,13 +879,6 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   params->vectorization_factor = vectorization_factor;
 
   // Calculate block and grid configuration based on break point
-  const bool exact_add_continuation =
-      jev_mode != scheduler::jev::Mode::Off &&
-      scheduler::jev::semanticV3Enabled() && isExactSm89Add2x16Carrier(
-          fusion,
-          runtime_info,
-          prop,
-          at::cuda::getCurrentDeviceProperties());
   auto config = pointwise_utils::getBlockGridConfig(
       prop,
       bp_info,

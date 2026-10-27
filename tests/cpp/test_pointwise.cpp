@@ -1926,6 +1926,7 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     decision_log.seekg(log_start);
     std::string row;
     std::string pw2_row;
+    std::string width_row;
     std::string cta_1d_row;
     std::string launch_row;
     std::string unroll_row;
@@ -1938,6 +1939,10 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       if (row.rfind("{\"site\":\"PW3.cta_1d\",", 0) == 0) {
         ASSERT_TRUE(cta_1d_row.empty());
         cta_1d_row = row;
+      }
+      if (row.rfind("{\"site\":\"PW3.width\",", 0) == 0) {
+        ASSERT_TRUE(width_row.empty());
+        width_row = row;
       }
       if (row.rfind("{\"site\":\"PW3.launch\",", 0) == 0) {
         ASSERT_TRUE(launch_row.empty());
@@ -2010,6 +2015,56 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
         std::string_view(device->name) == "NVIDIA GeForce RTX 4090" &&
         device->major == 8 && device->minor == 9 &&
         device->multiProcessorCount == 128 && device->warpSize == 32;
+    if (exact_carrier_device) {
+      ASSERT_FALSE(width_row.empty());
+      EXPECT_THAT(width_row, ::testing::HasSubstr("pointwise.width.v2"));
+      EXPECT_THAT(
+          width_row,
+          ::testing::HasSubstr(
+              "\"selected\":\"w" +
+              std::to_string(params->vectorization_factor) + "\""));
+      for (const int64_t offered_width : {1L, 2L, 4L}) {
+        const std::string option_id =
+            "\"id\":\"w" + std::to_string(offered_width) + "\"";
+        const auto begin = width_row.find(option_id);
+        ASSERT_NE(begin, std::string::npos);
+        const auto next =
+            width_row.find("\"id\":\"w", begin + option_id.size());
+        const std::string card = width_row.substr(begin, next - begin);
+        const bool two_dimensional = params->break_point == 1;
+        const int64_t leaves = !two_dimensional
+            ? 3
+            : offered_width == 1 ? 237 : offered_width == 2 ? 208 : 197;
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"schema\":\"nvfuser.pw3.width.add2x16.v1\""));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"terminal_leaf_count\":" + std::to_string(leaves)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"cta_count\":" +
+                std::to_string(two_dimensional ? 128 : 3)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"grid_binding\":\"" +
+                std::string(
+                    !two_dimensional ? "one_dimensional"
+                                     : params->flip_grid_binding ? "flipped"
+                                                                 : "normal") +
+                "\""));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                two_dimensional
+                    ? "\"pending_choices\":[\"PW3.launch\",\"PW3.unroll\"]"
+                    : "\"pending_choices\":[\"PW3.cta_1d\"]"));
+      }
+    }
     if (params->break_point == 0) {
       ASSERT_FALSE(cta_1d_row.empty());
       ASSERT_NE(results.kernel_executor, nullptr);
@@ -2395,7 +2450,13 @@ TEST_F(PointwiseTest, AddCtaBoundedContinuation) {
 
 TEST_F(PointwiseTest, AddLaunch2DBoundedContinuation) {
   using pointwise::non_tma::addLaunch2DContinuation;
+  using pointwise::non_tma::addWidthContinuation;
   for (const int64_t width : {1L, 2L, 4L}) {
+    const auto one_dimensional = addWidthContinuation(0, width);
+    ASSERT_TRUE(one_dimensional.has_value());
+    EXPECT_EQ(one_dimensional->cta_count, 3);
+    EXPECT_EQ(one_dimensional->terminal_leaf_count, 3);
+    EXPECT_EQ(one_dimensional->max_unroll_bound, 1);
     int64_t terminal_count = 0;
     for (int64_t x = 1; x <= 128; ++x) {
       const auto c = addLaunch2DContinuation(2, 16, width, x, 1);
@@ -2417,7 +2478,15 @@ TEST_F(PointwiseTest, AddLaunch2DBoundedContinuation) {
       }
     }
     EXPECT_EQ(terminal_count, width == 1 ? 237 : width == 2 ? 208 : 197);
+    const auto two_dimensional = addWidthContinuation(1, width);
+    ASSERT_TRUE(two_dimensional.has_value());
+    EXPECT_EQ(two_dimensional->cta_count, 128);
+    EXPECT_EQ(two_dimensional->terminal_leaf_count, terminal_count);
+    EXPECT_EQ(two_dimensional->max_unroll_bound,
+              width == 1 ? 16 : width == 2 ? 8 : 4);
   }
+  EXPECT_FALSE(addWidthContinuation(2, 1).has_value());
+  EXPECT_FALSE(addWidthContinuation(0, 8).has_value());
   EXPECT_FALSE(addLaunch2DContinuation(3, 16, 1, 1, 1).has_value());
   EXPECT_FALSE(addLaunch2DContinuation(2, 16, 8, 1, 1).has_value());
   EXPECT_FALSE(addLaunch2DContinuation(2, 16, 1, 129, 1).has_value());
@@ -2469,8 +2538,17 @@ TEST_F(PointwiseTest, AddCtaNonzeroStorageOffsetKeepsConditionalPreview_CUDA) {
   std::ifstream decisions(log_path);
   ASSERT_TRUE(decisions.good());
   std::string row;
+  bool saw_width = false;
   bool saw_cta = false;
   while (std::getline(decisions, row)) {
+    if (row.rfind("{\"site\":\"PW3.width\",", 0) == 0) {
+      saw_width = true;
+      EXPECT_THAT(row, ::testing::HasSubstr("pointwise.width.v1"));
+      EXPECT_THAT(
+          row,
+          ::testing::Not(::testing::HasSubstr(
+              "nvfuser.pw3.width.add2x16.v1")));
+    }
     if (row.rfind("{\"site\":\"PW3.cta_1d\",", 0) != 0) {
       continue;
     }
@@ -2479,6 +2557,7 @@ TEST_F(PointwiseTest, AddCtaNonzeroStorageOffsetKeepsConditionalPreview_CUDA) {
     EXPECT_THAT(row, ::testing::Not(::testing::HasSubstr(
                          "nvfuser.pw3.cta_1d.add2x16.v1")));
   }
+  EXPECT_TRUE(saw_width);
   EXPECT_TRUE(saw_cta);
 }
 
