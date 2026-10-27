@@ -6,11 +6,16 @@
  */
 // clang-format on
 #include <algorithm>
+#include <array>
 #include <complex>
 #include <cstdlib>
+#include <fstream>
+#include <optional>
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <vector>
+#include <unistd.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
@@ -45,6 +50,7 @@
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/all_schedulers.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/reduction_non_tma.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/utils.h"
@@ -61,6 +67,27 @@ using namespace at::indexing;
 using Gpu1Test = NVFuserTest;
 
 namespace {
+
+class ScopedJevEnv {
+ public:
+  ScopedJevEnv(const char* name, const char* value) : name_(name) {
+    if (const char* previous = std::getenv(name)) {
+      previous_ = previous;
+    }
+    NVF_CHECK(::setenv(name, value, 1) == 0);
+  }
+  ~ScopedJevEnv() {
+    if (previous_.has_value()) {
+      ::setenv(name_.c_str(), previous_->c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
 
 // Exact alternate caps are fixtures for the numeric harness, not a contract
 // for an arbitrary remote decision server.
@@ -6117,6 +6144,107 @@ TEST_F(Gpu1Test, JevAlternateInner3dWorkSplit_CUDA) {
       __FILE__,
       "",
       results.heuristic_params->lparams);
+}
+
+TEST(ReductionInner3DWaveTarget, DeduplicatesEquivalentCaps) {
+  using reduction::non_tma::Inner3DWaveCandidate;
+  using reduction::non_tma::Inner3DWaveTarget;
+  const auto check = [](int64_t n_elems,
+                        int64_t uncapped_blocks,
+                        int64_t initial_threads,
+                        const std::array<Inner3DWaveTarget, 3>& expected,
+                        const std::vector<int64_t>& retained) {
+    std::vector<Inner3DWaveCandidate> candidates;
+    for (int64_t waves : {2, 4, 8}) {
+      candidates.push_back(
+          {waves,
+           reduction::non_tma::previewInner3DWaveTarget(
+               n_elems, uncapped_blocks, initial_threads, 4, 4, 8, 128, 1536,
+               waves)});
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      EXPECT_EQ(candidates[i].target, expected[i]);
+    }
+    std::vector<int64_t> actual;
+    for (const auto& candidate :
+         reduction::non_tma::distinctInner3DWaveCandidates(candidates)) {
+      actual.push_back(candidate.waves);
+    }
+    EXPECT_EQ(actual, retained);
+  };
+  // The retained c21 geometry has three hard-valid caps with one effect.
+  check(512 * 32, 128, 64, {{{128, 32}, {128, 32}, {128, 32}}}, {4});
+  // Waves4 and waves8 tie, while waves2 remains distinct.
+  check(512 * 96, 384, 64, {{{256, 48}, {384, 32}, {384, 32}}}, {2, 4});
+  // The existing forced-wave numerical fixture retains all three choices.
+  check(1024 * 65, 520, 128, {{{256, 72}, {512, 40}, {520, 32}}},
+        {2, 4, 8});
+}
+
+TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->multiProcessorCount != 128 ||
+      device->maxThreadsPerMultiProcessor != 1536 ||
+      device->maxThreadsPerBlock != 1024) {
+    GTEST_SKIP() << "The retained no-op witness needs SM128 and 1536 threads/SM";
+  }
+  char log_path[] = "/tmp/nvfuser-rd5-wave-dedup-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedJevEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedJevEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(3);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input));
+  const auto tensor = at::empty(
+      {4, 32, 128}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  auto scheduler = SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+  std::unique_ptr<HeuristicParams> native;
+  std::unique_ptr<HeuristicParams> recorded;
+  {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "record");
+    recorded = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  ASSERT_NE(native, nullptr);
+  ASSERT_NE(recorded, nullptr);
+  EXPECT_EQ(native->toString(), recorded->toString());
+
+  std::ifstream decision_log(log_path);
+  std::string row;
+  bool saw_wave_request = false;
+  while (std::getline(decision_log, row)) {
+    saw_wave_request |=
+        row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
+        row.find("\"request\":") != std::string::npos;
+  }
+  std::ifstream outcome_log(std::string(log_path) + ".outcome.jsonl");
+  bool saw_no_choice = false;
+  while (std::getline(outcome_log, row)) {
+    saw_no_choice |=
+        row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos &&
+        row.find("wave caps have equal block and thread targets") !=
+            std::string::npos;
+  }
+  EXPECT_TRUE(saw_no_choice);
+  EXPECT_FALSE(saw_wave_request);
 }
 
 // The wave cap changes the complete CTA: four waves target five outer

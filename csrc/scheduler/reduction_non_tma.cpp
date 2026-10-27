@@ -1400,8 +1400,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   }
 
   // The wave cap couples the block count and the per-CTA SM thread budget.
-  // Preserve every hard-valid cap: equal CTAs can still have different target
-  // block counts and dependent grid or CTA-target menus.
+  // Offer one cap for each distinct pair consumed by the descendant planner.
+  // Equal CTAs alone are insufficient: their target-block counts can differ.
   int64_t target_waves = 4;
   const bool bounded_wave_domain =
       bounded_warp_input && total_reduction_numel > inner_most_dimension_numel &&
@@ -1422,7 +1422,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           "outside bounded 3D wave domain",
           "native_four_wave_cap");
     } else {
-      std::vector<scheduler::jev::ChoiceOption> options;
+      std::vector<Inner3DWaveCandidate> hard_valid_candidates;
       for (int64_t waves : {2, 4, 8}) {
         if (inner3dWarpPlanIsSafe(
                 total_reduction_numel,
@@ -1436,17 +1436,47 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
                 iteration_first,
                 nullptr,
                 waves)) {
-          options.push_back(
-              {"waves" + std::to_string(waves),
-               "Cap target blocks at " + std::to_string(waves) +
-                   " SM waves and target SM threads / " +
-                   std::to_string(waves) + " per CTA"});
+          hard_valid_candidates.push_back(
+              {waves,
+               previewInner3DWaveTarget(
+                   n_elems,
+                   target_blocks,
+                   target_threads_in_block,
+                   target_unroll,
+                   target_iterations,
+                   min_warp_size,
+                   device_multiprocessor_count,
+                   max_threads_per_sm,
+                   waves)});
         }
       }
       const bool native_preflighted = std::any_of(
-          options.begin(), options.end(), [](const auto& option) {
-            return option.id == "waves4";
-          });
+          hard_valid_candidates.begin(),
+          hard_valid_candidates.end(),
+          [](const auto& candidate) { return candidate.waves == 4; });
+      // A wave cap matters only through its completed target-block count and
+      // rounded target threads. Prefer waves4 within its equivalence class so
+      // Record can still emit the exact native winner.
+      const auto distinct_candidates =
+          distinctInner3DWaveCandidates(hard_valid_candidates);
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (const auto& candidate : distinct_candidates) {
+        const auto waves = candidate.waves;
+        const auto target = candidate.target;
+        options.push_back(
+            {"waves" + std::to_string(waves),
+             "Cap target blocks at " + std::to_string(waves) +
+                 " SM waves and target SM threads / " +
+                 std::to_string(waves) + " per CTA; target blocks " +
+                 std::to_string(target.capped_target_blocks) +
+                 "; rounded target threads " +
+                 std::to_string(target.rounded_target_threads_in_block),
+             "{\"target_blocks\":" +
+                 std::to_string(target.capped_target_blocks) +
+                 ",\"rounded_target_threads_per_block\":" +
+                 std::to_string(target.rounded_target_threads_in_block) +
+                 ",\"subchoices_pending\":true}"});
+      }
       if (!native_preflighted) {
         if (jev_mode_warp == scheduler::jev::Mode::Record) {
           scheduler::jev::recordCoverageSkip(
@@ -1458,12 +1488,14 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         scheduler::jev::recordNoChoiceDecision(
             "RD5.waves",
             "waves4",
-            "only one hard-valid wave cap",
+            hard_valid_candidates.size() == 1
+                ? "only one hard-valid wave cap"
+                : "wave caps have equal block and thread targets",
             "native_four_wave_cap");
       } else {
         const std::string state =
-            std::string(iteration_first ? "reduction.inner3d_waves.v2\n"
-                                        : "reduction.inner3d_waves.v1\n") +
+            std::string(iteration_first ? "reduction.inner3d_waves.v4\n"
+                                        : "reduction.inner3d_waves.v3\n") +
             "reduction_numel=" + std::to_string(total_reduction_numel) +
             "\niteration_numel=" + std::to_string(total_iteration_numel) +
             "\ninner_numel=" +
@@ -1493,21 +1525,18 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     }
   }
 
-  target_blocks =
-      std::min(target_blocks, device_multiprocessor_count * target_waves);
-
-  if (target_blocks * target_unroll * target_iterations < n_elems) {
-    // Balance the selected block-wave cap with the available SM threads.
-    target_threads_in_block = std::min(
-        ceilDiv(n_elems, target_blocks * target_unroll),
-        ceilDiv(max_threads_per_sm, target_waves));
-  }
-
-  // Round up to nearest warp.
-  if (target_threads_in_block % min_warp_size != 0) {
-    target_threads_in_block +=
-        min_warp_size - target_threads_in_block % min_warp_size;
-  }
+  const auto wave_target = previewInner3DWaveTarget(
+      n_elems,
+      target_blocks,
+      target_threads_in_block,
+      target_unroll,
+      target_iterations,
+      min_warp_size,
+      device_multiprocessor_count,
+      max_threads_per_sm,
+      target_waves);
+  target_blocks = wave_target.capped_target_blocks;
+  target_threads_in_block = wave_target.rounded_target_threads_in_block;
 
   // The four-wave/quarter-SM CTA target is a performance preference. Keep
   // native arithmetic above for Record mode. Offer every multiple of the
@@ -3552,6 +3581,47 @@ std::unique_ptr<ReductionParams> reductionHeuristic(
 }
 
 } // namespace
+
+Inner3DWaveTarget previewInner3DWaveTarget(
+    int64_t n_elems,
+    int64_t uncapped_target_blocks,
+    int64_t initial_target_threads,
+    int64_t target_unroll,
+    int64_t target_iterations,
+    int64_t logical_warp,
+    int64_t sm_count,
+    int64_t max_threads_per_sm,
+    int64_t target_waves) {
+  const int64_t blocks =
+      std::min(uncapped_target_blocks, sm_count * target_waves);
+  int64_t threads = initial_target_threads;
+  if (blocks * target_unroll * target_iterations < n_elems) {
+    threads = std::min(
+        ceilDiv(n_elems, blocks * target_unroll),
+        ceilDiv(max_threads_per_sm, target_waves));
+  }
+  if (threads % logical_warp != 0) {
+    threads += logical_warp - threads % logical_warp;
+  }
+  return {blocks, threads};
+}
+
+std::vector<Inner3DWaveCandidate> distinctInner3DWaveCandidates(
+    const std::vector<Inner3DWaveCandidate>& hard_valid_candidates) {
+  std::vector<Inner3DWaveCandidate> distinct;
+  for (const auto& candidate : hard_valid_candidates) {
+    auto duplicate = std::find_if(
+        distinct.begin(), distinct.end(), [&](const auto& existing) {
+          return existing.target == candidate.target;
+        });
+    if (duplicate == distinct.end()) {
+      distinct.push_back(candidate);
+    } else if (candidate.waves == 4) {
+      *duplicate = candidate;
+    }
+  }
+  return distinct;
+}
 
 std::unique_ptr<ReductionParams> getReductionHeuristics(
     Fusion* fusion,
