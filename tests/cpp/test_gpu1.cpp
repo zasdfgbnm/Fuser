@@ -5810,6 +5810,111 @@ TEST_F(Gpu1Test, JevAlternateOuterWidth_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// RD8 may choose a block plan before any grid-only RD9 decision is made. A
+// local test server forces block in Remote; the fixture checks both the
+// numerical reduction and the absence of discarded grid-branch requests.
+TEST_F(Gpu1Test, JevOuterPlanBlock_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({16384, 512}, options);
+  const auto jev_mode = scheduler::jev::mode();
+  const char* log_path = nullptr;
+  std::streampos log_start = 0;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    log_path = std::getenv("NVFUSER_JEV_LOG");
+    ASSERT_NE(log_path, nullptr);
+    std::ifstream existing_log(log_path, std::ios::ate);
+    if (existing_log.good()) {
+      log_start = existing_log.tellg();
+    }
+  }
+  std::unique_ptr<HeuristicParams> native;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+    auto scheduler =
+        SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  ASSERT_NE(results.heuristic_params, nullptr);
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  if (jev_mode == scheduler::jev::Mode::Record) {
+    ASSERT_NE(native, nullptr);
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(native->lparams, results.heuristic_params->lparams);
+    EXPECT_TRUE(rparams->cross_grid_inner_reduction);
+  } else if (jev_mode == scheduler::jev::Mode::Remote) {
+    EXPECT_FALSE(rparams->cross_grid_inner_reduction);
+  }
+
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::ifstream decision_log(log_path);
+    ASSERT_TRUE(decision_log.good());
+    decision_log.seekg(log_start);
+    std::vector<std::string> sites;
+    std::string row;
+    bool saw_v2_rd8 = false;
+    while (std::getline(decision_log, row)) {
+      if (row.rfind("{\"site\":\"", 0) != 0) {
+        continue;
+      }
+      const auto end = row.find('"', 9);
+      ASSERT_NE(end, std::string::npos);
+      const auto site = row.substr(9, end - 9);
+      sites.push_back(site);
+      if (site == "RD8") {
+        saw_v2_rd8 |=
+            row.find("reduction.outer_plan.v2") != std::string::npos &&
+            row.find(jev_mode == scheduler::jev::Mode::Record
+                         ? "\"selected\":\"grid\""
+                         : "\"selected\":\"block\"") != std::string::npos;
+      }
+    }
+    EXPECT_TRUE(saw_v2_rd8);
+    EXPECT_EQ(std::count(sites.begin(), sites.end(), "RD8"), 1);
+    const auto rd8 = std::find(sites.begin(), sites.end(), "RD8");
+    ASSERT_NE(rd8, sites.end());
+    for (const char* child : {
+             "RD9.waves",
+             "RD9.warp",
+             "RD9.cta",
+             "RD9.grid_base",
+             "RD9.unroll",
+             "RD9.ragged",
+             "RD9.stride"}) {
+      const auto found = std::find(sites.begin(), sites.end(), child);
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        EXPECT_NE(found, sites.end()) << child;
+        if (found != sites.end()) {
+          EXPECT_LT(rd8, found) << child;
+        }
+      } else {
+        EXPECT_EQ(found, sites.end()) << child;
+      }
+    }
+  }
+}
+
 // The native grid plan puts four aligned output elements in each thread.
 // Force one output element so that the remaining unroll budget moves to the
 // reduction axis, then validate the complete reduction against ATen.

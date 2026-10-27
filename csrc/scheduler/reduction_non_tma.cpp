@@ -3598,11 +3598,10 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
     }
   }
 
-  // Check that the event-free native preview reproduces the same grid plan as
-  // the live Record path. RD8 still runs after the grid choices in this step.
-  std::optional<OuterReductionParams> native_grid_preview;
-  if (jev_mode == scheduler::jev::Mode::Record) {
-    native_grid_preview = previewNativeGridOuterReduction(
+  // Off retains the original construction order and evaluates the native
+  // preference on the realized native grid plan exactly once.
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    auto grid_params = getGridOuterReduction(
         total_reduction_numel,
         total_iteration_numel,
         n_tensor_inputs,
@@ -3612,9 +3611,91 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
         sm_count,
         max_threads_per_sm,
         max_threads_per_block);
+    auto block_params = getBlockOuterReduction(
+        total_reduction_numel,
+        total_iteration_numel,
+        vectorize_factor,
+        max_unroll,
+        sm_count,
+        max_threads_per_block);
+    return heuristicParaToSchedulerPara(
+        isBetterThan(block_params, grid_params, sm_count) ? block_params
+                                                          : grid_params);
   }
 
-  // block or grid reduction heuristic
+  // RD8 sees a complete block plan and an event-free native grid baseline.
+  // Only the selected grid branch executes its seven descendant Choices.
+  const auto grid_baseline = previewNativeGridOuterReduction(
+      total_reduction_numel,
+      total_iteration_numel,
+      n_tensor_inputs,
+      max_dtype_size_bit_for_vectorization,
+      vectorize_factor,
+      max_unroll,
+      sm_count,
+      max_threads_per_sm,
+      max_threads_per_block);
+  const auto block_params = getBlockOuterReduction(
+      total_reduction_numel,
+      total_iteration_numel,
+      vectorize_factor,
+      max_unroll,
+      sm_count,
+      max_threads_per_block);
+  NVF_ERROR(
+      block_params.grdim == 1,
+      "RD8 requires a completed block-reduction plan");
+  const std::string state =
+      "reduction.outer_plan.v2\nsm_count=" + std::to_string(sm_count) +
+      "\nreduction_numel=" + std::to_string(total_reduction_numel) +
+      "\niteration_numel=" + std::to_string(total_iteration_numel) +
+      "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+      "\ndtype_bits=" +
+      std::to_string(max_dtype_size_bit_for_vectorization) +
+      "\nvector_width=" + std::to_string(vectorize_factor) +
+      "\nmax_unroll=" + std::to_string(max_unroll) +
+      "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+      "\nmax_threads_per_block=" + std::to_string(max_threads_per_block) +
+      "\nl2_cache_bytes=" + std::to_string(dev_prop->l2CacheSize) +
+      "\nblock_gidim=" + std::to_string(block_params.gidim) +
+      "\nblock_grdim=" + std::to_string(block_params.grdim) +
+      "\nblock_iter_unroll=" +
+      std::to_string(block_params.iter_unroll_factor) +
+      "\nblock_bdimx=" + std::to_string(block_params.bdimx) +
+      "\nblock_bdimy=" + std::to_string(block_params.bdimy) +
+      "\nblock_redu_unroll=" +
+      std::to_string(block_params.redu_unroll_factor) +
+      "\nblock_redu_serial=" + std::to_string(block_params.redu_serial) +
+      "\ngrid_gidim=" + std::to_string(grid_baseline.gidim) +
+      "\ngrid_grdim=" + std::to_string(grid_baseline.grdim) +
+      "\ngrid_iter_unroll=" +
+      std::to_string(grid_baseline.iter_unroll_factor) +
+      "\ngrid_bdimx=" + std::to_string(grid_baseline.bdimx) +
+      "\ngrid_bdimy=" + std::to_string(grid_baseline.bdimy) +
+      "\ngrid_redu_unroll=" +
+      std::to_string(grid_baseline.redu_unroll_factor) +
+      "\ngrid_redu_serial=" + std::to_string(grid_baseline.redu_serial) +
+      "\ngrid_pending_choices=RD9.waves,RD9.warp,RD9.cta,RD9.grid_base,"
+      "RD9.unroll,RD9.ragged,RD9.stride";
+  const std::vector<scheduler::jev::ChoiceOption> options = {
+      {"block",
+       "Use completed block reduction plan after shared register budget and "
+       "width"},
+      {"grid",
+       "Use native grid baseline; seven grid-only RD9 choices remain "
+       "pending"}};
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record
+      ? (isBetterThan(block_params, grid_baseline, sm_count) ? "block" : "grid")
+      : "";
+  const auto selected =
+      scheduler::jev::chooseDecision("RD8", state, options, native_choice);
+  NVF_ERROR(
+      selected == "block" || selected == "grid",
+      "RD8 response is outside the block/grid topology candidates");
+  if (selected == "block") {
+    return heuristicParaToSchedulerPara(block_params);
+  }
   auto grid_params = getGridOuterReduction(
       total_reduction_numel,
       total_iteration_numel,
@@ -3625,61 +3706,12 @@ std::unique_ptr<ReductionParams> outerReductionHeuristic(
       sm_count,
       max_threads_per_sm,
       max_threads_per_block);
-  if (native_grid_preview.has_value()) {
+  if (jev_mode == scheduler::jev::Mode::Record) {
     NVF_ERROR(
-        outerReductionFields(*native_grid_preview) ==
-            outerReductionFields(grid_params),
+        outerReductionFields(grid_baseline) == outerReductionFields(grid_params),
         "RD8 native grid preview differs from the live Record continuation");
   }
-
-  // block reduction heuristic
-  auto block_params = getBlockOuterReduction(
-      total_reduction_numel,
-      total_iteration_numel,
-      vectorize_factor,
-      max_unroll,
-      sm_count,
-      max_threads_per_block);
-
-  // RD8 chooses between two complete native plans. Keep both constructions and
-  // their legality checks in nvFuser; only the performance preference is a
-  // Choice. Do not evaluate the native preference on the remote path.
-  bool use_block = false;
-  if (jev_mode == scheduler::jev::Mode::Off) {
-    use_block = isBetterThan(block_params, grid_params, sm_count);
-  } else {
-    NVF_ERROR(
-        block_params.grdim == 1,
-        "RD8 requires a completed block-reduction plan");
-    const std::string state =
-        "reduction.outer_plan.v1\nsm_count=" + std::to_string(sm_count) +
-        "\nblock_gidim=" + std::to_string(block_params.gidim) +
-        "\nblock_grdim=" + std::to_string(block_params.grdim) +
-        "\nblock_iter_unroll=" +
-        std::to_string(block_params.iter_unroll_factor) +
-        "\ngrid_gidim=" + std::to_string(grid_params.gidim) +
-        "\ngrid_grdim=" + std::to_string(grid_params.grdim) +
-        "\ngrid_iter_unroll=" +
-        std::to_string(grid_params.iter_unroll_factor);
-    const std::vector<scheduler::jev::ChoiceOption> options = {
-        {"block", "Use the completed block-reduction plan"},
-        {"grid", "Use the completed grid-reduction plan"}};
-    const std::string native_choice =
-        jev_mode == scheduler::jev::Mode::Record
-        ? (isBetterThan(block_params, grid_params, sm_count) ? "block" : "grid")
-        : "";
-    const auto selected = scheduler::jev::chooseDecision(
-        "RD8", state, options, native_choice);
-    NVF_ERROR(
-        selected == "block" || selected == "grid",
-        "Remote RD8 choice is not a completed native plan");
-    use_block = selected == "block";
-  }
-  if (use_block) {
-    return heuristicParaToSchedulerPara(block_params);
-  } else {
-    return heuristicParaToSchedulerPara(grid_params);
-  }
+  return heuristicParaToSchedulerPara(grid_params);
 }
 
 std::unique_ptr<ReductionParams> reductionHeuristic(
