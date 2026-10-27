@@ -852,7 +852,15 @@ std::string semanticV3State(
   for (const auto* option : ordered_options) {
     if (result.back() != '[') result += ',';
     result += "{\"id\":" + quote(option->id) + ",\"description\":" +
-        quote(option->description) + '}';
+        quote(option->description);
+    if (!option->consequence_json.empty()) {
+      if (JsonReader(option->consequence_json).parse().kind !=
+          Json::Kind::Object) {
+        fail("semantic-v3 candidate consequence must be a JSON object");
+      }
+      result += ",\"consequence\":" + option->consequence_json;
+    }
+    result += '}';
   }
   return result + "]}}";
 }

@@ -17,6 +17,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -29,6 +30,15 @@ void require(bool condition, const char* message) {
 std::string readFile(const std::string& path) {
   std::ifstream stream(path);
   return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+std::string loggedRequest(const std::string& decision_row) {
+  constexpr std::string_view key = "\"request\":";
+  const auto field = decision_row.find(key);
+  const auto selected = decision_row.find(",\"selected\":", field);
+  require(field != std::string::npos && selected != std::string::npos,
+          "Choice log lacks a complete request");
+  return decision_row.substr(field + key.size(), selected - field - key.size());
 }
 
 class FakeServer {
@@ -217,6 +227,23 @@ int main() {
   require(
       readFile(path).find("\"case_key\":\"case-1\"") != std::string::npos,
       "record lacks case key");
+  {
+    const std::string before_plain = readFile(path);
+    require(chooseDecision("PW2", state, options, "bp0") == "bp0",
+            "text-v1 plain Record changed native choice");
+    const std::string plain_request =
+        loggedRequest(readFile(path).substr(before_plain.size()));
+    const std::vector<ChoiceOption> enriched{
+        {"bp0", "one dimensional", "{\"tile\":1}"},
+        {"bp1", "split", "{\"tile\":2}"}};
+    const std::string before_enriched = readFile(path);
+    require(chooseDecision("PW2", state, enriched, "bp0") == "bp0",
+            "text-v1 enriched Record changed native choice");
+    require(
+        loggedRequest(readFile(path).substr(before_enriched.size())) ==
+            plain_request,
+        "text-v1 wire bytes changed when consequences were supplied");
+  }
   {
     // An fp32 reduction with MUFU can prefer u4 even when 128 elements and a
     // 256-thread CTA leave only u1 in the per-thread Choice menu.
@@ -695,6 +722,20 @@ int main() {
               semantic_record.find("\"native_choice\"") == std::string::npos,
           "semantic Record did not preserve a winner-free object state");
   {
+    const std::vector<ChoiceOption> enriched{
+        {"w1", "one element per thread", "not JSON"},
+        {"w2", "two elements per thread", "[]"}};
+    const std::string before_enriched = readFile(path);
+    require(nvfuser::scheduler::jev::chooseSemanticDecision(
+                "PW3.width", semantic_state, "Choose vector width for this fusion",
+                enriched, "w2") == "w2",
+            "semantic-v2 enriched Record changed native choice");
+    require(
+        loggedRequest(readFile(path).substr(before_enriched.size())) ==
+            loggedRequest(semantic_record),
+        "semantic-v2 wire bytes changed when consequences were supplied");
+  }
+  {
     const std::string before_overflow = readFile(path);
     const std::string oversized = "{\"payload\":\"" +
         std::string(70 * 1024, 'x') + "\"}";
@@ -779,6 +820,50 @@ int main() {
                   std::string::npos &&
               v3_record.find("\"native_choice\"") == std::string::npos,
           "semantic-v3 envelope, history, or canonical candidate order failed");
+  require(v3_record.find("\"consequence\"") == std::string::npos,
+          "semantic-v3 emitted an absent consequence");
+  {
+    const std::vector<ChoiceOption> enriched_reverse{
+        {"bp1", "split", "{\"break_point\":128,\"tiles\":[64,128],\"legal\":true}"},
+        {"bp0", "one dimensional", "{\"break_point\":null,\"tiles\":[256],\"legal\":true}"}};
+    const std::string before_enriched = readFile(path);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "complete fusion and runtime", {}, v3_hardware);
+    require(chooseDecision("PW2", state, enriched_reverse, "bp0") == "bp0",
+            "semantic-v3 consequence Record changed native choice");
+    const std::string request =
+        loggedRequest(readFile(path).substr(before_enriched.size()));
+    require(
+        request.find(
+            "\"candidates\":[{\"id\":\"bp0\",\"description\":\"one dimensional\","
+            "\"consequence\":{\"break_point\":null,\"tiles\":[256],\"legal\":true}},"
+            "{\"id\":\"bp1\",\"description\":\"split\",\"consequence\":"
+            "{\"break_point\":128,\"tiles\":[64,128],\"legal\":true}}]") !=
+            std::string::npos &&
+            request.find("\"criteria\":{\"bp0\":\"one dimensional\",\"bp1\":\"split\"}") !=
+                std::string::npos,
+        "semantic-v3 candidate consequence lost its canonical ID association");
+  }
+  {
+    const std::string before_invalid = readFile(path);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "complete fusion and runtime", {}, v3_hardware);
+    for (const std::string& invalid : {
+             "[]",
+             "null",
+             "\"string\"",
+             "{bad",
+             "{\"duplicate\":1,\"duplicate\":2}"}) {
+      const std::vector<ChoiceOption> malformed{
+          {"bp0", "one dimensional", invalid}, {"bp1", "split"}};
+      bool rejected = false;
+      try { (void)chooseDecision("PW2", state, malformed, "bp0"); }
+      catch (const std::runtime_error&) { rejected = true; }
+      require(rejected, "semantic-v3 accepted a malformed candidate consequence");
+    }
+    require(readFile(path) == before_invalid,
+            "semantic-v3 logged a malformed candidate consequence");
+  }
   {
     bool rejected = false;
     try { (void)chooseDecision("PW2", state, options, "bp0"); }
@@ -797,6 +882,26 @@ int main() {
             "semantic-v3 request exceeding 8 MiB was sent or logged");
   }
   ::setenv("NVFUSER_JEV_MODE", "remote", 1);
+  {
+    FakeServer server(answer("bp1"));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    const std::string large_consequence =
+        "{\"payload\":\"" + std::string(70 * 1024, 'c') + "\"}";
+    const std::vector<ChoiceOption> enriched_reverse{
+        {"bp1", "split", large_consequence},
+        {"bp0", "one dimensional", "{\"tile\":1}"}};
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "complete fusion and runtime", {}, v3_hardware);
+    require(chooseDecision("PW2", state, enriched_reverse) == "bp1",
+            "semantic-v3 rejected a candidate consequence larger than 64 KiB");
+    const auto body_start = server.request().find("\r\n\r\n");
+    require(body_start != std::string::npos, "semantic-v3 consequence HTTP body missing");
+    const auto body = server.request().substr(body_start + 4);
+    require(body.size() > 64 * 1024 &&
+                body.find("\"consequence\":" + large_consequence) != std::string::npos &&
+                body.find("\"native_choice\"") == std::string::npos,
+            "semantic-v3 candidate consequence was omitted or truncated");
+  }
   {
     FakeServer server(answer("bp1"));
     ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);

@@ -39,10 +39,12 @@ std::string_view computeInvocationInputSnapshot() noexcept;
 std::string_view computeInvocationInputUnavailableReason() noexcept;
 
 // The identifier is the wire-format Choice key. Descriptions provide the
-// model with context; neither field contains the native decision.
+// model with context; neither field contains the native decision. An optional
+// JSON object describes a candidate's consequence in semantic-v3 only.
 struct ChoiceOption {
   std::string id;
   std::string description;
+  std::string consequence_json;
 };
 
 // NVFUSER_JEV_MODE: off (default), record, or remote.
