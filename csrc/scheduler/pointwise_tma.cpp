@@ -801,6 +801,39 @@ TmaBreakPointAvailability getTmaBreakPointAvailability(
       fusion, runtime_info, prop, search);
 }
 
+std::unique_ptr<PointwiseParams> getNativePointwiseHeuristicsPreview(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop) {
+  const auto native = pointwise_utils::getBreakPoint(
+      fusion, prop, nullptr, /*is_tma=*/true);
+  return getPointwiseHeuristicsForBreakPoint(
+      fusion,
+      runtime_info,
+      nullptr,
+      prop,
+      native,
+      scheduler::jev::Mode::Off,
+      nullptr,
+      /*emit_debug=*/false);
+}
+
+std::unique_ptr<PointwiseParams> getPointwiseHeuristicsPreviewForBreakPoint(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise_utils::BreakPointInfo& break_point) {
+  return getPointwiseHeuristicsForBreakPoint(
+      fusion,
+      runtime_info,
+      nullptr,
+      prop,
+      break_point,
+      scheduler::jev::Mode::Off,
+      nullptr,
+      /*emit_debug=*/false);
+}
+
 TmaBreakPointAvailability remoteRouteableTmaBreakPoints(
     const TmaBreakPointAvailability& materialized,
     int64_t n_elems,

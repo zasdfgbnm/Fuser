@@ -63,6 +63,20 @@ TmaBreakPointAvailability getTmaBreakPointAvailability(
     SchedulerRuntimeInfo& runtime_info,
     const pointwise_utils::FusionRuntimeProperties& prop);
 
+// The original TMA breakpoint and plan, evaluated with no caller cache,
+// child Choice, or SchedulerDebug output. A nullptr means the native TMA
+// branch falls through to ordinary PointWise.
+std::unique_ptr<PointwiseParams> getNativePointwiseHeuristicsPreview(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop);
+
+std::unique_ptr<PointwiseParams> getPointwiseHeuristicsPreviewForBreakPoint(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise_utils::BreakPointInfo& break_point);
+
 std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,

@@ -27,6 +27,7 @@
 #include "scheduler/compile_time_info.h"
 #include "scheduler/compute_invocation_input.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/pointwise_backend_route.h"
 #include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
 #include "scheduler/pointwise_utils.h"
@@ -2316,8 +2317,9 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   const auto tensor = at::empty(
       {32, 4096}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
   SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  HeuristicDataCache parent_cache;
   const auto prop = pointwise_utils::getFusionRuntimeProperties(
-      &fusion, runtime_info, nullptr);
+      &fusion, runtime_info, &parent_cache);
   ASSERT_TRUE(prop.has_value());
   const auto structural = pointwise_utils::getTmaBreakPointSearch(*prop, nullptr);
   EXPECT_EQ(structural.candidates.size(), 2);
@@ -2404,6 +2406,30 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   preview_events << preview_outcome.rdbuf();
   EXPECT_TRUE(preview_events.str().empty());
 
+  // PW1 uses these exact cache-free native projections before asking its
+  // backend Choice. Neither preview may write to the caller's cache or log.
+  std::stringstream parent_preview_debug;
+  std::unique_ptr<PointwiseParams> native_tma_baseline;
+  std::unique_ptr<PointwiseParams> ordinary_baseline;
+  {
+    DebugStreamGuard debug_guard(parent_preview_debug);
+    scheduler::jev::ScopedNativeDecisions native_scope;
+    native_tma_baseline =
+        pointwise::tma::getNativePointwiseHeuristicsPreview(
+            &fusion, runtime_info, *prop);
+    ordinary_baseline = pointwise::non_tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop, /*emit_debug=*/false);
+  }
+  ASSERT_NE(native_tma_baseline, nullptr);
+  ASSERT_NE(ordinary_baseline, nullptr);
+  EXPECT_TRUE(parent_preview_debug.str().empty());
+  EXPECT_FALSE(parent_cache.hasEntry(
+      HeuristicCompileTime::ResizeVectorizationFactors::EntryType));
+  std::ifstream parent_log(log_path);
+  std::stringstream parent_rows;
+  parent_rows << parent_log.rdbuf();
+  EXPECT_TRUE(parent_rows.str().empty());
+
   std::stringstream debug_output;
   std::unique_ptr<PointwiseParams> params;
   {
@@ -2412,6 +2438,18 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
         &fusion, runtime_info, nullptr, *prop);
   }
   ASSERT_NE(params, nullptr);
+  EXPECT_TRUE(params->sameAs(native_tma_baseline.get()));
+  for (const auto parallel_type : {
+           ParallelType::BIDx,
+           ParallelType::BIDy,
+           ParallelType::BIDz,
+           ParallelType::TIDx,
+           ParallelType::TIDy,
+           ParallelType::TIDz}) {
+    EXPECT_EQ(
+        params->lparams.getRawVal(parallel_type),
+        native_tma_baseline->lparams.getRawVal(parallel_type));
+  }
   const std::string marker = "==== Pointwise TMA Scheduler Heuristics ====";
   const std::string output = debug_output.str();
   const size_t first = output.find(marker);
@@ -2487,6 +2525,255 @@ TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
   }
   EXPECT_FALSE(cache.hasEntry(
       HeuristicCompileTime::ResizeVectorizationFactors::EntryType));
+}
+
+TEST_F(PointwiseTest, BackendParentFirstRouting) {
+  using pointwise::BackendRouteAction;
+  using scheduler::jev::Mode;
+  const auto route = pointwise::pointwiseBackendRoute;
+  EXPECT_EQ(
+      route(Mode::Record, true, true, true, true),
+      BackendRouteAction::OfferChoice);
+  EXPECT_EQ(
+      route(Mode::Record, true, false, true, true),
+      BackendRouteAction::PreserveNativeTma);
+  EXPECT_EQ(
+      route(Mode::Record, true, false, false, true),
+      BackendRouteAction::PreserveNativeTma);
+  EXPECT_EQ(
+      route(Mode::Remote, true, false, true, true),
+      BackendRouteAction::OfferChoice);
+  EXPECT_EQ(
+      route(Mode::Remote, true, false, false, true),
+      BackendRouteAction::OrdinaryOnly);
+  EXPECT_EQ(
+      route(Mode::Record, false, false, true, true),
+      BackendRouteAction::PreserveNativeOrdinary);
+  EXPECT_EQ(
+      route(Mode::Record, false, false, false, true),
+      BackendRouteAction::OrdinaryOnly);
+  EXPECT_EQ(
+      route(Mode::Record, false, false, true, false),
+      BackendRouteAction::NoPlan);
+  EXPECT_EQ(
+      route(Mode::Remote, false, false, true, false),
+      BackendRouteAction::TmaOnly);
+}
+
+// The SM89 host can construct both source baselines and the exact PW1 wire
+// without claiming that a Hopper-only TMA kernel executed there.
+TEST_F(PointwiseTest, BackendParentFirstV2Request) {
+  char local_path[] = "/tmp/nvfuser-pw1-v2-XXXXXX";
+  const char* log_path = std::getenv("NVFUSER_JEV_PW1_FIXTURE_LOG");
+  bool cleanup = false;
+  if (log_path == nullptr || *log_path == '\0') {
+    const int fd = ::mkstemp(local_path);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    log_path = local_path;
+    cleanup = true;
+  }
+  struct FileCleanup {
+    const char* path;
+    bool cleanup;
+    ~FileCleanup() {
+      if (cleanup) {
+        ::unlink(path);
+      }
+    }
+  } file_cleanup{log_path, cleanup};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {32, 4096}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  std::unique_ptr<PointwiseParams> tma_baseline;
+  std::unique_ptr<PointwiseParams> ordinary_baseline;
+  pointwise::tma::TmaBreakPointAvailability remote_tma;
+  {
+    scheduler::jev::ScopedNativeDecisions native_scope;
+    tma_baseline = pointwise::tma::getNativePointwiseHeuristicsPreview(
+        &fusion, runtime_info, *prop);
+    auto materialized = pointwise::tma::getTmaBreakPointAvailability(
+        &fusion, runtime_info, *prop);
+    remote_tma = pointwise::tma::remoteRouteableTmaBreakPoints(
+        materialized,
+        prop->n_elems,
+        prop->elem_counts.size(),
+        prop->min_dtype_size_bit_for_vectorization);
+    ordinary_baseline = pointwise::non_tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop, /*emit_debug=*/false);
+  }
+  ASSERT_NE(tma_baseline, nullptr);
+  ASSERT_NE(ordinary_baseline, nullptr);
+  ASSERT_EQ(remote_tma.options.size(), 2);
+  EXPECT_EQ(
+      pointwise::choosePointwiseBackend(
+          *prop,
+          remote_tma,
+          *tma_baseline,
+          "source_native_projection",
+          *ordinary_baseline,
+          "tma"),
+      "tma");
+  std::ifstream request_log(log_path);
+  std::stringstream rows;
+  rows << request_log.rdbuf();
+  EXPECT_THAT(rows.str(), ::testing::HasSubstr("\"site\":\"PW1\""));
+  EXPECT_THAT(rows.str(), ::testing::HasSubstr("pointwise.tma_preference.v2"));
+  EXPECT_THAT(
+      rows.str(), ::testing::HasSubstr("tma_remote_breakpoints=bp0,bp1"));
+  EXPECT_THAT(
+      rows.str(), ::testing::HasSubstr("ordinary_baseline_available=1"));
+  EXPECT_THAT(
+      rows.str(), ::testing::HasSubstr("\"candidates\":[\"tma\",\"ordinary\"]"));
+  EXPECT_THAT(
+      rows.str(),
+      ::testing::Not(::testing::HasSubstr("\"site\":\"PW4.")));
+  EXPECT_THAT(
+      rows.str(),
+      ::testing::Not(::testing::HasSubstr("\"site\":\"PW3.")));
+
+  char v3_path[] = "/tmp/nvfuser-pw1-v3-XXXXXX";
+  const char* v3_log_path = std::getenv("NVFUSER_JEV_PW1_V3_FIXTURE_LOG");
+  bool cleanup_v3 = false;
+  if (v3_log_path == nullptr || *v3_log_path == '\0') {
+    const int v3_fd = ::mkstemp(v3_path);
+    ASSERT_GE(v3_fd, 0);
+    ::close(v3_fd);
+    v3_log_path = v3_path;
+    cleanup_v3 = true;
+  }
+  struct V3Cleanup {
+    const char* path;
+    bool cleanup;
+    ~V3Cleanup() {
+      if (cleanup) {
+        ::unlink(path);
+        ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+      }
+    }
+  } v3_cleanup{v3_log_path, cleanup_v3};
+  {
+    ScopedTestEnv v3_protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+    ScopedTestEnv v3_log("NVFUSER_JEV_LOG", v3_log_path);
+    const std::string hardware = "{\"sm_count\":" +
+        std::to_string(prop->device_multiprocessor_count) + "}";
+    scheduler::jev::ComputeHeuristicsScope scope(
+        "source-only TMA and ordinary baseline projections", {}, hardware);
+    EXPECT_EQ(
+        pointwise::choosePointwiseBackend(
+            *prop,
+            remote_tma,
+            *tma_baseline,
+            "source_native_projection",
+            *ordinary_baseline,
+            "tma"),
+        "tma");
+    scope.complete("PointWise");
+  }
+  std::ifstream v3_request(v3_log_path);
+  std::stringstream v3_rows;
+  v3_rows << v3_request.rdbuf();
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("\"consequence\""));
+  EXPECT_THAT(
+      v3_rows.str(), ::testing::HasSubstr("\"baseline_projection\""));
+  EXPECT_THAT(
+      v3_rows.str(),
+      ::testing::HasSubstr(
+          "\"baseline_kind\":\"source_native_projection\""));
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("\"pending_choices\""));
+  EXPECT_THAT(
+      v3_rows.str(),
+      ::testing::HasSubstr("\"pending_choices_kind\":\"possible_descendants\""));
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("PW4.breakpoint"));
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("PW3.unroll"));
+}
+
+TEST_F(PointwiseTest, BackendParentFirstOrdinaryNumeric_CUDA) {
+  if (at::cuda::getCurrentDeviceProperties()->major >= 9) {
+    GTEST_SKIP() << "The ordinary-only control requires a pre-Hopper GPU";
+  }
+  char log_path[] = "/tmp/nvfuser-pw1-ordinary-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  EnableOptionsGuard::getCurOptions().set(EnableOption::TmaPointwise);
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::randn(
+      {32, 4096}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  std::unique_ptr<HeuristicParams> off_params;
+  {
+    ScopedTestEnv off_mode("NVFUSER_JEV_MODE", "off");
+    auto scheduler =
+        SchedulerEntry::makeSchedulerInstance(SchedulerType::PointWise);
+    off_params = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto result = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  ASSERT_NE(off_params, nullptr);
+  ASSERT_NE(result.heuristic_params, nullptr);
+  const auto* recorded = result.heuristic_params->as<PointwiseParams>();
+  const auto* off = off_params->as<PointwiseParams>();
+  EXPECT_FALSE(recorded->use_tma_load);
+  EXPECT_TRUE(recorded->sameAs(off));
+  for (const auto parallel_type : {
+           ParallelType::BIDx,
+           ParallelType::BIDy,
+           ParallelType::BIDz,
+           ParallelType::TIDx,
+           ParallelType::TIDy,
+           ParallelType::TIDz}) {
+    EXPECT_EQ(
+        recorded->lparams.getRawVal(parallel_type),
+        off->lparams.getRawVal(parallel_type));
+  }
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+
+  std::ifstream request_log(log_path);
+  std::stringstream requests;
+  requests << request_log.rdbuf();
+  EXPECT_THAT(requests.str(), ::testing::HasSubstr("\"site\":\"PW2\""));
+  EXPECT_THAT(
+      requests.str(),
+      ::testing::Not(::testing::HasSubstr("\"site\":\"PW1\"")));
+  std::ifstream outcome_log(std::string(log_path) + ".outcome.jsonl");
+  std::stringstream outcomes;
+  outcomes << outcome_log.rdbuf();
+  EXPECT_THAT(
+      outcomes.str(), ::testing::HasSubstr("\"site\":\"PW1\""));
+  EXPECT_THAT(outcomes.str(), ::testing::HasSubstr("\"kind\":\"no_choice\""));
 }
 
 // Inject route operands above the bp0 divisor-replay cap without allocating a

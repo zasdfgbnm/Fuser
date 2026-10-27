@@ -21,6 +21,7 @@
 #include "instrumentation.h"
 #include "scheduler/debug_utils.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/pointwise_backend_route.h"
 #include "scheduler/pointwise_non_tma.h"
 #include "scheduler/pointwise_tma.h"
 #include "scheduler/pointwise_utils.h"
@@ -531,7 +532,92 @@ void recordFinalPointwisePlan(
       launch.str(),
       compile.str());
 }
+
+std::string pointwiseBackendBaselineConsequence(
+    const PointwiseParams& baseline,
+    std::string_view baseline_kind,
+    bool tma) {
+  PointwiseRecordObject consequence;
+  consequence.add(
+      "plan_scope",
+      tma ? "tma_pointwise_branch" : "ordinary_pointwise_branch");
+  consequence.add("baseline_kind", baseline_kind);
+  // These are source projections before any descendant Choice. They are not
+  // the final PointwiseParams selected by the model.
+  PointwiseRecordObject projection;
+  projection.add("break_point", baseline.break_point);
+  projection.add("vectorization_factor", baseline.vectorization_factor);
+  projection.add("block_x_raw", baseline.lparams.getRawVal(ParallelType::TIDx));
+  projection.add("block_y_raw", baseline.lparams.getRawVal(ParallelType::TIDy));
+  projection.add("grid_x_raw", baseline.lparams.getRawVal(ParallelType::BIDx));
+  projection.add("grid_y_raw", baseline.lparams.getRawVal(ParallelType::BIDy));
+  if (tma) {
+    projection.add("tma_domain_inner", baseline.tma_domain_inner);
+    projection.add("tma_tile_inner", baseline.tma_tile_inner);
+    projection.add("tma_tile_outer", baseline.tma_tile_outer);
+  }
+  consequence.addRaw("baseline_projection", projection.str());
+  consequence.add("pending_choices_kind", "possible_descendants");
+  consequence.addRaw(
+      "pending_choices",
+      tma ? "[\"PW4.breakpoint\",\"PW4.domain_inner\",\"PW4.tile_inner\","
+            "\"PW4.tile_outer\",\"PW4.width\"]"
+          : "[\"PW2\",\"PW3.width\",\"PW3.cta_1d\",\"PW3.launch\","
+            "\"PW3.unroll\"]");
+  return consequence.str();
+}
+
+std::string pointwiseBackendStateV2(
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise::tma::TmaBreakPointAvailability& remote_tma,
+    bool ordinary_baseline_available) {
+  std::string state = "pointwise.tma_preference.v2\nn_elems=" +
+      std::to_string(prop.n_elems) +
+      "\nsm_count=" + std::to_string(prop.device_multiprocessor_count) +
+      "\nmin_dtype_bits=" +
+      std::to_string(prop.min_dtype_size_bit_for_vectorization) +
+      "\nmax_dtype_bits=" +
+      std::to_string(prop.max_dtype_size_bit_for_vectorization) +
+      "\ntma_remote_breakpoints=";
+  for (size_t i = 0; i < remote_tma.options.size(); ++i) {
+    if (i != 0) {
+      state += ',';
+    }
+    state += remote_tma.options[i].id;
+  }
+  state += "\nordinary_baseline_available=";
+  state += ordinary_baseline_available ? "1\n" : "0\n";
+  return state;
+}
 } // namespace
+
+namespace pointwise {
+
+std::string choosePointwiseBackend(
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const tma::TmaBreakPointAvailability& remote_tma,
+    const PointwiseParams& tma_baseline,
+    std::string_view tma_baseline_kind,
+    const PointwiseParams& ordinary_baseline,
+    std::string_view native_choice) {
+  const std::vector<scheduler::jev::ChoiceOption> options = {
+      {"tma",
+       "Use the TMA source baseline; PW4 descendant choices remain",
+       pointwiseBackendBaselineConsequence(
+           tma_baseline, tma_baseline_kind, /*tma=*/true)},
+      {"ordinary",
+       "Use the ordinary source baseline; PW2/PW3 descendant choices remain",
+       pointwiseBackendBaselineConsequence(
+           ordinary_baseline, "source_native_projection", /*tma=*/false)}};
+  return scheduler::jev::chooseDecision(
+      "PW1",
+      pointwiseBackendStateV2(
+          prop, remote_tma, /*ordinary_baseline_available=*/true),
+      options,
+      native_choice);
+}
+
+} // namespace pointwise
 
 std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
     Fusion* fusion,
@@ -592,40 +678,127 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
       mayUseTma(fusion, prop) && isOptionEnabled(EnableOption::TmaPointwise);
   const auto jev_mode = scheduler::jev::mode();
   std::unique_ptr<HeuristicParams> pparams = nullptr;
-  if (use_tma) {
-    pparams = pointwise::tma::getPointwiseHeuristics(
-        fusion, runtime_info, data_cache, prop);
-  }
-  if (pparams == nullptr) {
-    // TMA eligibility and plan construction are native correctness gates.
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    // Preserve the original TMA-first control flow and caller-cache use.
+    if (use_tma) {
+      pparams = pointwise::tma::getPointwiseHeuristics(
+          fusion, runtime_info, data_cache, prop);
+    }
+    if (pparams == nullptr) {
+      pparams = pointwise::non_tma::getPointwiseHeuristics(
+          fusion, runtime_info, data_cache, prop);
+    }
+  } else if (!use_tma) {
+    // Pre-Hopper hardware and fusions without a TMA route have no PW1 menu.
+    // Run the ordinary branch once with the caller cache and normal debug.
+    scheduler::jev::recordNoChoiceDecision(
+        "PW1", "ordinary", "TMA is unavailable", "hard");
     pparams = pointwise::non_tma::getPointwiseHeuristics(
         fusion, runtime_info, data_cache, prop);
-  } else if (jev_mode != scheduler::jev::Mode::Off) {
-    // Both completed plans must exist before the backend preference can be a
-    // Choice. Off mode keeps the original TMA-first fast path unchanged.
-    auto ordinary_params = pointwise::non_tma::getPointwiseHeuristics(
-        fusion, runtime_info, data_cache, prop);
-    if (ordinary_params != nullptr) {
-      const std::string state = "pointwise.tma_preference.v1\nn_elems=" +
-          std::to_string(prop.n_elems) +
-          "\nsm_count=" + std::to_string(prop.device_multiprocessor_count) +
-          "\nmin_dtype_bits=" +
-          std::to_string(prop.min_dtype_size_bit_for_vectorization) +
-          "\nmax_dtype_bits=" +
-          std::to_string(prop.max_dtype_size_bit_for_vectorization);
-      const std::vector<scheduler::jev::ChoiceOption> options = {
-          {"tma", "Use the complete TMA pointwise plan"},
-          {"ordinary", "Use the complete ordinary pointwise plan"}};
-      // The original policy prefers every materialized TMA pointwise plan.
-      const std::string native_choice =
-          jev_mode == scheduler::jev::Mode::Record ? "tma" : "";
-      const auto selected =
-          scheduler::jev::chooseDecision("PW1", state, options, native_choice);
+  } else {
+    // Preview both backends before asking PW1. Every preview uses a null
+    // cache, native decisions, and no debug output, so no losing branch can
+    // seed breakpoint-dependent cache data or emit a child Choice.
+    std::unique_ptr<PointwiseParams> native_tma_baseline;
+    std::unique_ptr<PointwiseParams> ordinary_baseline;
+    std::unique_ptr<PointwiseParams> alternate_tma_baseline;
+    pointwise::tma::TmaBreakPointAvailability remote_tma;
+    bool native_tma_breakpoint_routeable = false;
+    {
+      scheduler::jev::ScopedNativeDecisions preview_scope;
+      if (use_tma) {
+        native_tma_baseline =
+            pointwise::tma::getNativePointwiseHeuristicsPreview(
+                fusion, runtime_info, prop);
+        const auto materialized = pointwise::tma::getTmaBreakPointAvailability(
+            fusion, runtime_info, prop);
+        remote_tma = pointwise::tma::remoteRouteableTmaBreakPoints(
+            materialized,
+            prop.n_elems,
+            prop.elem_counts.size(),
+            prop.min_dtype_size_bit_for_vectorization);
+        if (native_tma_baseline != nullptr) {
+          const auto native_id =
+              "bp" + std::to_string(native_tma_baseline->break_point);
+          native_tma_breakpoint_routeable = std::any_of(
+              remote_tma.options.begin(),
+              remote_tma.options.end(),
+              [&](const auto& option) { return option.id == native_id; });
+        }
+        if (!remote_tma.options.empty() &&
+            !native_tma_breakpoint_routeable) {
+          alternate_tma_baseline =
+              pointwise::tma::getPointwiseHeuristicsPreviewForBreakPoint(
+                  fusion, runtime_info, prop, remote_tma.plans.front());
+          NVF_ERROR(
+              alternate_tma_baseline != nullptr,
+              "PW1 routeable TMA alternative changed during preview");
+        }
+      }
+      try {
+        ordinary_baseline = pointwise::non_tma::getPointwiseHeuristics(
+            fusion, runtime_info, nullptr, prop, /*emit_debug=*/false);
+      } catch (const nvfError&) {
+        // An ordinary candidate can fail even when the original TMA-first
+        // branch succeeds. Exclude only that speculative candidate; if TMA
+        // also has no route, preserve the ordinary error.
+        if (native_tma_baseline == nullptr && remote_tma.options.empty()) {
+          throw;
+        }
+      }
+    }
+
+    const auto route = pointwise::pointwiseBackendRoute(
+        jev_mode,
+        native_tma_baseline != nullptr,
+        native_tma_breakpoint_routeable,
+        !remote_tma.options.empty(),
+        ordinary_baseline != nullptr);
+    if (route == pointwise::BackendRouteAction::PreserveNativeTma) {
+      scheduler::jev::recordCoverageSkip(
+          "PW1", "native TMA breakpoint has no Remote-reachable PW4 continuation");
+      scheduler::jev::ScopedNativeDecisions native_scope;
+      pparams = pointwise::tma::getPointwiseHeuristics(
+          fusion, runtime_info, data_cache, prop);
+    } else if (route == pointwise::BackendRouteAction::PreserveNativeOrdinary) {
+      scheduler::jev::recordCoverageSkip(
+          "PW1", "native TMA plan absent but a Remote-only alternative exists");
+      pparams = pointwise::non_tma::getPointwiseHeuristics(
+          fusion, runtime_info, data_cache, prop);
+    } else {
       NVF_ERROR(
-          selected == "tma" || selected == "ordinary",
-          "PW1 must select a complete native pointwise plan");
-      if (selected == "ordinary") {
-        pparams = std::move(ordinary_params);
+          route != pointwise::BackendRouteAction::NoPlan,
+          "PW1 has no native or Remote-routeable backend plan");
+      std::string selected;
+      if (route == pointwise::BackendRouteAction::OfferChoice) {
+        const auto* tma_baseline = native_tma_breakpoint_routeable
+            ? native_tma_baseline.get()
+            : alternate_tma_baseline.get();
+        NVF_ERROR(tma_baseline != nullptr && ordinary_baseline != nullptr);
+        selected = pointwise::choosePointwiseBackend(
+            prop,
+            remote_tma,
+            *tma_baseline,
+            native_tma_breakpoint_routeable
+                ? "source_native_projection"
+                : "routeable_alternative_projection",
+            *ordinary_baseline,
+            jev_mode == scheduler::jev::Mode::Record ? "tma" : "");
+      } else {
+        selected = route == pointwise::BackendRouteAction::TmaOnly
+            ? "tma"
+            : "ordinary";
+        scheduler::jev::recordNoChoiceDecision(
+            "PW1", selected, "only one Remote-routeable backend", "hard");
+      }
+      if (selected == "tma") {
+        pparams = pointwise::tma::getPointwiseHeuristics(
+            fusion, runtime_info, data_cache, prop);
+      } else if (selected == "ordinary") {
+        pparams = pointwise::non_tma::getPointwiseHeuristics(
+            fusion, runtime_info, data_cache, prop);
+      } else {
+        NVF_ERROR(false, "PW1 response is outside the routeable backend menu");
       }
     }
   }

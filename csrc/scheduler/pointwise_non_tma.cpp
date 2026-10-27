@@ -403,7 +403,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    const pointwise_utils::FusionRuntimeProperties& prop) {
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    bool emit_debug) {
   FusionGuard fg(fusion);
   auto params = std::make_unique<PointwiseParams>();
   params->tag = "Pointwise heuristics";
@@ -1051,7 +1052,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
         ")");
   }
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (emit_debug && isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     // Get broadcast info for debug output
     TensorView* largest_out = prop.largest_out;
     auto broadcast_info_for_debug =
