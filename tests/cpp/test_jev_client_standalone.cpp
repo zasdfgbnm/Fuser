@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -28,7 +29,11 @@ std::string readFile(const std::string& path) {
 
 class FakeServer {
  public:
-  explicit FakeServer(std::string body, int status = 200) : body_(std::move(body)), status_(status) {
+  explicit FakeServer(
+      std::string body,
+      int status = 200,
+      std::chrono::milliseconds reply_delay = std::chrono::milliseconds(0))
+      : body_(std::move(body)), status_(status), reply_delay_(reply_delay) {
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     require(fd_ >= 0, "socket failed");
     sockaddr_in address{};
@@ -70,6 +75,7 @@ class FakeServer {
         if (request_.size() >= split + 4 + expected) break;
       }
     }
+    std::this_thread::sleep_for(reply_delay_);
     const std::string reply = "HTTP/1.0 " + std::to_string(status_) +
         (status_ == 200 ? " OK" : " Failure") + "\r\nContent-Type: application/json\r\n"
         "Content-Length: " + std::to_string(body_.size()) + "\r\n\r\n" + body_;
@@ -83,14 +89,17 @@ class FakeServer {
   }
   std::string body_;
   int status_;
+  std::chrono::milliseconds reply_delay_;
   int fd_ = -1;
   unsigned port_ = 0;
   std::thread thread_;
   std::string request_;
 };
 
-std::string answer(const std::string& choice) {
-  return "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"PW2\":{\"type\":\"choice\","
+std::string answer(
+    const std::string& choice,
+    const std::string& model = "nvfuser-analysis-v1") {
+  return "{\"model\":\"" + model + "\",\"answers\":{\"PW2\":{\"type\":\"choice\","
       "\"choice\":\"" + choice + "\",\"confidence\":1.0,\"probabilities\":{\"bp0\":0.0,"
       "\"bp1\":1.0}}},\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}";
 }
@@ -450,6 +459,51 @@ int main() {
                   "\",\"compute_event_index\":2,\"scheduler_type\":\"PointWise\"") !=
                   std::string::npos,
           "remote Choice and compute outcome cannot join");
+  // The Codex mode uses the same Choice envelope, but its model identifier
+  // must remain truthful and the request may take longer than the mock server.
+  {
+    ::setenv("NVFUSER_JEV_TIMEOUT_MS", "250", 1);
+    FakeServer server(
+        answer("bp1", "codex-gpt-6.1-sol-max"), 200,
+        std::chrono::milliseconds(40));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    require(chooseDecision("PW2", state, options) == "bp1",
+            "Codex model response or longer loopback deadline was rejected");
+    ::unsetenv("NVFUSER_JEV_TIMEOUT_MS");
+  }
+  {
+    FakeServer server(answer("bp1", "codex-gpt-6.1-sol-max-extra"));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    bool rejected = false;
+    try { (void)chooseDecision("PW2", state, options); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "unrecognized Codex response model was accepted");
+  }
+  {
+    ::setenv("NVFUSER_JEV_TIMEOUT_MS", "5", 1);
+    FakeServer server(
+        answer("bp1"), 200, std::chrono::milliseconds(40));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    bool timed_out = false;
+    try { (void)chooseDecision("PW2", state, options); }
+    catch (const std::runtime_error& error) {
+      timed_out = std::string(error.what()).find("loopback API timeout") !=
+          std::string::npos;
+    }
+    require(timed_out, "short loopback deadline did not time out");
+    ::unsetenv("NVFUSER_JEV_TIMEOUT_MS");
+  }
+  for (const char* invalid : {"0", "600001", "invalid"}) {
+    ::setenv("NVFUSER_JEV_TIMEOUT_MS", invalid, 1);
+    bool rejected = false;
+    try { (void)chooseDecision("PW2", state, options); }
+    catch (const std::runtime_error& error) {
+      rejected = std::string(error.what()).find("NVFUSER_JEV_TIMEOUT_MS") !=
+          std::string::npos;
+    }
+    require(rejected, "invalid loopback timeout was accepted");
+  }
+  ::unsetenv("NVFUSER_JEV_TIMEOUT_MS");
   // Semantic-v2 sends the same model-visible object in Record and Remote.
   // A real Jev response may resolve jev-latest to a versioned model name.
   ::setenv("NVFUSER_JEV_PROTOCOL", "semantic-v2", 1);
@@ -511,6 +565,18 @@ int main() {
                 body.find("full snapshot") != std::string::npos &&
                 body.find("native_choice") == std::string::npos,
             "Record and Remote sent different semantic requests");
+  }
+  {
+    FakeServer server(
+        "{\"model\":\"codex-gpt-6.1-sol-max\",\"answers\":{\"PW3.width\":{"
+        "\"type\":\"choice\",\"choice\":\"w1\",\"confidence\":1.0,"
+        "\"probabilities\":{\"w1\":1.0,\"w2\":0.0}}},"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}");
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    require(nvfuser::scheduler::jev::chooseSemanticDecision(
+                "PW3.width", semantic_state, "Choose vector width for this fusion",
+                width_options) == "w1",
+            "semantic Codex model response was rejected");
   }
   ::unsetenv("NVFUSER_JEV_PROTOCOL");
   const std::string remote_decisions_before_no_choice = readFile(path);

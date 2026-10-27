@@ -39,6 +39,7 @@ constexpr size_t kMaxRequest = 64 * 1024;
 constexpr size_t kMaxResponse = 64 * 1024;
 constexpr size_t kMaxHeaders = 8 * 1024;
 constexpr auto kTimeout = std::chrono::milliseconds(2000);
+constexpr unsigned kMaxTimeoutMs = 600000;
 constexpr std::string_view kPointwiseOutcomeSchema =
     "nvfuser.jev.pointwise.outcome.v1";
 constexpr std::string_view kComputeInvocationSchema =
@@ -311,6 +312,19 @@ unsigned portFromEnv() {
   return port;
 }
 
+std::chrono::milliseconds timeoutFromEnv() {
+  const std::string text = env("NVFUSER_JEV_TIMEOUT_MS");
+  if (text.empty()) return kTimeout;
+  unsigned timeout_ms = 0;
+  auto [end, error] = std::from_chars(
+      text.data(), text.data() + text.size(), timeout_ms);
+  if (error != std::errc{} || end != text.data() + text.size() ||
+      timeout_ms == 0 || timeout_ms > kMaxTimeoutMs) {
+    fail("NVFUSER_JEV_TIMEOUT_MS must be an integer in 1..600000");
+  }
+  return std::chrono::milliseconds(timeout_ms);
+}
+
 std::string post(std::string_view body) {
   if (body.size() > kMaxRequest) fail("request exceeds 64 KiB");
   Fd socket(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
@@ -318,7 +332,7 @@ std::string post(std::string_view body) {
   address.sin_family = AF_INET;
   address.sin_port = htons(static_cast<uint16_t>(portFromEnv()));
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  const auto deadline = Clock::now() + kTimeout;
+  const auto deadline = Clock::now() + timeoutFromEnv();
   int rc = ::connect(socket.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address));
   if (rc < 0 && errno != EINPROGRESS) fail(std::strerror(errno));
   if (rc < 0) {
@@ -444,10 +458,12 @@ std::string selectedFromResponse(
     bool semantic) {
   Json root = JsonReader(response).parse();
   const auto response_model = root.at("model").asString();
+  const bool known_codex_model = response_model == "codex-gpt-6.1-sol-max";
   const bool known_semantic_model = response_model == "nvfuser-analysis-v1" ||
-      response_model == "jev-latest" || response_model.starts_with("jev-");
+      response_model == "jev-latest" || response_model.starts_with("jev-") ||
+      known_codex_model;
   if (semantic ? !known_semantic_model
-               : response_model != "nvfuser-analysis-v1") {
+               : response_model != "nvfuser-analysis-v1" && !known_codex_model) {
     fail("unexpected response model");
   }
   const Json& answers = root.at("answers");
