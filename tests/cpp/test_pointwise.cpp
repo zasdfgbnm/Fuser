@@ -1955,7 +1955,16 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       }
     }
     ASSERT_FALSE(pw2_row.empty());
-    EXPECT_THAT(pw2_row, ::testing::HasSubstr("pointwise.breakpoint.v3"));
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    const bool exact_carrier_device =
+        std::string_view(device->name) == "NVIDIA GeForce RTX 4090" &&
+        device->major == 8 && device->minor == 9 &&
+        device->multiProcessorCount == 128 && device->warpSize == 32;
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            exact_carrier_device ? "pointwise.breakpoint.v4"
+                                 : "pointwise.breakpoint.v3"));
     EXPECT_THAT(
         pw2_row,
         ::testing::HasSubstr(
@@ -1974,13 +1983,67 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
     EXPECT_THAT(
         pw2_row,
         ::testing::HasSubstr(
-            "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\",\"PW3."
-            "unroll\"]"));
+            exact_carrier_device
+                ? "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\"]"
+                : "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\","
+                  "\"PW3.unroll\"]"));
     EXPECT_THAT(
         pw2_row,
         ::testing::HasSubstr(
             "\"pending_choices\":[\"PW3.width\",\"PW3.launch\",\"PW3."
             "unroll\"]"));
+    if (exact_carrier_device) {
+      EXPECT_LT(pw2_row.size(), 8u * 1024u * 1024u);
+      for (const auto* id : {"bp0", "bp1_normal", "bp1_flip"}) {
+        const std::string option_id = "\"id\":\"" + std::string(id) + "\"";
+        const auto begin = pw2_row.find(option_id);
+        ASSERT_NE(begin, std::string::npos);
+        const auto next =
+            pw2_row.find("\"id\":\"bp", begin + option_id.size());
+        const std::string card = pw2_row.substr(begin, next - begin);
+        const bool two_dimensional = std::string_view(id) != "bp0";
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"schema\":\"nvfuser.pw2.add2x16.v1\""));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"width_choices\":[\"w1\",\"w2\",\"w4\"]"));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"cta_count_per_width\":" +
+                std::to_string(two_dimensional ? 128 : 3)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"terminal_leaf_count\":" +
+                std::to_string(two_dimensional ? 642 : 9)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"max_unroll_bound\":" +
+                std::to_string(two_dimensional ? 16 : 1)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                two_dimensional
+                    ? "\"pending_choices\":[\"PW3.width\",\"PW3.launch\","
+                      "\"PW3.unroll\"]"
+                    : "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\"]"));
+        if (two_dimensional) {
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"effective_grid_x_formula\":\"" +
+                  std::string(
+                      std::string_view(id) == "bp1_flip" ? "L"
+                                                         : "ceil(R/U)") +
+                  "\""));
+        }
+      }
+    }
     if (jev_mode == scheduler::jev::Mode::Record) {
       EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
       EXPECT_EQ(params->break_point, 0);
@@ -2010,11 +2073,6 @@ TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
       EXPECT_EQ(params->break_point, 0);
     }
 
-    const auto* device = at::cuda::getCurrentDeviceProperties();
-    const bool exact_carrier_device =
-        std::string_view(device->name) == "NVIDIA GeForce RTX 4090" &&
-        device->major == 8 && device->minor == 9 &&
-        device->multiProcessorCount == 128 && device->warpSize == 32;
     if (exact_carrier_device) {
       ASSERT_FALSE(width_row.empty());
       EXPECT_THAT(width_row, ::testing::HasSubstr("pointwise.width.v2"));
@@ -2449,8 +2507,22 @@ TEST_F(PointwiseTest, AddCtaBoundedContinuation) {
 }
 
 TEST_F(PointwiseTest, AddLaunch2DBoundedContinuation) {
+  using pointwise::non_tma::addBreakpointContinuation;
   using pointwise::non_tma::addLaunch2DContinuation;
   using pointwise::non_tma::addWidthContinuation;
+  const auto one_dimensional_branch = addBreakpointContinuation(0);
+  ASSERT_TRUE(one_dimensional_branch.has_value());
+  EXPECT_EQ(one_dimensional_branch->width_count, 3);
+  EXPECT_EQ(one_dimensional_branch->cta_count_per_width, 3);
+  EXPECT_EQ(one_dimensional_branch->terminal_leaf_count, 9);
+  EXPECT_EQ(one_dimensional_branch->max_unroll_bound, 1);
+  const auto two_dimensional_branch = addBreakpointContinuation(1);
+  ASSERT_TRUE(two_dimensional_branch.has_value());
+  EXPECT_EQ(two_dimensional_branch->width_count, 3);
+  EXPECT_EQ(two_dimensional_branch->cta_count_per_width, 128);
+  EXPECT_EQ(two_dimensional_branch->terminal_leaf_count, 642);
+  EXPECT_EQ(two_dimensional_branch->max_unroll_bound, 16);
+  EXPECT_FALSE(addBreakpointContinuation(2).has_value());
   for (const int64_t width : {1L, 2L, 4L}) {
     const auto one_dimensional = addWidthContinuation(0, width);
     ASSERT_TRUE(one_dimensional.has_value());
@@ -2538,9 +2610,17 @@ TEST_F(PointwiseTest, AddCtaNonzeroStorageOffsetKeepsConditionalPreview_CUDA) {
   std::ifstream decisions(log_path);
   ASSERT_TRUE(decisions.good());
   std::string row;
+  bool saw_breakpoint = false;
   bool saw_width = false;
   bool saw_cta = false;
   while (std::getline(decisions, row)) {
+    if (row.rfind("{\"site\":\"PW2\",", 0) == 0) {
+      saw_breakpoint = true;
+      EXPECT_THAT(row, ::testing::HasSubstr("pointwise.breakpoint.v3"));
+      EXPECT_THAT(
+          row,
+          ::testing::Not(::testing::HasSubstr("nvfuser.pw2.add2x16.v1")));
+    }
     if (row.rfind("{\"site\":\"PW3.width\",", 0) == 0) {
       saw_width = true;
       EXPECT_THAT(row, ::testing::HasSubstr("pointwise.width.v1"));
@@ -2557,6 +2637,7 @@ TEST_F(PointwiseTest, AddCtaNonzeroStorageOffsetKeepsConditionalPreview_CUDA) {
     EXPECT_THAT(row, ::testing::Not(::testing::HasSubstr(
                          "nvfuser.pw3.cta_1d.add2x16.v1")));
   }
+  EXPECT_TRUE(saw_breakpoint);
   EXPECT_TRUE(saw_width);
   EXPECT_TRUE(saw_cta);
 }

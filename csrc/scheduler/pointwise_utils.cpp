@@ -390,7 +390,8 @@ BreakPointInfo getBreakPoint(
     bool is_tma,
     int64_t max_vect_factor,
     int64_t kThreadX,
-    bool native_default_1d) {
+    bool native_default_1d,
+    bool exact_sm89_add2x16) {
   BreakPointInfo result;
 
   // Calculate dtype_sum_bit from fusion inputs/outputs
@@ -430,6 +431,14 @@ BreakPointInfo getBreakPoint(
   // The request carries measurements only, never the native winning plan.
   const auto jev_mode =
       is_tma ? scheduler::jev::Mode::Off : scheduler::jev::mode();
+  const bool bounded_add = exact_sm89_add2x16 && !is_tma &&
+      scheduler::jev::semanticV3Enabled() && ref_loop.size() == 2 &&
+      elem_counts == std::vector<int64_t>{2, 16} && n_elems == 32 &&
+      max_vect_factor == 4 && kThreadX == 128 &&
+      prop.index_type == PrimDataType::Int32 &&
+      scheduler_utils::breakIsDisjoint(view_disjoint_sets, 1) &&
+      broadcast_bit_multiples[1].lhs_multiple >=
+          broadcast_bit_multiples[1].rhs_multiple;
   struct JevBreakpointRequest {
     std::string state;
     std::vector<scheduler::jev::ChoiceOption> options;
@@ -438,8 +447,13 @@ BreakPointInfo getBreakPoint(
   auto make_jev_request = [&]() {
     JevBreakpointRequest request;
     const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
-    request.state =
-        semantic_v3 ? "pointwise.breakpoint.v3\n" : "pointwise.breakpoint.v2\n";
+    if (bounded_add) {
+      request.state = "pointwise.breakpoint.v4\n";
+    } else if (semantic_v3) {
+      request.state = "pointwise.breakpoint.v3\n";
+    } else {
+      request.state = "pointwise.breakpoint.v2\n";
+    }
     std::vector<int64_t> disjoint;
     std::vector<int64_t> lhs;
     std::vector<int64_t> rhs;
@@ -481,9 +495,19 @@ BreakPointInfo getBreakPoint(
     request.state +=
         "sm_count=" + std::to_string(prop.device_multiprocessor_count) + '\n';
     request.state += "default_cta_threads=" + std::to_string(kThreadX);
+    if (bounded_add) {
+      request.state += "\ncarrier=sm89_fp32_add_2x16";
+      request.state += "\nindex_type=11";
+      request.state += "\nwidth_choices=w1,w2,w4";
+      request.state += "\nexpr_count=1";
+      request.state += "\nunroll_max_cap=64";
+      request.state += "\nunroll_expr_width_budget=8192";
+      request.state += "\ngrid_split_status=none_for_carrier";
+    }
 
-    // A candidate consequence describes only the geometry selected at PW2.
-    // The named PW3 sites are possible descendants, not a completed schedule.
+    // The ordinary consequence describes PW2's local geometry. The exact Add
+    // carrier also gives a compact bounded descendant grammar without running
+    // those descendants; named PW3 sites are possible future choices.
     auto append_option = [&](std::string id,
                              std::string description,
                              const BreakPointInfo& plan) {
@@ -505,9 +529,66 @@ BreakPointInfo getBreakPoint(
                 : (plan.flip_grid_binding ? "flipped" : "normal"));
         effect.add(
             "outer_broadcast_dominated", plan.is_outer_broadcast_dominated);
+        if (bounded_add) {
+          const auto bounded =
+              pointwise::non_tma::addBreakpointContinuation(plan.break_point);
+          NVF_ERROR(
+              bounded.has_value(),
+              "PW2 exact Add continuation lost its bounded descendant menu");
+          const bool two_dimensional = plan.break_point == 1;
+          scheduler::native_diagnostic::Object grammar;
+          grammar.add("schema", "nvfuser.pw2.add2x16.v1");
+          grammar.add("plan_scope", "ordinary_pointwise_branch");
+          grammar.addRaw("width_choices", "[\"w1\",\"w2\",\"w4\"]");
+          grammar.add("width_count", bounded->width_count);
+          grammar.add(
+              "cta_choice_site",
+              two_dimensional ? "PW3.launch" : "PW3.cta_1d");
+          grammar.add(
+              "cta_choices_kind",
+              two_dimensional ? "integer_range" : "warp_powers_of_two");
+          grammar.add(
+              "cta_range_low", two_dimensional ? int64_t{1} : int64_t{32});
+          grammar.add("cta_range_high", int64_t{128});
+          grammar.add("cta_count_per_width", bounded->cta_count_per_width);
+          grammar.add("terminal_leaf_count", bounded->terminal_leaf_count);
+          grammar.add("max_unroll_bound", bounded->max_unroll_bound);
+          grammar.add(
+              "unroll_choices_kind",
+              two_dimensional ? "integer_1_to_B_or_no_choice"
+                              : "no_choice_u1");
+          grammar.add("cta_y_formula", two_dimensional ? "floor(128/X)" : "1");
+          if (two_dimensional) {
+            grammar.add("preliminary_left_formula", "ceil(2/Y)");
+            grammar.add("preliminary_right_formula", "ceil(ceil(16/W)/X)");
+            grammar.add(
+                "unroll_bound_formula",
+                "min(max(1,L*R),64,max(1,floor(8192/E/W)))");
+            grammar.add("post_unroll_right_formula", "ceil(R/U)");
+            grammar.add(
+                "effective_grid_x_formula",
+                plan.flip_grid_binding ? "L" : "ceil(R/U)");
+            grammar.add(
+                "effective_grid_y_formula",
+                plan.flip_grid_binding ? "ceil(R/U)" : "L");
+            grammar.add("right_coverage_formula", "ceil(R/U)*X*W*U");
+            grammar.add("right_tail_formula", "right_coverage-16");
+          } else {
+            grammar.add("unroll_bound_formula", "ceil(floor(32/W)/X)");
+            grammar.add(
+                "effective_grid_x_formula", "ceil(ceil(ceil(32/W)/X)/U)");
+            grammar.add("effective_grid_y_formula", "1");
+            grammar.add("right_coverage_formula", "grid_x*X*W*U");
+            grammar.add("right_tail_formula", "right_coverage-32");
+          }
+          grammar.add("grid_split_status", "none_for_carrier");
+          effect.addRaw("continuation", grammar.str());
+        }
         effect.addRaw(
             "pending_choices",
-            plan.break_point == 0
+            bounded_add && plan.break_point == 0
+                ? "[\"PW3.width\",\"PW3.cta_1d\"]"
+                : plan.break_point == 0
                 ? "[\"PW3.width\",\"PW3.cta_1d\",\"PW3.unroll\"]"
                 : "[\"PW3.width\",\"PW3.launch\",\"PW3.unroll\"]");
         consequence = effect.str();

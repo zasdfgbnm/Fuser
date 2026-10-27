@@ -551,6 +551,14 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   const auto jev_mode = scheduler::jev::mode();
   const bool native_analyze_2d = jev_mode != scheduler::jev::Mode::Remote &&
       n_elems * 2 > device_multiprocessor_count * kThreadX;
+  const bool exact_sm89_add2x16 =
+      jev_mode != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticV3Enabled() && !block_quantization &&
+      isExactSm89Add2x16Carrier(
+          fusion,
+          runtime_info,
+          prop,
+          at::cuda::getCurrentDeviceProperties());
 
   // Only Off skips the breakpoint analysis. Record and Remote always build the
   // direct PW2 candidate menu; Record retains the native threshold's bp0.
@@ -564,7 +572,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
         max_vectorization_size_in_bit /
             prop.max_dtype_size_bit_for_vectorization,
         kThreadX,
-        /*native_default_1d=*/!native_analyze_2d);
+        /*native_default_1d=*/!native_analyze_2d,
+        exact_sm89_add2x16);
   }
 
   const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
@@ -573,12 +582,7 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // width is chosen. Reuse this fact for the later CTA continuation without
   // speculatively executing any child heuristic.
   bool exact_add_continuation =
-      jev_mode != scheduler::jev::Mode::Off &&
-      scheduler::jev::semanticV3Enabled() && isExactSm89Add2x16Carrier(
-          fusion,
-          runtime_info,
-          prop,
-          at::cuda::getCurrentDeviceProperties()) &&
+      exact_sm89_add2x16 &&
       (bp_info.break_point == 0 ||
        (bp_info.break_point == 1 && bp_info.right_elem_count == 16 &&
         !bp_info.is_outer_broadcast_dominated));

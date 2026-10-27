@@ -113,6 +113,13 @@ struct AddWidthContinuation {
   int64_t max_unroll_bound;
 };
 
+struct AddBreakpointContinuation {
+  int64_t width_count;
+  int64_t cta_count_per_width;
+  int64_t terminal_leaf_count;
+  int64_t max_unroll_bound;
+};
+
 // Count the complete bounded descendants of one width without constructing
 // or scheduling any losing CTA branch. The exact carrier has three 1D CTA
 // leaves, or all 128 source-hard-valid 2D CTA splits with 1..B unroll leaves.
@@ -144,6 +151,27 @@ constexpr std::optional<AddWidthContinuation> addWidthContinuation(
     return AddWidthContinuation{128, leaves, max_bound};
   }
   return std::nullopt;
+}
+
+// Summarize all descendants of one legal breakpoint without invoking their
+// analyzers. The same three hard widths are valid for all exact Add branches.
+constexpr std::optional<AddBreakpointContinuation> addBreakpointContinuation(
+    int64_t break_point) {
+  if (break_point != 0 && break_point != 1) {
+    return std::nullopt;
+  }
+  int64_t leaves = 0;
+  int64_t max_bound = 0;
+  for (const int64_t width : {1L, 2L, 4L}) {
+    const auto c = addWidthContinuation(break_point, width);
+    if (!c.has_value()) {
+      return std::nullopt;
+    }
+    leaves += c->terminal_leaf_count;
+    max_bound = std::max(max_bound, c->max_unroll_bound);
+  }
+  return AddBreakpointContinuation{
+      3, break_point == 0 ? 3 : 128, leaves, max_bound};
 }
 
 } // namespace nvfuser::pointwise::non_tma

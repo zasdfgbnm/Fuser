@@ -120,7 +120,8 @@ BreakPointInfo getBreakPoint(
     bool is_tma,
     int64_t max_vect_factor = 1,
     int64_t kThreadX = 128,
-    bool native_default_1d = false);
+    bool native_default_1d = false,
+    bool exact_sm89_add2x16 = false);
 
 // Structure to hold complete block and grid configuration
 struct BlockGridConfig {
