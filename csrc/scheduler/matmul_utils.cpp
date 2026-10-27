@@ -31,6 +31,7 @@
 #include "scheduler/jev_client.h"
 #include "scheduler/matmul_heuristic.h"
 #include "scheduler/matmul_heuristic_plugin.h"
+#include "scheduler/matmul_hopper_tile_menu.h"
 #include "scheduler/mma_utils.h"
 #include "scheduler/registry.h"
 #include "scheduler/runtime_info.h"
@@ -354,99 +355,53 @@ void fillOptimalHopperTileSizes(
       /*cta=*/{64, 64, 64}, /*warp=*/{64, 64, 64}, /*instr=*/{64, 64, 16}};
   int64_t best_bytes_tx = std::numeric_limits<int64_t>::max();
   int64_t best_stages = std::numeric_limits<int64_t>::max();
-  bool has_native_config = false;
   std::vector<TileConfig> legal_configs;
-
-  // If two sizes result in the same number of total byte, prefer the larger CTA
-  // K. To do this we iterate backwards here.
-  for (int64_t cta_k = 256; cta_k > 0; cta_k -= 64) {
-    for (const auto& [m_ratio, n_ratio] :
-         std::vector<std::pair<int64_t, int64_t>>{
-             {2L, 1L}, // coopA
-             {1L, 2L}, // coopB
-             {1L, 1L}, // single math group
-         }) {
-      for (int64_t instr_n = 256; instr_n > 8; instr_n -= 64) {
-        // for (int64_t instr_n = 64; instr_n <= 64; instr_n += 64) {
-        const int64_t cta_m = m_ratio * 64;
-        const int64_t cta_n = n_ratio * instr_n;
-
-        // TODO: inspect output tensors for epilogue smem dtype
-        const int64_t epilogue_bytes = cta_m * cta_n * 2;
-        // operands plus outputs plus mbarriers
-        const int64_t bytes_per_stage = (cta_m + cta_n) * cta_k * 2 + 8 * 2;
-        // Preserve the native preference for at least three load stages.
-        int64_t min_stages = 3L;
-
-        // There might be fewer than min_stages stages needed to compute the
-        // whole problem.
-        const int64_t tiles_m = ceilDiv(m, cta_m);
-        const int64_t tiles_n = ceilDiv(n, cta_n);
-        const int64_t stages_per_tile = ceilDiv(k, cta_k);
-        const int64_t tiles_per_sm = ceilDiv(tiles_m * tiles_n, num_sms);
-        const int64_t stages_per_sm = stages_per_tile * tiles_per_sm;
-        min_stages = std::max(1L, std::min(min_stages, stages_per_sm));
-
-        const bool native_valid =
-            bytes_per_stage * min_stages + epilogue_bytes <= smem_bytes;
-        // Reserve room for the Float MMA accumulator even if the downstream
-        // epilogue analysis elects to omit or reuse its shared-memory buffer.
-        const bool low_stage_valid =
-            offer_low_stage_tiles && !native_valid &&
-            bytes_per_stage + cta_m * cta_n * 4 <= smem_bytes;
-        if (!native_valid && !low_stage_valid) {
-          continue;
+  const auto tile_menu = hopper_tile_menu::enumerate(
+      m, n, k, num_sms, smem_bytes, offer_low_stage_tiles);
+  const bool has_native_config = tile_menu.has_native_config;
+  for (const auto& candidate : tile_menu.candidates) {
+    const TileConfig cfg{
+        .cta = {candidate.cta_m, candidate.cta_n, candidate.cta_k},
+        .warp = {64L, candidate.instr_n, candidate.cta_k},
+        .instr = {64L, candidate.instr_n, 16L},
+    };
+    if (jev_tile_enabled &&
+        defaultHopperTileStageBudget(
+            cfg.cta, smem_bytes, output_dtype_bytes_sum, num_problems)
+                .max_operand_stages >= 1) {
+      legal_configs.push_back(cfg);
+    }
+    if (!score_native || !candidate.native_valid) {
+      continue;
+    }
+    const int64_t bytes_tx = bytes_transferred(cfg.cta);
+    bool new_best = bytes_tx < best_bytes_tx;
+    if (bytes_tx == best_bytes_tx) {
+      // Keep the legacy stage tie break, including the first larger-K tile.
+      if (best_stages < 10) {
+        if (candidate.stages_per_sm > best_stages) {
+          new_best = true;
         }
-
-        if (cta_m > 256 || cta_n > 256 || cta_k > 256) {
-          // CTA tile is limited to 256 is each dim
-          continue;
-        }
-        const TileConfig cfg{
-            .cta = {cta_m, cta_n, cta_k},
-            .warp = {64L, instr_n, cta_k},
-            .instr = {64L, instr_n, 16L},
-        };
-        has_native_config |= native_valid;
-        if (jev_tile_enabled &&
-            defaultHopperTileStageBudget(
-                cfg.cta, smem_bytes, output_dtype_bytes_sum, num_problems)
-                    .max_operand_stages >= 1) {
-          legal_configs.push_back(cfg);
-        }
-        if (!score_native || !native_valid) {
-          continue;
-        }
-        const int64_t bytes_tx = bytes_transferred(cfg.cta);
-        bool new_best = bytes_tx < best_bytes_tx;
-        if (bytes_tx == best_bytes_tx) {
-          // Break ties by preferring more stages, up to a point. We don't
-          // want to choose a non-circular buffered solution (best_stages==1)
-          // over a circular buffered solution like stages_per_sm = 5, but it
-          // is also not ideal to use so low a cta_k that we need tons of
-          // stages
-          if (best_stages < 10) {
-            if (stages_per_sm > best_stages) {
-              new_best = true;
-            }
-          } else {
-            // best_stages is already at least 10. From here prefer fewer but
-            // larger stages
-            new_best = stages_per_sm >= 10 && stages_per_sm < best_stages;
-          }
-        }
-        if (new_best) {
-          best_bytes_tx = bytes_tx;
-          best_config = cfg;
-          best_stages = stages_per_sm;
-        }
+      } else {
+        new_best = candidate.stages_per_sm >= 10 &&
+            candidate.stages_per_sm < best_stages;
       }
+    }
+    if (new_best) {
+      best_bytes_tx = bytes_tx;
+      best_config = cfg;
+      best_stages = candidate.stages_per_sm;
     }
   }
 
   if (jev_tile_enabled) {
-    // The no-native-candidate case keeps the original fallback/error behavior.
-    if (!has_native_config) {
+    // Only Remote can select a hard-valid one-stage tile when the old
+    // three-stage scoring policy found no native candidate. Record keeps its
+    // exact native fallback and records a coverage skip.
+    const bool remote_low_stage_menu =
+        jev_mode == scheduler::jev::Mode::Remote && !has_native_config &&
+        !legal_configs.empty();
+    if (!has_native_config && !remote_low_stage_menu) {
       legal_configs.clear();
     }
     if (legal_configs.empty()) {
@@ -488,7 +443,9 @@ void fillOptimalHopperTileSizes(
                 std::to_string(budget.max_operand_stages)});
       }
       const std::string state =
-          "matmul.hopper_tile.v3\nm_extent=" + std::to_string(m) +
+          std::string(remote_low_stage_menu ? "matmul.hopper_tile.v4\nm_extent="
+                                            : "matmul.hopper_tile.v3\nm_extent=") +
+          std::to_string(m) +
           "\nn_extent=" + std::to_string(n) +
           "\nk_extent=" + std::to_string(k) +
           "\nsm_count=" + std::to_string(num_sms) +
@@ -528,7 +485,9 @@ void fillOptimalHopperTileSizes(
             });
         NVF_ERROR(
             selected_it != legal_configs.end(),
-            "MM1.tile response is outside the native-valid tile menu");
+            remote_low_stage_menu
+                ? "MM1.tile response is outside the positive-stage tile menu"
+                : "MM1.tile response is outside the native-valid tile menu");
         best_config = *selected_it;
       }
     }
@@ -1358,29 +1317,17 @@ HopperTileStageBudget defaultHopperTileStageBudget(
           smem_per_block_bytes >= 0 && output_dtype_bytes_sum > 0 &&
           num_problems > 0,
       "Default Hopper tile budget requires positive dimensions and dtypes");
-  constexpr int64_t max_int64 = std::numeric_limits<int64_t>::max();
-  const auto add = [](int64_t lhs, int64_t rhs) {
-    return lhs > max_int64 - rhs ? max_int64 : lhs + rhs;
-  };
-  const auto multiply = [](int64_t lhs, int64_t rhs) {
-    return lhs > max_int64 / rhs ? max_int64 : lhs * rhs;
-  };
-  if (num_problems > static_cast<size_t>(max_int64)) {
-    return {max_int64, max_int64, 0};
-  }
-  const int64_t output_reserve = multiply(
-      multiply(output_dtype_bytes_sum, cta_tile.m), cta_tile.n);
-  const int64_t operand_stage = add(
-      multiply(
-          multiply(
-              multiply(static_cast<int64_t>(num_problems), 2),
-              add(cta_tile.m, cta_tile.n)),
-          cta_tile.k),
-      16);
-  const int64_t stages = output_reserve <= smem_per_block_bytes
-      ? (smem_per_block_bytes - output_reserve) / operand_stage
-      : 0;
-  return {output_reserve, operand_stage, stages};
+  const auto budget = hopper_tile_menu::stageBudget(
+      cta_tile.m,
+      cta_tile.n,
+      cta_tile.k,
+      smem_per_block_bytes,
+      output_dtype_bytes_sum,
+      num_problems);
+  return {
+      budget.output_smem_reserve_bytes,
+      budget.operand_stage_bytes,
+      budget.max_operand_stages};
 }
 
 std::unique_ptr<MatmulParams> getMatmulHeuristics(

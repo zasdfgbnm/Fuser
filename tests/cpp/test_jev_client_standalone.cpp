@@ -2,6 +2,7 @@
 // Standalone, CPU-only protocol test: build with jev_client.cpp and -pthread.
 #include <scheduler/jev_client.h>
 #include <scheduler/inner_outer_mode_preflight.h>
+#include <scheduler/matmul_hopper_tile_menu.h>
 #include <scheduler/normalization_inner_outer_grid_rows_admission.h>
 #include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
@@ -29,6 +30,41 @@ namespace {
 
 void require(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
+}
+
+void testHopperLowStageMenu() {
+  using namespace nvfuser::matmul_utils::hopper_tile_menu;
+  // The legacy three-stage preference has no winner with this injected SMEM
+  // budget. The sole hard-admissible tile can continue with one operand stage.
+  const auto menu = enumerate(8192, 4096, 4096, 132, 40000, true);
+  require(!menu.has_native_config, "three-stage policy unexpectedly found a tile");
+  size_t positive_stages = 0;
+  for (const auto& candidate : menu.candidates) {
+    const auto budget = stageBudget(
+        candidate.cta_m,
+        candidate.cta_n,
+        candidate.cta_k,
+        40000,
+        2,
+        1);
+    if (budget.max_operand_stages < 1) {
+      continue;
+    }
+    ++positive_stages;
+    require(
+        candidate.cta_m == 64 && candidate.cta_n == 64 &&
+            candidate.cta_k == 64 && candidate.instr_n == 64 &&
+            !candidate.native_valid &&
+            budget.output_smem_reserve_bytes == 8192 &&
+            budget.operand_stage_bytes == 16400 &&
+            budget.max_operand_stages == 1,
+        "low-stage Hopper tile cannot continue under the injected budget");
+  }
+  require(positive_stages == 1, "low-stage Hopper menu is not the single expected tile");
+  const auto legacy = enumerate(8192, 4096, 4096, 132, 40000, false);
+  require(
+      !legacy.has_native_config && legacy.candidates.empty(),
+      "Off/Record tile admission changed under the injected budget");
 }
 
 std::string readFile(const std::string& path) {
@@ -300,6 +336,7 @@ void testInnerOuterGridRowsAdmission() {
 } // namespace
 
 int main() {
+  testHopperLowStageMenu();
   testInnerRemainderPlateauScan();
   testInnerOuterGridRowsAdmission();
   using nvfuser::inner_outer_mode_preflight::Action;
