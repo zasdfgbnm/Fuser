@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <string_view>
+#include <utility>
 
 #include "ir/printer.h"
 #include "multidevice/utils.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/native_diagnostic_jsonl.h"
 #include "scheduler/registry.h"
 #include "scheduler/runtime_info.h"
 
@@ -434,7 +436,9 @@ BreakPointInfo getBreakPoint(
   };
   auto make_jev_request = [&]() {
     JevBreakpointRequest request;
-    request.state = "pointwise.breakpoint.v2\n";
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    request.state =
+        semantic_v3 ? "pointwise.breakpoint.v3\n" : "pointwise.breakpoint.v2\n";
     std::vector<int64_t> disjoint;
     std::vector<int64_t> lhs;
     std::vector<int64_t> rhs;
@@ -473,12 +477,45 @@ BreakPointInfo getBreakPoint(
     // native answer after PW2.entry was removed. Expose every operand so a
     // stateless service can replay that preference from this request alone.
     request.state += "n_elems=" + std::to_string(n_elems) + '\n';
-    request.state += "sm_count=" +
-        std::to_string(prop.device_multiprocessor_count) + '\n';
+    request.state +=
+        "sm_count=" + std::to_string(prop.device_multiprocessor_count) + '\n';
     request.state += "default_cta_threads=" + std::to_string(kThreadX);
 
-    request.options.push_back({"bp0", "Use one-dimensional scheduling"});
-    request.plans.emplace_back();
+    // A candidate consequence describes only the geometry selected at PW2.
+    // The named PW3 sites are possible descendants, not a completed schedule.
+    auto append_option = [&](std::string id,
+                             std::string description,
+                             const BreakPointInfo& plan) {
+      std::string consequence;
+      if (semantic_v3) {
+        scheduler::native_diagnostic::Object effect;
+        effect.add("break_point", static_cast<int64_t>(plan.break_point));
+        // bp0 has no 2D split: all work belongs to its sole 1D domain.
+        effect.add(
+            "left_elems",
+            plan.break_point == 0 ? 0 : n_elems / plan.right_elem_count);
+        effect.add(
+            "right_elems",
+            plan.break_point == 0 ? n_elems : plan.right_elem_count);
+        effect.add(
+            "grid_binding",
+            plan.break_point == 0
+                ? "one_dimensional"
+                : (plan.flip_grid_binding ? "flipped" : "normal"));
+        effect.add(
+            "outer_broadcast_dominated", plan.is_outer_broadcast_dominated);
+        effect.addRaw(
+            "pending_choices",
+            plan.break_point == 0
+                ? "[\"PW3.width\",\"PW3.cta_1d\",\"PW3.unroll\"]"
+                : "[\"PW3.width\",\"PW3.launch\",\"PW3.unroll\"]");
+        consequence = effect.str();
+      }
+      request.options.push_back(
+          {std::move(id), std::move(description), std::move(consequence)});
+      request.plans.push_back(plan);
+    };
+    append_option("bp0", "Use one-dimensional scheduling", BreakPointInfo{});
     int64_t right_count = 1;
     for (int64_t i = static_cast<int64_t>(ref_loop.size()) - 1; i >= 1; --i) {
       right_count *= elem_counts[i];
@@ -490,15 +527,15 @@ BreakPointInfo getBreakPoint(
       plan.right_elem_count = right_count;
       plan.is_outer_broadcast_dominated = lhs[i] < rhs[i];
       const std::string prefix = "bp" + std::to_string(i);
-      request.options.push_back(
-          {prefix + "_normal",
-           "Split at axis " + std::to_string(i) + ", normal BID binding"});
-      request.plans.push_back(plan);
+      append_option(
+          prefix + "_normal",
+          "Split at axis " + std::to_string(i) + ", normal BID binding",
+          plan);
       plan.flip_grid_binding = true;
-      request.options.push_back(
-          {prefix + "_flip",
-           "Split at axis " + std::to_string(i) + ", flipped BID binding"});
-      request.plans.push_back(plan);
+      append_option(
+          prefix + "_flip",
+          "Split at axis " + std::to_string(i) + ", flipped BID binding",
+          plan);
     }
     return request;
   };

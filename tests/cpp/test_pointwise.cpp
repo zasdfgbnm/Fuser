@@ -1836,6 +1836,130 @@ TEST_F(PointwiseTest, SmallPointwiseDirectBreakpointChoiceRecord) {
       records, ::testing::Not(::testing::HasSubstr("\"site\":\"PW2.entry\"")));
 }
 
+// The small Add carrier offers bp0 and both legal bindings at bp1. The v3
+// candidate cards expose local geometry and possible PW3 descendants, while
+// the actual Remote answer may choose any of the hard-legal alternatives.
+TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
+  char local_path[] = "/tmp/nvfuser-pw2-effects-XXXXXX";
+  struct FileCleanup {
+    const char* path = nullptr;
+    ~FileCleanup() {
+      if (path != nullptr) {
+        ::unlink(path);
+        ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+      }
+    }
+  } file_cleanup;
+  const auto jev_mode = scheduler::jev::mode();
+  std::optional<ScopedTestEnv> local_log;
+  const char* log_path = std::getenv("NVFUSER_JEV_LOG");
+  if (jev_mode != scheduler::jev::Mode::Off &&
+      (log_path == nullptr || *log_path == '\0')) {
+    const int fd = ::mkstemp(local_path);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    file_cleanup.path = local_path;
+    local_log.emplace("NVFUSER_JEV_LOG", local_path);
+    log_path = local_path;
+  }
+  std::streampos log_start = 0;
+  if (log_path != nullptr) {
+    std::ifstream existing_log(log_path, std::ios::ate);
+    if (existing_log.good()) {
+      log_start = existing_log.tellg();
+    }
+  }
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::randn(
+      {2, 16}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::PointWise);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedTestEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  ASSERT_NE(native, nullptr);
+  EXPECT_EQ(native->as<PointwiseParams>()->break_point, 0);
+  auto results = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  ASSERT_NE(results.heuristic_params, nullptr);
+  const auto* params = results.heuristic_params->as<PointwiseParams>();
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(native->lparams, results.heuristic_params->lparams);
+  }
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    ASSERT_NE(log_path, nullptr);
+    std::ifstream decision_log(log_path);
+    ASSERT_TRUE(decision_log.good());
+    decision_log.seekg(log_start);
+    std::string row;
+    std::string pw2_row;
+    while (std::getline(decision_log, row)) {
+      if (row.rfind("{\"site\":\"PW2\",", 0) == 0) {
+        ASSERT_TRUE(pw2_row.empty());
+        pw2_row = row;
+      }
+    }
+    ASSERT_FALSE(pw2_row.empty());
+    EXPECT_THAT(pw2_row, ::testing::HasSubstr("pointwise.breakpoint.v3"));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"break_point\":0,\"left_elems\":0,\"right_elems\":32,"
+            "\"grid_binding\":\"one_dimensional\""));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"break_point\":1,\"left_elems\":2,\"right_elems\":16,"
+            "\"grid_binding\":\"normal\""));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"break_point\":1,\"left_elems\":2,\"right_elems\":16,"
+            "\"grid_binding\":\"flipped\""));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\",\"PW3."
+            "unroll\"]"));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"pending_choices\":[\"PW3.width\",\"PW3.launch\",\"PW3."
+            "unroll\"]"));
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
+      EXPECT_EQ(params->break_point, 0);
+    } else if (
+        pw2_row.find("\"selected\":\"bp1_normal\"") != std::string::npos) {
+      EXPECT_EQ(params->break_point, 1);
+      EXPECT_FALSE(params->flip_grid_binding);
+    } else if (pw2_row.find("\"selected\":\"bp1_flip\"") != std::string::npos) {
+      EXPECT_EQ(params->break_point, 1);
+      EXPECT_TRUE(params->flip_grid_binding);
+    } else {
+      EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
+      EXPECT_EQ(params->break_point, 0);
+    }
+  }
+}
+
 // The two structured protocols must describe the same conditional work for
 // each offered width and 1D CTA. The v3 wrapper retains the text state used
 // by the deterministic API parser and carries these previews per candidate.
@@ -1866,7 +1990,8 @@ TEST_F(PointwiseTest, PointwiseCandidatePreviewsMatchSemanticV2_CUDA) {
       &fusion, runtime_info, nullptr);
   ASSERT_TRUE(prop.has_value());
   const std::string hardware =
-      "{\"sm_count\":" + std::to_string(prop->device_multiprocessor_count) + "}";
+      "{\"sm_count\":" + std::to_string(prop->device_multiprocessor_count) +
+      "}";
 
   auto read_log = [&]() {
     std::ifstream stream(log_path);
