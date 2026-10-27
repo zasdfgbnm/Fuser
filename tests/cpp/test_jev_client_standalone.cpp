@@ -4,6 +4,7 @@
 #include <scheduler/inner_outer_mode_preflight.h>
 #include <scheduler/matmul_hopper_tile_menu.h>
 #include <scheduler/normalization_inner_outer_grid_rows_admission.h>
+#include <scheduler/normalization_inner_outer_tma_tmp_width.h>
 #include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
 #include <scheduler/reduction_inner_remainder_choice.h>
@@ -65,6 +66,40 @@ void testHopperLowStageMenu() {
   require(
       !legacy.has_native_config && legacy.candidates.empty(),
       "Off/Record tile admission changed under the injected budget");
+}
+
+void testTmaTemporaryReadWidthContinuation() {
+  using namespace nvfuser::inner_outer_tma_warp_specialized::tmp_width;
+  const auto half = bounds(/*inner_dim=*/4096, /*inner_vector=*/8,
+                           /*tmp_dtype_bits=*/16);
+  require(
+      half.hard_max == 8 && half.native_read == 4,
+      "IOP2 native performance cap was confused with the hard read limit");
+  const auto half_eight = readPlan(
+      8, 4096, 8, 16, /*bdimx=*/128, /*gdimy=*/128,
+      /*fixed_ws_plan_hard_valid=*/true);
+  require(
+      half_eight.hard_valid && !half_eight.combined_split_grid_inner_dim &&
+          half_eight.tmp_write_width_seed == 8 &&
+          !half_eight.tmp_write_choice_pending,
+      "IOP2 w8 cannot continue through temporary write and final grid");
+  const auto large_inner = readPlan(8, 1048576, 8, 16, 128, 128, true);
+  require(
+      large_inner.hard_valid && large_inner.combined_split_grid_inner_dim,
+      "IOP2 candidate-specific grid split was not recomputed");
+  require(
+      !readPlan(16, 4096, 8, 16, 128, 128, true).hard_valid &&
+          !readPlan(8, 4096, 8, 16, 128, 128, false).hard_valid,
+      "IOP2 accepted an excessive width or a failed fixed WS plan");
+
+  const auto byte = bounds(/*inner_dim=*/4096, /*inner_vector=*/16,
+                           /*tmp_dtype_bits=*/8);
+  const auto byte_eight = readPlan(8, 4096, 16, 8, 128, 128, true);
+  require(
+      byte.hard_max == 16 && byte.native_read == 4 &&
+          byte_eight.hard_valid && byte_eight.tmp_write_width_seed == 16 &&
+          byte_eight.tmp_write_choice_pending,
+      "IOP2 selected w8 cannot reach a hard-valid w8/w16 write choice");
 }
 
 std::string readFile(const std::string& path) {
@@ -337,6 +372,7 @@ void testInnerOuterGridRowsAdmission() {
 
 int main() {
   testHopperLowStageMenu();
+  testTmaTemporaryReadWidthContinuation();
   testInnerRemainderPlateauScan();
   testInnerOuterGridRowsAdmission();
   using nvfuser::inner_outer_mode_preflight::Action;

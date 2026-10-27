@@ -8,12 +8,14 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "base.h"
 #include "ops/arith.h"
 #include "options.h"
 #include "scheduler/jev_client.h"
+#include "scheduler/normalization_inner_outer_tma_tmp_width.h"
 #include "scheduler/normalization_inner_outer_utils.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/runtime_info.h"
@@ -404,14 +406,11 @@ void getHeuristics(
   // For read from tmp gmem, since the parallelization is changed, a different
   //                         vectorization factor is used to optimize the
   //                         number of reductions per thread.
-  constexpr int64_t max_gmem_vect_access_bit = 128;
-  const int64_t max_tmp_gmem_vect_factor = std::min(
-      max_gmem_vect_access_bit / (int64_t)computation_dtype_size_bit,
-      vect_factor);
+  const auto tmp_width_bounds = tmp_width::bounds(
+      inner_dim_numel, vect_factor, computation_dtype_size_bit);
+  const int64_t max_tmp_gmem_vect_factor = tmp_width_bounds.hard_max;
   int64_t tmp_gmem_write_vect = max_tmp_gmem_vect_factor;
-  const int64_t workload_per_thread = inner_dim_numel >= 4096 ? 4l : 2l;
-  int64_t vectorization_factor_outer =
-      std::min(workload_per_thread, max_tmp_gmem_vect_factor);
+  int64_t vectorization_factor_outer = tmp_width_bounds.native_read;
 
   // The read and write choices only change vectorization of the intermediate
   // global buffer. The TMA input layout, WS topology, and resource plan stay
@@ -457,18 +456,89 @@ void getHeuristics(
       }
     } else {
       std::vector<scheduler::jev::ChoiceOption> read_options;
-      for (int64_t width = 1; width <= vectorization_factor_outer;
-           width *= 2) {
-        read_options.push_back({
+      const int64_t native_read_width = vectorization_factor_outer;
+      // Record and Remote must advertise the same expanded menu. Record still
+      // selects the native 2/4 width, so an unchanged Remote answer has an
+      // identical request and dependent write-width continuation.
+      const bool expanded_hard_menu =
+          max_tmp_gmem_vect_factor > native_read_width;
+      const int64_t menu_max = expanded_hard_menu
+          ? max_tmp_gmem_vect_factor
+          : native_read_width;
+      for (int64_t width = 1; width <= menu_max; width *= 2) {
+        scheduler::jev::ChoiceOption option{
             "w" + std::to_string(width),
             "Read partial outer reduction from global memory with vector "
-            "width " + std::to_string(width)});
+            "width " + std::to_string(width)};
+        if (expanded_hard_menu) {
+          // Recheck the selected fixed WS resource plan at every candidate
+          // reader width, then prove the complete temporary write/grid
+          // continuation without relying on the native 2/4 preference.
+          vectorization_factor_outer = width;
+          const auto plan = tmp_width::readPlan(
+              width,
+              inner_dim_numel,
+              vect_factor,
+              computation_dtype_size_bit,
+              bdimx,
+              gdimy,
+              has_valid_tmp_width_envelope());
+          if (!plan.hard_valid || tmp_gmem_write_vect % width != 0) {
+            continue;
+          }
+          option.consequence_json =
+              "{\"outer_read_width\":" + std::to_string(width) +
+              ",\"tmp_write_width_seed\":" +
+              std::to_string(plan.tmp_write_width_seed) +
+              ",\"combined_split_grid_inner_dim\":" +
+              (plan.combined_split_grid_inner_dim ? "true" : "false") +
+              ",\"tmp_write_choice_pending\":" +
+              (plan.tmp_write_choice_pending ? "true" : "false") + "}";
+        }
+        read_options.push_back(std::move(option));
       }
+      vectorization_factor_outer = native_read_width;
+      NVF_ERROR(
+          !read_options.empty(),
+          "No complete hard-valid IOP2 temporary read width");
       const std::string state =
-          "inner_outer.tma_ws_tmp_read_width.v1\ninner_dim_numel=" +
+          std::string(expanded_hard_menu
+                          ? "inner_outer.tma_ws_tmp_read_width.v2\ninner_dim_numel="
+                          : "inner_outer.tma_ws_tmp_read_width.v1\ninner_dim_numel=") +
           std::to_string(inner_dim_numel) + "\ninner_vector_width=" +
           std::to_string(vect_factor) + "\ntmp_dtype_bits=" +
-          std::to_string(computation_dtype_size_bit);
+          std::to_string(computation_dtype_size_bit) +
+          (expanded_hard_menu
+               ? "\nouter_dim_numel=" + std::to_string(outer_dim_numel) +
+                   "\niter_unroll=" + std::to_string(iter_unroll) +
+                   "\nbdimx=" + std::to_string(bdimx) +
+                   "\nbdimy=" + std::to_string(bdimy) +
+                   "\ngdimy=" + std::to_string(gdimy) +
+                   "\nn_stages=" + std::to_string(n_stages) +
+                   "\nnon_circular_gmem_to_regs=" +
+                   std::to_string(is_non_circular_buffer_gmem_to_regs) +
+                   "\ncircular_regs_cached=" +
+                   std::to_string(is_circular_buffer_regs_cached) +
+                   "\nregister_buffer_bits=" +
+                   std::to_string(regs_buffer_size_bit) +
+                   "\ncircular_buffer_bits=" +
+                   std::to_string(circular_buffered_smem_size_bit) +
+                   "\nnon_circular_buffer_bits=" +
+                   std::to_string(non_circular_buffered_smem_size_bit) +
+                   "\nsmem_per_block_bytes=" +
+                   std::to_string(dev_prop->sharedMemPerBlockOptin) +
+                   "\nmax_threads_per_block=" +
+                   std::to_string(dev_prop->maxThreadsPerBlock) +
+                   "\nmax_threads_dim_x=" +
+                   std::to_string(dev_prop->maxThreadsDim[0]) +
+                   "\nmax_threads_dim_y=" +
+                   std::to_string(dev_prop->maxThreadsDim[1]) +
+                   "\nmax_grid_y=" +
+                   std::to_string(dev_prop->maxGridSize[1]) +
+                   "\navailable_regs_per_thread=" +
+                   std::to_string(getRegPerThreadGivenThreadsPerSM(
+                       bdimx * bdimy + kWarpSpecializationPaddedThreads))
+               : "");
       const std::string selected = scheduler::jev::chooseDecision(
           "IOP2.tmp_read_width",
           state,
@@ -517,7 +587,11 @@ void getHeuristics(
             "width " + std::to_string(width)});
       }
       const std::string state =
-          "inner_outer.tma_ws_tmp_write_width.v1\ninner_dim_numel=" +
+          std::string(
+              jev_mode == scheduler::jev::Mode::Remote &&
+                      vectorization_factor_outer > tmp_width_bounds.native_read
+                  ? "inner_outer.tma_ws_tmp_write_width.v2\ninner_dim_numel="
+                  : "inner_outer.tma_ws_tmp_write_width.v1\ninner_dim_numel=") +
           std::to_string(inner_dim_numel) + "\ninner_vector_width=" +
           std::to_string(vect_factor) + "\nouter_read_width=" +
           std::to_string(vectorization_factor_outer) + "\ntmp_dtype_bits=" +
@@ -534,7 +608,7 @@ void getHeuristics(
   }
 
   rparams->combined_split_grid_inner_dim =
-      vectorization_factor_outer * bdimx * gdimy < inner_dim_numel;
+      vectorization_factor_outer <= (inner_dim_numel - 1) / bdimx / gdimy;
   rparams->persistent_kernel = true;
   rparams->fastest_dim = true;
   rparams->combined_inner_outer = true;
