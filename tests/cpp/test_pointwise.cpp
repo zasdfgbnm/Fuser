@@ -343,8 +343,37 @@ TEST_F(PointwiseTest, JevSemanticV3UnsupportedGraphFallsBackBeforeChoice_CUDA) {
       records.str(),
       ::testing::HasSubstr(
           "\"reason\":\"semantic_graph_unsupported_operator\""));
+  if (recorded->as<PointwiseParams>()->use_tma_load) {
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW4.width\""));
+  } else {
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW2\""));
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW3.width\""));
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW3.unroll\""));
+  }
   EXPECT_THAT(
       records.str(), ::testing::Not(::testing::HasSubstr("\"request\":")));
+
+  std::ifstream outcome_file(std::string(log_path) + ".outcome.jsonl");
+  std::stringstream outcomes;
+  outcomes << outcome_file.rdbuf();
+  EXPECT_THAT(
+      outcomes.str(),
+      ::testing::HasSubstr("\"kind\":\"no_choice\""));
+  EXPECT_THAT(
+      outcomes.str(),
+      ::testing::HasSubstr("\"site\":\"PW1\""));
 
   Fusion supported;
   FusionGuard supported_guard(&supported);

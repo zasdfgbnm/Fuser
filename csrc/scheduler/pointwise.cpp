@@ -816,10 +816,38 @@ std::unique_ptr<HeuristicParams> PointWiseScheduler::computeHeuristicsImpl(
   if (semantic_graph_reason != nullptr) {
     scheduler::jev::recordContextFallback(semantic_graph_reason);
     const auto* pointwise = pparams->as<PointwiseParams>();
+    // The native plan is safe, but the graph gate suppressed the potential
+    // semantic sites below before their menus were built. A skip identifies a
+    // site without claiming it would have had multiple legal choices.
+    if (configured_jev_mode == scheduler::jev::Mode::Record) {
+      const auto skip = [&](std::string_view site) {
+        scheduler::jev::recordCoverageSkip(site, semantic_graph_reason);
+      };
+      if (use_tma) {
+        skip("PW1");
+      }
+      if (pointwise->use_tma_load) {
+        skip("PW4.domain_inner");
+        skip("PW4.tile_inner");
+        skip("PW4.tile_outer");
+        skip("PW4.width");
+        skip("PW4.breakpoint");
+      } else {
+        skip("PW2");
+        skip("PW3.width");
+        skip(pointwise->break_point > 0 ? "PW3.launch" : "PW3.cta_1d");
+        skip("PW3.unroll");
+      }
+    }
     if (pointwise->use_tma_load) {
       scheduler::jev::recordNoChoiceDecision(
           "PW1", "tma", semantic_graph_reason, "native");
     } else {
+      scheduler::jev::recordNoChoiceDecision(
+          "PW1",
+          "ordinary",
+          use_tma ? semantic_graph_reason : "TMA is unavailable",
+          use_tma ? "native" : "hard");
       scheduler::jev::recordNoChoiceDecision(
           "PW3.width",
           "w" + std::to_string(pointwise->vectorization_factor),
