@@ -9,6 +9,7 @@
 #include <scheduler/normalization_tma_prefetch_choice.h>
 #include <scheduler/pointwise_unroll_envelope.h>
 #include <scheduler/reduction_inner_remainder_choice.h>
+#include <scheduler/reduction_inner_width_choice.h>
 #include <scheduler/reduction_inner3d_iter_unroll_continuation.h>
 #include <scheduler/reduction_tma_unroll_choice.h>
 
@@ -1195,6 +1196,43 @@ int main() {
   const std::vector<ChoiceOption> reverse_options{
       {"bp1", "split"}, {"bp0", "one dimensional"}};
   ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  using nvfuser::reduction::non_tma::inner_width_choice::layoutCapOption;
+  const auto legacy_width_cap = layoutCapOption(3, false);
+  const auto contextual_width_cap = layoutCapOption(3, true);
+  require(
+      legacy_width_cap.id == contextual_width_cap.id &&
+          legacy_width_cap.id == "w3" &&
+          legacy_width_cap.description == "Use the native layout width cap" &&
+          contextual_width_cap.description ==
+              "Vectorize 3 element(s) per thread at the layout width cap",
+      "RD3 layout cap changed its ID or legacy wording, or leaked the native winner");
+  const std::string rd3_width_state =
+      "reduction.inner_width.v1\nlayout_max=3\nmax_dtype_bits=32\n"
+      "n_tensor_inputs=1\nhas_mufu=0\nsm_count=128\n"
+      "max_threads_per_sm=1536\nmemory_bus_bits=384\n"
+      "memory_clock_khz=1000000";
+  const std::vector<ChoiceOption> rd3_width_options{
+      contextual_width_cap, {"w1", "Vectorize 1 element(s) per thread"}};
+  std::string rd3_width_record_request;
+  {
+    const std::string before = readFile(path);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "RD3 synthetic input", {}, v3_hardware);
+    require(
+        chooseDecision("RD3.width", rd3_width_state, rd3_width_options, "w3") ==
+            "w3",
+        "RD3 layout cap Record changed the native selection");
+    rd3_width_record_request =
+        loggedRequest(readFile(path).substr(before.size()));
+    require(
+        rd3_width_record_request.find(
+            "\"criteria\":{\"w1\":\"Vectorize 1 element(s) per thread\","
+            "\"w3\":\"Vectorize 3 element(s) per thread at the layout width cap\"}") !=
+                std::string::npos &&
+            rd3_width_record_request.find("native layout width cap") ==
+                std::string::npos,
+        "RD3 semantic-v3 request exposed the source-native width hint");
+  }
   const std::string before_v3_record = readFile(path);
   nvfuser::scheduler::jev::recordContextFallback("snapshot_too_large");
   require(
@@ -1303,6 +1341,24 @@ int main() {
             "semantic-v3 request exceeding 8 MiB was sent or logged");
   }
   ::setenv("NVFUSER_JEV_MODE", "remote", 1);
+  {
+    FakeServer server(
+        "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"RD3.width\":{"
+        "\"type\":\"choice\",\"choice\":\"w1\",\"confidence\":1.0,"
+        "\"probabilities\":{\"w1\":1.0,\"w3\":0.0}}},"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}");
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "RD3 synthetic input", {}, v3_hardware);
+    require(
+        chooseDecision("RD3.width", rd3_width_state, rd3_width_options) == "w1",
+        "RD3 semantic-v3 Remote rejected a valid alternate width");
+    const auto body_start = server.request().find("\r\n\r\n");
+    require(body_start != std::string::npos,
+            "RD3 semantic-v3 Remote request body is missing");
+    require(server.request().substr(body_start + 4) == rd3_width_record_request,
+            "RD3 width Record and Remote requests differ");
+  }
   {
     FakeServer server(answer("bp1"));
     ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);

@@ -32,6 +32,7 @@
 #include "scheduler/reduction.h"
 #include "scheduler/reduction_inner3d_iter_unroll_continuation.h"
 #include "scheduler/reduction_inner_remainder_choice.h"
+#include "scheduler/reduction_inner_width_choice.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/runtime_info.h"
@@ -202,9 +203,8 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     // non-power-of-two layout cap reaches this path.
     if (scheduler_utils::lastPow2(max_vectorize_factor) !=
         max_vectorize_factor) {
-      options.push_back(
-          {"w" + std::to_string(max_vectorize_factor),
-           "Use the native layout width cap"});
+      options.push_back(inner_width_choice::layoutCapOption(
+          max_vectorize_factor, scheduler::jev::semanticV3Enabled()));
     }
 
     int memory_clock_khz = 0;
