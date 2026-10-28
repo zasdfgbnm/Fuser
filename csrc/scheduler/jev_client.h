@@ -51,7 +51,7 @@ struct ChoiceOption {
 // NVFUSER_JEV_LOG: required JSONL path in record/remote mode.
 // NVFUSER_JEV_PORT: loopback server port (default 8765) in remote mode.
 // NVFUSER_JEV_TIMEOUT_MS: total loopback POST deadline in milliseconds
-// (default 2000, allowed 1..600000) in remote mode.
+// (default 2000, allowed 1..3600000) in remote mode.
 // NVFUSER_JEV_CASE_KEY: optional benchmark case identifier for log matching.
 // native_choice is required in off/record modes. Call mode() before computing
 // the native preference: remote mode accepts an empty native_choice so a
