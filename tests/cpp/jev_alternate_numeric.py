@@ -2805,7 +2805,8 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("2D register fixture lacks its checked width menu")
         semantic = isinstance(event["state"], dict)
         if semantic:
-            from jev_shim import parse_inner_reg_width_state
+            from jev_shim import (parse_inner_reg_width_state,
+                                  _ip5_width_policy_summary_effect)
 
             context = event["state"]
             decision = context["decision"]
@@ -2813,7 +2814,7 @@ def check_alternate_report(report: dict[str, Any],
             rows = [row for row in report["multiplicity"]
                     if row["site"] == "IP5.width"]
             if (len(rows) != 1 or rows[0]["record"] != {"w4": 1} or
-                    rows[0]["remote"] != {"w1": 1} or source.version != 2 or
+                    rows[0]["remote"] != {"w1": 1} or source.version not in {2, 3} or
                     decision["site"] != "IP5.width" or
                     len(decision["candidates"]) != len(source.plans)):
                 raise ValueError("semantic IP5 width Record/Remote requests differ")
@@ -2821,6 +2822,12 @@ def check_alternate_report(report: dict[str, Any],
             for width_plan in source.plans:
                 card = by_id[width_plan.choice_id]
                 effect = card.get("consequence")
+                if source.version == 3:
+                    if effect != _ip5_width_policy_summary_effect(
+                            source, width_plan):
+                        raise ValueError(
+                            "semantic IP5 width policy summary differs from source")
+                    continue
                 parallel = source.inner_numel // width_plan.width
                 if (not isinstance(effect, dict) or
                         effect.get("vector_width") != width_plan.width or
@@ -2855,6 +2862,91 @@ def check_alternate_report(report: dict[str, Any],
                     }
                     if shown != expected:
                         raise ValueError("semantic IP5 width row/effect mismatch")
+            if source.version == 3:
+                from jev_shim import (InnerRegTargetsV2State,
+                                      parse_inner_reg_targets_state)
+
+                target_rows = [row for row in report["multiplicity"]
+                               if row["site"] == "IP5.targets"]
+                if len(target_rows) != 2:
+                    raise ValueError("width v3 needs both downstream target previews")
+                for target_row in target_rows:
+                    request = target_row["request"]
+                    target_context = request["state"]
+                    target = parse_inner_reg_targets_state(
+                        target_context["decision"]["analysis_inputs_text"])
+                    if not isinstance(target, InnerRegTargetsV2State):
+                        raise ValueError("width v3 needs target v2 downstream")
+                    prior_width = [entry["choice"] for entry in
+                                   target_context["current_schedule"]["prior_choices"]
+                                   if entry["site"] == "IP5.width"]
+                    if len(prior_width) != 1:
+                        raise ValueError("downstream target lacks selected width")
+                    summary = by_id[prior_width[0]]["consequence"]
+                    cards = {
+                        f"o{card['register_overhead_target']}_w"
+                        f"{card['resident_warps_per_sm_target']}": card
+                        for card in summary["policy_summaries"]}
+                    offered = set(request["questions"]["IP5.targets"][
+                        "criteria"])
+                    if {key for key, card in cards.items()
+                            if card["preflight_available"]} != offered:
+                        raise ValueError("width policy availability differs from target")
+                    for policy in target.policies:
+                        card = cards[policy.choice_id]
+                        seed_plans = [seed for seed in target.seeds
+                                      if seed.valid and
+                                      (seed.overhead, seed.warps) ==
+                                      (policy.overhead, policy.warps)]
+                        batches = [batch for seed in seed_plans
+                                   for batch in seed.batch_plans]
+                        def span(values):
+                            return [min(values), max(values)]
+                        def measurements(seed, batch):
+                            padded = ((batch.score_x + target.warp_size - 1) //
+                                      target.warp_size * target.warp_size)
+                            pad = (batch.score_x > 16 and
+                                   padded * batch.score_y <=
+                                   target.max_threads_per_block)
+                            physical_x = ((target.parallel_after_vectorize +
+                                           batch.batch - 1) // batch.batch)
+                            physical_padded = ((physical_x + target.warp_size - 1) //
+                                               target.warp_size * target.warp_size)
+                            return (
+                                (padded if pad else batch.score_x) * batch.score_y,
+                                (physical_padded if pad else physical_x) *
+                                batch.score_y,
+                                (target.total_iteration_numel + batch.score_y - 1) //
+                                batch.score_y)
+                        geometry = [measurements(seed, batch)
+                                    for seed in seed_plans
+                                    for batch in seed.batch_plans]
+                        expected_summary = {
+                            "policy_batch_offer_min": policy.batch_min,
+                            "policy_batch_offer_max": policy.batch_max,
+                            "valid_cta_seed_count": len(seed_plans),
+                            "candidate_batch_plan_count": len(batches),
+                            "persistent_batch_range": span(
+                                [batch.batch for batch in batches]),
+                            "score_cta_threads_range": span(
+                                [value[0] for value in geometry]),
+                            "physical_cta_threads_range": span(
+                                [value[1] for value in geometry]),
+                            "nvrtc_register_cap_per_thread_range": span(
+                                [batch.register_cap for batch in batches]),
+                            "estimated_occupancy_warps_per_sm_range": span(
+                                [batch.occupancy for batch in batches]),
+                            "estimated_waves_range": span(
+                                [batch.waves for batch in batches]),
+                            "persistent_tail_elements_range": span(
+                                [batch.tails for batch in batches]),
+                            "logical_iteration_grid_blocks_before_split_range": span(
+                                [value[2] for value in geometry]),
+                        }
+                        if any(card.get(key) != value for key, value in
+                               expected_summary.items()):
+                            raise ValueError(
+                                "width policy summary differs from downstream target")
         expected = sorted((
             ("winner_mismatch", "IP5.width"),
             ("record_only_state", "IP5.targets"),

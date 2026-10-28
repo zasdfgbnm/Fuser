@@ -881,6 +881,19 @@ std::string innerWidthFrontierConsequence(
       "],\"pending_choices\":[\"IP5.targets\",\"IP5.cta_seed\",\"IP5.batch\"]}";
 }
 
+struct InnerWidthPolicySummary {
+  std::string state_rows;
+  std::string consequence_json;
+  bool complete = false;
+};
+
+InnerWidthPolicySummary summarizeInnerWidthPolicies(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    const Inner2DPolicyResources& initial_resources,
+    int64_t native_overhead,
+    int64_t native_warps);
+
 PersistentKernelProperties chooseInner2DVectorWidth(
     const PersistentKernelProperties& properties,
     const ReductionParams& base,
@@ -1041,6 +1054,60 @@ PersistentKernelProperties chooseInner2DVectorWidth(
     }
   }
   NVF_ERROR(!plans.empty(), "No legal 2D register vector width");
+  if (semantic_frontier) {
+    // Width admission and its native answer were fixed above. The v3 preview
+    // only informs this Choice about symmetric later target/seed domains.
+    std::string v3_state = state;
+    v3_state.replace(
+        0,
+        std::string("inner_persistent.reg_width.v2").size(),
+        "inner_persistent.reg_width.v3");
+    const std::string policy_flags =
+        "\nhas_exp_op=" + std::to_string(properties.has_exp_op) +
+        "\nhigh_bandwidth_flops_ratio=" +
+        std::to_string(scheduler_utils::isHighBandwidthFlopsRatio()) +
+        "\ndisable_projection_avoid_recompute=" +
+        std::to_string(properties.disable_project_to_avoid_recompute);
+    v3_state.insert(v3_state.find("\nplan="), policy_flags);
+    auto v3_options = options;
+    bool complete = true;
+    for (size_t i = 0; i < plans.size(); ++i) {
+      auto candidate_properties = properties;
+      candidate_properties.vectorize_factor = plans[i].width;
+      const auto summary = summarizeInnerWidthPolicies(
+          candidate_properties,
+          base,
+          plans[i].resources,
+          native_overhead,
+          native_warps);
+      if (!summary.complete) {
+        complete = false;
+        break;
+      }
+      v3_state += summary.state_rows;
+      v3_options[i].consequence_json = summary.consequence_json;
+    }
+    size_t option_bytes = 0;
+    for (const auto& option : v3_options) {
+      option_bytes += option.id.size() + option.description.size() +
+          option.consequence_json.size();
+    }
+    // The text is ASCII and JSON quoting at most doubles it. Keep the
+    // existing v2 request if the richer, symmetric preview cannot fit.
+    const bool preview_fits =
+        v3_state.size() * 2 + option_bytes <= 64 * 1024;
+    if (complete && preview_fits) {
+      state = std::move(v3_state);
+      options = std::move(v3_options);
+    } else {
+      scheduler::jev::recordNoChoiceDecision(
+          "IP5.width.summary",
+          "v2",
+          complete ? "policy_summary_too_large" :
+                     "policy_summary_incomplete",
+          "source_preview_fallback");
+    }
+  }
   NVF_ERROR(
       state.size() <= (semantic_frontier ? 64 * 1024 : 16 * 1024),
       "Inner persistent width request exceeds safe size");
@@ -1152,6 +1219,253 @@ std::vector<Inner2DSeedPlan> enumerateInner2DCTASeeds(
     }
   }
   return plans;
+}
+
+InnerWidthPolicySummary summarizeInnerWidthPolicies(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    const Inner2DPolicyResources& initial_resources,
+    int64_t native_overhead,
+    int64_t native_warps) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const int64_t width = properties.vectorize_factor;
+  const int64_t parallel = properties.inner_most_dimension_numel / width;
+  const int64_t buffer_bits =
+      properties.max_persistent_buffer_size_bit /
+      properties.total_reduction_numel * width;
+  const int64_t max_multi_reduction_factor = std::min(
+      scheduler_utils::safeDiv(
+          scheduler_utils::register_file_size_bit,
+          properties.max_persistent_buffer_size_bit),
+      ceilDiv(properties.total_iteration_numel,
+              (int64_t)device->multiProcessorCount));
+  const int64_t first_seed = 4 * device->warpSize;
+  if (first_seed <= 0 || first_seed > device->maxThreadsPerBlock) {
+    return {};
+  }
+  std::vector<int64_t> canonical_seeds;
+  for (int64_t seed = first_seed;;
+       seed = std::min(seed * 2, (int64_t)device->maxThreadsPerBlock)) {
+    canonical_seeds.push_back(seed);
+    if (seed == device->maxThreadsPerBlock) {
+      break;
+    }
+  }
+  const int64_t native_seed =
+      properties.total_iteration_numel >= device->multiProcessorCount
+      ? first_seed
+      : device->maxThreadsPerBlock;
+  struct Span {
+    int64_t low = std::numeric_limits<int64_t>::max();
+    int64_t high = std::numeric_limits<int64_t>::min();
+    void add(int64_t value) {
+      low = std::min(low, value);
+      high = std::max(high, value);
+    }
+    std::string json() const {
+      return "[" + std::to_string(low) + "," + std::to_string(high) + "]";
+    }
+  };
+  InnerWidthPolicySummary summary;
+  summary.consequence_json =
+      "{\"schema\":\"nvfuser.ip5.width.target_policy_summaries.v1\","
+      "\"scope\":\"source_unranked_target_policy_summaries_before_later_choices\","
+      "\"vector_width\":" +
+      std::to_string(width) +
+      ",\"reduction_elements_after_vectorize\":" +
+      std::to_string(parallel) +
+      ",\"buffer_bits_per_batch\":" + std::to_string(buffer_bits) +
+      ",\"downstream_target_choice_transport\":\"subject_to_full_frontier_64KiB_budget\"" +
+      ",\"policy_summaries\":[";
+  for (const int64_t overhead : {16l, 32l}) {
+    for (const int64_t warps : {16l, 28l}) {
+      Inner2DPolicyResources resources;
+      bool available = overhead >= native_overhead;
+      if (available) {
+        if (overhead == native_overhead && warps == native_warps) {
+          resources = initial_resources;
+        } else {
+          try {
+            ReductionParams preview(base);
+            innerPersistentHeuristic2DPlan(
+                properties, &preview, overhead, warps, false, &resources);
+          } catch (const std::exception&) {
+            available = false;
+          }
+        }
+        available = available && resources.supported_menu &&
+            resources.batch_max <= initial_resources.batch_max;
+      }
+      std::vector<Inner2DSeedPlan> seeds;
+      if (available) {
+        seeds = enumerateInner2DCTASeeds(
+            properties, base, overhead, warps, true);
+        if (seeds.size() != canonical_seeds.size()) {
+          return {};
+        }
+        for (size_t i = 0; i < seeds.size(); ++i) {
+          if (seeds[i].seed != canonical_seeds[i] ||
+              (seeds[i].valid &&
+               (seeds[i].batch_plans.empty() ||
+                seeds[i].batch_plans.front().persistent_batch_size !=
+                    seeds[i].batch_min ||
+                seeds[i].batch_plans.back().persistent_batch_size !=
+                    seeds[i].batch_max ||
+                seeds[i].batch_plans.size() !=
+                    (size_t)(seeds[i].batch_max - seeds[i].batch_min + 1)))) {
+            return {};
+          }
+        }
+        const auto native_it = std::find_if(
+            seeds.begin(), seeds.end(), [&](const auto& seed) {
+              return seed.seed == native_seed;
+            });
+        if (native_it == seeds.end() || !native_it->valid) {
+          // Target v2 would retain the native policy on an incomplete menu.
+          // Keep width v2 rather than making a contradictory v3 promise.
+          return {};
+        }
+      }
+      Span batches, score_threads, physical_threads, register_caps, occupancy;
+      Span waves, tails, grid;
+      int64_t valid_seed_count = 0;
+      int64_t batch_plan_count = 0;
+      for (const auto& seed : seeds) {
+        if (!seed.valid) {
+          continue;
+        }
+        ++valid_seed_count;
+        for (const auto& batch : seed.batch_plans) {
+          const int64_t score_x = scheduler_utils::safeDiv(
+              parallel, batch.persistent_batch_size);
+          const int64_t score_y = std::min(
+              scheduler_utils::safeDiv(seed.seed, score_x),
+              max_multi_reduction_factor);
+          const int64_t padded_x =
+              ceilDiv(score_x, (int64_t)device->warpSize) * device->warpSize;
+          const bool pad = score_x > 16 &&
+              padded_x * score_y <= device->maxThreadsPerBlock;
+          const int64_t score_cta =
+              (pad ? padded_x : score_x) * score_y;
+          const int64_t physical_x =
+              ceilDiv(parallel, batch.persistent_batch_size);
+          const int64_t actual_x = pad
+              ? ceilDiv(physical_x, (int64_t)device->warpSize) *
+                  device->warpSize
+              : physical_x;
+          const int64_t physical_cta = actual_x * score_y;
+          const int64_t logical_grid =
+              ceilDiv(properties.total_iteration_numel, score_y);
+          const int64_t grid_x_limit = scheduler_utils::x_grid_limit;
+          const int64_t grid_y_limit = std::min<int64_t>(
+              scheduler_utils::y_grid_limit, device->maxGridSize[1]);
+          const bool grid_fits =
+              (logical_grid <= device->maxGridSize[0] ||
+               (logical_grid > grid_x_limit &&
+                grid_x_limit <= device->maxGridSize[0])) &&
+              ceilDiv(logical_grid, grid_x_limit) <= grid_y_limit;
+          const int64_t blocks_per_sm = scheduler_utils::safeDiv(
+              batch.occupancy * device->warpSize, score_cta);
+          if (batch.bdimx != score_x || batch.bdimy != score_y ||
+              batch.padded_bdimx != padded_x || batch.is_pad_bdimx != pad ||
+              batch.n_persistent_tails !=
+                  physical_x * batch.persistent_batch_size - parallel ||
+              batch.n_wave !=
+                  ceilDiv(properties.total_iteration_numel,
+                          (int64_t)device->multiProcessorCount * blocks_per_sm) ||
+              score_x > device->maxThreadsDim[0] ||
+              score_y > device->maxThreadsDim[1] ||
+              score_cta > device->maxThreadsPerBlock ||
+              actual_x > device->maxThreadsDim[0] ||
+              physical_cta > device->maxThreadsPerBlock ||
+              batch.register_per_thread <= 0 ||
+              batch.register_per_thread > 255 ||
+              batch.register_per_thread <
+                  buffer_bits * batch.persistent_batch_size /
+                          scheduler_utils::bits_per_register +
+                      overhead ||
+              batch.register_per_thread >
+                  device->regsPerBlock / std::max(score_cta, physical_cta) ||
+              batch.occupancy <= 0 ||
+              batch.occupancy >
+                  device->maxThreadsPerMultiProcessor / device->warpSize ||
+              !grid_fits) {
+            // The later target-v2 validator would reject this full row. Send
+            // the older width preview instead of an inconsistent summary.
+            return {};
+          }
+          ++batch_plan_count;
+          batches.add(batch.persistent_batch_size);
+          score_threads.add(score_cta);
+          physical_threads.add(physical_cta);
+          register_caps.add(batch.register_per_thread);
+          occupancy.add(batch.occupancy);
+          waves.add(batch.n_wave);
+          tails.add(batch.n_persistent_tails);
+          grid.add(logical_grid);
+        }
+      }
+      if (available && (valid_seed_count == 0 || batch_plan_count == 0)) {
+        return {};
+      }
+      summary.state_rows += "\npolicy=" + std::to_string(width) + ":" +
+          std::to_string(overhead) + ":" + std::to_string(warps) + ":" +
+          std::to_string(available) + ":" +
+          std::to_string(available ? resources.batch_min : 0) + ":" +
+          std::to_string(available ? resources.batch_max : 0) + ":" +
+          std::to_string(available ? register_caps.low : 0) + ":" +
+          std::to_string(available ? register_caps.high : 0) + ":" +
+          std::to_string(available ? occupancy.low : 0) + ":" +
+          std::to_string(available ? occupancy.high : 0) + ":" +
+          std::to_string(available ? waves.low : 0) + ":" +
+          std::to_string(available ? waves.high : 0);
+      for (size_t i = 0; i < canonical_seeds.size(); ++i) {
+        const auto& seed = available ? seeds[i] : Inner2DSeedPlan{};
+        const bool valid = available && seed.valid;
+        summary.state_rows += "\nseed=" + std::to_string(width) + ":" +
+            std::to_string(overhead) + ":" + std::to_string(warps) + ":" +
+            std::to_string(canonical_seeds[i]) + ":" +
+            std::to_string(valid) + ":" +
+            std::to_string(valid ? seed.batch_min : 0) + ":" +
+            std::to_string(valid ? seed.batch_max : 0);
+      }
+      if (summary.consequence_json.back() != '[') {
+        summary.consequence_json += ',';
+      }
+      summary.consequence_json +=
+          "{\"register_overhead_target\":" + std::to_string(overhead) +
+          ",\"resident_warps_per_sm_target\":" + std::to_string(warps) +
+          ",\"preflight_available\":" +
+          (available ? "true" : "false");
+      if (available) {
+        summary.consequence_json +=
+            ",\"policy_batch_offer_min\":" +
+            std::to_string(resources.batch_min) +
+            ",\"policy_batch_offer_max\":" +
+            std::to_string(resources.batch_max) +
+            ",\"valid_cta_seed_count\":" +
+            std::to_string(valid_seed_count) +
+            ",\"candidate_batch_plan_count\":" +
+            std::to_string(batch_plan_count) +
+            ",\"persistent_batch_range\":" + batches.json() +
+            ",\"score_cta_threads_range\":" + score_threads.json() +
+            ",\"physical_cta_threads_range\":" + physical_threads.json() +
+            ",\"nvrtc_register_cap_per_thread_range\":" +
+            register_caps.json() +
+            ",\"estimated_occupancy_warps_per_sm_range\":" +
+            occupancy.json() +
+            ",\"estimated_waves_range\":" + waves.json() +
+            ",\"persistent_tail_elements_range\":" + tails.json() +
+            ",\"logical_iteration_grid_blocks_before_split_range\":" +
+            grid.json();
+      }
+      summary.consequence_json += '}';
+    }
+  }
+  summary.consequence_json +=
+      "],\"pending_choices\":[\"IP5.targets\",\"IP5.cta_seed\",\"IP5.batch\"]}";
+  summary.complete = true;
+  return summary;
 }
 
 // The 128-thread versus device-maximum seed is an empirical occupancy target.

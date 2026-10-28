@@ -1294,6 +1294,73 @@ int main() {
                     ip5_width_record_request,
             "IP5 Record and Remote frontier requests differ");
   }
+  // The wider v3 summary keeps its four policy slots in each typed card;
+  // semantic transport must preserve those bytes and never add the Record
+  // answer to the request sent to the service.
+  ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  const std::string ip5_width_v3_state =
+      "inner_persistent.reg_width.v3\ninner_numel=64\n"
+      "policy=1:16:16:1:1:2:64:64:32:32:1:1";
+  const std::string ip5_width_v3_effect =
+      "{\"schema\":\"nvfuser.ip5.width.target_policy_summaries.v1\","
+      "\"policy_summaries\":[{\"register_overhead_target\":16,"
+      "\"resident_warps_per_sm_target\":16,\"preflight_available\":true},"
+      "{\"register_overhead_target\":16,"
+      "\"resident_warps_per_sm_target\":28,\"preflight_available\":false},"
+      "{\"register_overhead_target\":32,"
+      "\"resident_warps_per_sm_target\":16,\"preflight_available\":false},"
+      "{\"register_overhead_target\":32,"
+      "\"resident_warps_per_sm_target\":28,\"preflight_available\":false}]}";
+  const std::vector<ChoiceOption> ip5_width_v3_options{
+      {"w2", "Vector width 2, checked persistent batches 1 through 2",
+       ip5_width_v3_effect},
+      {"w1", "Vector width 1, checked persistent batches 1 through 2",
+       ip5_width_v3_effect}};
+  std::string ip5_width_v3_record_request;
+  {
+    const std::string before = readFile(path);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "IP5 v3 synthetic input", {}, v3_hardware);
+    require(
+        chooseDecision(
+            "IP5.width", ip5_width_v3_state, ip5_width_v3_options, "w2") ==
+            "w2",
+        "IP5 v3 Record changed its width");
+    ip5_width_v3_record_request =
+        loggedRequest(readFile(path).substr(before.size()));
+    const std::string expected_candidates =
+        "\"candidates\":[{\"id\":\"w1\",\"description\":\"" +
+        ip5_width_v3_options[1].description + "\",\"consequence\":" +
+        ip5_width_v3_effect +
+        "},{\"id\":\"w2\",\"description\":\"" +
+        ip5_width_v3_options[0].description + "\",\"consequence\":" +
+        ip5_width_v3_effect + "}]";
+    require(
+        ip5_width_v3_record_request.find(expected_candidates) !=
+                std::string::npos &&
+            ip5_width_v3_record_request.find("native_choice") ==
+                std::string::npos,
+        "IP5 v3 candidate array changed or exposed the native width");
+  }
+  ::setenv("NVFUSER_JEV_MODE", "remote", 1);
+  {
+    FakeServer server(
+        "{\"model\":\"jev-1.13.0\",\"answers\":{\"IP5.width\":{"
+        "\"type\":\"choice\",\"choice\":\"w1\",\"confidence\":1.0,"
+        "\"probabilities\":{\"w1\":1.0,\"w2\":0.0}}},"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}");
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "IP5 v3 synthetic input", {}, v3_hardware);
+    require(chooseDecision("IP5.width", ip5_width_v3_state,
+                           ip5_width_v3_options) == "w1",
+            "IP5 v3 Remote rejected its policy summaries");
+    const auto body_start = server.request().find("\r\n\r\n");
+    require(body_start != std::string::npos &&
+                server.request().substr(body_start + 4) ==
+                    ip5_width_v3_record_request,
+            "IP5 v3 Record and Remote requests differ");
+  }
   ::setenv("NVFUSER_JEV_MODE", "record", 1);
   ::setenv("NVFUSER_JEV_PROTOCOL", "text-v1", 1);
   {
