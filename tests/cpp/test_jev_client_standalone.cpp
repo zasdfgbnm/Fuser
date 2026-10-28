@@ -1082,7 +1082,14 @@ int main() {
     require(timed_out, "short loopback deadline did not time out");
     ::unsetenv("NVFUSER_JEV_TIMEOUT_MS");
   }
-  for (const char* invalid : {"0", "600001", "invalid"}) {
+  for (const char* valid : {"600001", "3600000"}) {
+    ::setenv("NVFUSER_JEV_TIMEOUT_MS", valid, 1);
+    FakeServer server(answer("bp1"));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    require(chooseDecision("PW2", state, options) == "bp1",
+            "extended loopback timeout was rejected");
+  }
+  for (const char* invalid : {"0", "3600001", "invalid"}) {
     ::setenv("NVFUSER_JEV_TIMEOUT_MS", invalid, 1);
     bool rejected = false;
     try { (void)chooseDecision("PW2", state, options); }

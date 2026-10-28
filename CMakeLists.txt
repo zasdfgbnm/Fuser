@@ -1112,6 +1112,8 @@ if(BUILD_TEST)
   target_include_directories(test_jev_client_standalone PRIVATE ${NVFUSER_SRCS_DIR})
   set_property(TARGET test_jev_client_standalone PROPERTY CXX_STANDARD ${NVFUSER_CPP_STANDARD})
   list(APPEND TEST_BINARIES test_jev_client_standalone)
+  add_test(NAME jev_client_standalone
+    COMMAND $<TARGET_FILE:test_jev_client_standalone>)
 
   add_executable(test_bounded_snapshot_stream_standalone
     ${NVFUSER_ROOT}/tests/cpp/test_bounded_snapshot_stream_standalone.cpp)

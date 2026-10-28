@@ -40,7 +40,7 @@ constexpr size_t kMaxSemanticV3Request = 8 * 1024 * 1024;
 constexpr size_t kMaxResponse = 64 * 1024;
 constexpr size_t kMaxHeaders = 8 * 1024;
 constexpr auto kTimeout = std::chrono::milliseconds(2000);
-constexpr unsigned kMaxTimeoutMs = 600000;
+constexpr unsigned kMaxTimeoutMs = 3600000;
 constexpr std::string_view kPointwiseOutcomeSchema =
     "nvfuser.jev.pointwise.outcome.v1";
 constexpr std::string_view kComputeInvocationSchema =
@@ -321,7 +321,7 @@ std::chrono::milliseconds timeoutFromEnv() {
       text.data(), text.data() + text.size(), timeout_ms);
   if (error != std::errc{} || end != text.data() + text.size() ||
       timeout_ms == 0 || timeout_ms > kMaxTimeoutMs) {
-    fail("NVFUSER_JEV_TIMEOUT_MS must be an integer in 1..600000");
+    fail("NVFUSER_JEV_TIMEOUT_MS must be an integer in 1..3600000");
   }
   return std::chrono::milliseconds(timeout_ms);
 }
