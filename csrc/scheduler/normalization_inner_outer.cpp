@@ -603,7 +603,7 @@ std::unique_ptr<ReductionParams> getInnerOuterPersistentHeuristics(
     }
     if (options.size() == 1) {
       // A proved native singleton has no performance choice to send remotely.
-      scheduler::jev::recordNoChoiceDecision(
+      scheduler::jev::recordHardSingletonDecision(
           "IOP3.inner_width",
           native_id,
           "only the native width is hard-valid",

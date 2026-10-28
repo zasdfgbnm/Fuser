@@ -1441,6 +1441,21 @@ if(BUILD_TEST)
       --expect-no-choice IOP3.inner_width=w1)
   set_tests_properties(jev_remote_numeric_inner_outer_singleton_width
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_outer_fixed_width_context
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_inner_outer_fixed_width_context
+      --site-prefix IOP --required-site IOP3.storage
+      --protocol semantic-v3
+      --expect-no-choice IOP3.inner_width=w1
+      --expect-no-choice-reason "only the native width is hard-valid"
+      --expect-no-choice-source native_inner_width
+      --expect-prior-in IOP3.storage)
+  set_tests_properties(jev_remote_numeric_inner_outer_fixed_width_context
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_outer_min_batch
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
