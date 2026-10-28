@@ -344,6 +344,30 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
         std::to_string(plan.bdimy) + "_b" +
         std::to_string(plan.batches_per_block);
   };
+  // Enumerate the same checked plans that the later OP3.cta Choice will
+  // expose, without retaining the seed or its native last-valid split.
+  const auto complete_block_frontier = [&](int64_t iter_unroll,
+                                           int64_t redu_unroll) {
+    std::vector<BlockPlan> plans;
+    for (int64_t seed = 1;
+         seed <= std::min(
+             max_multi_reduction_factor / iter_unroll, device_warp_size);
+         seed *= 2) {
+      for (const auto& plan :
+           make_block_candidates(seed, iter_unroll, redu_unroll)) {
+        const std::string id = plan_id(plan);
+        if (std::none_of(plans.begin(), plans.end(), [&](const BlockPlan& prior) {
+              return plan_id(prior) == id;
+            })) {
+          plans.push_back(plan);
+        }
+      }
+    }
+    std::sort(plans.begin(), plans.end(), [&](const auto& lhs, const auto& rhs) {
+      return plan_id(lhs) < plan_id(rhs);
+    });
+    return plans;
+  };
 
   const auto jev_mode = scheduler::jev::mode();
   // Reduction unrolling is an empirical choice. The old factor of one was
@@ -406,8 +430,11 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
   // request is formed, so speculative plans never produce nested Choice logs.
   int64_t selected_iter_unroll = 1;
   if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    constexpr size_t kMaxOp3UnrollConsequences = 2 * 1024 * 1024;
     std::vector<scheduler::jev::ChoiceOption> options;
     std::vector<int64_t> factors;
+    size_t consequence_bytes = 0;
     for (int64_t factor = 1;
          factor <= (int64_t)vectorize_factor &&
          factor <= total_iteration_numel;
@@ -427,39 +454,101 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
         }
       }
       if (has_complete_plan) {
-        options.push_back({
+        scheduler::jev::ChoiceOption option{
             "u" + std::to_string(factor),
             "Vectorize " + std::to_string(factor) +
-                " iteration elements per thread with a valid block plan"});
+                " iteration elements per thread with a valid block plan"};
+        if (semantic_v3) {
+          const auto plans = complete_block_frontier(
+              factor, params.redu_unroll_factor.get());
+          NVF_ERROR(
+              !plans.empty(),
+              "Outer iteration factor lost its complete CTA frontier");
+          std::string consequence =
+              "{\"scope\":\"conditional_local_cta_frontier\","
+              "\"later_choice_sites\":[\"OP3.cta\"],\"plans\":[";
+          for (const auto& plan : plans) {
+            if (consequence.back() != '[') {
+              consequence += ',';
+            }
+            const int64_t grid_ctas_per_sm =
+                ceilDiv(plan.gdimx, device_multiprocessor_count);
+            // The resource estimate is the same source heuristic budget used
+            // by the hard one-SM guard, not allocated register usage.
+            const int64_t estimated_persistent_bits =
+                max_persistent_buffer_size_bit * plan.bdimx * factor;
+            consequence +=
+                "{\"id\":\"" + plan_id(plan) + "\",\"block_x\":" +
+                std::to_string(plan.bdimx) + ",\"block_y\":" +
+                std::to_string(plan.bdimy) +
+                ",\"serial_reduction_batches\":" +
+                std::to_string(plan.batches_per_block) + ",\"grid_x\":" +
+                std::to_string(plan.gdimx) + ",\"cta_threads\":" +
+                std::to_string(plan.bdimx * plan.bdimy) +
+                ",\"grid_ctas_per_sm_ceil\":" +
+                std::to_string(grid_ctas_per_sm) +
+                ",\"estimated_persistent_bits\":" +
+                std::to_string(estimated_persistent_bits) + '}';
+          }
+          option.consequence_json = std::move(consequence) + "]}";
+          consequence_bytes += option.consequence_json.size();
+        }
+        options.push_back(std::move(option));
         factors.push_back(factor);
       }
     }
     NVF_ERROR(!options.empty(), "No legal outer persistent iteration factor");
-    const std::string state =
-        (params.redu_unroll_factor.get() == 1
-             ? "outer_persistent.iter_unroll.v1\n"
-             : "outer_persistent.iter_unroll.v2\nredu_unroll=" +
-                   std::to_string(params.redu_unroll_factor.get()) + "\n") +
-        "reduction_numel=" +
-        std::to_string(total_reduction_numel) + "\niteration_numel=" +
-        std::to_string(total_iteration_numel) + "\nvector_width=" +
-        std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
-        std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
-        std::to_string(device_warp_size) + "\nregister_file_bits=" +
-        std::to_string(scheduler_utils::register_file_size_bit);
-    const std::string choice = scheduler::jev::chooseDecision(
-        "OP3.unroll",
-        state,
-        options,
-        jev_mode == scheduler::jev::Mode::Record ? "u1" : "");
-    const auto option_it = std::find_if(
-        options.begin(),
-        options.end(),
-        [&](const auto& option) { return option.id == choice; });
-    NVF_ERROR(
-        option_it != options.end(), "Unknown outer persistent iteration factor");
-    selected_iter_unroll =
-        factors.at(std::distance(options.begin(), option_it));
+    if (semantic_v3 && consequence_bytes > kMaxOp3UnrollConsequences) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "OP3.unroll complete CTA frontier exceeds the 2 MiB site limit");
+      scheduler::jev::recordCoverageSkip(
+          "OP3.unroll", "complete CTA frontier exceeds the 2 MiB site limit");
+    } else {
+      const std::string legacy_state =
+          (params.redu_unroll_factor.get() == 1
+               ? "outer_persistent.iter_unroll.v1\n"
+               : "outer_persistent.iter_unroll.v2\nredu_unroll=" +
+                     std::to_string(params.redu_unroll_factor.get()) + "\n") +
+          "reduction_numel=" +
+          std::to_string(total_reduction_numel) + "\niteration_numel=" +
+          std::to_string(total_iteration_numel) + "\nvector_width=" +
+          std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+          std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
+          std::to_string(device_warp_size) + "\nregister_file_bits=" +
+          std::to_string(scheduler_utils::register_file_size_bit);
+      const std::string state = semantic_v3
+          ? "outer_persistent.iter_unroll.v3\nredu_unroll=" +
+                std::to_string(params.redu_unroll_factor.get()) +
+                "\nreduction_numel=" + std::to_string(total_reduction_numel) +
+                "\niteration_numel=" + std::to_string(total_iteration_numel) +
+                "\nvector_width=" + std::to_string(vectorize_factor) +
+                "\npersistent_buffer_bits=" +
+                std::to_string(max_persistent_buffer_size_bit) +
+                "\nmax_input_dtype_bits=" +
+                std::to_string(max_input_dtype_size_bit) +
+                "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+                "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+                "\nl2_cache_bytes=" + std::to_string(dev_prop->l2CacheSize) +
+                "\nwarp_size=" + std::to_string(device_warp_size) +
+                "\nregister_file_bits=" +
+                std::to_string(scheduler_utils::register_file_size_bit)
+          : legacy_state;
+      const std::string choice = scheduler::jev::chooseDecision(
+          "OP3.unroll",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "u1" : "");
+      const auto option_it = std::find_if(
+          options.begin(),
+          options.end(),
+          [&](const auto& option) { return option.id == choice; });
+      NVF_ERROR(
+          option_it != options.end(),
+          "Unknown outer persistent iteration factor");
+      selected_iter_unroll =
+          factors.at(std::distance(options.begin(), option_it));
+    }
   }
   params.iter_unroll_factor.set(selected_iter_unroll);
   params.iter_unroll_factor.finalize();

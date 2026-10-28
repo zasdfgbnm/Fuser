@@ -161,6 +161,71 @@ def require_greedy_scan_candidate_effects(
     return evidence
 
 
+def check_outer_iter_unroll_effects(
+        trace_paths: tuple[Path, Path], server_log: Path) -> None:
+    """Check the exact u frontier on both source traces and the API request."""
+    from jev_shim import (outer_iter_unroll_consequence,
+                          parse_outer_iter_unroll_state, validate_request)
+
+    requests = []
+    for mode, path in (*zip(("record", "remote"), trace_paths),
+                       ("server", server_log)):
+        rows = [row for row in trace_rows(path)
+                if server_site(row) == "OP3.unroll"]
+        if len(rows) != 1:
+            raise ValueError(f"expected one {mode} OP3.unroll request: {rows}")
+        request = rows[0]["request"]
+        context = request["state"]
+        if (not isinstance(context, dict) or
+                context.get("schema") != "nvfuser.systemone.context.v3" or
+                context["decision"]["site"] != "OP3.unroll"):
+            raise ValueError(f"{mode} OP3.unroll lost semantic-v3 context")
+        state = parse_outer_iter_unroll_state(
+            context["decision"]["analysis_inputs_text"])
+        if (context["decision"]["analysis_inputs_text"].splitlines()[0] !=
+                "outer_persistent.iter_unroll.v3" or
+                (state.reduction_numel, state.iteration_numel,
+                 state.vector_width, state.persistent_buffer_bits,
+                 state.redu_unroll) != (128, 8192, 4, 4096, 1) or
+                context["current_schedule"]["prior_choices"][-1] !=
+                {"site": "OP3.redu_unroll", "choice": "r1"}):
+            raise ValueError(f"{mode} OP3.unroll fixture measurements changed")
+        validated = validate_request(request)
+        if validated.preview_verification != "conditional_local_effect_verified":
+            raise ValueError(f"{mode} OP3.unroll frontier was not verified")
+        candidates = context["decision"]["candidates"]
+        if ({item["id"] for item in candidates} != {"u1", "u2", "u4"} or
+                any(item.get("consequence") != outer_iter_unroll_consequence(
+                    state, int(item["id"][1:])) or
+                    len(item["consequence"]["plans"]) != 5
+                    for item in candidates)):
+            raise ValueError(f"{mode} OP3.unroll omitted a complete CTA plan")
+        requests.append(request_hash(request))
+    if len(set(requests)) != 1:
+        raise ValueError("record, remote, and server OP3.unroll requests differ")
+
+    ctas = []
+    for mode, path, expected_u in zip(
+            ("record", "remote"), trace_paths, ("u1", "u2")):
+        rows = [row for row in trace_rows(path) if row.get("site") == "OP3.cta"]
+        if len(rows) != 1:
+            raise ValueError(f"expected one {mode} dependent OP3.cta request")
+        context = rows[0]["request"]["state"]
+        if (not isinstance(context, dict) or
+                context.get("schema") != "nvfuser.systemone.context.v3" or
+                context["current_schedule"]["prior_choices"][-1] !=
+                {"site": "OP3.unroll", "choice": expected_u}):
+            raise ValueError(f"{mode} OP3.cta lacks selected {expected_u}")
+        fields = state_fields(rows[0], "outer_persistent.block_cta.v4")
+        if fields.get("iter_unroll") != expected_u[1:]:
+            raise ValueError(f"{mode} OP3.cta used the wrong iteration factor")
+        ctas.append(context)
+    if (ctas[0]["workload"] != ctas[1]["workload"] or
+            ctas[0]["current_schedule"]["prior_choices"][:-1] !=
+            ctas[1]["current_schedule"]["prior_choices"][:-1]):
+        raise ValueError("OP3.cta changed unrelated workload or prior choices")
+
+
 def require_no_choice(
         report: dict[str, Any], trace_paths: tuple[Path, Path] | None,
         site: str, selected: str,
@@ -859,7 +924,13 @@ def paired_state_rows(report: dict[str, Any], site: str
 
 
 def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
-    lines = row["request"]["state"].splitlines()
+    state = row["request"]["state"]
+    if isinstance(state, dict):
+        if (state.get("schema") != "nvfuser.systemone.context.v3" or
+                state.get("decision", {}).get("site") != row["site"]):
+            raise ValueError(f"{row['site']} lost its semantic-v3 context")
+        state = state["decision"]["analysis_inputs_text"]
+    lines = state.splitlines()
     if not lines or lines[0] != version:
         raise ValueError(f"unexpected {row['site']} state version: {lines}")
     fields: dict[str, str] = {}
@@ -1563,6 +1634,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_width: bool = False,
                            require_outer_cta: bool = False,
                            require_outer_batch_menu: bool = False,
+                           require_outer_iter_unroll_effects: bool = False,
                            require_outer_ragged: bool = False,
                            require_outer_grid_base: bool = False,
                            require_outer_unroll: bool = False,
@@ -1603,7 +1675,8 @@ def check_alternate_report(report: dict[str, Any],
                            require_transpose_virtual: bool = False,
                            require_pointwise_1d_cta: bool = False,
                            require_resize_reorder: bool = False,
-                           trace_paths: tuple[Path, Path] | None = None
+                           trace_paths: tuple[Path, Path] | None = None,
+                           server_log: Path | None = None
                            ) -> dict[str, Any]:
     if (len(events) != expected_site_calls or
             not all(event["forced"] and event == events[0] for event in events)):
@@ -1645,6 +1718,10 @@ def check_alternate_report(report: dict[str, Any],
         if trace_paths is None:
             raise ValueError("RD5.cta candidate effects need both decision traces")
         check_rd5_cta_preflight_effects(trace_paths)
+    if require_outer_iter_unroll_effects:
+        if trace_paths is None or server_log is None:
+            raise ValueError("OP3 iteration effects need both traces and server log")
+        check_outer_iter_unroll_effects(trace_paths, server_log)
     if require_resize_reorder:
         if (site != "RS1.reorder" or event["native"] != "keep" or
                 alternate != "skip"):
@@ -1921,15 +1998,8 @@ def check_alternate_report(report: dict[str, Any],
                       if sum(entry["remote"].values()) == 1 and not entry["record"]]
         if len(ctas) != 2 or len(record_cta) != 1 or len(remote_cta) != 1:
             raise ValueError(f"expected exactly one replaced OP3.cta request: {ctas}")
-        if (not record_cta[0]["request"]["state"].startswith(
-                "outer_persistent.block_cta.v4\n") or
-                not remote_cta[0]["request"]["state"].startswith(
-                    "outer_persistent.block_cta.v4\n")):
-            raise ValueError("OP3.cta state versions did not follow factor choice")
-        original = dict(line.split("=", 1) for line in
-                        record_cta[0]["request"]["state"].splitlines()[1:])
-        selected = dict(line.split("=", 1) for line in
-                        remote_cta[0]["request"]["state"].splitlines()[1:])
+        original = state_fields(record_cta[0], "outer_persistent.block_cta.v4")
+        selected = state_fields(remote_cta[0], "outer_persistent.block_cta.v4")
         if (original.get("iter_unroll") != "1" or
                 selected.get("iter_unroll") != alternate[1:] or
                 int(selected.get("vector_width", "0")) < int(alternate[1:]) or
@@ -3662,6 +3732,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-width", action="store_true")
     parser.add_argument("--require-outer-cta", action="store_true")
     parser.add_argument("--require-outer-batch-menu", action="store_true")
+    parser.add_argument("--require-outer-iter-unroll-effects", action="store_true")
     parser.add_argument("--require-outer-ragged", action="store_true")
     parser.add_argument("--require-outer-grid-base", action="store_true")
     parser.add_argument("--require-outer-unroll", action="store_true")
@@ -3728,6 +3799,10 @@ def main(argv: list[str] | None = None) -> int:
             args.site != ("GR1.scan_batch" if args.scan_count == 1 else
                           "GR1.multi_scan_batch")):
         parser.error("--require-greedy-scan-effects needs semantic-v3 and a matching Scan site/count")
+    if args.require_outer_iter_unroll_effects and (
+            args.protocol != "semantic-v3" or args.site != "OP3.unroll" or
+            args.alternate != "u2"):
+        parser.error("--require-outer-iter-unroll-effects needs semantic-v3 OP3.unroll=u2")
     module_dir, loader, libraries = checked_environment()
     if args.require_sm89:
         capability = cuda_compute_capability(libraries)
@@ -3843,6 +3918,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_width=args.require_outer_width,
             require_outer_cta=args.require_outer_cta,
             require_outer_batch_menu=args.require_outer_batch_menu,
+            require_outer_iter_unroll_effects=args.require_outer_iter_unroll_effects,
             require_outer_ragged=args.require_outer_ragged,
             require_outer_grid_base=args.require_outer_grid_base,
             require_outer_unroll=args.require_outer_unroll,
@@ -3887,7 +3963,8 @@ def main(argv: list[str] | None = None) -> int:
             require_pointwise_1d_cta=args.require_pointwise_1d_cta,
             require_resize_reorder=args.require_resize_reorder,
             trace_paths=(Path(record["decision_log"]),
-                         Path(remote["decision_log"])))
+                         Path(remote["decision_log"])),
+            server_log=server_log)
         if args.require_greedy_scan_effects:
             manifest["greedy_scan_effects"] = require_greedy_scan_candidate_effects(
                 (Path(record["decision_log"]), Path(remote["decision_log"])),
