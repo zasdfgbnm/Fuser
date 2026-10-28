@@ -388,7 +388,8 @@ void innerPersistentHeuristic2DPlan(
     int64_t target_warps_per_sm,
     bool enable_batch_choice,
     Inner2DPolicyResources* policy_resources = nullptr,
-    int64_t min_threads_override = 0) {
+    int64_t min_threads_override = 0,
+    bool expand_preview = false) {
   bool is_high_bandwidth_flops_ratio =
       scheduler_utils::isHighBandwidthFlopsRatio();
   // Currently, we only considered the influence of exp op which is used in
@@ -595,7 +596,8 @@ void innerPersistentHeuristic2DPlan(
             candidate_heuristics.begin(),
             candidate_heuristics.end(),
             supported_plan);
-    if (jev_mode != scheduler::jev::Mode::Off && supported_native_menu &&
+    if ((jev_mode != scheduler::jev::Mode::Off || expand_preview) &&
+        supported_native_menu &&
         buffer_bits_per_batch > 0) {
       const int64_t register_budget =
           getRegPerThreadGivenThreadsPerSM(target_threads_per_sm) -
@@ -1058,54 +1060,49 @@ PersistentKernelProperties chooseInner2DVectorWidth(
   return chosen;
 }
 
-// The 128-thread versus device-maximum seed is an empirical occupancy target.
-// Keep the register, CTA and grid checks in the native planner and offer only
-// seeds for which that planner produces a complete physical schedule.
-int64_t chooseInner2DCTASeed(
+struct Inner2DSeedPlan {
+  int64_t seed;
+  int64_t batch_min = 0;
+  int64_t batch_max = 0;
+  int64_t batch = 0;
+  int64_t physical_x = 0;
+  int64_t physical_y = 0;
+  bool pad_to_warp = false;
+  int64_t register_cap = 0;
+  int64_t grid_x = 0;
+  bool valid = false;
+  std::vector<NormInnerParams> batch_plans;
+};
+
+// Pure preflight shared by the target frontier and the later seed Choice.
+// expand_preview collects the later IP5.batch domain without selecting a
+// batch or emitting a nested Choice.
+std::vector<Inner2DSeedPlan> enumerateInner2DCTASeeds(
     const PersistentKernelProperties& properties,
     const ReductionParams& base,
     int64_t overhead,
-    int64_t warps) {
-  const auto mode = scheduler::jev::mode();
+    int64_t warps,
+    bool expand_preview) {
   const auto* device = at::cuda::getCurrentDeviceProperties();
   const int64_t warp = device->warpSize;
   const int64_t max_threads = device->maxThreadsPerBlock;
   const int64_t first_seed = 4 * warp;
-  const int64_t native_seed =
-      properties.total_iteration_numel >= device->multiProcessorCount
-      ? first_seed
-      : max_threads;
-  if (mode == scheduler::jev::Mode::Off) {
-    return native_seed;
-  }
-
   const int64_t parallel =
       properties.inner_most_dimension_numel / properties.vectorize_factor;
   const int64_t buffer_bits =
       properties.max_persistent_buffer_size_bit /
       properties.total_reduction_numel * properties.vectorize_factor;
-  struct SeedPlan {
-    int64_t seed;
-    int64_t batch_min = 0;
-    int64_t batch_max = 0;
-    int64_t batch = 0;
-    int64_t physical_x = 0;
-    int64_t physical_y = 0;
-    bool pad_to_warp = false;
-    int64_t register_cap = 0;
-    int64_t grid_x = 0;
-    bool valid = false;
-  };
-  std::vector<SeedPlan> plans;
+  std::vector<Inner2DSeedPlan> plans;
   if (first_seed > 0 && first_seed <= max_threads && parallel > 0 &&
       buffer_bits > 0 && properties.total_iteration_numel > 0) {
     for (int64_t seed = first_seed;; seed = std::min(seed * 2, max_threads)) {
-      SeedPlan plan{seed};
+      Inner2DSeedPlan plan{seed};
       try {
         ReductionParams preview(base);
         Inner2DPolicyResources resources;
         innerPersistentHeuristic2DPlan(
-            properties, &preview, overhead, warps, false, &resources, seed);
+            properties, &preview, overhead, warps, false, &resources, seed,
+            expand_preview);
         plan.batch_min = resources.batch_min;
         plan.batch_max = resources.batch_max;
         plan.batch = preview.batches_per_block_inner_reduction;
@@ -1138,12 +1135,15 @@ int64_t chooseInner2DCTASeed(
               threads <= max_threads && plan.register_cap > 0 &&
               plan.register_cap <= 255 &&
               plan.register_cap <= device->regsPerBlock / threads && grid_fits;
+          if (plan.valid && expand_preview) {
+            plan.batch_plans = std::move(resources.candidate_plans);
+          }
         }
       } catch (const std::exception&) {
         // A failed alternate preflight never becomes an API option.
       }
       if (!plan.valid) {
-        plan = SeedPlan{seed};
+        plan = Inner2DSeedPlan{seed};
       }
       plans.push_back(plan);
       if (seed == max_threads) {
@@ -1151,8 +1151,38 @@ int64_t chooseInner2DCTASeed(
       }
     }
   }
+  return plans;
+}
+
+// The 128-thread versus device-maximum seed is an empirical occupancy target.
+// Keep the register, CTA and grid checks in the native planner and offer only
+// seeds for which that planner produces a complete physical schedule.
+int64_t chooseInner2DCTASeed(
+    const PersistentKernelProperties& properties,
+    const ReductionParams& base,
+    int64_t overhead,
+    int64_t warps) {
+  const auto mode = scheduler::jev::mode();
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const int64_t warp = device->warpSize;
+  const int64_t max_threads = device->maxThreadsPerBlock;
+  const int64_t first_seed = 4 * warp;
+  const int64_t native_seed =
+      properties.total_iteration_numel >= device->multiProcessorCount
+      ? first_seed
+      : max_threads;
+  if (mode == scheduler::jev::Mode::Off) {
+    return native_seed;
+  }
+  const int64_t parallel =
+      properties.inner_most_dimension_numel / properties.vectorize_factor;
+  const int64_t buffer_bits =
+      properties.max_persistent_buffer_size_bit /
+      properties.total_reduction_numel * properties.vectorize_factor;
+  const auto plans = enumerateInner2DCTASeeds(
+      properties, base, overhead, warps, false);
   const bool native_valid = std::any_of(
-      plans.begin(), plans.end(), [&](const SeedPlan& plan) {
+      plans.begin(), plans.end(), [&](const Inner2DSeedPlan& plan) {
         return plan.seed == native_seed && plan.valid;
       });
   NVF_ERROR(
@@ -1165,7 +1195,7 @@ int64_t chooseInner2DCTASeed(
   }
   const auto valid_count = std::count_if(
       plans.begin(), plans.end(),
-      [](const SeedPlan& plan) { return plan.valid; });
+      [](const Inner2DSeedPlan& plan) { return plan.valid; });
   // Two seeds can have the same preview winner but expose different later
   // IP5.batch menus and per-batch CTA/register plans. Only a single hard-valid
   // seed is proved to lack a model decision.
@@ -1238,7 +1268,7 @@ int64_t chooseInner2DCTASeed(
           ? "t" + std::to_string(native_seed)
           : "");
   const auto chosen = std::find_if(
-      plans.begin(), plans.end(), [&](const SeedPlan& plan) {
+      plans.begin(), plans.end(), [&](const Inner2DSeedPlan& plan) {
         return plan.valid && selected == "t" + std::to_string(plan.seed);
       });
   NVF_ERROR(chosen != plans.end(), "Unknown 2D register CTA seed");
@@ -1295,14 +1325,19 @@ void innerPersistentHeuristic2D(
     int64_t overhead;
     int64_t warps;
     Inner2DPolicyResources resources;
+    std::vector<Inner2DSeedPlan> seeds;
     std::string id() const {
       return "o" + std::to_string(overhead) + "_w" + std::to_string(warps);
     }
   };
   std::vector<Policy> policies;
   std::vector<scheduler::jev::ChoiceOption> options;
+  const bool semantic_frontier = scheduler::jev::semanticV3Enabled();
+  const auto* device = at::cuda::getCurrentDeviceProperties();
   std::string state =
-      "inner_persistent.reg_targets.v1\nhas_exp_op=" +
+      std::string(semantic_frontier ? "inner_persistent.reg_targets.v2\n"
+                                    : "inner_persistent.reg_targets.v1\n") +
+      "has_exp_op=" +
       std::to_string(properties.has_exp_op) +
       "\nhigh_bandwidth_flops_ratio=" + std::to_string(high_bandwidth) +
       "\ndisable_projection_avoid_recompute=" +
@@ -1317,10 +1352,33 @@ void innerPersistentHeuristic2D(
           properties.max_persistent_buffer_size_bit /
           properties.total_reduction_numel * properties.vectorize_factor) +
       "\nwarp_size=" +
-      std::to_string(at::cuda::getCurrentDeviceProperties()->warpSize) +
+      std::to_string(device->warpSize) +
       "\nmax_threads_per_block=" +
-      std::to_string(
-          at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock);
+      std::to_string(device->maxThreadsPerBlock);
+  if (semantic_frontier) {
+    state +=
+        "\ninner_numel=" +
+        std::to_string(properties.inner_most_dimension_numel) +
+        "\nreduction_numel=" + std::to_string(properties.total_reduction_numel) +
+        "\npersistent_buffer_bits=" +
+        std::to_string(properties.max_persistent_buffer_size_bit) +
+        "\nvector_width=" + std::to_string(properties.vectorize_factor) +
+        "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+        "\nmax_threads_per_sm=" +
+        std::to_string(device->maxThreadsPerMultiProcessor) +
+        "\nmax_threads_x=" + std::to_string(device->maxThreadsDim[0]) +
+        "\nmax_threads_y=" + std::to_string(device->maxThreadsDim[1]) +
+        "\nregisters_per_block=" + std::to_string(device->regsPerBlock) +
+        "\nmax_grid_x=" + std::to_string(device->maxGridSize[0]) +
+        "\nmax_grid_y=" + std::to_string(device->maxGridSize[1]) +
+        "\nmax_multi_reduction_factor=" +
+        std::to_string(std::min(
+            scheduler_utils::safeDiv(
+                scheduler_utils::register_file_size_bit,
+                properties.max_persistent_buffer_size_bit),
+            ceilDiv(properties.total_iteration_numel,
+                    (int64_t)device->multiProcessorCount)));
+  }
 
   // Canonical order does not expose the native policy. Preflight computes all
   // batch/CTA/register plans and suppresses the nested IP5.batch Choice.
@@ -1341,7 +1399,7 @@ void innerPersistentHeuristic2D(
           resources.batch_max > native_resources.batch_max) {
         continue;
       }
-      policies.push_back({overhead, warps, resources});
+      policies.push_back({overhead, warps, resources, {}});
       const auto& policy = policies.back();
       options.push_back(
           {policy.id(),
@@ -1354,8 +1412,159 @@ void innerPersistentHeuristic2D(
     }
   }
   NVF_ERROR(!policies.empty(), "No legal 2D register policy");
-  NVF_ERROR(
-      state.size() <= 16 * 1024, "Inner persistent policy request too large");
+  bool complete_frontier = true;
+  if (semantic_frontier) {
+    const int64_t parallel =
+        properties.inner_most_dimension_numel / properties.vectorize_factor;
+    for (auto& policy : policies) {
+      policy.seeds = enumerateInner2DCTASeeds(
+          properties, *rparams, policy.overhead, policy.warps, true);
+      const int64_t native_seed =
+          properties.total_iteration_numel >= device->multiProcessorCount
+          ? 4 * device->warpSize
+          : device->maxThreadsPerBlock;
+      const bool native_valid = std::any_of(
+          policy.seeds.begin(), policy.seeds.end(), [&](const auto& seed) {
+            return seed.seed == native_seed && seed.valid;
+          });
+      if (!native_valid) {
+        complete_frontier = false;
+        break;
+      }
+      for (const auto& seed : policy.seeds) {
+        state += "\nseed=" + std::to_string(policy.overhead) + ":" +
+            std::to_string(policy.warps) + ":" +
+            std::to_string(seed.seed) + ":" +
+            std::to_string(seed.valid) + ":" +
+            std::to_string(seed.batch_min) + ":" +
+            std::to_string(seed.batch_max);
+        if (!seed.valid) {
+          continue;
+        }
+        if (seed.batch_plans.empty() ||
+            seed.batch_plans.front().persistent_batch_size != seed.batch_min ||
+            seed.batch_plans.back().persistent_batch_size != seed.batch_max ||
+            !std::all_of(
+                seed.batch_plans.begin(),
+                seed.batch_plans.end(),
+                [&](const auto& batch) {
+                  return batch.persistent_batch_size ==
+                      seed.batch_min + (&batch - seed.batch_plans.data());
+                })) {
+          complete_frontier = false;
+          break;
+        }
+        for (const auto& batch : seed.batch_plans) {
+          state += "\nbatch_plan=" + std::to_string(policy.overhead) + ":" +
+              std::to_string(policy.warps) + ":" +
+              std::to_string(seed.seed) + ":" +
+              std::to_string(batch.persistent_batch_size) + ":" +
+              std::to_string(batch.bdimx) + ":" +
+              std::to_string(batch.bdimy) + ":" +
+              std::to_string(batch.padded_bdimx) + ":" +
+              std::to_string(batch.register_per_thread) + ":" +
+              std::to_string(batch.occupancy) + ":" +
+              std::to_string(batch.n_wave) + ":" +
+              std::to_string(batch.n_persistent_tails);
+        }
+      }
+      if (!complete_frontier) {
+        break;
+      }
+      auto& option = options.at(&policy - policies.data());
+      std::string effect =
+          "{\"schema\":\"nvfuser.ip5.targets.seed_batch_frontier.v1\","
+          "\"scope\":\"source_unranked_seed_batch_frontier_under_selected_width\","
+          "\"register_overhead_target\":" +
+          std::to_string(policy.overhead) +
+          ",\"resident_warps_per_sm_target\":" +
+          std::to_string(policy.warps) +
+          ",\"policy_batch_offer_min\":" +
+          std::to_string(policy.resources.batch_min) +
+          ",\"policy_batch_offer_max\":" +
+          std::to_string(policy.resources.batch_max) +
+          ",\"seed_frontier\":[";
+      for (const auto& seed : policy.seeds) {
+        if (!seed.valid) {
+          continue;
+        }
+        if (effect.back() != '[') {
+          effect += ',';
+        }
+        auto range = [&](const auto& measure) {
+          int64_t low = std::numeric_limits<int64_t>::max();
+          int64_t high = std::numeric_limits<int64_t>::min();
+          for (const auto& batch : seed.batch_plans) {
+            const int64_t value = measure(batch);
+            low = std::min(low, value);
+            high = std::max(high, value);
+          }
+          return "[" + std::to_string(low) + "," +
+              std::to_string(high) + "]";
+        };
+        effect += "{\"minimum_cta_target_threads\":" +
+            std::to_string(seed.seed) +
+            ",\"batch_min\":" + std::to_string(seed.batch_min) +
+            ",\"batch_max\":" + std::to_string(seed.batch_max) +
+            ",\"batch_count\":" +
+            std::to_string(seed.batch_plans.size()) +
+            ",\"score_cta_threads_range\":" + range([&](const auto& b) {
+              const bool pad = b.bdimx > 16 &&
+                  b.padded_bdimx * b.bdimy <= device->maxThreadsPerBlock;
+              return (pad ? b.padded_bdimx : b.bdimx) * b.bdimy;
+            }) +
+            ",\"physical_cta_threads_range\":" + range([&](const auto& b) {
+              const int64_t x = ceilDiv(parallel, b.persistent_batch_size);
+              const int64_t padded = ceilDiv(x, device->warpSize) *
+                  device->warpSize;
+              const bool pad = b.bdimx > 16 &&
+                  b.padded_bdimx * b.bdimy <= device->maxThreadsPerBlock;
+              return (pad ? padded : x) * b.bdimy;
+            }) +
+            ",\"nvrtc_register_cap_per_thread_range\":" +
+            range([](const auto& b) { return b.register_per_thread; }) +
+            ",\"estimated_occupancy_warps_per_sm_range\":" +
+            range([](const auto& b) { return b.occupancy; }) +
+            ",\"estimated_waves_range\":" +
+            range([](const auto& b) { return b.n_wave; }) +
+            ",\"persistent_tail_elements_range\":" +
+            range([](const auto& b) { return b.n_persistent_tails; }) +
+            ",\"logical_iteration_grid_blocks_before_split_range\":" +
+            range([&](const auto& b) {
+              return ceilDiv(properties.total_iteration_numel, b.bdimy);
+            }) + '}';
+      }
+      option.consequence_json = effect +
+          "],\"pending_choices\":[\"IP5.cta_seed\",\"IP5.batch\"]}";
+    }
+  }
+  size_t option_bytes = 0;
+  for (const auto& option : options) {
+    option_bytes += option.id.size() + option.description.size() +
+        option.consequence_json.size();
+  }
+  const bool request_fits = semantic_frontier
+      ? state.size() * 2 + option_bytes <= 64 * 1024
+      : state.size() <= 16 * 1024;
+  if (semantic_frontier && (!complete_frontier || !request_fits)) {
+    const std::string native_id = "o" + std::to_string(native_overhead) +
+        "_w" + std::to_string(native_warps);
+    scheduler::jev::recordHardSingletonDecision(
+        "IP5.targets", native_id,
+        complete_frontier ? "target_preview_too_large"
+                          : "target_preview_incomplete",
+        "native");
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "IP5.targets",
+          complete_frontier ? "Complete target seed/batch frontier exceeds 64 KiB"
+                            : "Target seed/batch frontier preflight is incomplete");
+    }
+    innerPersistentHeuristic2DPlan(
+        properties, rparams, native_overhead, native_warps, false);
+    return;
+  }
+  NVF_ERROR(request_fits, "Inner persistent policy request too large");
   const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
       ? "o" + std::to_string(native_overhead) + "_w" +
           std::to_string(native_warps)

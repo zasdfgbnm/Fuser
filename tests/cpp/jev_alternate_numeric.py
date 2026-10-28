@@ -2988,11 +2988,45 @@ def check_alternate_report(report: dict[str, Any],
         ))
         if sorted((issue["kind"], issue["site"]) for issue in issues) != expected_issues:
             raise ValueError(f"unexpected inner target comparison issues: {issues}")
+        target_request = entry["request"]
+        semantic_target = isinstance(target_request["state"], dict)
+        if semantic_target:
+            from jev_shim import (InnerRegTargetsV2State,
+                                  _ip5_research_view, _ip5_targets_frontier_effect,
+                                  validate_request)
+            context = target_request["state"]
+            decision = context["decision"]
+            validated = validate_request(target_request)
+            state = validated.state
+            if (not isinstance(state, InnerRegTargetsV2State) or
+                    decision["analysis_inputs_text"].splitlines()[0] !=
+                    "inner_persistent.reg_targets.v2" or
+                    context["current_schedule"]["prior_choices"][-1] !=
+                    {"site": "IP5.width", "choice": f"w{state.vector_width}"} or
+                    state.inner_numel // state.vector_width !=
+                    state.parallel_after_vectorize or
+                    len(state.seeds) != len(state.policies) * 4 or
+                    not all(seed.batch_plans for seed in state.seeds
+                            if seed.valid)):
+                raise ValueError("target v2 lost its complete width/seed/batch frontier")
+            by_id = {card["id"]: card for card in decision["candidates"]}
+            for policy in state.policies:
+                if (by_id[policy.choice_id].get("consequence") !=
+                        _ip5_targets_frontier_effect(state, policy)):
+                    raise ValueError("target v2 effect differs from source rows")
+            view = _ip5_research_view(target_request, validated)
+            if (set(by_id) != {card["id"] for card in view["decision"]["candidates"]}
+                    or any("native_" in str(card).lower() for card in
+                           view["decision"]["candidates"])):
+                raise ValueError("target v2 model view leaked native policy")
         seed_record, seed_remote, _ = paired_state_rows(report, "IP5.cta_seed")
         from jev_shim import parse_inner_reg_cta_seed_state
         for row, overhead, warps in ((seed_record, 16, 28),
                                      (seed_remote, 32, 16)):
-            state = parse_inner_reg_cta_seed_state(row["request"]["state"])
+            seed_wire = row["request"]["state"]
+            seed_text = (seed_wire["decision"]["analysis_inputs_text"]
+                         if isinstance(seed_wire, dict) else seed_wire)
+            state = parse_inner_reg_cta_seed_state(seed_text)
             if (state.selected_register_overhead != overhead or
                     state.selected_target_warps_per_sm != warps):
                 raise ValueError("CTA seed omitted selected register target")
@@ -3006,9 +3040,13 @@ def check_alternate_report(report: dict[str, Any],
             if (record_count, remote_count) not in {(1, 0), (0, 1)}:
                 raise ValueError(f"duplicate or shared nested batch request: {row}")
             state = row["request"]["state"]
+            state = (state["decision"]["analysis_inputs_text"]
+                     if isinstance(state, dict) else state)
             expected_overhead, expected_warps = ((16, 28) if record_count
                                                    else (32, 16))
-            if (not state.startswith("inner_persistent.reg_batch.v2\n") or
+            if (not state.startswith(("inner_persistent.reg_batch.v2\n",
+                                     "inner_persistent.reg_batch.v3\n",
+                                     "inner_persistent.reg_batch.v4\n")) or
                     f"\npolicy_register_overhead={expected_overhead}\n" not in state or
                     f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
                 raise ValueError(f"nested batch did not use selected target policy: {row}")
