@@ -183,6 +183,7 @@ def check_no_choice(
     record: dict[str, Any], remote: dict[str, Any], server_log: Path,
     report: dict[str, Any], case_key: str, site: str, selected: str,
     reason: str | None = None, source: str | None = None,
+    expected_count: int = 1,
 ) -> dict[str, Any]:
     # A structural singleton is a completed computeHeuristics outcome. It
     # must appear in both native outcome streams and nowhere on the Choice
@@ -199,7 +200,8 @@ def check_no_choice(
         outcome_log = Path(str(decision_log) + ".outcome.jsonl")
         matching = [row for row in read_jsonl(outcome_log)
                     if row.get("site") == site]
-        if len(matching) != 1 or any(
+        invocation_ids = [row.get("compute_invocation_id") for row in matching]
+        invalid = any(
             row.get("schema") != "nvfuser.jev.compute_invocation.v1" or
             row.get("kind") != "no_choice" or
             row.get("mode") != mode or
@@ -208,13 +210,18 @@ def check_no_choice(
             not row.get("reason") or not row.get("selection_source") or
             (reason is not None and row.get("reason") != reason) or
             (source is not None and row.get("selection_source") != source)
-            for row in matching
-        ):
+            for row in matching)
+        if (len(matching) != expected_count or
+            len(set(invocation_ids)) != expected_count or
+            any(not isinstance(value, str) or not value
+                for value in invocation_ids) or invalid):
             raise ValueError(
-                f"expected exactly one {mode} no_choice at {site}={selected}: {matching}")
+                f"expected {expected_count} distinct {mode} no_choice "
+                f"invocations at {site}={selected}: {matching}")
         evidence[mode] = {"outcome_log": str(outcome_log),
                           "outcome_sha256": file_hash(outcome_log),
-                          "no_choice": matching[0]}
+                          "no_choice": matching[0] if expected_count == 1
+                          else matching}
     if any(server_site(row) == site for row in read_jsonl(server_log)):
         raise ValueError(f"API server received a singleton Choice at {site}")
     return evidence
@@ -223,27 +230,38 @@ def check_no_choice(
 def check_prior_choice(
     record: dict[str, Any], remote: dict[str, Any], server_log: Path,
     request_site: str, prior_site: str, selected: str,
+    expected_count: int = 1,
 ) -> dict[str, Any]:
     expected = {"site": prior_site, "choice": selected}
     evidence = {}
     for mode, run in (("record", record), ("remote", remote)):
         rows = [row for row in read_jsonl(Path(run["decision_log"]))
                 if row.get("site") == request_site]
-        if len(rows) != 1:
-            raise ValueError(f"expected one {mode} {request_site} Choice: {rows}")
-        prior = rows[0].get("state", {}).get("current_schedule", {}).get("prior_choices")
-        if not isinstance(prior, list) or prior.count(expected) != 1:
-            raise ValueError(f"{mode} {request_site} lacks prior {expected}: {prior}")
-        evidence[mode] = prior
+        outcome_log = Path(str(run["decision_log"]) + ".outcome.jsonl")
+        fixed = [row for row in read_jsonl(outcome_log)
+                 if row.get("site") == prior_site and row.get("kind") == "no_choice"]
+        if (len(rows) != expected_count or len(fixed) != expected_count or
+                {row.get("compute_invocation_id") for row in rows} !=
+                {row.get("compute_invocation_id") for row in fixed}):
+            raise ValueError(
+                f"expected {expected_count} paired {mode} {request_site} "
+                f"Choice and {prior_site} no_choice invocations")
+        priors = [row.get("state", {}).get("current_schedule", {}).get(
+            "prior_choices") for row in rows]
+        if any(not isinstance(prior, list) or prior.count(expected) != 1
+               for prior in priors):
+            raise ValueError(f"{mode} {request_site} lacks prior {expected}: {priors}")
+        evidence[mode] = priors[0] if expected_count == 1 else priors
     rows = [row for row in read_jsonl(server_log)
             if server_site(row) == request_site]
-    if len(rows) != 1:
-        raise ValueError(f"expected one API {request_site} request: {rows}")
-    prior = rows[0].get("request", {}).get("state", {}).get(
-        "current_schedule", {}).get("prior_choices")
-    if not isinstance(prior, list) or prior.count(expected) != 1:
-        raise ValueError(f"API {request_site} lacks prior {expected}: {prior}")
-    evidence["server"] = prior
+    if len(rows) != expected_count:
+        raise ValueError(f"expected {expected_count} API {request_site} requests")
+    priors = [row.get("request", {}).get("state", {}).get(
+        "current_schedule", {}).get("prior_choices") for row in rows]
+    if any(not isinstance(prior, list) or prior.count(expected) != 1
+           for prior in priors):
+        raise ValueError(f"API {request_site} lacks prior {expected}: {priors}")
+    evidence["server"] = priors[0] if expected_count == 1 else priors
     return evidence
 
 
@@ -348,6 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--site-prefix", required=True)
     parser.add_argument("--required-site")
     parser.add_argument("--expect-no-choice", metavar="SITE=SELECTED")
+    parser.add_argument("--expect-no-choice-count", type=int, default=1)
     parser.add_argument("--expect-no-choice-reason")
     parser.add_argument("--expect-no-choice-source")
     parser.add_argument("--expect-prior-in", metavar="DOWNSTREAM_SITE")
@@ -375,10 +394,13 @@ def main(argv: list[str] | None = None) -> int:
             no_choice_match["site"] == args.required_site):
         parser.error("invalid no-choice site or selected ID")
     if args.expect_no_choice is None and (
+            args.expect_no_choice_count != 1 or
             args.expect_no_choice_reason is not None or
             args.expect_no_choice_source is not None or
             args.expect_prior_in is not None):
         parser.error("no-choice reason/source/prior requires --expect-no-choice")
+    if not 1 <= args.expect_no_choice_count <= 16:
+        parser.error("--expect-no-choice-count must be in 1..16")
     if args.expect_prior_in is not None and (
             REQUIRED_SITE.fullmatch(args.expect_prior_in) is None or
             not args.expect_prior_in.startswith(args.site_prefix) or
@@ -403,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         "required_site_prefix": args.site_prefix,
         "required_site": args.required_site,
         "expected_no_choice": args.expect_no_choice,
+        "expected_no_choice_count": args.expect_no_choice_count,
         "expected_no_choice_reason": args.expect_no_choice_reason,
         "expected_no_choice_source": args.expect_no_choice_source,
         "expected_prior_in": args.expect_prior_in,
@@ -473,11 +496,13 @@ def main(argv: list[str] | None = None) -> int:
             manifest["no_choice_evidence"] = check_no_choice(
                 record, remote, server_log, report, args.case_key,
                 no_choice_match["site"], no_choice_match["selected"],
-                args.expect_no_choice_reason, args.expect_no_choice_source)
+                args.expect_no_choice_reason, args.expect_no_choice_source,
+                args.expect_no_choice_count)
             if args.expect_prior_in is not None:
                 manifest["prior_choice_evidence"] = check_prior_choice(
                     record, remote, server_log, args.expect_prior_in,
-                    no_choice_match["site"], no_choice_match["selected"])
+                    no_choice_match["site"], no_choice_match["selected"],
+                    args.expect_no_choice_count)
         if args.check_ip6_local_previews:
             manifest["ip6_local_preview_evidence"] = check_ip6_local_previews(
                 record, remote, server_log)

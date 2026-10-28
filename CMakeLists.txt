@@ -1408,6 +1408,36 @@ if(BUILD_TEST)
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
   set_tests_properties(jev_remote_numeric_inner_hard_singleton_register
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_outer_redu_unroll_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu3Test.JevInstanceNormNhwcHalfReductionSingleton_CUDA
+      --case-key jev_remote_numeric_outer_redu_unroll_singleton
+      --site-prefix OP --required-site OP3.unroll
+      --protocol semantic-v3
+      --expect-no-choice OP3.redu_unroll=r1
+      --expect-no-choice-count 2
+      --expect-no-choice-reason "only one hard-valid reduction unroll factor"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in OP3.unroll
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_outer_redu_unroll_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_batch_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInnerRegisterBatchSingleton_CUDA
+      --case-key jev_remote_numeric_inner_batch_singleton
+      --site-prefix IP --required-site IP5.width
+      --protocol semantic-v3
+      --expect-no-choice IP5.batch=b1
+      --expect-no-choice-reason "only one hard-valid persistent batch plan"
+      --expect-no-choice-source hard_legal_singleton
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_batch_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_remote_numeric_inner_fixed_work_split_context
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"

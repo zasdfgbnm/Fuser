@@ -8680,6 +8680,53 @@ TEST_F(Gpu1Test, FusionMagicSchedulerRMSNormalization_CUDA) {
       "");
 }
 
+// At this fp16 shape the checked register-backed batch menu contains only b1.
+// Later API choices still exercise the schedule and the result is checked
+// against a double-precision RMSNorm reference.
+TEST_F(Gpu1Test, JevInnerRegisterBatchSingleton_CUDA) {
+  constexpr int64_t norm_size = 128;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto input = makeContigTensor(2, DataType::Half);
+  auto weight = makeContigTensor(1, DataType::Half);
+  fusion.addInput(input);
+  fusion.addInput(weight);
+  auto result = rms_norm(
+      castOp(DataType::Float, input),
+      1,
+      castOp(DataType::Float, weight),
+      IrBuilder::create<Val>(eps));
+  fusion.addOutput(castOp(DataType::Half, result.output));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  auto aten_input = at::randn({128, norm_size}, options);
+  auto aten_weight = at::randn({norm_size}, options);
+  auto results = scheduleAndRun(
+      &fusion,
+      SchedulerType::InnerPersistent,
+      {aten_input, aten_weight});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  const auto x = aten_input.to(at::kDouble);
+  const auto w = aten_weight.to(at::kDouble);
+  const auto reference =
+      (x * at::pow(at::pow(x, 2).mean({1}, true) + eps, -0.5) * w)
+          .to(at::kHalf);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input, aten_weight},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      rparams->lparams);
+}
+
 // P=1025 and batch=2 make the score CTA 512 threads but the physical,
 // warp-padded CTA 544 threads. The 16-warp target asks for 128 registers per
 // thread, which fits the score CTA and exceeds the SM89 physical block budget.

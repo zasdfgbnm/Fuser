@@ -400,25 +400,38 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
       }
     }
     NVF_ERROR(!options.empty(), "No legal outer persistent reduction factor");
-    const std::string state =
-        "outer_persistent.redu_unroll.v1\nreduction_numel=" +
-        std::to_string(total_reduction_numel) + "\niteration_numel=" +
-        std::to_string(total_iteration_numel) + "\nvector_width=" +
-        std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
-        std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
-        std::to_string(device_warp_size) + "\nregister_file_bits=" +
-        std::to_string(scheduler_utils::register_file_size_bit);
-    const std::string choice = scheduler::jev::chooseDecision(
-        "OP3.redu_unroll",
-        state,
-        options,
-        jev_mode == scheduler::jev::Mode::Record ? "r1" : "");
-    const auto option_it = std::find_if(
-        options.begin(),
-        options.end(),
-        [&](const auto& option) { return option.id == choice; });
-    NVF_ERROR(option_it != options.end(), "Unknown outer persistent reduction factor");
-    selected_redu_unroll = std::stoll(choice.substr(1));
+    if (options.size() == 1) {
+      NVF_ERROR(
+          options.front().id == "r1",
+          "Native outer persistent reduction factor missing from singleton menu");
+      scheduler::jev::recordHardSingletonDecision(
+          "OP3.redu_unroll",
+          "r1",
+          "only one hard-valid reduction unroll factor",
+          "hard_legal_singleton");
+    } else {
+      const std::string state =
+          "outer_persistent.redu_unroll.v1\nreduction_numel=" +
+          std::to_string(total_reduction_numel) + "\niteration_numel=" +
+          std::to_string(total_iteration_numel) + "\nvector_width=" +
+          std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+          std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
+          std::to_string(device_warp_size) + "\nregister_file_bits=" +
+          std::to_string(scheduler_utils::register_file_size_bit);
+      const std::string choice = scheduler::jev::chooseDecision(
+          "OP3.redu_unroll",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "r1" : "");
+      const auto option_it = std::find_if(
+          options.begin(),
+          options.end(),
+          [&](const auto& option) { return option.id == choice; });
+      NVF_ERROR(
+          option_it != options.end(),
+          "Unknown outer persistent reduction factor");
+      selected_redu_unroll = std::stoll(choice.substr(1));
+    }
   }
   params.redu_unroll_factor.set(selected_redu_unroll);
   params.redu_unroll_factor.finalize();

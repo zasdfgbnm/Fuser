@@ -743,12 +743,35 @@ void innerPersistentHeuristic2DPlan(
             "Register-backed inner persistent Choice request exceeds safe "
             "size");
         if (request_fits) {
-          const std::string native_choice =
-              jev_mode == scheduler::jev::Mode::Record
-              ? "b" + std::to_string(best_heuristic.persistent_batch_size)
-              : "";
-          const std::string selected = scheduler::jev::chooseDecision(
-              "IP5.batch", state, options, native_choice);
+          std::string selected;
+          if (options.size() == 1) {
+            NVF_ERROR(
+                candidate_heuristics.size() == 1,
+                "Invalid singleton register-backed inner persistent batch menu");
+            const auto& only_plan = candidate_heuristics.front();
+            selected = "b" + std::to_string(only_plan.persistent_batch_size);
+            NVF_ERROR(
+                options.front().id == selected,
+                "Singleton register-backed inner persistent batch ID mismatch");
+            if (jev_mode == scheduler::jev::Mode::Record) {
+              NVF_ERROR(
+                  best_heuristic.persistent_batch_size ==
+                      only_plan.persistent_batch_size,
+                  "Native inner persistent batch missing from singleton menu");
+            }
+            scheduler::jev::recordHardSingletonDecision(
+                "IP5.batch",
+                selected,
+                "only one hard-valid persistent batch plan",
+                "hard_legal_singleton");
+          } else {
+            const std::string native_choice =
+                jev_mode == scheduler::jev::Mode::Record
+                ? "b" + std::to_string(best_heuristic.persistent_batch_size)
+                : "";
+            selected = scheduler::jev::chooseDecision(
+                "IP5.batch", state, options, native_choice);
+          }
           const auto selected_it = std::find_if(
               candidate_heuristics.begin(),
               candidate_heuristics.end(),

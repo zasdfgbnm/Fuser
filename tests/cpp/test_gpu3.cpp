@@ -7361,6 +7361,12 @@ TEST_F(Gpu3Test, JevInstanceNormNhwcHalfCta_CUDA) {
   runJevInstanceNormNhwcCtaNumeric(DataType::Half, 64);
 }
 
+// The 7x7 reduction has no divisible factor of two or four. The reduction
+// unroll is fixed at one, while later outer-persistent choices remain live.
+TEST_F(Gpu3Test, JevInstanceNormNhwcHalfReductionSingleton_CUDA) {
+  runJevInstanceNormNhwcCtaNumeric(DataType::Half, 32);
+}
+
 TEST_F(Gpu3Test, JevInstanceNormNhwcFloatCta_CUDA) {
   runJevInstanceNormNhwcCtaNumeric(DataType::Float, 32);
 }
