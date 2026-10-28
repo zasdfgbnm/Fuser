@@ -920,6 +920,74 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
 // Prove a logical-warp candidate before exposing it to the API. This bounded
 // subset covers the full native 3D block and grid arithmetic, including every
 // later RD5.iter_unroll option. No Choice is made while probing a candidate.
+struct Inner3DPreflightGrid {
+  int64_t iteration_unroll;
+  int64_t output_blocks;
+  int64_t inner_reduction_blocks;
+  int64_t outer_reduction_blocks;
+};
+
+struct Inner3DPreflightGeometry {
+  int64_t logical_warp;
+  int64_t target_blocks;
+  int64_t target_threads_per_cta;
+  int64_t target_reduction_unroll;
+  int64_t target_serial_iterations;
+  int64_t inner_reduction_unroll;
+  int64_t outer_reduction_unroll;
+  int64_t logical_block_x;
+  int64_t logical_block_y;
+  int64_t logical_block_z;
+  int64_t physical_block_x;
+  std::vector<Inner3DPreflightGrid> grid_cases;
+};
+
+std::string inner3dWarpPreflightEffect(
+    const Inner3DPreflightGeometry& geometry) {
+  scheduler::native_diagnostic::Object cta;
+  cta.add("logical_x", geometry.logical_block_x);
+  cta.add("logical_y", geometry.logical_block_y);
+  cta.add("logical_z", geometry.logical_block_z);
+  cta.add("physical_x", geometry.physical_block_x);
+  cta.add(
+      "physical_threads",
+      geometry.physical_block_x * geometry.logical_block_y *
+          geometry.logical_block_z);
+  std::string grids = "[";
+  for (const auto& candidate : geometry.grid_cases) {
+    scheduler::native_diagnostic::Object grid;
+    grid.add("iteration_unroll", candidate.iteration_unroll);
+    grid.add("output_blocks", candidate.output_blocks);
+    grid.add("inner_reduction_blocks", candidate.inner_reduction_blocks);
+    grid.add("outer_reduction_blocks", candidate.outer_reduction_blocks);
+    if (grids.size() > 1) {
+      grids += ',';
+    }
+    grids += grid.str();
+  }
+  grids += ']';
+  scheduler::native_diagnostic::Object effect;
+  effect.add("plan_scope", "conditional_inner3d_warp_preflight");
+  effect.add("assumed_work_split", "unroll_first");
+  effect.add("assumed_wave_cap", int64_t{4});
+  effect.add("assumed_cta_target", "derived");
+  effect.add("logical_warp_threads", geometry.logical_warp);
+  effect.add("target_blocks", geometry.target_blocks);
+  effect.add("target_threads_per_cta", geometry.target_threads_per_cta);
+  effect.add("target_reduction_unroll", geometry.target_reduction_unroll);
+  effect.add("target_serial_iterations", geometry.target_serial_iterations);
+  effect.add("inner_reduction_unroll", geometry.inner_reduction_unroll);
+  effect.add("outer_reduction_unroll", geometry.outer_reduction_unroll);
+  effect.addRaw("cta", cta.str());
+  effect.addRaw("grid_cases", grids);
+  effect.addRaw(
+      "pending_choices",
+      "[\"RD5.work_split\",\"RD5.waves\",\"RD5.cta\","
+      "\"RD5.outer_unroll\",\"RD5.iter_unroll\",\"RD5.grid\","
+      "\"RD5.width\"]");
+  return effect.str();
+}
+
 bool inner3dWarpPlanIsSafe(
     int64_t reduction_numel,
     int64_t iteration_numel,
@@ -931,7 +999,8 @@ bool inner3dWarpPlanIsSafe(
     int64_t requested_target_threads = 0,
     bool iteration_first = false,
     int64_t* completed_block_x = nullptr,
-    int64_t target_waves = 4) {
+    int64_t target_waves = 4,
+    Inner3DPreflightGeometry* geometry = nullptr) {
   // Keep every intermediate product bounded, and fix the vector work budget
   // to four. Other shapes retain the native heuristic without a warp request.
   if (reduction_numel <= inner_numel || reduction_numel > 4096 ||
@@ -1047,6 +1116,10 @@ bool inner3dWarpPlanIsSafe(
       padded_x > max_threads_per_block) {
     return false;
   }
+  std::vector<Inner3DPreflightGrid> grid_cases;
+  if (geometry != nullptr) {
+    grid_cases.reserve(hard_limit);
+  }
   for (int64_t iter_unroll = 1; iter_unroll <= hard_limit; ++iter_unroll) {
     int64_t godim = div(iteration_numel, y * iter_unroll);
     int64_t gridim = 1;
@@ -1069,9 +1142,26 @@ bool inner3dWarpPlanIsSafe(
         gridim * godim > sm_count) {
       return false;
     }
+    if (geometry != nullptr) {
+      grid_cases.push_back({iter_unroll, godim, gridim, grodim});
+    }
   }
   if (completed_block_x != nullptr) {
     *completed_block_x = padded_x;
+  }
+  if (geometry != nullptr) {
+    *geometry = {logical_warp,
+                 target_blocks,
+                 target_threads,
+                 target_unroll,
+                 target_iterations,
+                 inner_unroll,
+                 outer_unroll,
+                 x,
+                 y,
+                 z,
+                 padded_x,
+                 std::move(grid_cases)};
   }
   return true;
 }
@@ -1230,6 +1320,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       dev_prop->warpSize == 32 && dev_prop->l2CacheSize > 0 &&
       n_tensor_inputs == 1 && max_dtype_size_bit_for_vectorization == 32 &&
       vectorize_factor == 4;
+  const bool semantic_v3_warp = scheduler::jev::semanticV3Enabled();
+  std::array<Inner3DPreflightGeometry, 16> warp_geometry;
   bool offer_warp = bounded_warp_input;
   if (jev_mode_warp != scheduler::jev::Mode::Off && offer_warp) {
     for (int64_t candidate = 1; candidate <= 16; ++candidate) {
@@ -1240,7 +1332,12 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
               candidate,
               device_multiprocessor_count,
               max_threads_per_sm,
-              dev_prop->maxThreadsPerBlock)) {
+              dev_prop->maxThreadsPerBlock,
+              0,
+              false,
+              nullptr,
+              4,
+              semantic_v3_warp ? &warp_geometry.at(candidate - 1) : nullptr)) {
         offer_warp = false;
         break;
       }
@@ -1260,7 +1357,11 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       options.push_back(
           {"m" + std::to_string(warp),
            "Use " + std::to_string(warp) +
-               " logical reduction threads in the completed 3D plan"});
+               (semantic_v3_warp ? " logical reduction threads"
+                                 : " logical reduction threads in the completed 3D plan"),
+           semantic_v3_warp
+               ? inner3dWarpPreflightEffect(warp_geometry.at(warp - 1))
+               : ""});
     }
     const std::string state =
         "reduction.inner3d_warp_target.v1\nreduction_numel=" +
