@@ -942,7 +942,8 @@ struct Inner3DPreflightGeometry {
   std::vector<Inner3DPreflightGrid> grid_cases;
 };
 
-std::string inner3dWarpPreflightEffect(
+void addInner3DPreflightGeometry(
+    scheduler::native_diagnostic::Object& effect,
     const Inner3DPreflightGeometry& geometry) {
   scheduler::native_diagnostic::Object cta;
   cta.add("logical_x", geometry.logical_block_x);
@@ -966,11 +967,6 @@ std::string inner3dWarpPreflightEffect(
     grids += grid.str();
   }
   grids += ']';
-  scheduler::native_diagnostic::Object effect;
-  effect.add("plan_scope", "conditional_inner3d_warp_preflight");
-  effect.add("assumed_work_split", "unroll_first");
-  effect.add("assumed_wave_cap", int64_t{4});
-  effect.add("assumed_cta_target", "derived");
   effect.add("logical_warp_threads", geometry.logical_warp);
   effect.add("target_blocks", geometry.target_blocks);
   effect.add("target_threads_per_cta", geometry.target_threads_per_cta);
@@ -980,10 +976,37 @@ std::string inner3dWarpPreflightEffect(
   effect.add("outer_reduction_unroll", geometry.outer_reduction_unroll);
   effect.addRaw("cta", cta.str());
   effect.addRaw("grid_cases", grids);
+}
+
+std::string inner3dWarpPreflightEffect(
+    const Inner3DPreflightGeometry& geometry) {
+  scheduler::native_diagnostic::Object effect;
+  effect.add("plan_scope", "conditional_inner3d_warp_preflight");
+  effect.add("assumed_work_split", "unroll_first");
+  effect.add("assumed_wave_cap", int64_t{4});
+  effect.add("assumed_cta_target", "derived");
+  addInner3DPreflightGeometry(effect, geometry);
   effect.addRaw(
       "pending_choices",
       "[\"RD5.work_split\",\"RD5.waves\",\"RD5.cta\","
       "\"RD5.outer_unroll\",\"RD5.iter_unroll\",\"RD5.grid\","
+      "\"RD5.width\"]");
+  return effect.str();
+}
+
+std::string inner3dCtaPreflightEffect(
+    const Inner3DPreflightGeometry& geometry,
+    bool iteration_first,
+    int64_t target_waves) {
+  scheduler::native_diagnostic::Object effect;
+  effect.add("plan_scope", "conditional_inner3d_cta_preflight");
+  effect.add(
+      "work_split", iteration_first ? "iter_first" : "unroll_first");
+  effect.add("wave_cap", target_waves);
+  addInner3DPreflightGeometry(effect, geometry);
+  effect.addRaw(
+      "pending_choices",
+      "[\"RD5.outer_unroll\",\"RD5.iter_unroll\",\"RD5.grid\","
       "\"RD5.width\"]");
   return effect.str();
 }
@@ -1686,6 +1709,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   // choices, grid extents, and the unsupported 3D-to-2D fallback.
   bool cta_choice_emitted = false;
   std::string_view cta_no_choice_reason = "cta_menu_outside_bounded_domain";
+  const bool semantic_v3_cta = scheduler::jev::semanticV3Enabled();
   if (jev_mode_warp != scheduler::jev::Mode::Off && bounded_warp_input &&
       min_warp_size >= 1 && min_warp_size <= 16 &&
       target_threads_in_block >= min_warp_size &&
@@ -1698,6 +1722,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
     std::string hard_valid_targets;
     for (int64_t candidate = min_warp_size; candidate <= candidate_limit;
          candidate += min_warp_size) {
+      Inner3DPreflightGeometry geometry;
       if (!inner3dWarpPlanIsSafe(
               total_reduction_numel,
               total_iteration_numel,
@@ -1709,7 +1734,8 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
               candidate,
               iteration_first,
               nullptr,
-              target_waves)) {
+              target_waves,
+              semantic_v3_cta ? &geometry : nullptr)) {
         continue;
       }
       if (!hard_valid_targets.empty()) {
@@ -1719,7 +1745,12 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       options.push_back(
           {"t" + std::to_string(candidate),
            "Target " + std::to_string(candidate) +
-               " threads in the completed 3D CTA plan"});
+               (semantic_v3_cta ? " threads for the 3D CTA"
+                                : " threads in the completed 3D CTA plan"),
+           semantic_v3_cta
+               ? inner3dCtaPreflightEffect(
+                     geometry, iteration_first, target_waves)
+               : ""});
     }
     const bool native_target_preflighted = std::any_of(
         options.begin(), options.end(), [&](const auto& option) {

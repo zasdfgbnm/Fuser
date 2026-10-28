@@ -307,13 +307,74 @@ def check_rd5_width_candidate_effects(trace_paths: tuple[Path, Path]) -> None:
             raise ValueError(f"{mode} RD5.width selected card differs from final plan")
 
 
-def check_rd5_warp_preflight_effects(trace_paths: tuple[Path, Path]) -> None:
-    """Require every v3 warp card to expose its bounded conditional geometry."""
-    from jev_shim import (_inner3d_warp_plan,
-                          parse_inner3d_warp_target_state)
+def expected_inner3d_preflight_geometry(
+        state: dict[str, Any], warp: int, target_threads: int | None = None,
+        iteration_first: bool = False, target_waves: int = 4
+        ) -> tuple[dict[str, int], dict[str, int], list[dict[str, int]]]:
+    """Replay the mirrored preflight, including logical CTA and each grid case."""
+    from jev_shim import _inner3d_warp_plan
 
     def ceil(numerator: int, denominator: int) -> int:
         return (numerator + denominator - 1) // denominator
+
+    expected = _inner3d_warp_plan(
+        state, warp, target_threads, iteration_first, target_waves)
+    if expected is None:
+        raise ValueError("3D candidate lacks independent hard preflight")
+    target = (target_threads if target_threads is not None else
+              expected["native_target"])
+    inner = state["inner_numel"]
+    reduction = state["reduction_numel"]
+    outputs = state["iteration_numel"]
+    x = min(max(ceil(inner, 4), warp), target)
+    if x * 4 != inner:
+        x = (1 << (x.bit_length() - 1)) if x < warp else x - x % warp
+    y = max(warp // x, 1)
+    z = min(max(target // (x * y), 1), ceil(reduction, inner), 64)
+    y = max(target // (x * z), 1)
+    if x * y * z < warp:
+        x = min(max(inner, warp), target)
+        y = max(warp // x, 1)
+        z = min(max(target // (x * y), 1), ceil(reduction, inner))
+        y = max(target // (x * z), 1)
+    cta = {
+        "logical_x": x, "logical_y": y, "logical_z": z,
+        "physical_x": expected["x"],
+        "physical_threads": expected["x"] * y * z,
+    }
+    grids = []
+    for unroll in range(1, expected["iter_unroll_limit"] + 1):
+        output = ceil(outputs, y * unroll)
+        inner_grid = outer_grid = 1
+        if (output < expected["target_blocks"] or
+                expected["remainder"] >= 8):
+            reduction_grid = min(expected["remainder"], x * y * 8)
+            inner_grid = expected["inner_remainder"]
+            outer_grid = max(reduction_grid // inner_grid, 1)
+            outer_grid = max(min(expected["remainder"] //
+                                 expected["inner_remainder"], outer_grid), 1)
+        if inner_grid > 1 or outer_grid > 1:
+            output = ceil(outputs, y)
+        grids.append({
+            "iteration_unroll": unroll,
+            "output_blocks": output,
+            "inner_reduction_blocks": inner_grid,
+            "outer_reduction_blocks": outer_grid,
+        })
+    scalars = {
+        "target_blocks": expected["target_blocks"],
+        "target_threads_per_cta": target,
+        "target_reduction_unroll": expected["target_unroll"],
+        "target_serial_iterations": expected["target_iterations"],
+        "inner_reduction_unroll": expected["inner_unroll"],
+        "outer_reduction_unroll": expected["outer_unroll"],
+    }
+    return scalars, cta, grids
+
+
+def check_rd5_warp_preflight_effects(trace_paths: tuple[Path, Path]) -> None:
+    """Require every v3 warp card to expose its bounded conditional geometry."""
+    from jev_shim import parse_inner3d_warp_target_state
 
     pending = ["RD5.work_split", "RD5.waves", "RD5.cta",
                "RD5.outer_unroll", "RD5.iter_unroll", "RD5.grid", "RD5.width"]
@@ -388,56 +449,8 @@ def check_rd5_warp_preflight_effects(trace_paths: tuple[Path, Path]) -> None:
                         grid["inner_reduction_blocks"] *
                         grid["output_blocks"] > sm_count):
                     raise ValueError(f"{mode} {candidate['id']} has an invalid grid")
-            expected = _inner3d_warp_plan(state, warp)
-            if expected is None:
-                raise ValueError(f"{mode} {candidate['id']} lacks mirror preflight")
-            target = expected["native_target"]
-            inner = state["inner_numel"]
-            reduction = state["reduction_numel"]
-            outputs = state["iteration_numel"]
-            x = min(max(ceil(inner, 4), warp), target)
-            if x * 4 != inner:
-                x = (1 << (x.bit_length() - 1)) if x < warp else x - x % warp
-            y = max(warp // x, 1)
-            z = min(max(target // (x * y), 1), ceil(reduction, inner), 64)
-            y = max(target // (x * z), 1)
-            if x * y * z < warp:
-                x = min(max(inner, warp), target)
-                y = max(warp // x, 1)
-                z = min(max(target // (x * y), 1), ceil(reduction, inner))
-                y = max(target // (x * z), 1)
-            expected_cta = {
-                "logical_x": x, "logical_y": y, "logical_z": z,
-                "physical_x": expected["x"],
-                "physical_threads": expected["x"] * y * z,
-            }
-            expected_grids = []
-            for unroll in range(1, expected["iter_unroll_limit"] + 1):
-                output = ceil(outputs, y * unroll)
-                inner_grid = outer_grid = 1
-                if (output < expected["target_blocks"] or
-                        expected["remainder"] >= 8):
-                    reduction_grid = min(expected["remainder"], x * y * 8)
-                    inner_grid = expected["inner_remainder"]
-                    outer_grid = max(reduction_grid // inner_grid, 1)
-                    outer_grid = max(min(expected["remainder"] //
-                                         expected["inner_remainder"], outer_grid), 1)
-                if inner_grid > 1 or outer_grid > 1:
-                    output = ceil(outputs, y)
-                expected_grids.append({
-                    "iteration_unroll": unroll,
-                    "output_blocks": output,
-                    "inner_reduction_blocks": inner_grid,
-                    "outer_reduction_blocks": outer_grid,
-                })
-            expected_scalars = {
-                "target_blocks": expected["target_blocks"],
-                "target_threads_per_cta": target,
-                "target_reduction_unroll": expected["target_unroll"],
-                "target_serial_iterations": expected["target_iterations"],
-                "inner_reduction_unroll": expected["inner_unroll"],
-                "outer_reduction_unroll": expected["outer_unroll"],
-            }
+            expected_scalars, expected_cta, expected_grids = (
+                expected_inner3d_preflight_geometry(state, warp))
             if (any(effect[key] != value for key, value in
                     expected_scalars.items()) or cta != expected_cta or
                     grids != expected_grids):
@@ -469,6 +482,109 @@ def check_rd5_warp_preflight_effects(trace_paths: tuple[Path, Path]) -> None:
                 params["unroll_factor_outer_reduction"] !=
                 effect["outer_reduction_unroll"]):
             raise ValueError(f"{mode} selected RD5.warp witness differs from plan")
+
+
+def check_rd5_cta_preflight_effects(trace_paths: tuple[Path, Path]) -> None:
+    """Replay every offered CTA card and bind the selected one to the plan."""
+    from jev_shim import parse_inner3d_cta_target_state
+
+    pending = ["RD5.outer_unroll", "RD5.iter_unroll", "RD5.grid", "RD5.width"]
+    effect_keys = {"plan_scope", "work_split", "wave_cap",
+                   "logical_warp_threads", "target_blocks",
+                   "target_threads_per_cta", "target_reduction_unroll",
+                   "target_serial_iterations", "inner_reduction_unroll",
+                   "outer_reduction_unroll", "cta", "grid_cases", "pending_choices"}
+    for mode, path in zip(("record", "remote"), trace_paths):
+        rows = [row for row in trace_rows(path) if row.get("site") == "RD5.cta"]
+        if len(rows) != 1:
+            raise ValueError(f"expected one {mode} RD5.cta request: {rows}")
+        row = rows[0]
+        request = row["request"]
+        context = request["state"]
+        if (not isinstance(context, dict) or
+                context.get("schema") != "nvfuser.systemone.context.v3"):
+            raise ValueError(f"{mode} RD5.cta is not semantic-v3")
+        if len(json.dumps(request, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")) >= 8 * 1024 * 1024:
+            raise ValueError(f"{mode} RD5.cta exceeds the 8 MiB request cap")
+        state = parse_inner3d_cta_target_state(
+            context["decision"]["analysis_inputs_text"])
+        warp = state["logical_warp"]
+        first = state["iteration_first"]
+        waves = state.get("target_waves", 4)
+        prior = context["current_schedule"]["prior_choices"]
+        selected_warps = [choice["choice"] for choice in prior
+                          if choice["site"] == "RD5.warp"]
+        if not selected_warps or selected_warps[-1] != f"m{warp}":
+            raise ValueError(f"{mode} RD5.cta omitted selected upstream warp")
+        selected_splits = [choice["choice"] for choice in prior
+                           if choice["site"] == "RD5.work_split"]
+        selected_waves = [choice["choice"] for choice in prior
+                          if choice["site"] == "RD5.waves"]
+        if ((first and (not selected_splits or
+                        selected_splits[-1] != "iter_first")) or
+                (selected_splits and selected_splits[-1] !=
+                 ("iter_first" if first else "unroll_first")) or
+                (waves != 4 and (not selected_waves or
+                                 selected_waves[-1] != f"waves{waves}")) or
+                (selected_waves and selected_waves[-1] != f"waves{waves}")):
+            raise ValueError(f"{mode} RD5.cta omitted selected split or waves")
+        candidates = context["decision"]["candidates"]
+        ids = {candidate["id"] for candidate in candidates}
+        expected_ids = {f"t{target}" for target in state["hard_valid_targets"]}
+        if (not 2 <= len(candidates) <= 255 or ids != expected_ids or
+                set(request["questions"]["RD5.cta"]["criteria"]) != ids):
+            raise ValueError(f"{mode} RD5.cta menu differs from hard preflight")
+        effects = {}
+        for candidate in candidates:
+            target = int(candidate["id"][1:])
+            effect = candidate.get("consequence")
+            if (not isinstance(effect, dict) or set(effect) != effect_keys or
+                    effect["plan_scope"] != "conditional_inner3d_cta_preflight" or
+                    effect["work_split"] !=
+                    ("iter_first" if first else "unroll_first") or
+                    effect["wave_cap"] != waves or
+                    effect["logical_warp_threads"] != warp or
+                    effect["pending_choices"] != pending or
+                    any(word in candidate["description"].lower()
+                        for word in ("completed", "native", "preferred"))):
+                raise ValueError(f"{mode} {candidate['id']} has a misleading CTA card")
+            expected_scalars, expected_cta, expected_grids = (
+                expected_inner3d_preflight_geometry(
+                    state, warp, target, first, waves))
+            if (any(effect[key] != value for key, value in
+                    expected_scalars.items()) or
+                    effect["cta"] != expected_cta or
+                    effect["grid_cases"] != expected_grids):
+                raise ValueError(
+                    f"{mode} {candidate['id']} differs from independent preflight")
+            effects[candidate["id"]] = effect
+        final = [outcome for outcome in trace_rows(path, outcome=True)
+                 if outcome.get("schema") == "nvfuser.native_outcome.v2" and
+                 outcome.get("compute_invocation_id") ==
+                 row.get("compute_invocation_id")]
+        if len(final) != 1:
+            raise ValueError(f"expected one {mode} final RD5.cta plan")
+        effect = effects[row["selected"]]
+        cta = effect["cta"]
+        grid = effect["grid_cases"][0]
+        launch = final[0]["launch"]
+        params = final[0]["scheduler_fields"]
+        if (params["unroll_factor_iter_dom"] != 1 or
+                launch["block_x_raw"] != cta["physical_x"] or
+                launch["block_y_raw"] != -1 or
+                launch["block_z_raw"] !=
+                (cta["logical_z"] if cta["logical_z"] > 1 else -1) or
+                launch["grid_z_raw"] !=
+                (grid["outer_reduction_blocks"] if
+                 grid["outer_reduction_blocks"] > 1 else -1) or
+                params["cross_grid_outer_reduction"] !=
+                (grid["outer_reduction_blocks"] > 1) or
+                params["unroll_factor_inner_reduction"] !=
+                effect["inner_reduction_unroll"] or
+                params["unroll_factor_outer_reduction"] !=
+                effect["outer_reduction_unroll"]):
+            raise ValueError(f"{mode} selected RD5.cta witness differs from plan")
 
 DEPENDENT_DECISION_ORDER = {
     "jev_alternate_numeric_inner3d_warp_target":
@@ -1306,6 +1422,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_rd9_effects: bool = False,
                            require_rd5_width_effects: bool = False,
                            require_rd5_warp_effects: bool = False,
+                           require_rd5_cta_effects: bool = False,
                            require_inner_iter_unroll: bool = False,
                            require_inner_warp_target: bool = False,
                            require_inner_cta_envelope: bool = False,
@@ -1375,6 +1492,10 @@ def check_alternate_report(report: dict[str, Any],
         if trace_paths is None:
             raise ValueError("RD5.warp candidate effects need both decision traces")
         check_rd5_warp_preflight_effects(trace_paths)
+    if require_rd5_cta_effects:
+        if trace_paths is None:
+            raise ValueError("RD5.cta candidate effects need both decision traces")
+        check_rd5_cta_preflight_effects(trace_paths)
     if require_resize_reorder:
         if (site != "RS1.reorder" or event["native"] != "keep" or
                 alternate != "skip"):
@@ -3073,6 +3194,22 @@ def check_alternate_report(report: dict[str, Any],
                                  f"{final_outer}")
         if issues != [intended]:
             raise ValueError(f"unexpected outer-unroll dependencies: {issues}")
+    elif require_rd5_cta_effects:
+        if (site != "RD5.cta" or event["native"] != "t32" or
+                alternate not in {"t64", "t128"}):
+            raise ValueError("3D CTA effect fixture lacks its selected targets")
+        record_width, remote_width, width_issues = paired_state_rows(
+            report, "RD5.width")
+        if (record_width["record"] != {"w4": 1} or
+                remote_width["remote"] != {"w4": 1}):
+            raise ValueError("RD5.cta changed the selected vector width")
+        check_rd5_wave_dependency(report, trace_paths)
+        require_no_choice(
+            report, trace_paths, "RD5.iter_unroll", "u1",
+            ("only one hard-legal iteration unroll factor",) * 2)
+        if sorted(issues, key=str) != sorted(
+                [intended, *width_issues], key=str):
+            raise ValueError(f"unexpected 3D CTA effect dependencies: {issues}")
     elif require_rd5_warp_effects:
         if (site != "RD5.warp" or event["native"] != "m8" or
                 alternate != "m4"):
@@ -3155,6 +3292,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-rd9-effects", action="store_true")
     parser.add_argument("--require-rd5-width-effects", action="store_true")
     parser.add_argument("--require-rd5-warp-effects", action="store_true")
+    parser.add_argument("--require-rd5-cta-effects", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -3305,6 +3443,7 @@ def main(argv: list[str] | None = None) -> int:
             require_rd9_effects=args.require_rd9_effects,
             require_rd5_width_effects=args.require_rd5_width_effects,
             require_rd5_warp_effects=args.require_rd5_warp_effects,
+            require_rd5_cta_effects=args.require_rd5_cta_effects,
             require_inner_targets=args.require_inner_targets,
             require_inner_storage=args.require_inner_storage,
             require_inner_iter_unroll=args.require_inner_iter_unroll,

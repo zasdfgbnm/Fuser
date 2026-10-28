@@ -1622,6 +1622,17 @@ if(BUILD_TEST)
       --require-inner3d-cta-target)
   set_tests_properties(jev_alternate_numeric_inner3d_cta_target PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_cta_target_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.cta --alternate t64
+      --gtest Gpu1Test.JevAlternateInner3dCtaTarget_CUDA
+      --case-key jev_alternate_numeric_inner3d_cta_target_v3_effects
+      --protocol semantic-v3 --require-rd5-cta-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_cta_target_v3_effects
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_inner3d_cta_full
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
@@ -1633,6 +1644,17 @@ if(BUILD_TEST)
       --require-inner3d-cta-full)
   set_tests_properties(jev_alternate_numeric_inner3d_cta_full PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_cta_full_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.cta --alternate t128
+      --gtest Gpu1Test.JevAlternateInner3dCtaFull_CUDA
+      --case-key jev_alternate_numeric_inner3d_cta_full_v3_effects
+      --protocol semantic-v3 --require-rd5-cta-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_cta_full_v3_effects
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_inner3d_work_split
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
