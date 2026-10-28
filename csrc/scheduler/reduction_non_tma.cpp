@@ -28,6 +28,7 @@
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/native_diagnostic_jsonl.h"
+#include "scheduler/native_plan_fields.h"
 #include "scheduler/reduction.h"
 #include "scheduler/reduction_inner3d_iter_unroll_continuation.h"
 #include "scheduler/reduction_inner_remainder_choice.h"
@@ -2258,6 +2259,17 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
   // vector width divides the original vector factor, so the source layout
   // and alignment proof still applies.
   const int64_t fixed_inner_factor = rparams->unroll_factor_inner_reduction;
+  const auto apply_width = [fixed_inner_factor](
+                               ReductionParams& params, int64_t width) {
+    if (width == 1) {
+      // Retain the original ordinary unroll and cache placement.
+      params.vectorize_inner_reduction = false;
+    } else if (width != fixed_inner_factor) {
+      params.unroll_factor_inner_reduction = width;
+      params.unroll_factor_top_of_vectorization =
+          fixed_inner_factor / width;
+    }
+  };
   if (jev_mode != scheduler::jev::Mode::Off &&
       rparams->vectorize_inner_reduction && fixed_inner_factor > 1 &&
       (fixed_inner_factor & (fixed_inner_factor - 1)) == 0 &&
@@ -2266,10 +2278,34 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       inner_work_per_thread >= fixed_inner_factor) {
     std::vector<scheduler::jev::ChoiceOption> options;
     for (int64_t width = 1; width <= fixed_inner_factor; width *= 2) {
+      std::string consequence;
+      if (scheduler::jev::semanticV3Enabled()) {
+        auto candidate = *rparams;
+        apply_width(candidate, width);
+        scheduler::native_diagnostic::Object launch;
+        const auto raw_launch = nativeLaunchFields(candidate.lparams);
+        launch.add("grid_x_raw", raw_launch[0]);
+        launch.add("grid_y_raw", raw_launch[1]);
+        launch.add("grid_z_raw", raw_launch[2]);
+        launch.add("block_x_raw", raw_launch[3]);
+        launch.add("block_y_raw", raw_launch[4]);
+        launch.add("block_z_raw", raw_launch[5]);
+        launch.add("dynamic_smem_bytes", raw_launch[6]);
+        scheduler::native_diagnostic::Object effect;
+        effect.add("plan_scope", "terminal_rd5_local_reduction_plan");
+        effect.add("selected_vector_width", width);
+        effect.addRaw(
+            "scheduler_fields",
+            scheduler::native_diagnostic::schedulerFields(candidate));
+        effect.addRaw("launch", launch.str());
+        effect.addRaw("pending_choices", "[]");
+        consequence = effect.str();
+      }
       options.push_back(
           {"w" + std::to_string(width),
            "Vectorize " + std::to_string(width) +
-               " innermost reduction element(s) per thread"});
+               " innermost reduction element(s) per thread",
+           std::move(consequence)});
     }
     const std::string state =
         "reduction.inner3d_width.v1\nlayout_max=" +
@@ -2293,15 +2329,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       }
     }
     NVF_ERROR(selected_width > 0, "RD5.width response exceeds native bounds");
-    if (selected_width == 1) {
-      // Keep the original factor as an ordinary unroll so isUnrolled() and
-      // cache placement remain unchanged even when vectorization is disabled.
-      rparams->vectorize_inner_reduction = false;
-    } else if (selected_width != fixed_inner_factor) {
-      rparams->unroll_factor_inner_reduction = selected_width;
-      rparams->unroll_factor_top_of_vectorization =
-          fixed_inner_factor / selected_width;
-    }
+    apply_width(*rparams, selected_width);
   }
 
   // Observe unoffered native targets at the successful 3D return, after the

@@ -1662,6 +1662,28 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_inner3d_width)
   set_tests_properties(jev_alternate_numeric_inner3d_width PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_width_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.width --alternate w1
+      --gtest Gpu1Test.JevAlternateInner3dWidth_CUDA
+      --case-key jev_alternate_numeric_inner3d_width_v3_effects
+      --protocol semantic-v3 --require-rd5-width-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_width_v3_effects PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_inner3d_width_v3_partial
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.width --alternate w2
+      --gtest Gpu1Test.JevAlternateInner3dWidth_CUDA
+      --case-key jev_alternate_numeric_inner3d_width_v3_partial
+      --protocol semantic-v3 --require-rd5-width-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_width_v3_partial PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_outer_warp
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

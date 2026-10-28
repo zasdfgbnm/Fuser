@@ -237,6 +237,75 @@ def require_rd9_candidate_effects(
                 (reduction_grid > 1) or launch["grid_y_raw"] != grid_y):
             raise ValueError(f"{mode} final RD9 params differ from candidate effect")
 
+
+def check_rd5_width_candidate_effects(trace_paths: tuple[Path, Path]) -> None:
+    """Match every v3 width card to the fixed 3D plan and selected outcome."""
+    for mode, path in zip(("record", "remote"), trace_paths):
+        rows = [row for row in trace_rows(path) if row.get("site") == "RD5.width"]
+        if len(rows) != 1:
+            raise ValueError(f"expected one {mode} RD5.width request: {rows}")
+        row = rows[0]
+        request = row["request"]
+        context = request["state"]
+        if (not isinstance(context, dict) or
+                context.get("schema") != "nvfuser.systemone.context.v3"):
+            raise ValueError(f"{mode} RD5.width is not semantic-v3")
+        candidates = context["decision"]["candidates"]
+        choices = request["questions"]["RD5.width"]["criteria"]
+        if {candidate["id"] for candidate in candidates} != set(choices):
+            raise ValueError(f"{mode} RD5.width effect IDs differ from menu")
+        widths = sorted(int(candidate["id"][1:]) for candidate in candidates)
+        if widths != [1 << exponent for exponent in range(len(widths))]:
+            raise ValueError(f"{mode} RD5.width menu is not a power-of-two range")
+        fixed = widths[-1]
+        effects = {}
+        changing = {"vectorize_inner_reduction",
+                    "unroll_factor_inner_reduction",
+                    "unroll_factor_top_of_vectorization"}
+        for candidate in candidates:
+            width = int(candidate["id"][1:])
+            effect = candidate.get("consequence")
+            if (not isinstance(effect, dict) or set(effect) != {
+                    "plan_scope", "selected_vector_width", "scheduler_fields",
+                    "launch", "pending_choices"} or
+                    effect["plan_scope"] != "terminal_rd5_local_reduction_plan" or
+                    effect["selected_vector_width"] != width or
+                    effect["pending_choices"] != []):
+                raise ValueError(f"{mode} RD5.width lacks a typed terminal card")
+            fields = effect["scheduler_fields"]
+            if (not isinstance(fields, dict) or
+                    fields["schedule_3d"] is not True or
+                    fields["vectorize_inner_reduction"] is not (width > 1) or
+                    fields["unroll_factor_inner_reduction"] !=
+                    (fixed if width == 1 else width) or
+                    fields["unroll_factor_top_of_vectorization"] !=
+                    (1 if width == 1 else fixed // width)):
+                raise ValueError(f"{mode} RD5.width w{width} has wrong local factors")
+            launch = effect["launch"]
+            if (not isinstance(launch, dict) or set(launch) != {
+                    "grid_x_raw", "grid_y_raw", "grid_z_raw", "block_x_raw",
+                    "block_y_raw", "block_z_raw", "dynamic_smem_bytes"}):
+                raise ValueError(f"{mode} RD5.width lacks its fixed launch")
+            effects[candidate["id"]] = effect
+        baseline = effects[f"w{fixed}"]
+        fixed_fields = {name: value for name, value in
+                        baseline["scheduler_fields"].items() if name not in changing}
+        for choice, effect in effects.items():
+            if ({name: value for name, value in
+                 effect["scheduler_fields"].items() if name not in changing}
+                    != fixed_fields or effect["launch"] != baseline["launch"]):
+                raise ValueError(f"{mode} {choice} changed fixed 3D geometry")
+        final = [outcome for outcome in trace_rows(path, outcome=True)
+                 if outcome.get("schema") == "nvfuser.native_outcome.v2" and
+                 outcome.get("compute_invocation_id") ==
+                 row.get("compute_invocation_id")]
+        if len(final) != 1:
+            raise ValueError(f"expected one {mode} final RD5.width plan")
+        selected = effects[row["selected"]]
+        if (final[0]["scheduler_fields"] != selected["scheduler_fields"] or
+                final[0]["launch"] != selected["launch"]):
+            raise ValueError(f"{mode} RD5.width selected card differs from final plan")
+
 DEPENDENT_DECISION_ORDER = {
     "jev_alternate_numeric_inner3d_warp_target":
         ("RD4", "RD5.warp", "RD5.cta", "RD5.width"),
@@ -1071,6 +1140,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_grid_base: bool = False,
                            require_outer_unroll: bool = False,
                            require_rd9_effects: bool = False,
+                           require_rd5_width_effects: bool = False,
                            require_inner_iter_unroll: bool = False,
                            require_inner_warp_target: bool = False,
                            require_inner_cta_envelope: bool = False,
@@ -1132,6 +1202,10 @@ def check_alternate_report(report: dict[str, Any],
         if trace_paths is None:
             raise ValueError("RD9 candidate effects need both decision traces")
         require_rd9_candidate_effects(trace_paths)
+    if require_rd5_width_effects:
+        if trace_paths is None:
+            raise ValueError("RD5.width candidate effects need both decision traces")
+        check_rd5_width_candidate_effects(trace_paths)
     if require_resize_reorder:
         if (site != "RS1.reorder" or event["native"] != "keep" or
                 alternate != "skip"):
@@ -2893,6 +2967,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-magic-zero", action="store_true")
     parser.add_argument("--require-sm89", action="store_true")
     parser.add_argument("--require-rd9-effects", action="store_true")
+    parser.add_argument("--require-rd5-width-effects", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -3041,6 +3116,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_grid_base=args.require_outer_grid_base,
             require_outer_unroll=args.require_outer_unroll,
             require_rd9_effects=args.require_rd9_effects,
+            require_rd5_width_effects=args.require_rd5_width_effects,
             require_inner_targets=args.require_inner_targets,
             require_inner_storage=args.require_inner_storage,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
