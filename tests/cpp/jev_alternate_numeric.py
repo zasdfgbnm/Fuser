@@ -322,8 +322,29 @@ def require_rd9_candidate_effects(
     for mode, path in zip(("record", "remote"), trace_paths):
         rows = trace_rows(path)
         by_site = {}
+        singleton_unroll = None
+        singleton_ragged = None
         for site in sites:
             matches = [row for row in rows if row.get("site") == site]
+            if site in ("RD9.unroll", "RD9.ragged") and not matches:
+                outcomes = [row for row in trace_rows(path, outcome=True)
+                            if row.get("site") == site]
+                selected = outcomes[0].get("selected") if len(outcomes) == 1 else None
+                if (len(outcomes) != 1 or
+                        outcomes[0].get("kind") != "no_choice" or
+                        outcomes[0].get("mode") != mode or
+                        outcomes[0].get("reason") !=
+                        "only one source-offered candidate at this step" or
+                        outcomes[0].get("selection_source") !=
+                        "source_menu_singleton" or
+                        (not re.fullmatch(r"u[1-9][0-9]*", str(selected))
+                         if site == "RD9.unroll" else selected != "clean")):
+                    raise ValueError(f"expected one {mode} {site} no_choice: {outcomes}")
+                if site == "RD9.unroll":
+                    singleton_unroll = outcomes[0]
+                else:
+                    singleton_ragged = outcomes[0]
+                continue
             if len(matches) != 1:
                 raise ValueError(f"expected one {mode} {site} effect request: {matches}")
             by_site[site] = matches[0]
@@ -397,7 +418,44 @@ def require_rd9_candidate_effects(
                             fields["base_grdim"]):
                     raise ValueError(f"{mode} raw ragged grid differs from analysis")
 
-        selected = lambda site: by_site[site]["selected"]
+        if singleton_unroll is not None:
+            if singleton_ragged is None:
+                ragged_row = by_site["RD9.ragged"]
+                prior = ragged_row["request"]["state"]["current_schedule"]["prior_choices"]
+                if (singleton_unroll.get("compute_invocation_id") !=
+                        ragged_row.get("compute_invocation_id") or
+                        {"site": "RD9.unroll", "choice": singleton_unroll["selected"]}
+                        not in prior):
+                    raise ValueError(f"{mode} RD9.unroll singleton lost downstream lineage")
+                clean = effects["RD9.ragged"]["clean"]
+            else:
+                grid_base_row = by_site["RD9.grid_base"]
+                clean = effects["RD9.grid_base"][grid_base_row["selected"]]
+                if (singleton_unroll.get("compute_invocation_id") !=
+                        grid_base_row.get("compute_invocation_id")):
+                    raise ValueError(f"{mode} RD9.unroll singleton changed invocation")
+            if any(plan["iteration_vector_width"] != int(
+                    singleton_unroll["selected"][1:]) for plan in
+                   (clean["base"], clean["stride_capped"])):
+                raise ValueError(f"{mode} RD9.unroll singleton changed ragged input width")
+            effects["RD9.unroll"] = {singleton_unroll["selected"]: clean}
+        if singleton_ragged is not None:
+            unroll_selected = (singleton_unroll["selected"] if singleton_unroll
+                               else by_site["RD9.unroll"]["selected"])
+            anchor = singleton_unroll or by_site["RD9.unroll"]
+            if (singleton_ragged.get("compute_invocation_id") !=
+                    anchor.get("compute_invocation_id") or
+                    singleton_ragged.get("compute_event_index", 0) <=
+                    anchor.get("compute_event_index", 0)):
+                raise ValueError(f"{mode} RD9.ragged singleton changed invocation/order")
+            effects["RD9.ragged"] = {"clean": effects["RD9.unroll"][unroll_selected]}
+
+        def selected(site: str) -> str:
+            if site == "RD9.unroll" and singleton_unroll is not None:
+                return singleton_unroll["selected"]
+            if site == "RD9.ragged" and singleton_ragged is not None:
+                return singleton_ragged["selected"]
+            return by_site[site]["selected"]
         base = effects["RD9.grid_base"][selected("RD9.grid_base")]
         unroll = effects["RD9.unroll"]
         highest = unroll[max(unroll, key=lambda choice: int(choice[1:]))]
@@ -410,6 +468,8 @@ def require_rd9_candidate_effects(
                for name in ("base", "stride_capped")):
             raise ValueError(f"{mode} RD9 ragged clean plan changed unexpectedly")
         ragged = effects["RD9.ragged"][selected("RD9.ragged")]
+        ragged_invocation = (singleton_ragged or by_site["RD9.ragged"])[
+            "compute_invocation_id"]
         if stride_requests:
             stride = effects["RD9.stride"]
             if not any(effect["plan"] == ragged["base"]
@@ -433,13 +493,12 @@ def require_rd9_candidate_effects(
                     no_choice[0].get("selection_source") !=
                     "hard_legal_singleton" or
                     no_choice[0].get("compute_invocation_id") !=
-                    by_site["RD9.ragged"].get("compute_invocation_id")):
+                    ragged_invocation):
                 raise ValueError(f"{mode} RD9 stride singleton differs from ragged plan")
 
         final = [row for row in trace_rows(path, outcome=True)
                  if row.get("schema") == "nvfuser.native_outcome.v2" and
-                 row.get("compute_invocation_id") ==
-                 by_site["RD9.ragged"].get("compute_invocation_id")]
+                 row.get("compute_invocation_id") == ragged_invocation]
         if len(final) != 1:
             raise ValueError(f"expected one {mode} realized RD9 plan")
         params = final[0]["scheduler_fields"]

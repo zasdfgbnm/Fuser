@@ -1307,6 +1307,38 @@ if(BUILD_TEST)
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(reduction
     "Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA" "RD")
+  # A source-offered singleton stays local in semantic-v3 while subsequent
+  # choices still reach the API with that decision in their prior history.
+  add_test(NAME jev_remote_numeric_source_singleton_inner_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu1Test.FusionReductionScheduler_CUDA
+      --case-key jev_remote_numeric_source_singleton_inner_cta
+      --site-prefix RD --required-site RD3.warp
+      --protocol semantic-v3
+      --expect-no-choice RD3.cta=t512
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton
+      --expect-prior-in RD3.warp)
+  set_tests_properties(jev_remote_numeric_source_singleton_inner_cta
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_source_singleton_outer_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_remote_numeric_source_singleton_outer_unroll
+      --site-prefix RD --required-site RD9.ragged
+      --protocol semantic-v3
+      --expect-no-choice RD9.unroll=u1
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton
+      --expect-prior-in RD9.ragged)
+  set_tests_properties(jev_remote_numeric_source_singleton_outer_unroll
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_remote_numeric_outer_stride_singleton
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
@@ -1516,10 +1548,39 @@ if(BUILD_TEST)
     "Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA" "OP" "OP3.cta")
   add_jev_remote_numeric_test(op_instance_norm_float
     "Gpu3Test.JevInstanceNormNhwcFloatCta_CUDA" "OP" "OP3.cta")
+  add_test(NAME jev_remote_numeric_source_singleton_outer_persistent_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu3Test.JevSoftmaxDropoutOuterHalfCta_CUDA
+      --case-key jev_remote_numeric_source_singleton_outer_persistent_cta
+      --site-prefix OP --required-site OP3.unroll
+      --protocol semantic-v3
+      --expect-no-choice OP3.cta=x64_y2_b6
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton)
+  set_tests_properties(jev_remote_numeric_source_singleton_outer_persistent_cta
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(op_softmax_dropout_outer_half
     "Gpu3Test.JevSoftmaxDropoutOuterHalfCta_CUDA" "OP" "OP3.cta")
   add_jev_remote_numeric_test(inner_outer_persistent
     "CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv" "IOP")
+  add_test(NAME jev_remote_numeric_source_singleton_inner_outer_tmp_read
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_source_singleton_inner_outer_tmp_read
+      --site-prefix IOP --required-site IOP3.grid_rows
+      --protocol semantic-v3
+      --expect-no-choice IOP3.tmp_read_width=w1
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton
+      --expect-prior-in IOP3.grid_rows)
+  set_tests_properties(jev_remote_numeric_source_singleton_inner_outer_tmp_read
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_remote_numeric_inner_outer_singleton_width
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"

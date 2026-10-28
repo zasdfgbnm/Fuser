@@ -929,6 +929,19 @@ std::string chooseDecisionImpl(
       : semantic ? std::string(state) : quote(state);
   if (structured && JsonReader(state_json).parse().kind != Json::Kind::Object)
     fail("semantic state must be a JSON object");
+  // A single source-offered alternative needs no model preference. Validate
+  // the complete v3 context above, then retain the choice in the compute
+  // outcome and in the prior choices seen by later decisions.
+  if (semantic_v3 && options.size() == 1 &&
+      active_compute_scope->observing()) {
+    const std::string& selected = options.front().id;
+    recordHardSingletonDecision(
+        site,
+        selected,
+        "only one source-offered candidate at this step",
+        "source_menu_singleton");
+    return selected;
+  }
   const std::string log_case_key = case_key.empty()
       ? (active_invocation.id.empty() ? env("NVFUSER_JEV_CASE_KEY")
                                       : active_invocation.case_key)

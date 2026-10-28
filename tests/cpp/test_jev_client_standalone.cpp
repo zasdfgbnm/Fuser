@@ -1110,6 +1110,15 @@ int main() {
   const std::vector<ChoiceOption> width_options{
       {"w1", "one element per thread"}, {"w2", "two elements per thread"}};
   ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  {
+    const std::string before = readFile(path);
+    require(nvfuser::scheduler::jev::chooseSemanticDecision(
+                "PW3.width", semantic_state, "Choose vector width for this fusion",
+                {{"w1", "one element per thread"}}, "w1") == "w1" &&
+                readFile(path).substr(before.size()).find(
+                    "{\"site\":\"PW3.width\"") == 0,
+            "semantic-v2 singleton stopped using its existing Choice protocol");
+  }
   const std::string before_semantic_record = readFile(path);
   {
     nvfuser::scheduler::jev::ComputeHeuristicsScope scope("full snapshot", {});
@@ -1195,6 +1204,116 @@ int main() {
   const std::string v3_hardware = "{\"sm_count\":128}";
   const std::vector<ChoiceOption> reverse_options{
       {"bp1", "split"}, {"bp0", "one dimensional"}};
+  ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  const std::vector<ChoiceOption> sole_grid{
+      {"g1", "Use the only source-offered grid", "{\"grid_y\":1}"}};
+  const std::string singleton_reason =
+      "only one source-offered candidate at this step";
+  const std::string singleton_source = "source_menu_singleton";
+  {
+    const std::string choices_before = readFile(path);
+    const std::string outcomes_before = readFile(std::string(path) + ".outcome.jsonl");
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "singleton Record fusion", {}, v3_hardware);
+    const std::string invocation_id(scope.invocationId());
+    require(chooseDecision("RD3.grid", "one hard-valid grid", sole_grid, "g1") ==
+                "g1" &&
+                readFile(path) == choices_before,
+            "semantic-v3 Record singleton emitted a Choice");
+    require(chooseDecision("PW2", state, reverse_options, "bp0") == "bp0",
+            "semantic-v3 Record downstream Choice changed");
+    const std::string downstream = readFile(path).substr(choices_before.size());
+    require(downstream.find("\"prior_choices\":[{\"site\":\"RD3.grid\","
+                            "\"choice\":\"g1\"}]") != std::string::npos &&
+                downstream.find("{\"site\":\"PW2\"") == 0,
+            "semantic-v3 Record singleton was not retained as downstream prior");
+    scope.complete("Reduction");
+    const std::string outcomes =
+        readFile(std::string(path) + ".outcome.jsonl").substr(outcomes_before.size());
+    require(outcomes.find(
+                "\"compute_invocation_id\":\"" + invocation_id +
+                "\",\"compute_event_index\":1,\"site\":\"RD3.grid\","
+                "\"selected\":\"g1\",\"reason\":\"" + singleton_reason +
+                "\",\"selection_source\":\"" + singleton_source + "\"") !=
+                std::string::npos &&
+                outcomes.find("\"kind\":\"no_choice\",\"mode\":\"record\"") !=
+                    std::string::npos &&
+                outcomes.find("\"compute_event_index\":3,\"scheduler_type\":"
+                              "\"Reduction\"") != std::string::npos,
+            "semantic-v3 Record singleton outcome or event sequence is incomplete");
+  }
+  {
+    const std::string choices_before = readFile(path);
+    const std::string outcomes_before = readFile(std::string(path) + ".outcome.jsonl");
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "singleton validation fusion", {}, v3_hardware);
+    const auto rejected = [&](std::string_view analysis,
+                              const std::vector<ChoiceOption>& candidates,
+                              std::string_view native) {
+      try {
+        (void)chooseDecision("RD3.grid", analysis, candidates, native);
+      } catch (const std::runtime_error&) {
+        return true;
+      }
+      return false;
+    };
+    require(rejected("one grid", sole_grid, "g2") &&
+                rejected("", sole_grid, "g1") &&
+                rejected("one grid", {{"g1", "grid", "[]"}}, "g1") &&
+                readFile(path) == choices_before &&
+                readFile(std::string(path) + ".outcome.jsonl").substr(
+                    outcomes_before.size()).find("\"kind\":\"no_choice\"") ==
+                    std::string::npos,
+            "semantic-v3 singleton bypassed native, analysis, or consequence validation");
+  }
+  {
+    const std::string choices_before = readFile(path);
+    bool rejected = false;
+    try {
+      (void)chooseDecision("RD3.grid", "one grid", sole_grid, "g1");
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    require(rejected && readFile(path) == choices_before,
+            "semantic-v3 singleton bypassed the required compute scope");
+  }
+  ::setenv("NVFUSER_JEV_MODE", "remote", 1);
+  {
+    const std::string choices_before = readFile(path);
+    const std::string outcomes_before = readFile(std::string(path) + ".outcome.jsonl");
+    ::setenv("NVFUSER_JEV_PORT", "0", 1);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "singleton Remote fusion", {}, v3_hardware);
+    const std::string invocation_id(scope.invocationId());
+    require(chooseDecision("RD3.grid", "one hard-valid grid", sole_grid) ==
+                "g1" &&
+                readFile(path) == choices_before,
+            "semantic-v3 Remote singleton attempted HTTP or emitted a Choice");
+    FakeServer server(answer("bp1"));
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    require(chooseDecision("PW2", state, reverse_options) == "bp1",
+            "semantic-v3 Remote downstream Choice was not served");
+    const std::string remote_choice = readFile(path).substr(choices_before.size());
+    const auto body_start = server.request().find("\r\n\r\n");
+    require(remote_choice.find("{\"site\":\"PW2\"") == 0 &&
+                remote_choice.find("\n{\"site\":") == std::string::npos &&
+                body_start != std::string::npos &&
+                server.request().substr(body_start + 4).find(
+                    "\"prior_choices\":[{\"site\":\"RD3.grid\","
+                    "\"choice\":\"g1\"}]") != std::string::npos,
+            "semantic-v3 Remote singleton was not carried into the sole HTTP request");
+    scope.complete("Reduction");
+    const std::string outcomes =
+        readFile(std::string(path) + ".outcome.jsonl").substr(outcomes_before.size());
+    require(outcomes.find("\"kind\":\"no_choice\",\"mode\":\"remote\"") !=
+                std::string::npos &&
+                outcomes.find("\"compute_invocation_id\":\"" + invocation_id +
+                              "\",\"compute_event_index\":1,\"site\":\"RD3.grid\","
+                              "\"selected\":\"g1\",\"reason\":\"" +
+                              singleton_reason + "\",\"selection_source\":\"" +
+                              singleton_source + "\"") != std::string::npos,
+            "semantic-v3 Remote singleton outcome or prior lineage is incomplete");
+  }
   ::setenv("NVFUSER_JEV_MODE", "record", 1);
   using nvfuser::reduction::non_tma::inner_width_choice::layoutCapOption;
   const auto legacy_width_cap = layoutCapOption(3, false);
@@ -1364,6 +1483,12 @@ int main() {
   ::setenv("NVFUSER_JEV_MODE", "record", 1);
   ::setenv("NVFUSER_JEV_PROTOCOL", "text-v1", 1);
   {
+    const std::string before_singleton = readFile(path);
+    require(chooseDecision("IP5.width", "legacy singleton",
+                           {{"w1", "Vector width 1"}}, "w1") == "w1" &&
+                readFile(path).substr(before_singleton.size()).find(
+                    "{\"site\":\"IP5.width\"") == 0,
+            "text-v1 singleton stopped using its existing Choice protocol");
     const std::string legacy_state =
         "inner_persistent.reg_width.v1\ninner_numel=64\nplan=1:1:2";
     const std::string before_plain = readFile(path);
