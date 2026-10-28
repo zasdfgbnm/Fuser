@@ -1585,6 +1585,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_inner_cta_seed: bool = False,
                            require_inner_magic_zero: bool = False,
                            require_inner_targets: bool = False,
+                           require_inner_target_physical_gate: bool = False,
                            require_inner_storage: bool = False,
                            require_inner3d_warp: bool = False,
                            require_inner3d_occupancy: bool = False,
@@ -2918,6 +2919,60 @@ def check_alternate_report(report: dict[str, Any],
                 raise ValueError(f"upstream inner decision changed: {row}")
         if issues != [intended]:
             raise ValueError(f"unexpected output unroll comparison issues: {issues}")
+    elif require_inner_target_physical_gate:
+        # At P=1025, batch=2 the score CTA has 512 threads, whereas the
+        # scheduled warp-padded CTA has 544. SM89 admits 128 registers per
+        # thread for the former but only 120 for the latter. The 16-warp
+        # target must therefore be absent from the actual Choice request.
+        expected_menu = {"o16_w28", "o32_w28"}
+        if (site != "IP5.targets" or event["native"] != "o16_w28" or
+                alternate != "o32_w28" or
+                set(event["candidates"]) != expected_menu):
+            raise ValueError(f"physical CTA gate leaked an unsafe policy: {event}")
+        request = entry["request"]
+        decision = request["state"]["decision"]
+        menu = request["questions"][site]["criteria"]
+        analysis = decision["analysis_inputs_text"].splitlines()
+        hardware = request["state"]["workload"]["hardware"]
+        if (set(menu) != expected_menu or
+                {candidate["id"] for candidate in decision["candidates"]} !=
+                expected_menu or
+                "parallel_after_vectorize=1025" not in analysis or
+                "total_iteration_numel=64" not in analysis or
+                "buffer_bits_per_batch=32" not in analysis or
+                "policy=16:28:2:2" not in analysis or
+                "policy=32:28:2:2" not in analysis or
+                (hardware["compute_capability_major"],
+                 hardware["compute_capability_minor"]) != (8, 9) or
+                hardware["warp_size"] != 32 or
+                hardware["registers_per_block"] != 65536):
+            raise ValueError("physical CTA fixture did not reach the expected request")
+        expected_issues = sorted((
+            ("winner_mismatch", site),
+            ("record_only_state", "IP5.cta_seed"),
+            ("remote_only_state", "IP5.cta_seed"),
+            ("record_only_state", "IP5.batch"),
+            ("remote_only_state", "IP5.batch"),
+        ))
+        if sorted((issue["kind"], issue["site"]) for issue in issues) != expected_issues:
+            raise ValueError(f"unexpected physical gate comparison issues: {issues}")
+        seed_record, seed_remote, _ = paired_state_rows(report, "IP5.cta_seed")
+        from jev_shim import parse_inner_reg_cta_seed_state
+        for row, overhead in ((seed_record, 16), (seed_remote, 32)):
+            state = parse_inner_reg_cta_seed_state(
+                row["request"]["state"]["decision"]["analysis_inputs_text"])
+            if (state.selected_register_overhead != overhead or
+                    state.selected_target_warps_per_sm != 28 or
+                    row["record" if overhead == 16 else "remote"] !=
+                    {"t1024": 1}):
+                raise ValueError("physical gate did not preserve the selected CTA policy")
+        batch_rows = [row for row in report["multiplicity"]
+                      if row["site"] == "IP5.batch"]
+        if (len(batch_rows) != 2 or
+                sorted(((row["record"], row["remote"])
+                        for row in batch_rows), key=str) !=
+                sorted((({"b2": 1}, {}), ({}, {"b2": 1})), key=str)):
+            raise ValueError(f"physical gate did not retain batch=2: {batch_rows}")
     elif require_inner_targets:
         if (site != "IP5.targets" or event["native"] != "o16_w28" or
                 alternate != "o32_w16" or
@@ -3481,6 +3536,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-outer-grid-base", action="store_true")
     parser.add_argument("--require-outer-unroll", action="store_true")
     parser.add_argument("--require-inner-targets", action="store_true")
+    parser.add_argument("--require-inner-target-physical-gate", action="store_true")
     parser.add_argument("--require-inner-storage", action="store_true")
     parser.add_argument("--require-inner-iter-unroll", action="store_true")
     parser.add_argument("--require-inner-warp-target", action="store_true")
@@ -3665,6 +3721,7 @@ def main(argv: list[str] | None = None) -> int:
             require_rd5_warp_effects=args.require_rd5_warp_effects,
             require_rd5_cta_effects=args.require_rd5_cta_effects,
             require_inner_targets=args.require_inner_targets,
+            require_inner_target_physical_gate=args.require_inner_target_physical_gate,
             require_inner_storage=args.require_inner_storage,
             require_inner_iter_unroll=args.require_inner_iter_unroll,
             require_inner_warp_target=args.require_inner_warp_target,

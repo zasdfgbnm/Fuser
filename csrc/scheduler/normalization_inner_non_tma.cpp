@@ -560,13 +560,14 @@ void innerPersistentHeuristic2DPlan(
       const int64_t actual_x =
           candidate.is_pad_bdimx ? physical_padded_x : physical_x;
       const int64_t actual_threads = actual_x * candidate.bdimy;
-      const bool alternate_seed = min_threads_override > 0 &&
-          min_threads_override != native_min_threads_per_block;
-      return (!alternate_seed ||
-              (actual_x > 0 && actual_x <= dev_prop->maxThreadsDim[0] &&
-               actual_threads > 0 && actual_threads <= max_threads_in_block &&
-               candidate.register_per_thread <=
-                   dev_prop->regsPerBlock / actual_threads)) &&
+      // The score uses floor(parallel / batch), but the scheduled TIDx uses
+      // ceil(parallel / batch). A policy can fit the score CTA yet exceed the
+      // physical register budget, even with the native CTA seed. Check the
+      // physical CTA for every offered policy, not just alternate seeds.
+      return actual_x > 0 && actual_x <= dev_prop->maxThreadsDim[0] &&
+          actual_threads > 0 && actual_threads <= max_threads_in_block &&
+          candidate.register_per_thread <=
+              dev_prop->regsPerBlock / actual_threads &&
           candidate.is_pad_bdimx == should_pad && threads > 0 &&
           threads <= max_threads_in_block &&
           candidate.bdimx <= dev_prop->maxThreadsDim[0] &&

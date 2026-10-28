@@ -1884,6 +1884,18 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_inner_targets --require-inner-targets)
   set_tests_properties(jev_alternate_numeric_inner_targets PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_target_physical_gate
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.targets --alternate o32_w28
+      --gtest Gpu1Test.JevInner2DTargetPhysicalGate_CUDA
+      --case-key jev_inner_target_physical_gate
+      --protocol semantic-v3 --require-sm89
+      --require-inner-target-physical-gate)
+  set_tests_properties(jev_alternate_numeric_inner_target_physical_gate PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_inner_register_width
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

@@ -8680,6 +8680,51 @@ TEST_F(Gpu1Test, FusionMagicSchedulerRMSNormalization_CUDA) {
       "");
 }
 
+// P=1025 and batch=2 make the score CTA 512 threads but the physical,
+// warp-padded CTA 544 threads. The 16-warp target asks for 128 registers per
+// thread, which fits the score CTA and exceeds the SM89 physical block budget.
+// Keep that alternate policy out of the API menu while testing the remaining
+// hard-valid policies numerically.
+TEST_F(Gpu1Test, JevInner2DTargetPhysicalGate_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major != 8 || device->minor != 9) {
+    GTEST_SKIP() << "The physical CTA/register boundary is specific to SM89";
+  }
+  constexpr int64_t norm_size = 1025;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  const std::vector<int64_t> norm_shape{norm_size};
+  auto result = rms_norm(
+      input, norm_shape, nullptr, IrBuilder::create<Val>(eps));
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.invstd);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({64, norm_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+
+  auto squared = at::pow(aten_input.to(at::kDouble), 2);
+  auto invstd = at::pow(squared.mean(-1, true) + eps, -0.5);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {aten_input.to(at::kDouble) * invstd, invstd},
+      __LINE__,
+      __FILE__,
+      "",
+      rparams->lparams);
+}
+
 // On SM89 the original 2D register policy stops at batch 10, while batch 12
 // has a complete CTA/register/grid plan. Exercise both choices numerically.
 TEST_F(Gpu1Test, JevAlternateInnerRegisterBatchCap_CUDA) {
