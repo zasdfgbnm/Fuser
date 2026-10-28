@@ -26,7 +26,7 @@ from threading import Lock, Thread, local
 from typing import Any, Callable
 
 from jev_remote_numeric import (checked_environment, file_hash, run_numeric,
-                                write_manifest)
+                                server_site, write_manifest)
 
 
 SITE = "RD3.grid"
@@ -68,6 +68,97 @@ def trace_rows(path: Path, *, outcome: bool = False) -> list[dict[str, Any]]:
     """Read one numeric run's decision or source outcome events."""
     source = Path(str(path) + ".outcome.jsonl") if outcome else path
     return [json.loads(line) for line in source.read_text().splitlines() if line]
+
+
+def greedy_scan_cub_bytes(threads: int, item_bytes: int) -> int:
+    """Independently calculate CUB BlockScan temporary storage in bytes."""
+    def align(value: int, multiple: int) -> int:
+        return (value + multiple - 1) // multiple * multiple
+
+    if threads % 32 == 0:
+        return align((threads // 32) * (item_bytes + 1) + item_bytes, 32)
+    segment = (threads + min(threads, 32) - 1) // min(threads, 32)
+    raking_threads = (threads + segment - 1) // segment
+    padding = int(segment % 2 == 0 and segment > 2)
+    if raking_threads & (raking_threads - 1) == 0:
+        warp_bytes = 1
+    else:
+        half_warp = 1 << ((raking_threads - 1).bit_length() - 1)
+        warp_bytes = item_bytes * (raking_threads + half_warp)
+    grid_bytes = item_bytes * raking_threads * (segment + padding)
+    return align(align(warp_bytes, 16) + align(grid_bytes, 16) + item_bytes, 16)
+
+
+def require_greedy_scan_candidate_effects(
+        trace_paths: tuple[Path, Path], server_log: Path,
+        site: str, scan_count: int) -> dict[str, Any]:
+    """Recompute every offered Scan resource card from the wire inputs."""
+    expected_tag = ("greedy.scan_batch.v1" if scan_count == 1 else
+                    "greedy.multi_scan_batch.v1")
+    evidence = {}
+    for mode, path in (*zip(("record", "remote"), trace_paths),
+                       ("server", server_log)):
+        rows = [row for row in trace_rows(path) if server_site(row) == site]
+        if len(rows) != 1:
+            raise ValueError(f"expected one {mode} {site} request: {rows}")
+        request = rows[0]["request"]
+        context = request["state"]
+        if (context.get("schema") != "nvfuser.systemone.context.v3" or
+                context.get("decision", {}).get("site") != site):
+            raise ValueError(f"{mode} {site} lost its semantic-v3 context")
+        decision = context["decision"]
+        lines = decision["analysis_inputs_text"].splitlines()
+        if lines[0] != expected_tag:
+            raise ValueError(f"{mode} {site} changed its analysis tag")
+        fields = dict(line.split("=", 1) for line in lines[1:])
+        count = int(fields.get("scan_count", 1))
+        extent = int(fields["extent"])
+        item_bytes = int(fields["item_bytes"])
+        registers = int(fields["regs_per_block"])
+        shmem = int(fields["smem_per_block_bytes"])
+        if (count != scan_count or extent != 2048 or item_bytes != 4 or
+                any(value <= 0 for value in
+                    (registers, shmem, extent, item_bytes))):
+            raise ValueError(f"{mode} {site} fixture parameters changed: {fields}")
+        criteria = request["questions"][site]["criteria"]
+        candidates = decision["candidates"]
+        if (set(criteria) != {"b2", "b4", "b8"} or
+                [card["id"] for card in candidates] != sorted(criteria)):
+            raise ValueError(f"{mode} {site} lost its checked batch menu")
+        for candidate in candidates:
+            batch = int(candidate["id"][1:])
+            threads = (extent + batch - 1) // batch
+            cub_bytes = scan_count * greedy_scan_cub_bytes(
+                threads, item_bytes)
+            estimated = ((batch * item_bytes // 4 + 20) if scan_count == 1
+                         else (batch * 2 * scan_count * item_bytes + 3) // 4 + 20)
+            expected = {
+                "schema": "nvfuser.gr1.scan_batch.resources.v1",
+                "scan_count": scan_count,
+                "items_per_thread": batch,
+                "threads_x": threads,
+                "cub_temp_storage_bytes": cub_bytes,
+                "cub_aligned_shared_bytes":
+                    (cub_bytes + 127) // 128 * 128,
+                "estimated_registers_per_thread": estimated,
+                "register_budget_per_thread": registers // threads,
+            }
+            actual = candidate.get("consequence")
+            if (not isinstance(actual, dict) or
+                    any(type(actual.get(key)) is not int for key in expected
+                        if key != "schema") or actual != expected):
+                raise ValueError(
+                    f"{mode} {site} {candidate['id']} resource mismatch: "
+                    f"{actual} != {expected}")
+            if (cub_bytes > shmem or expected["cub_aligned_shared_bytes"] > shmem or
+                    candidate["description"] != criteria[candidate["id"]]):
+                raise ValueError(f"{mode} {site} offered an unproved resource plan")
+        evidence[mode] = {"ids": sorted(criteria),
+                          "effects": {card["id"]: card["consequence"]
+                                      for card in candidates}}
+    if evidence["record"] != evidence["remote"] or evidence["remote"] != evidence["server"]:
+        raise ValueError(f"{site} resource cards changed across transport")
+    return evidence
 
 
 def require_no_choice(
@@ -3293,6 +3384,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-rd5-width-effects", action="store_true")
     parser.add_argument("--require-rd5-warp-effects", action="store_true")
     parser.add_argument("--require-rd5-cta-effects", action="store_true")
+    parser.add_argument("--require-greedy-scan-effects", action="store_true")
+    parser.add_argument("--scan-count", type=int, choices=(1, 2, 3, 4))
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -3322,6 +3415,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--gtest must be one exact GTest name")
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.case_key):
         parser.error("--case-key must use lowercase letters, digits, underscores")
+    if args.require_greedy_scan_effects and (
+            args.protocol != "semantic-v3" or
+            args.scan_count is None or
+            args.site != ("GR1.scan_batch" if args.scan_count == 1 else
+                          "GR1.multi_scan_batch")):
+        parser.error("--require-greedy-scan-effects needs semantic-v3 and a matching Scan site/count")
     module_dir, loader, libraries = checked_environment()
     if args.require_sm89:
         capability = cuda_compute_capability(libraries)
@@ -3480,6 +3579,10 @@ def main(argv: list[str] | None = None) -> int:
             require_resize_reorder=args.require_resize_reorder,
             trace_paths=(Path(record["decision_log"]),
                          Path(remote["decision_log"])))
+        if args.require_greedy_scan_effects:
+            manifest["greedy_scan_effects"] = require_greedy_scan_candidate_effects(
+                (Path(record["decision_log"]), Path(remote["decision_log"])),
+                server_log, args.site, args.scan_count)
         manifest["alternate"] = summary
         manifest["status"] = "alternate_numeric_pass"
         write_manifest(manifest_path, manifest)

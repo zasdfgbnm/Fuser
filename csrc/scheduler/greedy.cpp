@@ -29,6 +29,7 @@
 #include "scheduler/debug_utils.h"
 #include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
+#include "scheduler/native_diagnostic_jsonl.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/cub_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -138,6 +139,39 @@ void GreedyParams::transferProducerParams(
 }
 
 namespace {
+
+// Describe the same CUB allocation that made a Scan batch hard-legal. The
+// register estimate is diagnostic for every candidate, including the native
+// one; it is not an additional eligibility check.
+std::string scanBatchResourceConsequence(
+    int64_t scan_count,
+    int64_t batch,
+    int64_t threads,
+    int64_t item_bytes,
+    int64_t required_storage,
+    int64_t registers_per_block) {
+  scheduler::native_diagnostic::Object effect;
+  effect.add("schema", "nvfuser.gr1.scan_batch.resources.v1");
+  effect.add("scan_count", scan_count);
+  effect.add("items_per_thread", batch);
+  effect.add("threads_x", threads);
+  effect.add("cub_temp_storage_bytes", required_storage);
+  effect.add(
+      "cub_aligned_shared_bytes", (required_storage + 127) / 128 * 128);
+  const __int128 bytes = static_cast<__int128>(batch) * item_bytes *
+      (scan_count == 1 ? 1 : 2 * scan_count);
+  const __int128 estimated_registers =
+      (scan_count == 1 ? bytes / 4 : (bytes + 3) / 4) + 20;
+  if (estimated_registers <= std::numeric_limits<int64_t>::max()) {
+    effect.add(
+        "estimated_registers_per_thread",
+        static_cast<int64_t>(estimated_registers));
+  } else {
+    effect.addRaw("estimated_registers_per_thread", "null");
+  }
+  effect.add("register_budget_per_thread", registers_per_block / threads);
+  return effect.str();
+}
 
 // Utility function to get the total size of the given IDs if all
 // extents are statically known
@@ -1010,15 +1044,17 @@ class HeuristicsBuilder : private IterVisitor {
     }
     const int64_t native_batch = ceilDiv(*extent, max_threads);
     const int64_t native_threads = ceilDiv(*extent, native_batch);
-    auto storage_fits = [&](int64_t threads, int64_t batch) {
+    auto storage_fits = [&](int64_t threads, int64_t batch, int64_t& required) {
       scheduler_tools::CubSharedMemoryBuffer storage;
       for (size_t i = 0; i < scan_count; ++i) {
         storage.registerScan(threads, batch, first_tv->dtype());
       }
-      const int64_t required = storage.getTotalSizeInBytes();
+      required = storage.getTotalSizeInBytes();
       return required <= shmem && (required + 127) / 128 * 128 <= shmem;
     };
-    if (native_threads > max_threads_x || !storage_fits(native_threads, native_batch)) {
+    int64_t native_storage = 0;
+    if (native_threads > max_threads_x ||
+        !storage_fits(native_threads, native_batch, native_storage)) {
       NVF_ERROR(
           jev_mode != scheduler::jev::Mode::Remote,
           "Unable to prove native multi-Scan CUB capacity");
@@ -1026,17 +1062,24 @@ class HeuristicsBuilder : private IterVisitor {
     }
 
     std::vector<scheduler::jev::ChoiceOption> options;
-    auto add_option = [&](int64_t batch, int64_t threads) {
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    auto add_option = [&](int64_t batch, int64_t threads, int64_t required_storage) {
       const auto scope = scan_count == 2
           ? "both Scan ops"
           : scan_count == 3 ? "all three Scan ops" : "all four Scan ops";
-      options.push_back({
+      scheduler::jev::ChoiceOption option{
           "b" + std::to_string(batch),
           "Use " + std::to_string(batch) +
               " items per thread for " + scope + " with " +
-              std::to_string(threads) + " TIDx threads"});
+              std::to_string(threads) + " TIDx threads"};
+      if (semantic_v3) {
+        option.consequence_json = scanBatchResourceConsequence(
+            scan_count, batch, threads, item_bytes, required_storage,
+            registers);
+      }
+      options.push_back(std::move(option));
     };
-    add_option(native_batch, native_threads);
+    add_option(native_batch, native_threads, native_storage);
     const int64_t bytes_per_item =
         2 * static_cast<int64_t>(scan_count) * item_bytes;
     for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
@@ -1056,12 +1099,13 @@ class HeuristicsBuilder : private IterVisitor {
       }
       const int64_t estimated_registers =
           ceilDiv(batch * bytes_per_item, int64_t{4}) + 20;
+      int64_t required_storage = 0;
       if (estimated_registers > 255 ||
           estimated_registers > registers / threads ||
-          !storage_fits(threads, batch)) {
+          !storage_fits(threads, batch, required_storage)) {
         continue;
       }
-      add_option(batch, threads);
+      add_option(batch, threads, required_storage);
     }
 
     const std::string state =
@@ -1276,18 +1320,24 @@ class HeuristicsBuilder : private IterVisitor {
       std::vector<scheduler::jev::ChoiceOption> options;
       std::vector<int64_t> batches;
 
-      auto storage_fits = [&](int64_t threads, int64_t batch) {
+      auto storage_fits = [&](int64_t threads, int64_t batch, int64_t& required) {
         scheduler_tools::CubSharedMemoryBuffer scan_storage;
         scan_storage.registerScan(threads, batch, constrained_tv->dtype());
-        const int64_t required = scan_storage.getScanTotalSizeInBytes();
+        required = scan_storage.getScanTotalSizeInBytes();
         return required <= shmem && (required + 127) / 128 * 128 <= shmem;
       };
-      auto add_option = [&](int64_t batch, int64_t threads) {
-        options.push_back({
+      const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+      auto add_option = [&](int64_t batch, int64_t threads, int64_t required_storage) {
+        scheduler::jev::ChoiceOption option{
             "b" + std::to_string(batch),
             "Use " + std::to_string(batch) +
                 " scan items per thread with " +
-                std::to_string(threads) + " TIDx threads"});
+                std::to_string(threads) + " TIDx threads"};
+        if (semantic_v3) {
+          option.consequence_json = scanBatchResourceConsequence(
+              1, batch, threads, item_bytes, required_storage, registers);
+        }
+        options.push_back(std::move(option));
         batches.push_back(batch);
       };
 
@@ -1297,8 +1347,9 @@ class HeuristicsBuilder : private IterVisitor {
             ceilDiv(size_of_constrained_ids, batch_size);
         // The native batch remains a choice even if its last Group item is
         // a padded tail. Only alternatives require exact divisibility.
-        if (storage_fits(native_threads, batch_size)) {
-          add_option(batch_size, native_threads);
+        int64_t native_storage = 0;
+        if (storage_fits(native_threads, batch_size, native_storage)) {
+          add_option(batch_size, native_threads, native_storage);
           for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
             if (batch_size > std::numeric_limits<int64_t>::max() / factor) {
               continue;
@@ -1318,12 +1369,13 @@ class HeuristicsBuilder : private IterVisitor {
             }
             const int64_t estimated_registers =
                 candidate_batch * item_bytes / 4 + 20;
+            int64_t required_storage = 0;
             if (estimated_registers > 255 ||
                 estimated_registers > registers / threads ||
-                !storage_fits(threads, candidate_batch)) {
+                !storage_fits(threads, candidate_batch, required_storage)) {
               continue;
             }
-            add_option(candidate_batch, threads);
+            add_option(candidate_batch, threads, required_storage);
           }
         }
       }

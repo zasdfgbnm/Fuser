@@ -7,6 +7,9 @@
 // clang-format on
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <string>
+
 #include "device_lower/lower2device.h"
 #include "exceptions.h"
 #include "expr_evaluator.h"
@@ -25,6 +28,16 @@
 namespace nvfuser {
 
 using GreedySchedulerTest = NVFuserTest;
+
+// The alternate numeric harness forwards this test-only expectation to the
+// child process. Record always uses the source's native b2 plan.
+int64_t expectedJevScanBatch() {
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Remote) {
+    return 2;
+  }
+  const char* expected = std::getenv("JEV_EXPECTED_SCAN_BATCH");
+  return expected == nullptr ? 4 : std::stoll(expected);
+}
 
 class GreedySchedulerTestConstraintSize
     : public GreedySchedulerTest,
@@ -858,6 +871,59 @@ TEST_F(GreedySchedulerTest, JevAlternateScatterBatch_CUDA) {
       testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
 }
 
+// A single Scan has its own batch Choice. Check the forced b4 schedule as
+// well as its numerical result against ATen's prefix sum.
+TEST_F(GreedySchedulerTest, JevAlternateSingleScanBatch_CUDA) {
+  auto fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  const std::vector<int64_t> shape{8, 2048};
+  auto input_tv = makeContigConcreteTensor(shape, DataType::Float);
+  fusion.addInput(input_tv);
+  auto scan_tv = scan(input_tv, -1, BinaryOpType::Add);
+  auto output_tv = add(scan_tv, fusion.oneVal());
+  fusion.addOutput(output_tv);
+
+  auto input = at::zeros(
+      shape, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  input.select(-1, 0).fill_(1.0);
+  FusionExecutorCache executor_cache(std::move(fusion_ptr));
+  auto outputs = executor_cache.runFusionWithInputs({input});
+  testValidate(executor_cache.fusion(), outputs, {input}, __LINE__, __FILE__);
+  ASSERT_EQ(outputs.size(), 1);
+  EXPECT_TRUE(at::equal(outputs[0].as<at::Tensor>(), input.cumsum(-1) + 1));
+  auto* runtime = executor_cache.getMostRecentKernelRuntime();
+  ASSERT_FALSE(runtime->isSegmented());
+  ASSERT_THAT(
+      runtime->fusionSegments()->groups(),
+      testing::ElementsAre(HeuristicIs(SchedulerType::Greedy)));
+  auto* scheduled = runtime->executors()
+                        .at(0)
+                        ->as<KernelExecutor>()
+                        ->compiledKernel()
+                        ->kernel();
+  const int64_t expected_batch = expectedJevScanBatch();
+  int64_t scan_count = 0;
+  for (auto* tv : scheduled->allTvs()) {
+    if (!tv->isDefinitionType<ScanOp>()) {
+      continue;
+    }
+    ++scan_count;
+    ASSERT_EQ(tv->getLoopDomain().size(), 3);
+    EXPECT_EQ(tv->axis(0)->getParallelType(), ParallelType::BIDx);
+    EXPECT_EQ(tv->axis(1)->getParallelType(), ParallelType::TIDx);
+    EXPECT_EQ(
+        tv->axis(1)->extent()->evaluate().as<int64_t>(),
+        2048 / expected_batch);
+    EXPECT_EQ(tv->axis(2)->getParallelType(), ParallelType::Group);
+    EXPECT_EQ(
+        tv->axis(2)->extent()->evaluate().as<int64_t>(),
+        expected_batch);
+  }
+  EXPECT_EQ(scan_count, 1);
+}
+
 // The local API forces one shared b4 choice for two equal Scan operations.
 // Check the second scan against an independent ATen prefix-sum reference.
 TEST_F(GreedySchedulerTest, JevAlternateMultiScanBatch_CUDA) {
@@ -974,10 +1040,8 @@ TEST_F(GreedySchedulerTest, JevAlternateFourScanBatch_CUDA) {
                         ->as<KernelExecutor>()
                         ->compiledKernel()
                         ->kernel();
-  const bool forced_batch =
-      scheduler::jev::mode() == scheduler::jev::Mode::Remote;
-  const int64_t expected_threads = forced_batch ? 512 : 1024;
-  const int64_t expected_batch = forced_batch ? 4 : 2;
+  const int64_t expected_batch = expectedJevScanBatch();
+  const int64_t expected_threads = 2048 / expected_batch;
   int64_t scan_count = 0;
   for (auto* tv : scheduled->allTvs()) {
     if (!tv->isDefinitionType<ScanOp>()) {

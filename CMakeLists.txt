@@ -2110,6 +2110,50 @@ if(BUILD_TEST)
   set_tests_properties(jev_alternate_numeric_greedy_four_scan_batch PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
 
+  foreach(scan_count RANGE 1 4)
+    if(scan_count EQUAL 1)
+      set(scan_site GR1.scan_batch)
+      set(scan_fixture JevAlternateSingleScanBatch_CUDA)
+    elseif(scan_count EQUAL 2)
+      set(scan_site GR1.multi_scan_batch)
+      set(scan_fixture JevAlternateMultiScanBatch_CUDA)
+    elseif(scan_count EQUAL 3)
+      set(scan_site GR1.multi_scan_batch)
+      set(scan_fixture JevAlternateThreeScanBatch_CUDA)
+    else()
+      set(scan_site GR1.multi_scan_batch)
+      set(scan_fixture JevAlternateFourScanBatch_CUDA)
+    endif()
+    set(scan_test jev_alternate_numeric_greedy_scan_effects_${scan_count})
+    add_test(NAME ${scan_test}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+        --binary "$<TARGET_FILE:test_greedy>"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+        --site ${scan_site} --alternate b4
+        --gtest GreedySchedulerTest.${scan_fixture}
+        --case-key ${scan_test}
+        --protocol semantic-v3 --require-sm89
+        --scan-count ${scan_count} --require-greedy-scan-effects)
+    set_tests_properties(${scan_test} PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+
+    set(scan_b8_test jev_alternate_numeric_greedy_scan_effects_b8_${scan_count})
+    add_test(NAME ${scan_b8_test}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+        --binary "$<TARGET_FILE:test_greedy>"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+        --site ${scan_site} --alternate b8
+        --gtest GreedySchedulerTest.${scan_fixture}
+        --case-key ${scan_b8_test}
+        --protocol semantic-v3 --require-sm89
+        --scan-count ${scan_count} --require-greedy-scan-effects)
+    set_tests_properties(${scan_b8_test} PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77
+      ENVIRONMENT "JEV_EXPECTED_SCAN_BATCH=8")
+  endforeach()
+
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()
 
