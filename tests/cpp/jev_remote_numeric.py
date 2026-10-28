@@ -247,6 +247,99 @@ def check_prior_choice(
     return evidence
 
 
+IP6_LOCAL_PREVIEW_SITES = (
+    "IP6.width", "IP6.waves", "IP6.occupancy", "IP6.warp",
+    "IP6.outer_unroll",
+)
+
+
+def check_ip6_local_previews(record: dict[str, Any], remote: dict[str, Any],
+                             server_log: Path) -> dict[str, Any]:
+    """Check source plan effects survive Record, HTTP, and numeric Remote.
+
+    The original plan tuples remain in the raw analysis for the mock server.
+    They cross-check the typed effects at sites that already emit them; wave
+    and warp sites are checked against their descriptions and hardware.
+    """
+    evidence = {}
+    for mode, path in (("record", Path(record["decision_log"])),
+                       ("remote", Path(remote["decision_log"])),
+                       ("server", server_log)):
+        rows = read_jsonl(path)
+        matching = {site: [row for row in rows if server_site(row) == site]
+                    for site in IP6_LOCAL_PREVIEW_SITES}
+        counts = {site: len(found) for site, found in matching.items()}
+        if any(count != 1 for count in counts.values()):
+            raise ValueError(f"{mode} did not expose all five IP6 previews: "
+                             f"{counts}")
+        for site, found in matching.items():
+            request = found[0]["request"]
+            state = request["state"]
+            if state["schema"] != "nvfuser.systemone.context.v3":
+                raise ValueError(f"{mode} {site} lost its semantic-v3 context")
+            decision = state["decision"]
+            if decision["site"] != site:
+                raise ValueError(f"{mode} {site} disagrees with question site")
+            candidates = decision["candidates"]
+            if not candidates or [item["id"] for item in candidates] != sorted(
+                    request["questions"][site]["criteria"]):
+                raise ValueError(f"{mode} {site} candidate menu changed")
+            plan_rows = {}
+            for line in decision["analysis_inputs_text"].splitlines()[1:]:
+                key, _, value = line.partition("=")
+                if key.startswith("plan"):
+                    plan_rows[key] = tuple(int(part) for part in value.split(","))
+            hardware = state["workload"]["hardware"]
+            for candidate in candidates:
+                effect = candidate.get("consequence")
+                if not isinstance(effect, dict) or set(effect) != {
+                        "schema", "scope", "inner", "outer", "block",
+                        "iteration_grid_blocks", "nvrtc_maxrregcount",
+                        "planner_work"} or effect["schema"] != (
+                            "nvfuser.inner_persistent.3d_local_plan.v1") or (
+                            effect["scope"] !=
+                            "local_preview_before_later_choices"):
+                    raise ValueError(f"{mode} {site} lacks a typed local plan")
+                inner, outer, block = (effect[name] for name in
+                                       ("inner", "outer", "block"))
+                work = effect["planner_work"]
+                if (set(inner) != {"batches_per_block", "unroll", "vectorized"}
+                        or set(outer) != {"batches_per_block", "unroll"}
+                        or set(block) != {"padded_x", "y", "z", "threads"}
+                        or set(work) != {"target_unroll", "target_iterations"}
+                        or type(inner["vectorized"]) is not bool):
+                    raise ValueError(f"{mode} {site} has an incomplete plan")
+                measured = (inner["batches_per_block"], inner["unroll"],
+                            outer["batches_per_block"], outer["unroll"],
+                            block["padded_x"], block["y"], block["z"],
+                            block["threads"], effect["nvrtc_maxrregcount"],
+                            effect["iteration_grid_blocks"])
+                if (any(type(value) is not int or value <= 0 for value in
+                        (*measured, *work.values())) or
+                        block["threads"] !=
+                        block["padded_x"] * block["y"] * block["z"] or
+                        block["threads"] > hardware["max_threads_per_block"] or
+                        effect["nvrtc_maxrregcount"] * block["threads"] >
+                        hardware["registers_per_block"]):
+                    raise ValueError(f"{mode} {site} plan violates basic resources")
+                prose = candidate["description"]
+                if (f"completed CTA={block['threads']}, register cap="
+                        f"{effect['nvrtc_maxrregcount']}, grid blocks="
+                        f"{effect['iteration_grid_blocks']}" not in prose):
+                    raise ValueError(f"{mode} {site} plan and prose disagree")
+                if site in {"IP6.width", "IP6.occupancy", "IP6.outer_unroll"}:
+                    key = "plan" + re.search(r"[0-9]+$", candidate["id"])[0]
+                    if key not in plan_rows or plan_rows[key][:10] != measured:
+                        raise ValueError(f"{mode} {site} typed/raw plan mismatch")
+                effect_text = json.dumps(effect).lower()
+                if "native" in effect_text or "baseline" in effect_text:
+                    raise ValueError(f"{mode} {site} leaked a preferred plan")
+        evidence[mode] = {site: len(found[0]["request"]["state"]
+                                      ["decision"]["candidates"])
+                          for site, found in matching.items()}
+    return evidence
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
@@ -260,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expect-prior-in", metavar="DOWNSTREAM_SITE")
     parser.add_argument("--protocol", choices=("text-v1", "semantic-v2", "semantic-v3"))
     parser.add_argument("--analysis-only", action="store_true")
+    parser.add_argument("--check-ip6-local-previews", action="store_true")
     parser.add_argument("--artifacts-root", required=True, type=Path)
     args = parser.parse_args(argv)
     names = args.gtest_filter.split(":")
@@ -292,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("invalid downstream prior-choice site")
     if args.expect_prior_in is not None and args.protocol != "semantic-v3":
         parser.error("--expect-prior-in requires --protocol semantic-v3")
+    if args.check_ip6_local_previews and args.protocol != "semantic-v3":
+        parser.error("--check-ip6-local-previews requires --protocol semantic-v3")
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
     if not args.artifacts_root.is_absolute():
@@ -382,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
                 manifest["prior_choice_evidence"] = check_prior_choice(
                     record, remote, server_log, args.expect_prior_in,
                     no_choice_match["site"], no_choice_match["selected"])
+        if args.check_ip6_local_previews:
+            manifest["ip6_local_preview_evidence"] = check_ip6_local_previews(
+                record, remote, server_log)
         manifest["status"] = ("analysis_and_decision_parity_pass" if args.analysis_only
                               else "numeric_and_decision_parity_pass")
         write_manifest(manifest_path, manifest)

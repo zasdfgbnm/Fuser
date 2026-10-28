@@ -1665,6 +1665,40 @@ struct Inner3DPlanResources {
   int64_t target_iterations = 0;
 };
 
+// A Choice is made before later IP6 controls can rebuild the plan. Describe
+// the complete plan materialized for this candidate at the current site, not
+// a final launch or measured occupancy. This is only sent by semantic-v3.
+std::string inner3DLocalPlanConsequence(
+    const ReductionParams& params,
+    const Inner3DPlanResources& resources) {
+  return "{\"schema\":\"nvfuser.inner_persistent.3d_local_plan.v1\","
+         "\"scope\":\"local_preview_before_later_choices\","
+         "\"inner\":{\"batches_per_block\":" +
+      std::to_string(params.batches_per_block_inner_reduction) +
+      ",\"unroll\":" +
+      std::to_string(params.unroll_factor_inner_reduction) +
+      ",\"vectorized\":" +
+      (params.vectorize_inner_reduction ? "true" : "false") +
+      "},\"outer\":{\"batches_per_block\":" +
+      std::to_string(params.batches_per_block_outer_reduction) +
+      ",\"unroll\":" +
+      std::to_string(params.unroll_factor_outer_reduction) +
+      "},\"block\":{\"padded_x\":" +
+      std::to_string(resources.padded_threads_x) +
+      ",\"y\":" + std::to_string(resources.threads_y) +
+      ",\"z\":" + std::to_string(resources.threads_z) +
+      ",\"threads\":" +
+      std::to_string(resources.padded_threads_per_block) +
+      "},\"iteration_grid_blocks\":" +
+      std::to_string(resources.grid_blocks) +
+      ",\"nvrtc_maxrregcount\":" +
+      std::to_string(resources.registers_per_thread) +
+      ",\"planner_work\":{\"target_unroll\":" +
+      std::to_string(resources.target_unroll) +
+      ",\"target_iterations\":" +
+      std::to_string(resources.target_iterations) + "}}";
+}
+
 // Retain the exact L1/L2 estimate used by the native 3D planner.
 int64_t getInner3DNativeWarpTarget(
     const PersistentKernelProperties& properties,
@@ -2357,7 +2391,8 @@ PersistentKernelProperties chooseInner3DVectorWidth(
               std::to_string(resources.padded_threads_per_block) +
               ", register cap=" +
               std::to_string(resources.registers_per_thread) +
-              ", grid blocks=" + std::to_string(resources.grid_blocks)});
+              ", grid blocks=" + std::to_string(resources.grid_blocks),
+          inner3DLocalPlanConsequence(candidate, resources)});
     }
     plans.push_back({width, std::move(candidate), resources});
   }
@@ -2476,7 +2511,8 @@ Inner3DChosenOccupancy chooseInner3DOccupancyTarget(
               std::to_string(resources.padded_threads_per_block) +
               ", register cap=" +
               std::to_string(resources.registers_per_thread) +
-              ", grid blocks=" + std::to_string(resources.grid_blocks)});
+              ", grid blocks=" + std::to_string(resources.grid_blocks),
+          inner3DLocalPlanConsequence(*params, resources)});
     }
     plans.push_back({target, std::move(params), resources});
   }
@@ -2917,7 +2953,8 @@ std::unique_ptr<ReductionParams> chooseInner3DOuterUnroll(
               std::to_string(resources.padded_threads_per_block) +
               ", register cap=" +
               std::to_string(resources.registers_per_thread) +
-              ", grid blocks=" + std::to_string(resources.grid_blocks)});
+              ", grid blocks=" + std::to_string(resources.grid_blocks),
+          inner3DLocalPlanConsequence(*params, resources)});
     }
     plans.push_back({target, std::move(params), resources});
   };
@@ -3216,7 +3253,8 @@ std::unique_ptr<ReductionParams> chooseInner3DWarpTarget(
             " threads; completed CTA=" +
             std::to_string(resources.padded_threads_per_block) +
             ", register cap=" + std::to_string(resources.registers_per_thread) +
-            ", grid blocks=" + std::to_string(resources.grid_blocks)});
+            ", grid blocks=" + std::to_string(resources.grid_blocks),
+        inner3DLocalPlanConsequence(*params, resources)});
     plans.push_back({target, std::move(params), resources});
   };
   add_plan(native_warp, std::move(native), native_resources);
@@ -3358,7 +3396,8 @@ std::unique_ptr<ReductionParams> innerPersistentHeuristic3D(
             " SM waves; completed CTA=" +
             std::to_string(resources.padded_threads_per_block) +
             ", register cap=" + std::to_string(resources.registers_per_thread) +
-            ", grid blocks=" + std::to_string(resources.grid_blocks)});
+            ", grid blocks=" + std::to_string(resources.grid_blocks),
+        inner3DLocalPlanConsequence(*params, resources)});
     plans.push_back({waves, std::move(params), resources});
   }
 

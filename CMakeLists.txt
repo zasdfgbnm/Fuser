@@ -1394,6 +1394,17 @@ if(BUILD_TEST)
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
   set_tests_properties(jev_remote_numeric_inner_hard_singleton_register
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_ip6_local_previews
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu1Test.JevAlternateInner3dPersistentWarp_CUDA
+      --case-key jev_remote_numeric_ip_local_previews
+      --site-prefix IP --required-site IP6.width
+      --protocol semantic-v3 --check-ip6-local-previews)
+  set_tests_properties(jev_remote_numeric_ip6_local_previews
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(outer_persistent
     "Gpu3Test.TemplateFunctionTypeMismatch" "OP")
   add_jev_remote_numeric_test(op_instance_norm_half
