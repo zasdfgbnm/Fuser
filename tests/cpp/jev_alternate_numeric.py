@@ -257,6 +257,48 @@ def require_no_choice(
                 raise ValueError(f"{mode} final plan did not keep RD5 u1")
 
 
+def require_inner_batch_singleton(
+        report: dict[str, Any], trace_paths: tuple[Path, Path] | None,
+        server_log: Path | None, batch: int) -> None:
+    """Bind a local IP5.batch to its preceding seed and final numeric plan."""
+    if trace_paths is None or server_log is None:
+        raise ValueError("inner batch singleton needs source and server traces")
+    site = "IP5.batch"
+    selected = f"b{batch}"
+    require_no_choice(
+        report, trace_paths, site, selected,
+        reasons=("only one hard-valid persistent batch plan",) * 2,
+        sources=("hard_legal_singleton",) * 2)
+    if any(server_site(row) == site for row in trace_rows(server_log)):
+        raise ValueError("local inner batch reached the API server")
+    for mode, path in zip(("record", "remote"), trace_paths):
+        choices = trace_rows(path)
+        outcomes = trace_rows(path, outcome=True)
+        seeds = [row for row in choices if row.get("site") == "IP5.cta_seed"]
+        batches = [row for row in outcomes if row.get("site") == site]
+        compute_finals = [row for row in outcomes if
+                          row.get("schema") == "nvfuser.jev.compute_invocation.v1" and
+                          row.get("kind") == "final"]
+        finals = [row for row in outcomes if
+                  row.get("schema") == "nvfuser.native_outcome.v2" and
+                  row.get("kind") == "final"]
+        if (len(seeds) != 1 or len(batches) != 1 or
+                len(compute_finals) != 1 or len(finals) != 1 or
+                not isinstance(seeds[0].get("compute_invocation_id"), str) or
+                seeds[0]["compute_invocation_id"] !=
+                    batches[0].get("compute_invocation_id") or
+                seeds[0]["compute_invocation_id"] !=
+                    compute_finals[0].get("compute_invocation_id") or
+                seeds[0]["compute_invocation_id"] !=
+                    finals[0].get("compute_invocation_id") or
+                not (seeds[0].get("compute_event_index", -1) <
+                     batches[0].get("compute_event_index", -1) <
+                     compute_finals[0].get("compute_event_index", -1)) or
+                finals[0].get("scheduler_fields", {}).get(
+                    "batches_per_block_inner_reduction") != batch):
+            raise ValueError(f"{mode} local batch lost seed or final plan")
+
+
 def require_outer_stride_no_choice(path: Path, mode: str,
                                    selected: str) -> None:
     """Check a source-owned terminal grid against its realized numeric plan."""
@@ -3312,8 +3354,6 @@ def check_alternate_report(report: dict[str, Any],
             ("winner_mismatch", site),
             ("record_only_state", "IP5.cta_seed"),
             ("remote_only_state", "IP5.cta_seed"),
-            ("record_only_state", "IP5.batch"),
-            ("remote_only_state", "IP5.batch"),
         ))
         if sorted((issue["kind"], issue["site"]) for issue in issues) != expected_issues:
             raise ValueError(f"unexpected physical gate comparison issues: {issues}")
@@ -3327,26 +3367,24 @@ def check_alternate_report(report: dict[str, Any],
                     row["record" if overhead == 16 else "remote"] !=
                     {"t1024": 1}):
                 raise ValueError("physical gate did not preserve the selected CTA policy")
-        batch_rows = [row for row in report["multiplicity"]
-                      if row["site"] == "IP5.batch"]
-        if (len(batch_rows) != 2 or
-                sorted(((row["record"], row["remote"])
-                        for row in batch_rows), key=str) !=
-                sorted((({"b2": 1}, {}), ({}, {"b2": 1})), key=str)):
-            raise ValueError(f"physical gate did not retain batch=2: {batch_rows}")
+        require_inner_batch_singleton(report, trace_paths, server_log, 2)
     elif require_inner_targets:
         if (site != "IP5.targets" or event["native"] != "o16_w28" or
                 alternate != "o32_w16" or
                 set(event["candidates"]) != {
                     "o16_w16", "o16_w28", "o32_w16", "o32_w28"}):
             raise ValueError("inner target fixture lacks its expected four-policy menu")
+        batch_rows = [row for row in report["multiplicity"]
+                      if row["site"] == "IP5.batch"]
+        batch_singleton = not batch_rows
         expected_issues = sorted((
             ("winner_mismatch", "IP5.targets"),
             ("record_only_state", "IP5.cta_seed"),
             ("remote_only_state", "IP5.cta_seed"),
+        ) + (() if batch_singleton else (
             ("record_only_state", "IP5.batch"),
             ("remote_only_state", "IP5.batch"),
-        ))
+        )))
         if sorted((issue["kind"], issue["site"]) for issue in issues) != expected_issues:
             raise ValueError(f"unexpected inner target comparison issues: {issues}")
         target_request = entry["request"]
@@ -3391,26 +3429,29 @@ def check_alternate_report(report: dict[str, Any],
             if (state.selected_register_overhead != overhead or
                     state.selected_target_warps_per_sm != warps):
                 raise ValueError("CTA seed omitted selected register target")
-        nested = [row for row in report["multiplicity"]
-                  if row["site"] == "IP5.batch"]
-        if len(nested) != 2:
-            raise ValueError(f"expected one record and one remote IP5.batch state: {nested}")
-        for row in nested:
-            record_count = sum(row["record"].values())
-            remote_count = sum(row["remote"].values())
-            if (record_count, remote_count) not in {(1, 0), (0, 1)}:
-                raise ValueError(f"duplicate or shared nested batch request: {row}")
-            state = row["request"]["state"]
-            state = (state["decision"]["analysis_inputs_text"]
-                     if isinstance(state, dict) else state)
-            expected_overhead, expected_warps = ((16, 28) if record_count
-                                                   else (32, 16))
-            if (not state.startswith(("inner_persistent.reg_batch.v2\n",
-                                     "inner_persistent.reg_batch.v3\n",
-                                     "inner_persistent.reg_batch.v4\n")) or
-                    f"\npolicy_register_overhead={expected_overhead}\n" not in state or
-                    f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
-                raise ValueError(f"nested batch did not use selected target policy: {row}")
+        if batch_singleton:
+            require_inner_batch_singleton(report, trace_paths, server_log, 1)
+        else:
+            if len(batch_rows) != 2:
+                raise ValueError(
+                    f"expected one record and one remote IP5.batch state: {batch_rows}")
+            for row in batch_rows:
+                record_count = sum(row["record"].values())
+                remote_count = sum(row["remote"].values())
+                if (record_count, remote_count) not in {(1, 0), (0, 1)}:
+                    raise ValueError(f"duplicate or shared nested batch request: {row}")
+                state = row["request"]["state"]
+                state = (state["decision"]["analysis_inputs_text"]
+                         if isinstance(state, dict) else state)
+                expected_overhead, expected_warps = ((16, 28) if record_count
+                                                       else (32, 16))
+                if (not state.startswith(("inner_persistent.reg_batch.v2\n",
+                                         "inner_persistent.reg_batch.v3\n",
+                                         "inner_persistent.reg_batch.v4\n")) or
+                        f"\npolicy_register_overhead={expected_overhead}\n" not in state or
+                        f"\npolicy_target_warps_per_sm={expected_warps}\n" not in state):
+                    raise ValueError(
+                        f"nested batch did not use selected target policy: {row}")
     elif require_inner3d_work_split:
         from jev_shim import parse_inner3d_work_split_state
 
