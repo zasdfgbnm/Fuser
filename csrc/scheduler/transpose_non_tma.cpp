@@ -267,7 +267,7 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
     }
 
     if (has_view || !virtual_changes_axes) {
-      scheduler::jev::recordNoChoiceDecision(
+      scheduler::jev::recordHardSingletonDecision(
           "TR1",
           "original",
           has_view ? "view_disallows_virtual_axes"

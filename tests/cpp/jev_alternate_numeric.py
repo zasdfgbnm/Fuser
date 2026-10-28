@@ -1238,6 +1238,16 @@ def check_transpose_virtual_dependency(
                 tr1[0]["selected"] !=
                 ("virtual" if mode == "record" else "original")):
             raise ValueError(f"{mode} TR1 did not use the intended v3 branch")
+        if any(row.get("site") == "TR1" and row.get("kind") == "no_choice"
+               for row in trace_rows(path, outcome=True)):
+            raise ValueError(f"{mode} recorded an original-axis no_choice for a TR1 Choice")
+        dependent = [row for row in trace_rows(path)
+                     if str(row.get("site", "")).startswith("TR2.")]
+        expected_prior = {"site": "TR1", "choice": tr1[0]["selected"]}
+        if not dependent or any(
+                row["request"]["state"]["current_schedule"]["prior_choices"].count(
+                    expected_prior) != 1 for row in dependent):
+            raise ValueError(f"{mode} TR2 requests lost the selected TR1 axis plan")
         source = request["state"]["decision"]["analysis_inputs_text"]
         state = parse_transpose_axes_v2_state(source)
         preview = transpose_virtual_preview(state)

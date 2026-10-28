@@ -1411,6 +1411,21 @@ if(BUILD_TEST)
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
   set_tests_properties(jev_remote_numeric_transpose_virtual_one_wave_no_choice
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_transpose_original_prior
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter TransposeTest.FusionScheduleTransposeTileChoice
+      --case-key jev_remote_numeric_transpose_original_prior
+      --site-prefix TR --required-site TR2.tile
+      --protocol semantic-v3
+      --expect-no-choice TR1=original
+      --expect-no-choice-reason virtual_axis_constructor_no_effect
+      --expect-no-choice-source native_axis_plan
+      --expect-prior-in TR2.tile
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_transpose_original_prior
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_transpose_virtual_axes
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
