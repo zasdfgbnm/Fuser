@@ -3087,7 +3087,7 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
   } catch (const std::exception&) {
     // Failure to materialize an optional plan cannot displace the proved
     // native plan. In particular, never send an unproved singleton remotely.
-    scheduler::jev::recordNoChoiceDecision(
+    scheduler::jev::recordHardSingletonDecision(
         "IP6.work_split",
         "unroll_first",
         "alternate 3D work split failed planning",
@@ -3141,7 +3141,7 @@ std::unique_ptr<ReductionParams> chooseInner3DWorkSplit(
           alternate_resources,
           device);
   if (!alternate_valid) {
-    scheduler::jev::recordNoChoiceDecision(
+    scheduler::jev::recordHardSingletonDecision(
         "IP6.work_split",
         "unroll_first",
         "no distinct, resource-valid 3D work split",

@@ -1394,6 +1394,21 @@ if(BUILD_TEST)
       --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
   set_tests_properties(jev_remote_numeric_inner_hard_singleton_register
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_fixed_work_split_context
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dHardWidthSingleton_CUDA
+      --case-key jev_remote_numeric_inner_fixed_work_split_context
+      --site-prefix IP --required-site IP6.outer_unroll
+      --protocol semantic-v3
+      --expect-no-choice IP6.work_split=unroll_first
+      --expect-no-choice-reason "no distinct, resource-valid 3D work split"
+      --expect-no-choice-source native_unroll_first_branch
+      --expect-prior-in IP6.outer_unroll
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_fixed_work_split_context
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_remote_numeric_ip6_local_previews
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
