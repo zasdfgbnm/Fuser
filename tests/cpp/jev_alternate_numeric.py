@@ -257,6 +257,44 @@ def require_no_choice(
                 raise ValueError(f"{mode} final plan did not keep RD5 u1")
 
 
+def require_outer_stride_no_choice(path: Path, mode: str,
+                                   selected: str) -> None:
+    """Check a source-owned terminal grid against its realized numeric plan."""
+    outcomes = trace_rows(path, outcome=True)
+    rows = [row for row in outcomes if row.get("site") == "RD9.stride"]
+    finals = [row for row in outcomes if
+              row.get("schema") == "nvfuser.native_outcome.v2" and
+              row.get("kind") == "final"]
+    ragged = [row for row in trace_rows(path) if
+              row.get("site") == "RD9.ragged"]
+    if (len(rows) != 1 or len(finals) != 1 or len(ragged) != 1 or
+            any(rows[0].get(key) != value for key, value in {
+                "kind": "no_choice", "mode": mode,
+                "selected": selected,
+                "reason": "baseline and stride-capped grids have the same block count",
+                "selection_source": "hard_legal_singleton",
+            }.items()) or
+            rows[0].get("compute_invocation_id") !=
+            ragged[0].get("compute_invocation_id") or
+            finals[0].get("compute_invocation_id") !=
+            ragged[0].get("compute_invocation_id") or
+            finals[0]["launch"]["grid_y_raw"] !=
+            (int(selected[1:]) if selected != "g1" else -1)):
+        raise ValueError(f"{mode} terminal RD9.stride {selected} differs from outcome")
+
+
+def require_outer_stride_singletons(
+        report: dict[str, Any], trace_paths: tuple[Path, Path] | None,
+        record_selected: str, remote_selected: str) -> None:
+    """Check the terminal grid in outcomes when neither side has an API menu."""
+    if trace_paths is None:
+        raise ValueError("RD9.stride singleton check needs outcome traces")
+    if any(row["site"] == "RD9.stride" for row in report["multiplicity"]):
+        raise ValueError("a singleton RD9.stride reached the Choice wire")
+    require_outer_stride_no_choice(trace_paths[0], "record", record_selected)
+    require_outer_stride_no_choice(trace_paths[1], "remote", remote_selected)
+
+
 OUTER_PARENT_ORDER = (
     "RD9.reg_budget", "RD9.width", "RD8", "RD9.waves", "RD9.warp",
     "RD9.cta", "RD9.grid_base", "RD9.unroll", "RD9.ragged",
@@ -267,7 +305,7 @@ OUTER_PARENT_ORDER = (
 def require_rd9_candidate_effects(
         trace_paths: tuple[Path, Path]) -> None:
     """Bind four v3 candidate cards to each other and the realized grid plan."""
-    sites = ("RD9.grid_base", "RD9.unroll", "RD9.ragged", "RD9.stride")
+    sites = ("RD9.grid_base", "RD9.unroll", "RD9.ragged")
     pending = {
         "RD9.grid_base": ["RD9.unroll", "RD9.ragged", "RD9.stride"],
         "RD9.unroll": ["RD9.ragged", "RD9.stride"],
@@ -289,6 +327,11 @@ def require_rd9_candidate_effects(
             if len(matches) != 1:
                 raise ValueError(f"expected one {mode} {site} effect request: {matches}")
             by_site[site] = matches[0]
+        stride_requests = [row for row in rows if row.get("site") == "RD9.stride"]
+        if len(stride_requests) > 1:
+            raise ValueError(f"multiple {mode} RD9.stride requests")
+        if stride_requests:
+            by_site["RD9.stride"] = stride_requests[0]
         effects = {}
         for site, row in by_site.items():
             request = row["request"]
@@ -367,22 +410,38 @@ def require_rd9_candidate_effects(
                for name in ("base", "stride_capped")):
             raise ValueError(f"{mode} RD9 ragged clean plan changed unexpectedly")
         ragged = effects["RD9.ragged"][selected("RD9.ragged")]
-        stride = effects["RD9.stride"]
-        if not any(effect["plan"] == ragged["base"]
-                   for effect in stride.values()):
-            raise ValueError(f"{mode} RD9 stride baseline differs from ragged plan")
-        if len(stride) == 2 and not any(
-                effect["plan"] == ragged["stride_capped"]
-                for effect in stride.values()):
-            raise ValueError(f"{mode} RD9 stride cap differs from ragged plan")
+        if stride_requests:
+            stride = effects["RD9.stride"]
+            if not any(effect["plan"] == ragged["base"]
+                       for effect in stride.values()):
+                raise ValueError(f"{mode} RD9 stride baseline differs from ragged plan")
+            if len(stride) == 2 and not any(
+                    effect["plan"] == ragged["stride_capped"]
+                    for effect in stride.values()):
+                raise ValueError(f"{mode} RD9 stride cap differs from ragged plan")
+            plan = stride[selected("RD9.stride")]["plan"]
+        else:
+            no_choice = [row for row in trace_rows(path, outcome=True)
+                         if row.get("site") == "RD9.stride"]
+            plan = ragged["base"]
+            expected = "g" + str(plan["logical_reduction_grid_blocks_pre_split"])
+            if (len(no_choice) != 1 or
+                    no_choice[0].get("kind") != "no_choice" or
+                    no_choice[0].get("selected") != expected or
+                    no_choice[0].get("reason") !=
+                    "baseline and stride-capped grids have the same block count" or
+                    no_choice[0].get("selection_source") !=
+                    "hard_legal_singleton" or
+                    no_choice[0].get("compute_invocation_id") !=
+                    by_site["RD9.ragged"].get("compute_invocation_id")):
+                raise ValueError(f"{mode} RD9 stride singleton differs from ragged plan")
 
         final = [row for row in trace_rows(path, outcome=True)
                  if row.get("schema") == "nvfuser.native_outcome.v2" and
                  row.get("compute_invocation_id") ==
-                 by_site["RD9.stride"].get("compute_invocation_id")]
+                 by_site["RD9.ragged"].get("compute_invocation_id")]
         if len(final) != 1:
             raise ValueError(f"expected one {mode} realized RD9 plan")
-        plan = stride[selected("RD9.stride")]["plan"]
         params = final[0]["scheduler_fields"]
         launch = final[0]["launch"]
         reduction_grid = plan["logical_reduction_grid_blocks_pre_split"]
@@ -831,8 +890,19 @@ def check_dependent_trace(
         ordered = tuple(row["site"] for row in choices if "site" in row)
         event_indices = [row["compute_event_index"] for row in choices if
                          "site" in row]
-        if (ordered != DEPENDENT_DECISION_ORDER[case_key] or
-                not event_indices or event_indices[0] != 1 or
+        expected_order = DEPENDENT_DECISION_ORDER[case_key]
+        if (expected_order[-1] == "RD9.stride" and
+                ordered == expected_order[:-1]):
+            terminal = [row for row in trace_rows(path, outcome=True) if
+                        row.get("site") == "RD9.stride"]
+            if (not event_indices or len(terminal) != 1 or
+                    terminal[0].get("kind") != "no_choice" or
+                    terminal[0].get("compute_event_index", 0) <=
+                    event_indices[-1]):
+                raise ValueError(f"{mode} lost terminal RD9.stride order")
+        elif ordered != expected_order:
+            raise ValueError(f"{mode} parent/child decision order changed: {ordered}")
+        if (not event_indices or event_indices[0] != 1 or
                 any(left >= right for left, right in
                     zip(event_indices, event_indices[1:]))):
             raise ValueError(f"{mode} parent/child decision order changed: {ordered}")
@@ -1497,39 +1567,6 @@ def outer_stride_fields(row: dict[str, Any]) -> dict[str, str]:
     return fields
 
 
-def check_outer_ragged_dependency(report: dict[str, Any],
-                                  record_stride: dict[str, Any],
-                                  remote_stride: dict[str, Any],
-                                  vector_widths: tuple[str, str]
-                                  ) -> list[dict[str, str]]:
-    versions = [row["request"]["state"].splitlines()[0] for row in
-                (record_stride, remote_stride)]
-    if versions == ["reduction.outer_grid_stride.v1"] * 2:
-        if any(row["site"] == "RD9.ragged" for row in report["multiplicity"]):
-            raise ValueError("v1 stride unexpectedly contains RD9.ragged requests")
-        return []
-    if versions != ["reduction.outer_grid_stride.v2"] * 2:
-        raise ValueError(f"mixed dependent stride versions: {versions}")
-    record_ragged, remote_ragged, ragged_issues = paired_state_rows(
-        report, "RD9.ragged")
-    for ragged, stride, width, side in (
-            (record_ragged, record_stride, vector_widths[0], "record"),
-            (remote_ragged, remote_stride, vector_widths[1], "remote")):
-        if (ragged[side] != {"clean": 1} or
-                set(ragged["request"]["questions"]["RD9.ragged"]["criteria"]) !=
-                {"clean"}):
-            raise ValueError("dependent RD9.ragged winner or menu changed")
-        selected = state_fields(ragged, "reduction.outer_ragged.v1")
-        forwarded = outer_stride_fields(stride)
-        if (set(selected) != OUTER_RAGGED_FORWARD_KEYS | {
-                "max_threads_per_block", "max_unroll", "vector_width"} or
-                selected["vector_width"] != width or
-                any(selected[key] != forwarded[key]
-                    for key in OUTER_RAGGED_FORWARD_KEYS)):
-            raise ValueError(f"RD9.ragged omitted selected grid plan: {selected}")
-    return ragged_issues
-
-
 def clean_outer_grid_waves(raw_grid: int, output_grid: int, sms: int) -> int:
     """Replay RD9's native ragged-wave contraction for a selected raw grid."""
     blocks = raw_grid * output_grid
@@ -1583,12 +1620,9 @@ def check_outer_parent_baseline(row: dict[str, Any]) -> dict[str, str]:
     return plan
 
 
-def check_outer_grid_plan(record: dict[str, Any], remote: dict[str, Any],
-                          record_stride: dict[str, Any],
-                          remote_stride: dict[str, Any]) -> None:
-    # RD8 is now chosen before RD9.stride. Its grid projection is a baseline,
-    # while the selected final grid is checked through stride and typed outcome.
-    del record_stride, remote_stride
+def check_outer_grid_plan(record: dict[str, Any],
+                          remote: dict[str, Any]) -> None:
+    # RD8 is chosen before RD9.stride; its grid projection is a baseline.
     if record["record"] != {"grid": 1} or remote["remote"] != {"grid": 1}:
         raise ValueError("selected grid plan changed the RD8 winner")
     check_outer_parent_baseline(record)
@@ -2130,28 +2164,9 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed with ragged choice: {rows}")
-        strides = [row for row in report["multiplicity"]
-                   if row["site"] == "RD9.stride"]
-        clean = [row for row in strides if row["record"] == {"g7": 1} and
-                 not row["remote"]]
-        raw = [row for row in strides if row["remote"] == {"g8": 1} and
-               not row["record"]]
-        if len(strides) != 2 or len(clean) != 1 or len(raw) != 1:
-            raise ValueError(f"ragged choice did not reach both stride grids: {strides}")
-        if ("base_grdim=8\nragged_policy=clean" not in
-                clean[0]["request"]["state"] or
-                "base_grdim=8\nragged_policy=raw" not in
-                raw[0]["request"]["state"]):
-            raise ValueError("stride grid did not receive the selected ragged policy")
-        allowed = {site, "RD9.stride", "RD8"}
-        if any(issue["site"] not in allowed for issue in issues):
-            raise ValueError(f"unrelated ragged decision issue: {issues}")
-        for row in (clean[0], raw[0]):
-            kind = ("record_only_state" if row is clean[0]
-                    else "remote_only_state")
-            if {"kind": kind, "site": "RD9.stride",
-                "request_sha256": row["request_sha256"]} not in issues:
-                raise ValueError(f"missing dependent stride state: {issues}")
+        require_outer_stride_singletons(report, trace_paths, "g7", "g8")
+        if issues != [intended]:
+            raise ValueError(f"unexpected ragged decision issue: {issues}")
     elif require_outer_unroll:
         if (site != "RD9.unroll" or event["native"] != "u4" or
                 alternate != "u1" or
@@ -2174,10 +2189,8 @@ def check_alternate_report(report: dict[str, Any],
                 raise ValueError(f"upstream {upstream} changed with unroll: {rows}")
         record_ragged, remote_ragged, ragged_issues = paired_state_rows(
             report, "RD9.ragged")
-        record_stride, remote_stride, stride_issues = paired_state_rows(
-            report, "RD9.stride")
+        require_outer_stride_singletons(report, trace_paths, "g32", "g8")
         shared_plan = shared_outer_parent(report)
-        record_plan, remote_plan, plan_issues = shared_plan, shared_plan, []
         expected_factors = (("4", "8", "8", "32"),
                             ("1", "32", "32", "8"))
         for row, factors in zip((record_ragged, remote_ragged), expected_factors):
@@ -2185,19 +2198,10 @@ def check_alternate_report(report: dict[str, Any],
             if tuple(fields.get(key) for key in (
                     "iter_unroll", "redu_unroll", "gidim", "base_grdim")) != factors:
                 raise ValueError(f"ragged plan ignored selected unroll: {fields}")
-        for row, factors in zip((record_stride, remote_stride), expected_factors):
-            fields = outer_stride_fields(row)
-            if tuple(fields.get(key) for key in (
-                    "iter_unroll", "redu_unroll", "gidim", "base_grdim")) != factors:
-                raise ValueError(f"stride plan ignored selected unroll: {fields}")
-        if (record_stride["record"] != {"g32": 1} or
-                remote_stride["remote"] != {"g8": 1}):
-            raise ValueError("outer unroll did not select its complete grid")
-        check_outer_grid_plan(
-            record_plan, remote_plan, record_stride, remote_stride)
+        check_outer_grid_plan(shared_plan, shared_plan)
         # The selected grid child can change the final grid without changing
         # the already-issued parent baseline or completed block alternative.
-        expected = [intended, *ragged_issues, *stride_issues, *plan_issues]
+        expected = [intended, *ragged_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer unroll dependencies: {issues}")
     elif require_outer_grid_base:
@@ -2289,19 +2293,35 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("CTA target did not reach dependent grid baseline")
         unroll_issues = check_outer_unroll_dependency(
             report, "cta_share", "4", "8")
-        record_stride, remote_stride, stride_issues = paired_state_rows(
-            report, "RD9.stride")
-        before, after = (outer_stride_fields(row) for row in
-                         (record_stride, remote_stride))
-        ragged_issues = check_outer_ragged_dependency(
-            report, record_stride, remote_stride, ("4", "4"))
-        if (before["bdimx"] != "16" or before["bdimy"] != "32" or
+        if trace_paths is None:
+            raise ValueError("outer CTA needs source outcome traces")
+        require_outer_stride_no_choice(trace_paths[0], "record", "g32")
+        stride_rows = [row for row in report["multiplicity"]
+                       if row["site"] == "RD9.stride"]
+        if (len(stride_rows) != 1 or stride_rows[0]["record"] or
+                stride_rows[0]["remote"] != {"g64": 1} or
+                set(stride_rows[0]["request"]["questions"]["RD9.stride"]
+                    ["criteria"]) != {"g32", "g64"}):
+            raise ValueError(f"remote CTA lost its two-grid stride menu: {stride_rows}")
+        after = outer_stride_fields(stride_rows[0])
+        rag_record, rag_remote, ragged_issues = paired_state_rows(
+            report, "RD9.ragged")
+        before = state_fields(rag_record, "reduction.outer_ragged.v1")
+        remote_ragged = state_fields(rag_remote, "reduction.outer_ragged.v1")
+        if (rag_record["record"] != {"clean": 1} or
+                rag_remote["remote"] != {"clean": 1} or
+                before["vector_width"] != "4" or
+                remote_ragged["vector_width"] != "4" or
+                any(remote_ragged[key] != after[key]
+                    for key in OUTER_RAGGED_FORWARD_KEYS) or
+                before["bdimx"] != "16" or before["bdimy"] != "32" or
                 before["base_grdim"] != "32" or
                 after["bdimx"] != "16" or after["bdimy"] != "16" or
-                after["base_grdim"] != "64" or
-                record_stride["record"] != {"g32": 1} or
-                remote_stride["remote"] != {"g64": 1}):
+                after["base_grdim"] != "64"):
             raise ValueError(f"outer CTA did not reshape the grid plan: {before}, {after}")
+        stride_issues = [{
+            "kind": "remote_only_state", "site": "RD9.stride",
+            "request_sha256": stride_rows[0]["request_sha256"]}]
         shared_outer_parent(report)
         expected = [intended, *base_issues, *unroll_issues, *ragged_issues,
                     *stride_issues]
@@ -2345,25 +2365,28 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("width did not reach dependent grid baseline")
         unroll_issues = check_outer_unroll_dependency(
             report, "vector_width", "4", "1")
-        record_stride, remote_stride, stride_issues = paired_state_rows(
-            report, "RD9.stride")
-        before, after = (outer_stride_fields(row) for row in
-                         (record_stride, remote_stride))
-        ragged_issues = check_outer_ragged_dependency(
-            report, record_stride, remote_stride,
-            (cta_before["vector_width"], cta_after["vector_width"]))
-        record_unroll = int(before["iter_unroll"])
-        remote_unroll = int(after["iter_unroll"])
+        require_outer_stride_singletons(report, trace_paths, "g32", "g8")
+        record_ragged, remote_ragged, ragged_issues = paired_state_rows(
+            report, "RD9.ragged")
+        for row, side, width in (
+                (record_ragged, "record", cta_before["vector_width"]),
+                (remote_ragged, "remote", cta_after["vector_width"])):
+            fields = state_fields(row, "reduction.outer_ragged.v1")
+            if (row[side] != {"clean": 1} or
+                    set(row["request"]["questions"]["RD9.ragged"]
+                        ["criteria"]) != {"clean"} or
+                    fields["vector_width"] != width):
+                raise ValueError("width did not reach the ragged grid plan")
+        record_unroll = int(state_fields(
+            record_ragged, "reduction.outer_ragged.v1")["iter_unroll"])
+        remote_unroll = int(state_fields(
+            remote_ragged, "reduction.outer_ragged.v1")["iter_unroll"])
         if record_unroll <= remote_unroll or remote_unroll != 1:
             raise ValueError("outer width did not lower dependent iteration unroll")
-        if (record_stride["record"] != {"g32": 1} or
-                remote_stride["remote"] != {"g8": 1}):
-            raise ValueError("width changed the stride winner unexpectedly")
         record_plan, remote_plan, plan_issues = paired_state_rows(report, "RD8")
-        check_outer_grid_plan(record_plan, remote_plan, record_stride, remote_stride)
+        check_outer_grid_plan(record_plan, remote_plan)
         expected = [intended, *cta_issues, *base_issues, *unroll_issues,
-                    *ragged_issues, *stride_issues,
-                    *plan_issues]
+                    *ragged_issues, *plan_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer-width comparison issues: {issues}")
     elif require_reduction_inner3d_waves:
@@ -2730,16 +2753,12 @@ def check_alternate_report(report: dict[str, Any],
             report, "warp", "16", "32")
         rag_record, rag_remote, rag_issues = paired_state_rows(
             report, "RD9.ragged")
-        stride_record, stride_remote, stride_issues = paired_state_rows(
-            report, "RD9.stride")
+        require_outer_stride_singletons(report, trace_paths, "g7", "g15")
         shared_outer_parent(report)
-        for rag, stride, side, warp, block, output, raw in (
-                (rag_record, stride_record,
-                 "record", "16", (16, 32), 33, 8),
-                (rag_remote, stride_remote,
-                 "remote", "32", (32, 16), 17, 16)):
+        for rag, side, block, output, raw, selected in (
+                (rag_record, "record", (16, 32), 33, 8, 7),
+                (rag_remote, "remote", (32, 16), 17, 16, 15)):
             rag_fields = state_fields(rag, "reduction.outer_ragged.v1")
-            stride_fields = outer_stride_fields(stride)
             cleaned = clean_outer_grid_waves(raw, output, int(rag_fields["sm_count"]))
             if (rag[side] != {"clean": 1} or
                     set(rag["request"]["questions"]["RD9.ragged"]
@@ -2748,13 +2767,10 @@ def check_alternate_report(report: dict[str, Any],
                     tuple(map(str, block)) or
                     rag_fields.get("gidim") != str(output) or
                     rag_fields.get("base_grdim") != str(raw) or
-                    stride_fields.get("min_warp_size") != warp or
-                    any(rag_fields[key] != stride_fields[key]
-                        for key in OUTER_RAGGED_FORWARD_KEYS) or
-                    stride[side] != {f"g{cleaned}": 1}):
+                    cleaned != selected):
                 raise ValueError("dependent grid plan ignored selected warp")
         expected = [intended, *cta_issues, *base_issues, *unroll_issues,
-                    *rag_issues, *stride_issues]
+                    *rag_issues]
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected outer warp issues: {issues}")
     elif require_inner_storage:

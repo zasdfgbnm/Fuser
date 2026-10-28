@@ -1307,6 +1307,20 @@ if(BUILD_TEST)
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(reduction
     "Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA" "RD")
+  add_test(NAME jev_remote_numeric_outer_stride_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_remote_numeric_outer_stride_singleton
+      --site-prefix RD --required-site RD9.ragged
+      --protocol semantic-v3
+      --expect-no-choice RD9.stride=g7
+      --expect-no-choice-reason "baseline and stride-capped grids have the same block count"
+      --expect-no-choice-source hard_legal_singleton
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_outer_stride_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_remote_numeric_inner3d_iter_unroll_singleton
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
@@ -1320,6 +1334,38 @@ if(BUILD_TEST)
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(transpose
     "TransposeTest.FusionScheduleTransposeSmall:Gpu3Test.JevTransposeFp16Inner3D12Ordinal11833_CUDA" "TR")
+  foreach(SITE_SUFFIX IN ITEMS tile width1 width2)
+    if(SITE_SUFFIX STREQUAL "tile")
+      set(SINGLETON_SELECTED tile32)
+      set(SINGLETON_REASON "only the native transpose tile satisfies hard bounds")
+      set(DEPENDENT_SITE TR2.unroll)
+      set(CASE_SUFFIX tile)
+    else()
+      set(SINGLETON_SELECTED w1)
+      set(SINGLETON_REASON "only one hard-valid transpose group width")
+      set(DEPENDENT_SITE TR2.cta)
+      if(SITE_SUFFIX STREQUAL "width1")
+        set(CASE_SUFFIX width_one)
+      else()
+        set(CASE_SUFFIX width_two)
+      endif()
+    endif()
+    add_test(NAME jev_remote_numeric_transpose_${CASE_SUFFIX}_singleton
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+        --binary "$<TARGET_FILE:test_nvfuser>"
+        --gtest-filter TransposeTest.FusionScheduleTransposeSmall
+        --case-key jev_remote_numeric_transpose_${CASE_SUFFIX}_singleton
+        --site-prefix TR --required-site ${DEPENDENT_SITE}
+        --protocol semantic-v3
+        --expect-no-choice TR2.${SITE_SUFFIX}=${SINGLETON_SELECTED}
+        --expect-no-choice-reason "${SINGLETON_REASON}"
+        --expect-no-choice-source hard_legal_singleton
+        --expect-prior-in ${DEPENDENT_SITE}
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+    set_tests_properties(jev_remote_numeric_transpose_${CASE_SUFFIX}_singleton
+      PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  endforeach()
   add_jev_remote_numeric_test(transpose_virtual_changed
     "TransposeTest.FusionScheduleTransposeSmall" "TR" "TR1")
   add_test(NAME jev_remote_numeric_transpose_virtual_one_wave_no_choice

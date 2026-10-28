@@ -388,11 +388,22 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
     if (square_16_eligible) {
       options.push_back({"tile16", "Tile both transpose axes by 16"});
     }
-    const auto selected = scheduler::jev::chooseDecision(
-        "TR2.tile",
-        state,
-        options,
-        jev_mode == scheduler::jev::Mode::Record ? "tile32" : "");
+    std::string selected;
+    if (options.size() == 1) {
+      NVF_ERROR(options.front().id == "tile32");
+      selected = options.front().id;
+      scheduler::jev::recordHardSingletonDecision(
+          "TR2.tile",
+          selected,
+          "only the native transpose tile satisfies hard bounds",
+          "hard_legal_singleton");
+    } else {
+      selected = scheduler::jev::chooseDecision(
+          "TR2.tile",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "tile32" : "");
+    }
     if (selected == "tile16" && square_16_eligible) {
       tparams->tile_size1 = 16;
       tparams->tile_size2 = 16;
@@ -660,11 +671,22 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
         NVF_ERROR_EQ(native_width, max_legal);
         native_choice = "w" + std::to_string(native_width);
       }
-      const auto selected = scheduler::jev::chooseDecision(
-          "TR2.width" + std::to_string(group),
-          state,
-          options,
-          native_choice);
+      const std::string site = "TR2.width" + std::to_string(group);
+      std::string selected;
+      if (options.size() == 1) {
+        NVF_ERROR(
+            native_choice.empty() || native_choice == options.front().id,
+            "The only hard-valid transpose group width must be native");
+        selected = options.front().id;
+        scheduler::jev::recordHardSingletonDecision(
+            site,
+            selected,
+            "only one hard-valid transpose group width",
+            "hard_legal_singleton");
+      } else {
+        selected = scheduler::jev::chooseDecision(
+            site, state, options, native_choice);
+      }
       for (const auto& option : options) {
         if (selected == option.id) {
           return std::stoll(selected.substr(1));

@@ -3708,8 +3708,21 @@ OuterReductionParams getGridOuterReduction(
       ? "g" + std::to_string(
             plans.native_use_stride ? stride.grdim : baseline.grdim)
       : "";
-  const auto selected = scheduler::jev::chooseDecision(
-      "RD9.stride", state, options, native_choice);
+  std::string selected;
+  if (options.size() == 1) {
+    NVF_ERROR(
+        native_choice.empty() || native_choice == options.front().id,
+        "The only hard-valid outer reduction grid must be native");
+    selected = options.front().id;
+    scheduler::jev::recordHardSingletonDecision(
+        "RD9.stride",
+        selected,
+        "baseline and stride-capped grids have the same block count",
+        "hard_legal_singleton");
+  } else {
+    selected = scheduler::jev::chooseDecision(
+        "RD9.stride", state, options, native_choice);
+  }
   NVF_ERROR(
       selected == options.front().id ||
           (options.size() == 2 && selected == options.back().id),
