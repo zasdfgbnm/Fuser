@@ -274,7 +274,7 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
                    : "virtual_axis_constructor_no_effect",
           "native_axis_plan");
     } else {
-      std::string state = "transpose.virtual_axes.v1\nshape=";
+      std::string state = "transpose.virtual_axes.v2\nshape=";
       for (size_t i = 0; i < shape_in_ref1.size(); ++i) {
         if (i != 0) {
           state += ',';
@@ -288,6 +288,35 @@ std::unique_ptr<TransposeParams> getTransposeHeuristics(
       state += "\nsm_count=" + std::to_string(device_multiprocessor_count);
       state += "\nn_elems=" + std::to_string(n_elems);
       state += "\nhas_view=" + std::to_string(has_view);
+      // The source constructor has already produced this complete alternative.
+      // Transport its exact ordered transformations, then let the stateless
+      // server independently replay the constructor before showing effects.
+      const auto encode_dims = [](const std::vector<int64_t>& dims) {
+        std::string encoded = "none";
+        for (const auto dim : dims) {
+          if (encoded == "none") {
+            encoded.clear();
+          } else {
+            encoded += ',';
+          }
+          encoded += std::to_string(dim);
+        }
+        return encoded;
+      };
+      std::string encoded_splits = "none";
+      for (const auto& [dim, factor] : virtual_preview->split_before_tiling) {
+        if (encoded_splits == "none") {
+          encoded_splits.clear();
+        } else {
+          encoded_splits += ',';
+        }
+        encoded_splits += std::to_string(dim) + ':' + std::to_string(factor);
+      }
+      state += "\nvirtual_merge1=" +
+          encode_dims(virtual_preview->dims_merged_with_1);
+      state += "\nvirtual_merge2=" +
+          encode_dims(virtual_preview->dims_merged_with_2);
+      state += "\nvirtual_split=" + encoded_splits;
 
       std::vector<scheduler::jev::ChoiceOption> options = {
           {"original", "Tile the original inner axes"},

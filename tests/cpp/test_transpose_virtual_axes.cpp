@@ -26,10 +26,21 @@ TEST(TransposeVirtualAxisPreviewTest, OneWaveAndSatisfiedAxesAreNoOps) {
   transpose::utils::maybeBuildVirtualInnerDims(
       &changed_axes, /*sm_count=*/128, /*n_elems=*/1024 * 2 * 2,
       /*shape=*/{1024, 2, 2}, /*inner1=*/1, /*inner2=*/2);
-  EXPECT_TRUE(
-      !changed_axes.split_before_tiling.empty() ||
-      !changed_axes.dims_merged_with_1.empty() ||
-      !changed_axes.dims_merged_with_2.empty());
+  EXPECT_EQ(
+      changed_axes.split_before_tiling,
+      (std::vector<std::pair<int64_t, int64_t>>{{0, 16}}));
+  EXPECT_EQ(changed_axes.dims_merged_with_1, (std::vector<int64_t>{1}));
+  EXPECT_EQ(changed_axes.dims_merged_with_2, (std::vector<int64_t>{0}));
+
+  TransposeParams reversed_axes;
+  transpose::utils::maybeBuildVirtualInnerDims(
+      &reversed_axes, /*sm_count=*/128, /*n_elems=*/1024 * 2 * 2,
+      /*shape=*/{1024, 2, 2}, /*inner1=*/2, /*inner2=*/1);
+  EXPECT_EQ(
+      reversed_axes.split_before_tiling,
+      (std::vector<std::pair<int64_t, int64_t>>{{0, 16}}));
+  EXPECT_EQ(reversed_axes.dims_merged_with_1, (std::vector<int64_t>{0}));
+  EXPECT_EQ(reversed_axes.dims_merged_with_2, (std::vector<int64_t>{1}));
 }
 
 } // namespace nvfuser

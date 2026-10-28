@@ -886,6 +886,62 @@ def check_rd5_wave_dependency(
     return []
 
 
+def check_transpose_virtual_dependency(
+        report: dict[str, Any], trace_paths: tuple[Path, Path] | None,
+        intended: dict[str, str], issues: list[dict[str, str]]) -> None:
+    """Require real v2 TR1 effects and both numeric branch outcomes."""
+    if trace_paths is None:
+        raise ValueError("TR1 alternate needs both source outcome traces")
+    from jev_shim import (_codex_model_call, parse_transpose_axes_v2_state,
+                          transpose_virtual_preview, validate_request)
+
+    expected_effects = None
+    for mode, path in zip(("record", "remote"), trace_paths):
+        tr1 = [row for row in trace_rows(path) if row.get("site") == "TR1"]
+        finals = [row for row in trace_rows(path, outcome=True)
+                  if row.get("schema") == "nvfuser.native_outcome.v2" and
+                  row.get("kind") == "final"]
+        if len(tr1) != 1 or len(finals) != 1:
+            raise ValueError(f"{mode} TR1 lacks one Choice and final plan")
+        request = tr1[0]["request"]
+        if (request["state"].get("schema") !=
+                "nvfuser.systemone.context.v3" or
+                tr1[0]["selected"] !=
+                ("virtual" if mode == "record" else "original")):
+            raise ValueError(f"{mode} TR1 did not use the intended v3 branch")
+        source = request["state"]["decision"]["analysis_inputs_text"]
+        state = parse_transpose_axes_v2_state(source)
+        preview = transpose_virtual_preview(state)
+        model_call = _codex_model_call(
+            request, validate_request(request), research_mode=True)
+        effects = {candidate["id"]: candidate["consequence"] for candidate in
+                   model_call.payload["research_view"]["decision"]["candidates"]}
+        if (model_call.payload["server_certification"]["admission"] !=
+                "exploratory_unverified" or
+                effects["virtual"]["split_before_tiling"] !=
+                [list(pair) for pair in preview.split_before_tiling] or
+                effects["virtual"]["dims_merged_with_1"] !=
+                list(preview.merged_with_1) or
+                effects["virtual"]["dims_merged_with_2"] !=
+                list(preview.merged_with_2) or
+                effects["virtual"]["effective_inner_extents"] ==
+                effects["original"]["effective_inner_extents"]):
+            raise ValueError("TR1 model view omits the distinct source effects")
+        if expected_effects is None:
+            expected_effects = effects
+        elif expected_effects != effects:
+            raise ValueError("TR1 model effects changed between Record and Remote")
+        fields = finals[0]["scheduler_fields"]
+        selected = effects[tr1[0]["selected"]]
+        for key in ("split_before_tiling", "dims_merged_with_1",
+                    "dims_merged_with_2"):
+            if fields[key] != selected[key]:
+                raise ValueError(f"{mode} final TR1 {key} ignored selected effects")
+    if any(issue != intended and not str(issue.get("site", "")).startswith("TR2.")
+           for issue in issues):
+        raise ValueError(f"TR1 changed an unrelated decision: {issues}")
+
+
 def check_transpose_tile_dependency(
         report: dict[str, Any],
         trace_paths: tuple[Path, Path] | None = None
@@ -1543,6 +1599,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_inner_width: bool = False,
                            require_iop3_storage: bool = False,
                            require_transpose_tile: bool = False,
+                           require_transpose_virtual: bool = False,
                            require_pointwise_1d_cta: bool = False,
                            require_resize_reorder: bool = False,
                            trace_paths: tuple[Path, Path] | None = None
@@ -1736,6 +1793,12 @@ def check_alternate_report(report: dict[str, Any],
             expected_issues.extend(replacements)
         if sorted(issues, key=str) != sorted(expected_issues, key=str):
             raise ValueError(f"unexpected resize reorder comparison issues: {issues}")
+    elif require_transpose_virtual:
+        if (site != "TR1" or event["native"] != "virtual" or
+                alternate != "original" or
+                set(event["candidates"]) != {"original", "virtual"}):
+            raise ValueError("transpose fixture lacks the active virtual menu")
+        check_transpose_virtual_dependency(report, trace_paths, intended, issues)
     elif require_transpose_tile:
         if (site != "TR2.tile" or event["native"] != "tile32" or
                 alternate != "tile16" or
@@ -3399,6 +3462,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-iop3-inner-width", action="store_true")
     parser.add_argument("--require-iop3-storage", action="store_true")
     parser.add_argument("--require-transpose-tile", action="store_true")
+    parser.add_argument("--require-transpose-virtual", action="store_true")
     parser.add_argument("--require-pointwise-1d-cta", action="store_true")
     parser.add_argument("--require-resize-reorder", action="store_true")
     parser.add_argument("--protocol", choices=("text-v1", "semantic-v3"))
@@ -3575,6 +3639,7 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_inner_width=args.require_iop3_inner_width,
             require_iop3_storage=args.require_iop3_storage,
             require_transpose_tile=args.require_transpose_tile,
+            require_transpose_virtual=args.require_transpose_virtual,
             require_pointwise_1d_cta=args.require_pointwise_1d_cta,
             require_resize_reorder=args.require_resize_reorder,
             trace_paths=(Path(record["decision_log"]),
