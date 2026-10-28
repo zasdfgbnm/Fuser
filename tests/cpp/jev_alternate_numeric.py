@@ -2802,6 +2802,58 @@ def check_alternate_report(report: dict[str, Any],
                 alternate != "w1" or
                 set(event["candidates"]) != {"w1", "w2", "w4"}):
             raise ValueError("2D register fixture lacks its checked width menu")
+        semantic = isinstance(event["state"], dict)
+        if semantic:
+            from jev_shim import parse_inner_reg_width_state
+
+            context = event["state"]
+            decision = context["decision"]
+            source = parse_inner_reg_width_state(decision["analysis_inputs_text"])
+            rows = [row for row in report["multiplicity"]
+                    if row["site"] == "IP5.width"]
+            if (len(rows) != 1 or rows[0]["record"] != {"w4": 1} or
+                    rows[0]["remote"] != {"w1": 1} or source.version != 2 or
+                    decision["site"] != "IP5.width" or
+                    len(decision["candidates"]) != len(source.plans)):
+                raise ValueError("semantic IP5 width Record/Remote requests differ")
+            by_id = {card["id"]: card for card in decision["candidates"]}
+            for width_plan in source.plans:
+                card = by_id[width_plan.choice_id]
+                effect = card.get("consequence")
+                parallel = source.inner_numel // width_plan.width
+                if (not isinstance(effect, dict) or
+                        effect.get("vector_width") != width_plan.width or
+                        effect.get("batch_min") != width_plan.batch_min or
+                        effect.get("batch_max") != width_plan.batch_max or
+                        effect.get("pending_choices") !=
+                        ["IP5.targets", "IP5.cta_seed", "IP5.batch"] or
+                        len(effect.get("batch_plans", [])) !=
+                        len(width_plan.batch_plans)):
+                    raise ValueError("semantic IP5 width frontier is incomplete")
+                for raw, shown in zip(width_plan.batch_plans,
+                                      effect["batch_plans"]):
+                    pad = (raw.score_x > 16 and raw.padded_x * raw.score_y <=
+                           source.max_threads_per_block)
+                    score_x = raw.padded_x if pad else raw.score_x
+                    expected = {
+                        "persistent_batch": raw.batch,
+                        "score_block": {
+                            "x": score_x, "y": raw.score_y,
+                            "threads": score_x * raw.score_y,
+                            "padded_x": raw.padded_x,
+                            "pad_x_to_warp": pad,
+                        },
+                        "required_reduction_threads_x":
+                            (parallel + raw.batch - 1) // raw.batch,
+                        "nvrtc_register_cap_per_thread": raw.register_cap,
+                        "estimated_occupancy_warps_per_sm": raw.occupancy,
+                        "estimated_waves": raw.waves,
+                        "persistent_tail_elements": raw.tails,
+                        "logical_iteration_grid_blocks_before_split":
+                            (source.iteration_numel + raw.score_y - 1) // raw.score_y,
+                    }
+                    if shown != expected:
+                        raise ValueError("semantic IP5 width row/effect mismatch")
         expected = sorted((
             ("winner_mismatch", "IP5.width"),
             ("record_only_state", "IP5.targets"),
@@ -2826,16 +2878,21 @@ def check_alternate_report(report: dict[str, Any],
                 remote_count = sum(row["remote"].values())
                 if (record_count, remote_count) not in {(1, 0), (0, 1)}:
                     raise ValueError(f"duplicate/shared dependent state: {row}")
+                nested_state = row["request"]["state"]
+                nested_text = (nested_state["decision"]["analysis_inputs_text"]
+                               if isinstance(nested_state, dict) else nested_state)
                 fields = dict(line.split("=", 1) for line in
-                              row["request"]["state"].splitlines()[1:]
+                              nested_text.splitlines()[1:]
                               if line.count("=") == 1 and
                               not line.startswith(("policy=", "plan=")))
                 expected_parallel = (native_parallel if record_count
                                      else selected_parallel)
                 if int(fields["parallel_after_vectorize"]) != expected_parallel:
                     raise ValueError(f"{nested_site} ignored selected width: {fields}")
+        width_text = (event["state"]["decision"]["analysis_inputs_text"]
+                      if semantic else event["state"])
         width_fields = dict(line.split("=", 1) for line in
-                            event["state"].splitlines()[1:] if line.count("=") == 1
+                            width_text.splitlines()[1:] if line.count("=") == 1
                             and not line.startswith("plan="))
         if (width_fields.get("max_legal_width") != "4" or
                 width_fields.get("inner_numel") != "1024"):

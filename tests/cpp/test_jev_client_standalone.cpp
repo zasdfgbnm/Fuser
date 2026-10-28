@@ -1233,6 +1233,89 @@ int main() {
                 std::string::npos,
         "RD3 semantic-v3 request exposed the source-native width hint");
   }
+  // IP5.width sends a conditional, unranked batch frontier only through the
+  // semantic-v3 envelope. Record and Remote must send identical candidate
+  // effects; the native Record answer is not part of either request.
+  const std::string ip5_width_state =
+      "inner_persistent.reg_width.v2\ninner_numel=64\n"
+      "plan=1:1:2\nbatch_plan=1:1:64:2:64:64:32:1:0";
+  const std::vector<ChoiceOption> ip5_width_options{
+      {"w2", "Vector width 2, checked persistent batches 1 through 2",
+       "{\"schema\":\"nvfuser.ip5.width.batch_frontier.v1\","
+       "\"vector_width\":2,\"batch_plans\":[{\"persistent_batch\":1}]}"},
+      {"w1", "Vector width 1, checked persistent batches 1 through 2",
+       "{\"schema\":\"nvfuser.ip5.width.batch_frontier.v1\","
+       "\"vector_width\":1,\"batch_plans\":[{\"persistent_batch\":1},"
+       "{\"persistent_batch\":2}]}"}};
+  std::string ip5_width_record_request;
+  {
+    const std::string before = readFile(path);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "IP5 synthetic input", {}, v3_hardware);
+    require(chooseDecision("IP5.width", ip5_width_state, ip5_width_options,
+                           "w2") == "w2",
+            "IP5 semantic-v3 Record changed its width");
+    ip5_width_record_request =
+        loggedRequest(readFile(path).substr(before.size()));
+    const std::string exact_cards =
+        "\"candidates\":[{\"id\":\"w1\",\"description\":\"" +
+        ip5_width_options[1].description + "\",\"consequence\":" +
+        ip5_width_options[1].consequence_json +
+        "},{\"id\":\"w2\",\"description\":\"" +
+        ip5_width_options[0].description + "\",\"consequence\":" +
+        ip5_width_options[0].consequence_json + "}]";
+    require(
+        ip5_width_record_request.find("inner_persistent.reg_width.v2") !=
+                std::string::npos &&
+            ip5_width_record_request.find(exact_cards) != std::string::npos &&
+            ip5_width_record_request.find(
+                "\"criteria\":{\"w1\":\"Vector width 1") !=
+                std::string::npos &&
+            ip5_width_record_request.find("native_choice") ==
+                std::string::npos,
+        "IP5 semantic-v3 frontier lost candidate data or exposed the winner");
+  }
+  ::setenv("NVFUSER_JEV_MODE", "remote", 1);
+  {
+    FakeServer server(
+        "{\"model\":\"jev-1.13.0\",\"answers\":{\"IP5.width\":{"
+        "\"type\":\"choice\",\"choice\":\"w1\",\"confidence\":1.0,"
+        "\"probabilities\":{\"w1\":1.0,\"w2\":0.0}}},"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}");
+    ::setenv("NVFUSER_JEV_PORT", std::to_string(server.port()).c_str(), 1);
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "IP5 synthetic input", {}, v3_hardware);
+    require(chooseDecision("IP5.width", ip5_width_state, ip5_width_options) ==
+                "w1",
+            "IP5 semantic-v3 Remote rejected its width frontier");
+    const auto body_start = server.request().find("\r\n\r\n");
+    require(body_start != std::string::npos &&
+                server.request().substr(body_start + 4) ==
+                    ip5_width_record_request,
+            "IP5 Record and Remote frontier requests differ");
+  }
+  ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  ::setenv("NVFUSER_JEV_PROTOCOL", "text-v1", 1);
+  {
+    const std::string legacy_state =
+        "inner_persistent.reg_width.v1\ninner_numel=64\nplan=1:1:2";
+    const std::string before_plain = readFile(path);
+    require(chooseDecision("IP5.width", legacy_state,
+                           {{"w2", ip5_width_options[0].description},
+                            {"w1", ip5_width_options[1].description}},
+                           "w2") == "w2",
+            "IP5 text-v1 Record changed its native width");
+    const std::string plain =
+        loggedRequest(readFile(path).substr(before_plain.size()));
+    const std::string before_enriched = readFile(path);
+    require(chooseDecision("IP5.width", legacy_state, ip5_width_options,
+                           "w2") == "w2",
+            "IP5 text-v1 enriched options changed the width");
+    require(loggedRequest(readFile(path).substr(before_enriched.size())) ==
+                plain,
+            "IP5 text-v1 wire bytes changed with semantic consequences");
+  }
+  ::setenv("NVFUSER_JEV_PROTOCOL", "semantic-v3", 1);
   const std::string before_v3_record = readFile(path);
   nvfuser::scheduler::jev::recordContextFallback("snapshot_too_large");
   require(

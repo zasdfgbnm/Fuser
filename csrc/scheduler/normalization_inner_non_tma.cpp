@@ -376,6 +376,9 @@ struct Inner2DPolicyResources {
   int64_t batch_min = 0;
   int64_t batch_max = 0;
   bool supported_menu = false;
+  // Ascending, unranked score plans copied before native preference sorting.
+  // Used only for the semantic-v3 width frontier; no selected winner is sent.
+  std::vector<NormInnerParams> candidate_plans;
 };
 
 void innerPersistentHeuristic2DPlan(
@@ -643,6 +646,9 @@ void innerPersistentHeuristic2DPlan(
           ? native_batch_max
           : candidate_heuristics.back().persistent_batch_size;
       policy_resources->supported_menu = supported_menu;
+      if (supported_menu) {
+        policy_resources->candidate_plans = candidate_heuristics;
+      }
     }
     // Candidate preflight has no nested Choice or log side effect.
     if (jev_mode != scheduler::jev::Mode::Off) {
@@ -819,6 +825,59 @@ void innerPersistentHeuristic2DPlan(
 // vectorization breakpoint proved by getVectorizationFactor. Recompute the
 // complete register-backed batch/CTA/register/grid menu before offering it;
 // the width Choice must not rely on a later policy to make a plan legal.
+std::string innerWidthFrontierConsequence(
+    const PersistentKernelProperties& properties,
+    int64_t width,
+    const Inner2DPolicyResources& resources) {
+  const int64_t parallel = properties.inner_most_dimension_numel / width;
+  const int64_t buffer_bits =
+      properties.max_persistent_buffer_size_bit /
+      properties.total_reduction_numel * width;
+  std::string result =
+      "{\"schema\":\"nvfuser.ip5.width.batch_frontier.v1\","
+      "\"scope\":\"source_unranked_batch_score_frontier_under_initial_targets_and_cta_seed\","
+      "\"conditioning\":\"One source-initial resource target and CTA seed; other target and seed branches are pending.\","
+      "\"vector_width\":" +
+      std::to_string(width) +
+      ",\"reduction_elements_after_vectorize\":" + std::to_string(parallel) +
+      ",\"buffer_bits_per_batch\":" + std::to_string(buffer_bits) +
+      ",\"batch_min\":" + std::to_string(resources.batch_min) +
+      ",\"batch_max\":" + std::to_string(resources.batch_max) +
+      ",\"batch_plans\":[";
+  for (const auto& plan : resources.candidate_plans) {
+    const int64_t score_x =
+        plan.is_pad_bdimx ? plan.padded_bdimx : plan.bdimx;
+    const int64_t required_x = ceilDiv(parallel, plan.persistent_batch_size);
+    const int64_t grid_x =
+        ceilDiv(properties.total_iteration_numel, plan.bdimy);
+    if (result.back() != '[') {
+      result += ',';
+    }
+    result +=
+        "{\"persistent_batch\":" +
+        std::to_string(plan.persistent_batch_size) +
+        ",\"score_block\":{\"x\":" + std::to_string(score_x) +
+        ",\"y\":" + std::to_string(plan.bdimy) +
+        ",\"threads\":" + std::to_string(score_x * plan.bdimy) +
+        ",\"padded_x\":" + std::to_string(plan.padded_bdimx) +
+        ",\"pad_x_to_warp\":" +
+        (plan.is_pad_bdimx ? "true" : "false") +
+        "},\"required_reduction_threads_x\":" +
+        std::to_string(required_x) +
+        ",\"nvrtc_register_cap_per_thread\":" +
+        std::to_string(plan.register_per_thread) +
+        ",\"estimated_occupancy_warps_per_sm\":" +
+        std::to_string(plan.occupancy) +
+        ",\"estimated_waves\":" + std::to_string(plan.n_wave) +
+        ",\"persistent_tail_elements\":" +
+        std::to_string(plan.n_persistent_tails) +
+        ",\"logical_iteration_grid_blocks_before_split\":" +
+        std::to_string(grid_x) + '}';
+  }
+  return result +
+      "],\"pending_choices\":[\"IP5.targets\",\"IP5.cta_seed\",\"IP5.batch\"]}";
+}
+
 PersistentKernelProperties chooseInner2DVectorWidth(
     const PersistentKernelProperties& properties,
     const ReductionParams& base,
@@ -882,8 +941,22 @@ PersistentKernelProperties chooseInner2DVectorWidth(
     return properties;
   }
 
+  const bool semantic_frontier = scheduler::jev::semanticV3Enabled();
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const int64_t min_threads_per_block =
+      properties.total_iteration_numel >= device->multiProcessorCount
+      ? 4l * device->warpSize
+      : device->maxThreadsPerBlock;
+  const int64_t max_multi_reduction_factor = std::min(
+      scheduler_utils::safeDiv(
+          scheduler_utils::register_file_size_bit,
+          properties.max_persistent_buffer_size_bit),
+      ceilDiv(properties.total_iteration_numel,
+              (int64_t)device->multiProcessorCount));
   std::string state =
-      "inner_persistent.reg_width.v1\ninner_numel=" +
+      std::string(semantic_frontier ? "inner_persistent.reg_width.v2\n"
+                                    : "inner_persistent.reg_width.v1\n") +
+      "inner_numel=" +
       std::to_string(properties.inner_most_dimension_numel) +
       "\nreduction_numel=" +
       std::to_string(properties.total_reduction_numel) +
@@ -895,7 +968,22 @@ PersistentKernelProperties chooseInner2DVectorWidth(
       "\nnative_batch_max=" +
       std::to_string(native_resources.batch_max) +
       "\nmax_threads_per_block=" +
-      std::to_string(at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock);
+      std::to_string(device->maxThreadsPerBlock);
+  if (semantic_frontier) {
+    state += "\nmin_threads_per_block=" +
+        std::to_string(min_threads_per_block) +
+        "\nmax_multi_reduction_factor=" +
+        std::to_string(max_multi_reduction_factor) +
+        "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+        "\nwarp_size=" + std::to_string(device->warpSize) +
+        "\nmax_threads_per_sm=" +
+        std::to_string(device->maxThreadsPerMultiProcessor) +
+        "\nmax_threads_x=" + std::to_string(device->maxThreadsDim[0]) +
+        "\nmax_threads_y=" + std::to_string(device->maxThreadsDim[1]) +
+        "\nregisters_per_block=" + std::to_string(device->regsPerBlock) +
+        "\nmax_grid_x=" + std::to_string(device->maxGridSize[0]) +
+        "\nmax_grid_y=" + std::to_string(device->maxGridSize[1]);
+  }
   for (int64_t width = 1; width <= max_width; width *= 2) {
     auto candidate_properties = properties;
     candidate_properties.vectorize_factor = width;
@@ -921,19 +1009,37 @@ PersistentKernelProperties chooseInner2DVectorWidth(
       continue;
     }
     plans.push_back({width, resources});
-    options.push_back({
+    scheduler::jev::ChoiceOption option{
         "w" + std::to_string(width),
         "Vector width " + std::to_string(width) +
             ", checked persistent batches " +
             std::to_string(resources.batch_min) + " through " +
-            std::to_string(resources.batch_max)});
+            std::to_string(resources.batch_max)};
+    if (semantic_frontier) {
+      option.consequence_json =
+          innerWidthFrontierConsequence(properties, width, resources);
+    }
+    options.push_back(std::move(option));
     state += "\nplan=" + std::to_string(width) + ":" +
         std::to_string(resources.batch_min) + ":" +
         std::to_string(resources.batch_max);
+    if (semantic_frontier) {
+      for (const auto& plan : resources.candidate_plans) {
+        state += "\nbatch_plan=" + std::to_string(width) + ":" +
+            std::to_string(plan.persistent_batch_size) + ":" +
+            std::to_string(plan.bdimx) + ":" +
+            std::to_string(plan.bdimy) + ":" +
+            std::to_string(plan.padded_bdimx) + ":" +
+            std::to_string(plan.register_per_thread) + ":" +
+            std::to_string(plan.occupancy) + ":" +
+            std::to_string(plan.n_wave) + ":" +
+            std::to_string(plan.n_persistent_tails);
+      }
+    }
   }
   NVF_ERROR(!plans.empty(), "No legal 2D register vector width");
   NVF_ERROR(
-      state.size() <= 16 * 1024,
+      state.size() <= (semantic_frontier ? 64 * 1024 : 16 * 1024),
       "Inner persistent width request exceeds safe size");
   const std::string native_choice =
       jev_mode == scheduler::jev::Mode::Record
