@@ -6126,6 +6126,42 @@ TEST_F(Gpu1Test, JevAlternateInnerWarpTarget_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// The model can fix the CTA width at 128 threads while retaining several
+// legal remainder unroll factors. Exercise that path with a listed remote
+// answer and compare the result against the same ATen reduction in all modes.
+TEST_F(Gpu1Test, JevSingleWidthRemainderUnroll_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4096, 4096}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->schedule_3d);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    ASSERT_EQ(rparams->lparams.bdimx(), 128);
+    ASSERT_EQ(rparams->unroll_factor_inner_reduction, 1);
+  }
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // Force a second preflighted logical warp target in a genuine 3D reduction.
 // The native cache target m8 uses 32 threads on x; m4 uses 16.
 TEST_F(Gpu1Test, JevAlternateInner3dWarpTarget_CUDA) {
