@@ -1554,7 +1554,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
                : "logical_warp_outside_preflight_range");
   }
   if (!work_split_no_choice_reason.empty()) {
-    scheduler::jev::recordNoChoiceDecision(
+    scheduler::jev::recordHardSingletonDecision(
         "RD5.work_split",
         "unroll_first",
         work_split_no_choice_reason,
@@ -1578,7 +1578,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
       dev_prop->maxThreadsPerBlock <= 2048;
   if (jev_mode_warp != scheduler::jev::Mode::Off) {
     if (!bounded_wave_domain) {
-      scheduler::jev::recordNoChoiceDecision(
+      scheduler::jev::recordHardSingletonDecision(
           "RD5.waves",
           "waves4",
           "outside bounded 3D wave domain",
@@ -1647,7 +1647,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
           NVF_ERROR(false, "RD5.waves lacks a complete native plan");
         }
       } else if (options.size() == 1) {
-        scheduler::jev::recordNoChoiceDecision(
+        scheduler::jev::recordHardSingletonDecision(
             "RD5.waves",
             "waves4",
             hard_valid_candidates.size() == 1
@@ -1970,7 +1970,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
             "RD5.outer_unroll", "native outer unroll lacks bounded 3D proof");
       }
     } else if (options.size() == 1) {
-      scheduler::jev::recordNoChoiceDecision(
+      scheduler::jev::recordHardSingletonDecision(
           "RD5.outer_unroll",
           "u" + std::to_string(native_factor),
           "only native outer unroll has a 3D proof",
@@ -2064,7 +2064,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
         "RD5.iter_unroll native factor exceeds the bounded option set");
     if (hard_limit == 1) {
       // A singleton has no performance decision for the API to make.
-      scheduler::jev::recordNoChoiceDecision(
+      scheduler::jev::recordHardSingletonDecision(
           "RD5.iter_unroll",
           "u1",
           "only one hard-legal iteration unroll factor",
@@ -2096,7 +2096,7 @@ std::unique_ptr<ReductionParams> inner3dReductionHeuristic(
               ? std::optional<int64_t>{native_factor}
               : std::nullopt);
       if (request.candidates.size() == 1) {
-        scheduler::jev::recordNoChoiceDecision(
+        scheduler::jev::recordHardSingletonDecision(
             "RD5.iter_unroll",
             "u" + std::to_string(native_factor),
             "all iteration unroll factors realize the same grid plan",

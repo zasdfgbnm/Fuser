@@ -554,9 +554,56 @@ def require_rd9_candidate_effects(
             raise ValueError(f"{mode} final RD9 params differ from candidate effect")
 
 
+def check_rd5_selected_fixed_prior(
+        path: Path, mode: str, required_fixed: tuple[str, ...]) -> None:
+    """Bind selected 3D fixed facts to RD4 and the later width request."""
+    decisions = trace_rows(path)
+    widths = [row for row in decisions if row.get("site") == "RD5.width"]
+    parents = [row for row in decisions if row.get("site") == "RD4"]
+    if len(widths) != 1 or len(parents) != 1 or parents[0]["selected"] != "3d":
+        raise ValueError(f"{mode} lacks one selected RD4=3d parent and width")
+    width, parent = widths[0], parents[0]
+    invocation = width["compute_invocation_id"]
+    parent_index = parent["compute_event_index"]
+    width_index = width["compute_event_index"]
+    if (parent["compute_invocation_id"] != invocation or
+            not 0 < parent_index < width_index):
+        raise ValueError(f"{mode} recorded RD5 before its selected 3D parent")
+
+    fixed_sites = {"RD5.work_split", "RD5.waves", "RD5.outer_unroll",
+                   "RD5.iter_unroll"}
+    outcomes = trace_rows(path, outcome=True)
+    fixed = [row for row in outcomes if row.get("kind") == "no_choice" and
+             row.get("site") in fixed_sites and
+             row.get("compute_invocation_id") == invocation]
+    for site in required_fixed:
+        if sum(row["site"] == site for row in fixed) != 1:
+            raise ValueError(f"{mode} lacks selected fixed {site}")
+    for row in fixed:
+        if (row.get("mode") != mode or not row.get("selected") or
+                not row.get("reason") or not row.get("selection_source") or
+                not parent_index < row["compute_event_index"] < width_index or
+                any(choice["site"] == row["site"] for choice in decisions)):
+            raise ValueError(f"{mode} invalid selected 3D fixed fact: {row}")
+    preceding = [row for row in decisions if
+                 row.get("compute_invocation_id") == invocation and
+                 row["compute_event_index"] < width_index]
+    preceding.extend(fixed)
+    preceding.sort(key=lambda row: row["compute_event_index"])
+    expected = [{"site": row["site"], "choice": row["selected"]}
+                for row in preceding]
+    actual = width["request"]["state"]["current_schedule"]["prior_choices"]
+    if actual != expected or expected[0] != {"site": "RD4", "choice": "3d"}:
+        raise ValueError(
+            f"{mode} width prior differs from selected event order: "
+            f"{actual} != {expected}")
+
+
 def check_rd5_width_candidate_effects(trace_paths: tuple[Path, Path]) -> None:
     """Match every v3 width card to the fixed 3D plan and selected outcome."""
     for mode, path in zip(("record", "remote"), trace_paths):
+        check_rd5_selected_fixed_prior(
+            path, mode, ("RD5.work_split", "RD5.iter_unroll"))
         rows = [row for row in trace_rows(path) if row.get("site") == "RD5.width"]
         if len(rows) != 1:
             raise ValueError(f"expected one {mode} RD5.width request: {rows}")
@@ -811,6 +858,9 @@ def check_rd5_cta_preflight_effects(trace_paths: tuple[Path, Path]) -> None:
                    "target_serial_iterations", "inner_reduction_unroll",
                    "outer_reduction_unroll", "cta", "grid_cases", "pending_choices"}
     for mode, path in zip(("record", "remote"), trace_paths):
+        check_rd5_selected_fixed_prior(
+            path, mode,
+            ("RD5.work_split", "RD5.waves", "RD5.iter_unroll"))
         rows = [row for row in trace_rows(path) if row.get("site") == "RD5.cta"]
         if len(rows) != 1:
             raise ValueError(f"expected one {mode} RD5.cta request: {rows}")
