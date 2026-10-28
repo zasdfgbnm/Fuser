@@ -107,6 +107,136 @@ OUTER_PARENT_ORDER = (
     "RD9.stride",
 )
 
+
+def require_rd9_candidate_effects(
+        trace_paths: tuple[Path, Path]) -> None:
+    """Bind four v3 candidate cards to each other and the realized grid plan."""
+    sites = ("RD9.grid_base", "RD9.unroll", "RD9.ragged", "RD9.stride")
+    pending = {
+        "RD9.grid_base": ["RD9.unroll", "RD9.ragged", "RD9.stride"],
+        "RD9.unroll": ["RD9.ragged", "RD9.stride"],
+        "RD9.ragged": ["RD9.stride"],
+        "RD9.stride": [],
+    }
+    plan_keys = {
+        "iteration_elements", "reduction_elements",
+        "logical_iteration_grid_blocks_pre_split",
+        "logical_reduction_grid_blocks_pre_split",
+        "iteration_threads", "reduction_threads", "iteration_vector_width",
+        "reduction_unroll", "reduction_serial",
+    }
+    for mode, path in zip(("record", "remote"), trace_paths):
+        rows = trace_rows(path)
+        by_site = {}
+        for site in sites:
+            matches = [row for row in rows if row.get("site") == site]
+            if len(matches) != 1:
+                raise ValueError(f"expected one {mode} {site} effect request: {matches}")
+            by_site[site] = matches[0]
+        effects = {}
+        for site, row in by_site.items():
+            request = row["request"]
+            context = request["state"]
+            if (not isinstance(context, dict) or
+                    context.get("schema") != "nvfuser.systemone.context.v3"):
+                raise ValueError(f"{mode} {site} is not semantic-v3")
+            text = context["decision"]["analysis_inputs_text"]
+            fields = dict(line.split("=", 1) for line in text.splitlines()[1:]
+                          if line.count("=") == 1)
+            candidates = context["decision"]["candidates"]
+            if {candidate["id"] for candidate in candidates} != set(
+                    request["questions"][site]["criteria"]):
+                raise ValueError(f"{mode} {site} candidate IDs differ from criteria")
+            effects[site] = {}
+            for candidate in candidates:
+                effect = candidate.get("consequence")
+                if not isinstance(effect, dict) or effect.get(
+                        "pending_choices") != pending[site]:
+                    raise ValueError(f"{mode} {site} lacks its typed continuation")
+                expected_scope = ("terminal_rd9_logical_plan" if site == "RD9.stride"
+                                  else "conditional_outer_grid_variants")
+                if effect.get("plan_scope") != expected_scope:
+                    raise ValueError(f"{mode} {site} has a wrong plan scope")
+                expected_effect_keys = ({"plan_scope", "plan", "pending_choices",
+                                         "deterministic_conversion_pending"}
+                                        if site == "RD9.stride" else
+                                        {"plan_scope", "base", "stride_capped",
+                                         "pending_choices"})
+                if set(effect) != expected_effect_keys:
+                    raise ValueError(f"{mode} {site} exposes unexpected effect fields")
+                if site == "RD9.stride" and effect.get(
+                        "deterministic_conversion_pending") is not True:
+                    raise ValueError(f"{mode} {site} omitted pending deterministic conversion")
+                plans = ({"plan": effect.get("plan")} if site == "RD9.stride"
+                         else {key: effect.get(key) for key in
+                               ("base", "stride_capped")})
+                for name, plan in plans.items():
+                    if (not isinstance(plan, dict) or set(plan) != plan_keys or
+                            any(type(value) is not int or value <= 0
+                                for value in plan.values()) or
+                            plan["iteration_elements"] != int(
+                                fields["iteration_numel"]) or
+                            plan["reduction_elements"] != int(
+                                fields["reduction_numel"])):
+                        raise ValueError(f"{mode} {site} {name} is not a complete positive plan")
+                effects[site][candidate["id"]] = effect
+                if site == "RD9.unroll" and any(
+                        plan["iteration_vector_width"] != int(candidate["id"][1:])
+                        for plan in plans.values()):
+                    raise ValueError(f"{mode} RD9 unroll effect disagrees with ID")
+                if site == "RD9.stride" and plans["plan"][
+                        "logical_reduction_grid_blocks_pre_split"] != int(
+                            candidate["id"][1:]):
+                    raise ValueError(f"{mode} RD9 stride effect disagrees with ID")
+                if site in ("RD9.ragged", "RD9.stride") and any(
+                        word in candidate["description"].lower()
+                        for word in ("native", "baseline", "preferred")):
+                    raise ValueError(f"{mode} {site} description leaks native policy")
+            if site == "RD9.ragged" and "raw" in effects[site]:
+                if effects[site]["raw"]["base"][
+                        "logical_reduction_grid_blocks_pre_split"] != int(
+                            fields["base_grdim"]):
+                    raise ValueError(f"{mode} raw ragged grid differs from analysis")
+
+        selected = lambda site: by_site[site]["selected"]
+        base = effects["RD9.grid_base"][selected("RD9.grid_base")]
+        unroll = effects["RD9.unroll"]
+        highest = unroll[max(unroll, key=lambda choice: int(choice[1:]))]
+        for name in ("base", "stride_capped"):
+            if base[name] != highest[name]:
+                raise ValueError(f"{mode} RD9 grid baseline changed before unroll")
+        chosen_unroll = unroll[selected("RD9.unroll")]
+        clean = effects["RD9.ragged"]["clean"]
+        if any(chosen_unroll[name] != clean[name]
+               for name in ("base", "stride_capped")):
+            raise ValueError(f"{mode} RD9 ragged clean plan changed unexpectedly")
+        ragged = effects["RD9.ragged"][selected("RD9.ragged")]
+        stride = effects["RD9.stride"]
+        if not any(effect["plan"] == ragged["base"]
+                   for effect in stride.values()):
+            raise ValueError(f"{mode} RD9 stride baseline differs from ragged plan")
+        if len(stride) == 2 and not any(
+                effect["plan"] == ragged["stride_capped"]
+                for effect in stride.values()):
+            raise ValueError(f"{mode} RD9 stride cap differs from ragged plan")
+
+        final = [row for row in trace_rows(path, outcome=True)
+                 if row.get("schema") == "nvfuser.native_outcome.v2" and
+                 row.get("compute_invocation_id") ==
+                 by_site["RD9.stride"].get("compute_invocation_id")]
+        if len(final) != 1:
+            raise ValueError(f"expected one {mode} realized RD9 plan")
+        plan = stride[selected("RD9.stride")]["plan"]
+        params = final[0]["scheduler_fields"]
+        launch = final[0]["launch"]
+        reduction_grid = plan["logical_reduction_grid_blocks_pre_split"]
+        grid_y = min(reduction_grid, 65535) if reduction_grid > 1 else -1
+        if (params["unroll_factor_iter_dom"] != plan["iteration_vector_width"] or
+                params["unroll_factor_inner_reduction"] != plan["reduction_unroll"] or
+                params["cross_grid_inner_reduction"] !=
+                (reduction_grid > 1) or launch["grid_y_raw"] != grid_y):
+            raise ValueError(f"{mode} final RD9 params differ from candidate effect")
+
 DEPENDENT_DECISION_ORDER = {
     "jev_alternate_numeric_inner3d_warp_target":
         ("RD4", "RD5.warp", "RD5.cta", "RD5.width"),
@@ -940,6 +1070,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_outer_ragged: bool = False,
                            require_outer_grid_base: bool = False,
                            require_outer_unroll: bool = False,
+                           require_rd9_effects: bool = False,
                            require_inner_iter_unroll: bool = False,
                            require_inner_warp_target: bool = False,
                            require_inner_cta_envelope: bool = False,
@@ -997,6 +1128,10 @@ def check_alternate_report(report: dict[str, Any],
                 "request_sha256": event["request_sha256"]}
     if intended not in issues:
         raise ValueError(f"missing intended winner mismatch: {issues}")
+    if require_rd9_effects:
+        if trace_paths is None:
+            raise ValueError("RD9 candidate effects need both decision traces")
+        require_rd9_candidate_effects(trace_paths)
     if require_resize_reorder:
         if (site != "RS1.reorder" or event["native"] != "keep" or
                 alternate != "skip"):
@@ -2695,6 +2830,16 @@ def check_alternate_report(report: dict[str, Any],
                                  f"{final_outer}")
         if issues != [intended]:
             raise ValueError(f"unexpected outer-unroll dependencies: {issues}")
+    elif require_rd9_effects:
+        affected = {"RD9.grid_base", "RD9.unroll", "RD9.ragged", "RD9.stride"}
+        if (site not in affected or
+                any(problem["site"] not in affected or
+                    problem["kind"] not in {"winner_mismatch", "record_only_state",
+                                            "remote_only_state"}
+                    for problem in issues) or
+                any(problem["kind"] == "winner_mismatch" and problem != intended
+                    for problem in issues)):
+            raise ValueError(f"unexpected RD9 decision comparison issues: {issues}")
     elif issues != [intended]:
         raise ValueError(f"unexpected decision comparison issues: {issues}")
     if report["summary"]["remote_events"] != report["summary"]["server_successes"]:
@@ -2747,6 +2892,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-inner-cta-seed", action="store_true")
     parser.add_argument("--require-inner-magic-zero", action="store_true")
     parser.add_argument("--require-sm89", action="store_true")
+    parser.add_argument("--require-rd9-effects", action="store_true")
     parser.add_argument("--require-inner3d-warp", action="store_true")
     parser.add_argument("--require-inner3d-occupancy", action="store_true")
     parser.add_argument("--require-inner3d-width", action="store_true")
@@ -2894,6 +3040,7 @@ def main(argv: list[str] | None = None) -> int:
             require_outer_ragged=args.require_outer_ragged,
             require_outer_grid_base=args.require_outer_grid_base,
             require_outer_unroll=args.require_outer_unroll,
+            require_rd9_effects=args.require_rd9_effects,
             require_inner_targets=args.require_inner_targets,
             require_inner_storage=args.require_inner_storage,
             require_inner_iter_unroll=args.require_inner_iter_unroll,

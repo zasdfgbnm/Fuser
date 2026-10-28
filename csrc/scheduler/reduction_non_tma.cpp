@@ -2719,6 +2719,42 @@ struct OuterGridWarpPlans {
   bool native_use_stride;
 };
 
+// These are the source planner's logical dimensions before CUDA grid splitting.
+// Keep the description independent of which variant the native policy picks.
+std::string outerGridPlanEffect(const OuterReductionParams& plan) {
+  scheduler::native_diagnostic::Object effect;
+  effect.add("iteration_elements", plan.total_iteration_numel);
+  effect.add("reduction_elements", plan.total_reduction_numel);
+  effect.add("logical_iteration_grid_blocks_pre_split", plan.gidim);
+  effect.add("logical_reduction_grid_blocks_pre_split", plan.grdim);
+  effect.add("iteration_threads", plan.bdimx);
+  effect.add("reduction_threads", plan.bdimy);
+  effect.add("iteration_vector_width", plan.iter_unroll_factor);
+  effect.add("reduction_unroll", plan.redu_unroll_factor);
+  effect.add("reduction_serial", plan.redu_serial);
+  return effect.str();
+}
+
+std::string outerGridVariantEffects(
+    const OuterGridWarpPlans& plans,
+    std::string_view pending_choices) {
+  scheduler::native_diagnostic::Object effect;
+  effect.add("plan_scope", "conditional_outer_grid_variants");
+  effect.addRaw("base", outerGridPlanEffect(plans.baseline));
+  effect.addRaw("stride_capped", outerGridPlanEffect(plans.stride_capped));
+  effect.addRaw("pending_choices", pending_choices);
+  return effect.str();
+}
+
+std::string outerGridTerminalEffect(const OuterReductionParams& plan) {
+  scheduler::native_diagnostic::Object effect;
+  effect.add("plan_scope", "terminal_rd9_logical_plan");
+  effect.addRaw("plan", outerGridPlanEffect(plan));
+  effect.addRaw("pending_choices", "[]");
+  effect.add("deterministic_conversion_pending", true);
+  return effect.str();
+}
+
 // Construct both complete grid plans for one logical warp target. This is pure
 // arithmetic: candidate preflight must not send nested Choices or emit a
 // SchedulerDebug schedule for a plan that will never be selected.
@@ -3286,7 +3322,11 @@ OuterReductionParams getGridOuterReduction(
       cta_share,
       false);
   std::vector<scheduler::jev::ChoiceOption> grid_base_options = {
-      {"target", "Apply target-block reduction-grid formula"}};
+      {"target",
+       "Apply target-block reduction-grid formula",
+       outerGridVariantEffects(
+           plans,
+           "[\"RD9.unroll\",\"RD9.ragged\",\"RD9.stride\"]")}};
   if (wave_plans.base_grdim != plans.base_grdim &&
       outerGridWarpPlansHardValid(
           wave_plans,
@@ -3296,7 +3336,11 @@ OuterReductionParams getGridOuterReduction(
           max_unroll,
           max_threads_per_block)) {
     grid_base_options.push_back(
-        {"wave", "Keep one-SM-wave reduction grid"});
+        {"wave",
+         "Keep one-SM-wave reduction grid",
+         outerGridVariantEffects(
+             wave_plans,
+             "[\"RD9.unroll\",\"RD9.ragged\",\"RD9.stride\"]")});
   }
   const std::string grid_base_state =
       "reduction.outer_grid_base.v1\nreduction_numel=" +
@@ -3362,7 +3406,9 @@ OuterReductionParams getGridOuterReduction(
       unroll_options.push_back(
           {"u" + std::to_string(factor),
            "Unroll " + std::to_string(factor) +
-               " iteration element(s); recompute reduction unroll"});
+               " iteration element(s); recompute reduction unroll",
+           outerGridVariantEffects(
+               candidate, "[\"RD9.ragged\",\"RD9.stride\"]")});
       unroll_plans.push_back(std::move(candidate));
     }
     if (factor == native_iter_unroll) {
@@ -3419,11 +3465,20 @@ OuterReductionParams getGridOuterReduction(
       max_unroll,
       max_threads_per_block);
   std::vector<scheduler::jev::ChoiceOption> ragged_options = {
-      {"clean", "Apply the native ragged-wave grid adjustment"}};
+      {"clean",
+       scheduler::jev::semanticV3Enabled()
+           ? "Apply ragged-wave grid adjustment"
+           : "Apply the native ragged-wave grid adjustment",
+       outerGridVariantEffects(plans, "[\"RD9.stride\"]")}};
   if (raw_valid &&
       (plans.base_grdim != plans.baseline.grdim ||
        plans.stride_grdim != plans.stride_capped.grdim)) {
-    ragged_options.push_back({"raw", "Keep the complete raw reduction grids"});
+    ragged_options.push_back(
+        {"raw",
+         scheduler::jev::semanticV3Enabled()
+             ? "Keep pre-adjustment reduction grids"
+             : "Keep the complete raw reduction grids",
+         outerGridVariantEffects(raw_plans, "[\"RD9.stride\"]")});
   }
   const std::string ragged_state =
       "reduction.outer_ragged.v1\nreduction_numel=" +
@@ -3474,11 +3529,19 @@ OuterReductionParams getGridOuterReduction(
       "\nragged_policy=" + ragged_choice;
   std::vector<scheduler::jev::ChoiceOption> options = {
       {"g" + std::to_string(baseline.grdim),
-       "Use the baseline reduction grid"}};
+       scheduler::jev::semanticV3Enabled()
+           ? "Use reduction grid with " + std::to_string(baseline.grdim) +
+               " blocks"
+           : "Use the baseline reduction grid",
+       outerGridTerminalEffect(baseline)}};
   if (stride.grdim != baseline.grdim) {
     options.push_back(
         {"g" + std::to_string(stride.grdim),
-         "Use the stride-capped reduction grid"});
+         scheduler::jev::semanticV3Enabled()
+             ? "Use reduction grid with " + std::to_string(stride.grdim) +
+                 " blocks"
+             : "Use the stride-capped reduction grid",
+         outerGridTerminalEffect(stride)});
   }
   const std::string native_choice =
       jev_mode == scheduler::jev::Mode::Record

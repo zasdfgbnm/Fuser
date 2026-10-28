@@ -1678,6 +1678,17 @@ if(BUILD_TEST)
       --require-outer-unroll)
   set_tests_properties(jev_alternate_numeric_outer_unroll PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_unroll_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.unroll --alternate u1
+      --gtest Gpu1Test.JevAlternateOuterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_unroll_v3_effects
+      --protocol semantic-v3 --require-rd9-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_outer_unroll_v3_effects PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_outer_cta
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
@@ -1698,6 +1709,17 @@ if(BUILD_TEST)
       --case-key jev_alternate_numeric_outer_ragged --require-outer-ragged)
   set_tests_properties(jev_alternate_numeric_outer_ragged PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_ragged_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.ragged --alternate raw
+      --gtest Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_alternate_numeric_outer_ragged_v3_effects
+      --protocol semantic-v3 --require-rd9-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_outer_ragged_v3_effects PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_reduction_outer_grid_base
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
@@ -1709,6 +1731,17 @@ if(BUILD_TEST)
       --require-outer-grid-base)
   set_tests_properties(jev_alternate_numeric_reduction_outer_grid_base PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_reduction_outer_grid_base_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.grid_base --alternate wave
+      --gtest Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_alternate_numeric_reduction_outer_grid_base_v3_effects
+      --protocol semantic-v3 --require-rd9-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_reduction_outer_grid_base_v3_effects
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
   add_test(NAME jev_alternate_numeric_outer_grid_base
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
