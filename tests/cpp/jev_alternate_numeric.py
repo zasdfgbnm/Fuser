@@ -993,6 +993,43 @@ def paired_state_rows(report: dict[str, Any], site: str
     ]
 
 
+def iop3_record_write_remote_singleton(
+        report: dict[str, Any], trace_paths: tuple[Path, Path] | None,
+        selected: str) -> tuple[dict[str, Any], dict[str, str]]:
+    """Check a remote hard singleton replacing the native write-width Choice."""
+    rows = [row for row in report["multiplicity"] if
+            row["site"] == "IOP3.tmp_write_width"]
+    if (len(rows) != 1 or rows[0]["record"] != {"w4": 1} or
+            rows[0]["remote"] or trace_paths is None):
+        raise ValueError(f"unexpected IOP3 write-width wire coverage: {rows}")
+    remote_choices = trace_rows(trace_paths[1])
+    remote_outcomes = trace_rows(trace_paths[1], outcome=True)
+    cta = [row for row in remote_choices if row.get("site") == "IOP3.cta"]
+    local = [row for row in remote_outcomes if
+             row.get("site") == "IOP3.tmp_write_width"]
+    final = [row for row in remote_outcomes if
+             row.get("schema") == "nvfuser.native_outcome.v2" and
+             row.get("kind") == "final"]
+    if (len(cta) != 1 or len(local) != 1 or len(final) != 1 or
+            any(local[0].get(field) != value for field, value in {
+                "kind": "no_choice", "mode": "remote", "selected": selected,
+                "reason": "only one hard-valid temporary write width",
+                "selection_source": "hard_legal_singleton",
+            }.items()) or
+            local[0].get("compute_invocation_id") !=
+            cta[0].get("compute_invocation_id") or
+            final[0].get("compute_invocation_id") !=
+            cta[0].get("compute_invocation_id") or
+            local[0].get("compute_event_index", 0) <=
+            cta[0].get("compute_event_index", 0) or
+            final[0]["scheduler_fields"]
+            ["vectorization_factor_tmp_gmem_write"] != int(selected[1:])):
+        raise ValueError("remote IOP3 write singleton lacks its final plan")
+    return rows[0], {"kind": "record_only_state",
+                     "site": "IOP3.tmp_write_width",
+                     "request_sha256": rows[0]["request_sha256"]}
+
+
 def state_fields(row: dict[str, Any], version: str) -> dict[str, str]:
     state = row["request"]["state"]
     if isinstance(state, dict):
@@ -1420,7 +1457,8 @@ def check_iop3_grid_rows_dependency(
 
 def check_iop3_inner_width_dependency(
         report: dict[str, Any], event: dict[str, Any],
-        intended: dict[str, str], issues: list[dict[str, str]]) -> None:
+        intended: dict[str, str], issues: list[dict[str, str]],
+        trace_paths: tuple[Path, Path] | None) -> None:
     """Pair and replay every IOP3 request after a narrower inner vector."""
     from jev_shim import (evaluate, parse_inner_outer_inner_width_state,
                           parse_inner_outer_storage_state)
@@ -1434,7 +1472,7 @@ def check_iop3_inner_width_dependency(
     paired = {}
     expected = [intended]
     for site in ("IOP3.storage", "IOP3.min_batch", "IOP3.tmp_read_width",
-                 "IOP3.grid_rows", "IOP3.cta", "IOP3.tmp_write_width"):
+                 "IOP3.grid_rows", "IOP3.cta"):
         before, after, pair_issues = paired_state_rows(report, site)
         paired[site] = (before, after)
         expected.extend(pair_issues)
@@ -1446,6 +1484,10 @@ def check_iop3_inner_width_dependency(
                 raise ValueError(f"invalid dependent {site} request") from exc
             if row[side] != {native: 1}:
                 raise ValueError(f"dependent {site} changed its native winner")
+    record_write, write_issue = iop3_record_write_remote_singleton(
+        report, trace_paths, "w2")
+    expected.append(write_issue)
+    paired["IOP3.tmp_write_width"] = (record_write, None)
 
     storage_rows = paired["IOP3.storage"]
     batch_rows = paired["IOP3.min_batch"]
@@ -1466,7 +1508,9 @@ def check_iop3_inner_width_dependency(
                             if not line.startswith("plan="))
         read_fields = state_fields(read, "inner_outer_multi_wave.tmp_read_width.v1")
         rows_fields, _ = checked_iop3_rows_request(rows)
-        write_fields = state_fields(write, "inner_outer_multi_wave.tmp_write_width.v2")
+        write_fields = (state_fields(
+            write, "inner_outer_multi_wave.tmp_write_width.v2")
+            if write is not None else None)
         cta_fields, cta_plans = iop3_rows_expected_cta(
             rows["request"]["state"], 8)
         storage_state = parse_inner_outer_storage_state(
@@ -1492,9 +1536,10 @@ def check_iop3_inner_width_dependency(
                 rows_fields["regs_buffer_bits"] != str(target_plans[width][1]) or
                 actual_cta_fields != cta_fields or
                 iop3_cta_plan_fields(cta, 2) != cta_plans or
-                write_fields["inner_vector_width"] != str(width) or
-                write_fields["outer_read_width"] != "2" or
-                write_fields["tmp_dtype_bits"] != "32"):
+                (write_fields is not None and (
+                    write_fields["inner_vector_width"] != str(width) or
+                    write_fields["outer_read_width"] != "2" or
+                    write_fields["tmp_dtype_bits"] != "32"))):
             raise ValueError("inner width did not produce the exact dependent plan")
     shared_storage, narrow_storage = (
         parse_inner_outer_storage_state(row["request"]["state"])
@@ -1506,16 +1551,12 @@ def check_iop3_inner_width_dependency(
             {key: value for key, value in vars(narrow_storage).items()
              if key not in changing_storage}):
         raise ValueError("inner width changed unrelated storage measurements")
-    for site, version, changing in (
-            ("IOP3.tmp_read_width", "inner_outer_multi_wave.tmp_read_width.v1",
-             {"inner_vector_width", "legal_widths"}),
-            ("IOP3.tmp_write_width", "inner_outer_multi_wave.tmp_write_width.v2",
-             {"inner_vector_width"})):
-        before, after = paired[site]
-        left, right = (state_fields(row, version) for row in (before, after))
-        if ({key: value for key, value in left.items() if key not in changing} !=
-                {key: value for key, value in right.items() if key not in changing}):
-            raise ValueError(f"inner width changed unrelated {site} fields")
+    left, right = (state_fields(row, "inner_outer_multi_wave.tmp_read_width.v1")
+                   for row in read_rows)
+    changing = {"inner_vector_width", "legal_widths"}
+    if ({key: value for key, value in left.items() if key not in changing} !=
+            {key: value for key, value in right.items() if key not in changing}):
+        raise ValueError("inner width changed unrelated read-width fields")
     batch_before, batch_after = (
         {key: value for key, value in
          (line.split("=", 1) for line in row["request"]["state"].splitlines()[1:]
@@ -1538,6 +1579,88 @@ def check_iop3_inner_width_dependency(
         raise ValueError("inner width changed unrelated CTA measurements")
     if sorted(issues, key=str) != sorted(expected, key=str):
         raise ValueError(f"unexpected inner-width decision differences: {issues}")
+
+
+def check_iop3_singleton_lineage(
+        report: dict[str, Any], event: dict[str, Any],
+        intended: dict[str, str], issues: list[dict[str, str]],
+        trace_paths: tuple[Path, Path] | None,
+        server_log: Path | None) -> None:
+    """An upstream vector choice makes opposite IOP3 sites singletons."""
+    if trace_paths is None or server_log is None:
+        raise ValueError("IOP3 singleton lineage requires both source traces")
+    context = event["state"]
+    if (event["native"] != "w8" or event["requested_alternate"] != "w2" or
+            set(event["candidates"]) != {"w1", "w2", "w4", "w8"} or
+            not isinstance(context, dict) or
+            context.get("schema") != "nvfuser.systemone.context.v3"):
+        raise ValueError("IOP3 singleton fixture lacks the vector alternate")
+    from jev_shim import parse_inner_outer_inner_width_state
+    width = parse_inner_outer_inner_width_state(
+        context["decision"]["analysis_inputs_text"])
+    if width.inner_dim != 512 or width.outer_dim != 160:
+        raise ValueError("IOP3 singleton fixture changed its numeric shape")
+
+    expected_issues = {(intended["kind"], intended["site"])}
+    for dependent in ("IOP3.storage", "IOP3.min_batch",
+                      "IOP3.tmp_read_width", "IOP3.grid_rows"):
+        expected_issues |= {("record_only_state", dependent),
+                            ("remote_only_state", dependent)}
+    expected_issues |= {("remote_only_state", "IOP3.cta"),
+                        ("record_only_state", "IOP3.tmp_write_width")}
+    if (len(issues) != len(expected_issues) or
+            {(item["kind"], item["site"]) for item in issues} != expected_issues):
+        raise ValueError(f"unexpected singleton-dependent states: {issues}")
+
+    for arm, path in zip(("record", "remote"), trace_paths):
+        choices = trace_rows(path)
+        outcomes = trace_rows(path, outcome=True)
+        initial = [row for row in choices if row.get("site") == "IOP3.inner_width"]
+        cta = [row for row in choices if row.get("site") == "IOP3.cta"]
+        write = [row for row in choices if row.get("site") == "IOP3.tmp_write_width"]
+        local = [row for row in outcomes if row.get("kind") == "no_choice" and
+                 row.get("site") in ("IOP3.cta", "IOP3.tmp_write_width")]
+        final = [row for row in outcomes if
+                 row.get("schema") == "nvfuser.native_outcome.v2" and
+                 row.get("kind") == "final"]
+        if len(initial) != 1 or len(local) != 1 or len(final) != 1:
+            raise ValueError(f"{arm} lost the IOP3 numeric invocation")
+        invocation = initial[0]["compute_invocation_id"]
+        if (local[0].get("compute_invocation_id") != invocation or
+                final[0].get("compute_invocation_id") != invocation or
+                local[0].get("selection_source") != "hard_legal_singleton"):
+            raise ValueError(f"{arm} singleton escaped its compute invocation")
+        if arm == "record":
+            if (cta or len(write) != 1 or local[0].get("site") != "IOP3.cta" or
+                    local[0].get("selected") != "t64" or
+                    local[0].get("reason") !=
+                    "only one hard-valid inner-outer CTA plan" or
+                    write[0]["candidates"] != ["w2", "w4"] or
+                    write[0]["selected"] != "w4" or
+                    {"site": "IOP3.cta", "choice": "t64"} not in
+                    write[0]["state"]["current_schedule"]["prior_choices"] or
+                    final[0]["launch"]["block_x_raw"] != 64 or
+                    final[0]["scheduler_fields"]
+                    ["vectorization_factor_tmp_gmem_write"] != 4):
+                raise ValueError("Record lost local CTA or its downstream prior")
+        elif (len(cta) != 1 or write or
+              cta[0]["candidates"] != ["t256", "t128"] or
+              cta[0]["selected"] != "t256" or
+              local[0].get("site") != "IOP3.tmp_write_width" or
+              local[0].get("selected") != "w2" or
+              local[0].get("reason") !=
+              "only one hard-valid temporary write width" or
+              local[0]["compute_event_index"] <=
+              cta[0]["compute_event_index"] or
+              final[0]["launch"]["block_x_raw"] != 256 or
+              final[0]["scheduler_fields"]
+              ["vectorization_factor_tmp_gmem_write"] != 2):
+            raise ValueError("Remote lost its multi-choice CTA or local write")
+    served = [row for row in trace_rows(server_log)
+              if server_site(row) in ("IOP3.cta", "IOP3.tmp_write_width")]
+    if len(served) != 1 or server_site(served[0]) != "IOP3.cta" or \
+            served[0].get("status") != 200:
+        raise ValueError("singleton reached HTTP or multi-choice CTA did not")
 
 
 OUTER_STRIDE_KEYS = {
@@ -1704,6 +1827,7 @@ def check_alternate_report(report: dict[str, Any],
                            require_iop3_tmp_write: bool = False,
                            require_iop3_tmp_read: bool = False,
                            require_iop3_inner_width: bool = False,
+                           require_iop3_singleton_lineage: bool = False,
                            require_iop3_storage: bool = False,
                            require_transpose_tile: bool = False,
                            require_transpose_virtual: bool = False,
@@ -3453,10 +3577,16 @@ def check_alternate_report(report: dict[str, Any],
             ("hard_legal_singleton",) * 2)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent warp comparison issues: {issues}")
+    elif require_iop3_singleton_lineage:
+        if site != "IOP3.inner_width" or alternate != "w2":
+            raise ValueError("unexpected IOP3 singleton lineage alternate")
+        check_iop3_singleton_lineage(
+            report, event, intended, issues, trace_paths, server_log)
     elif require_iop3_inner_width:
         if site != "IOP3.inner_width" or alternate != "w2":
             raise ValueError("unexpected IOP3 inner-width alternate")
-        check_iop3_inner_width_dependency(report, event, intended, issues)
+        check_iop3_inner_width_dependency(
+            report, event, intended, issues, trace_paths)
     elif require_iop3_storage:
         if (site != "IOP3.storage" or event["native"] != "shared" or
                 alternate != "register" or
@@ -3614,16 +3744,25 @@ def check_alternate_report(report: dict[str, Any],
             if nested_site == "IOP3.cta":
                 record_row, remote_row = record_cta, remote_cta
                 pair_issues = []
+            elif nested_site == "IOP3.tmp_write_width" and alternate == "w4":
+                record_row, one_issue = iop3_record_write_remote_singleton(
+                    report, trace_paths, "w4")
+                remote_row, pair_issues = None, [one_issue]
             else:
                 record_row, remote_row, pair_issues = paired_state_rows(
                     report, nested_site)
-            if (record_row["record"] != remote_row["remote"] or
-                    sum(record_row["record"].values()) != 1):
+            if (sum(record_row["record"].values()) != 1 or
+                    (remote_row is not None and
+                     record_row["record"] != remote_row["remote"])):
                 raise ValueError(f"{nested_site} changed its winner: "
                                  f"{record_row}, {remote_row}")
+            if remote_row is None and record_row["record"] != {"w4": 1}:
+                raise ValueError("write-width singleton changed the native winner")
             cta_plans: dict[str, list[tuple[int, ...]]] = {}
             for row, width in ((record_row, "2"),
                                (remote_row, alternate_width)):
+                if row is None:
+                    continue
                 if nested_site == "IOP3.cta":
                     cta_plans[width] = iop3_cta_plan_fields(row, int(width))
                 elif state_fields(row, version).get(field) != width:
@@ -3790,6 +3929,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--require-iop3-tmp-write", action="store_true")
     parser.add_argument("--require-iop3-tmp-read", action="store_true")
     parser.add_argument("--require-iop3-inner-width", action="store_true")
+    parser.add_argument("--require-iop3-singleton-lineage", action="store_true")
     parser.add_argument("--require-iop3-storage", action="store_true")
     parser.add_argument("--require-transpose-tile", action="store_true")
     parser.add_argument("--require-transpose-virtual", action="store_true")
@@ -3973,6 +4113,7 @@ def main(argv: list[str] | None = None) -> int:
             require_iop3_tmp_write=args.require_iop3_tmp_write,
             require_iop3_tmp_read=args.require_iop3_tmp_read,
             require_iop3_inner_width=args.require_iop3_inner_width,
+            require_iop3_singleton_lineage=args.require_iop3_singleton_lineage,
             require_iop3_storage=args.require_iop3_storage,
             require_transpose_tile=args.require_transpose_tile,
             require_transpose_virtual=args.require_transpose_virtual,

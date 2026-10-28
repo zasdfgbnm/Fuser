@@ -1546,6 +1546,35 @@ if(BUILD_TEST)
       --expect-prior-in IOP3.storage)
   set_tests_properties(jev_remote_numeric_inner_outer_fixed_width_context
     PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_outer_cta_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.JevLayerNormBackwardSingletonCta
+      --case-key jev_remote_numeric_inner_outer_cta_singleton
+      --site-prefix IOP --required-site IOP3.tmp_write_width
+      --protocol semantic-v3
+      --expect-no-choice IOP3.cta=t64
+      --expect-no-choice-reason "only one hard-valid inner-outer CTA plan"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in IOP3.tmp_write_width)
+  set_tests_properties(jev_remote_numeric_inner_outer_cta_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_outer_tmp_write_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_inner_outer_tmp_write_singleton
+      --site-prefix IOP --required-site IOP3.storage
+      --protocol semantic-v3
+      --expect-no-choice IOP3.tmp_write_width=w1
+      --expect-no-choice-reason "only one hard-valid temporary write width"
+      --expect-no-choice-source hard_legal_singleton)
+  set_tests_properties(jev_remote_numeric_inner_outer_tmp_write_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_outer_min_batch
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
@@ -1579,6 +1608,17 @@ if(BUILD_TEST)
       --require-iop3-inner-width)
   set_tests_properties(jev_alternate_numeric_inner_outer_inner_width PROPERTIES
     RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_iop3_singleton_lineage
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.inner_width --alternate w2
+      --gtest CombinedSchedulerTest.JevLayerNormBackwardSingletonCta
+      --case-key jev_alternate_numeric_iop3_singleton_lineage
+      --protocol semantic-v3 --require-iop3-singleton-lineage)
+  set_tests_properties(jev_alternate_numeric_iop3_singleton_lineage
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_test(NAME jev_alternate_numeric_inner_outer_storage
     COMMAND "${Python_EXECUTABLE}"
       "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"

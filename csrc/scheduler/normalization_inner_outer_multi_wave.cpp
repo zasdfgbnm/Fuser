@@ -770,8 +770,21 @@ void getHeuristics(
           "IOP3 CTA plans cannot be offered safely within Jev bounds");
       iop = native_ranked.front();
     } else {
-      const auto selected = scheduler::jev::chooseDecision(
-          "IOP3.cta", state, options, native_choice);
+      std::string selected;
+      if (options.size() == 1) {
+        selected = options.front().id;
+        NVF_ERROR(
+            native_choice.empty() || native_choice == selected,
+            "The only hard-valid inner-outer CTA plan must be native");
+        scheduler::jev::recordHardSingletonDecision(
+            "IOP3.cta",
+            selected,
+            "only one hard-valid inner-outer CTA plan",
+            "hard_legal_singleton");
+      } else {
+        selected = scheduler::jev::chooseDecision(
+            "IOP3.cta", state, options, native_choice);
+      }
       const auto it = std::find_if(
           options.begin(),
           options.end(),
@@ -879,13 +892,26 @@ void getHeuristics(
           "\nouter_read_width=" +
           std::to_string(iop.vectorization_factor_outer) +
           "\ntmp_dtype_bits=" + std::to_string(tmp_gmem_dtype_size_bit);
-      const std::string selected = scheduler::jev::chooseDecision(
-          "IOP3.tmp_write_width",
-          state,
-          options,
-          jev_mode == scheduler::jev::Mode::Record
-              ? "w" + std::to_string(iop.tmp_gmem_write_vect)
-              : "");
+      std::string selected;
+      if (options.size() == 1) {
+        selected = options.front().id;
+        NVF_ERROR(
+            selected == "w" + std::to_string(iop.tmp_gmem_write_vect),
+            "The only hard-valid temporary write width must be native");
+        scheduler::jev::recordHardSingletonDecision(
+            "IOP3.tmp_write_width",
+            selected,
+            "only one hard-valid temporary write width",
+            "hard_legal_singleton");
+      } else {
+        selected = scheduler::jev::chooseDecision(
+            "IOP3.tmp_write_width",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record
+                ? "w" + std::to_string(iop.tmp_gmem_write_vect)
+                : "");
+      }
       const auto option = std::find_if(
           options.begin(), options.end(), [&](const auto& candidate) {
             return candidate.id == selected;
