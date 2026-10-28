@@ -44,9 +44,28 @@ inline std::vector<InnerUnrollRange> innerUnrollRanges(
   return ranges;
 }
 
-// The selected RD3.unroll target is passed to CTA, warp, and remainder
-// planning. This hierarchy retains the full structural range even when its
-// upper endpoint is too large for a single Choice request.
+// RD3.unroll chooses a concrete cap before the CTA, warp, and remainder
+// planners. The menu depends only on the hard reduction extent; the native
+// empirical target is never used to construct a Remote menu.
+inline std::vector<scheduler::jev::ChoiceOption> innerUnrollTargetChoices(
+    int64_t after_vect) {
+  if (after_vect < 1) {
+    throw std::invalid_argument("invalid RD3 inner extent");
+  }
+  std::vector<scheduler::jev::ChoiceOption> options;
+  for (int64_t target = 1; target <= after_vect && target <= 16;
+       target *= 2) {
+    options.push_back({
+        "u" + std::to_string(target),
+        "Cap inner unroll target at " + std::to_string(target) +
+            " element(s) per thread before CTA and remainder planning"});
+  }
+  return options;
+}
+
+// A non-power-of-two or larger native target remains unchanged in Record.
+// Such a case is explicitly outside this model experiment, so Remote cannot
+// silently approximate the original scheduler's result.
 inline int64_t chooseInnerUnrollTarget(
     const std::string& state_base,
     int64_t after_vect,
@@ -57,41 +76,28 @@ inline int64_t chooseInnerUnrollTarget(
        (native_target < 1 || native_target > after_vect))) {
     throw std::invalid_argument("invalid RD3.unroll Choice range");
   }
-  int64_t low = 1;
-  int64_t high = after_vect;
-  for (;;) {
-    const auto ranges = innerUnrollRanges(low, high);
-    std::vector<scheduler::jev::ChoiceOption> options;
-    options.reserve(ranges.size());
-    std::string native_choice;
-    for (const auto& range : ranges) {
-      options.push_back(
-          {range.id,
-           "Inner unroll target in [" + std::to_string(range.low) + ", " +
-               std::to_string(range.high) + "]"});
-      if (jev_mode == scheduler::jev::Mode::Record &&
-          range.low <= native_target && native_target <= range.high) {
-        native_choice = range.id;
-      }
-    }
-    const std::string state = state_base +
-        "range_low=" + std::to_string(low) + '\n' +
-        "range_high=" + std::to_string(high) + '\n';
-    const auto selected = scheduler::jev::chooseDecision(
-        "RD3.unroll", state, options, native_choice);
-    const auto found = std::find_if(
-        ranges.begin(), ranges.end(), [&](const InnerUnrollRange& range) {
-          return range.id == selected;
-        });
-    if (found == ranges.end()) {
-      throw std::runtime_error("RD3.unroll response is outside reduction bounds");
-    }
-    if (found->low == found->high) {
-      return found->low;
-    }
-    low = found->low;
-    high = found->high;
+  const auto options = innerUnrollTargetChoices(after_vect);
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record
+      ? "u" + std::to_string(native_target)
+      : "";
+  if (jev_mode == scheduler::jev::Mode::Record &&
+      std::none_of(options.begin(), options.end(), [&](const auto& option) {
+        return option.id == native_choice;
+      })) {
+    scheduler::jev::recordCoverageSkip(
+        "RD3.unroll", "native_target_outside_compact_menu");
+    return native_target;
   }
+  const auto selected = scheduler::jev::chooseDecision(
+      "RD3.unroll", state_base + "candidate_cap=16\n", options, native_choice);
+  for (int64_t target = 1; target <= after_vect && target <= 16;
+       target *= 2) {
+    if (selected == "u" + std::to_string(target)) {
+      return target;
+    }
+  }
+  throw std::runtime_error("RD3.unroll response is outside concrete target menu");
 }
 
 // RD3.remainder_x and RD3.remainder_u share this bounded Choice hierarchy.

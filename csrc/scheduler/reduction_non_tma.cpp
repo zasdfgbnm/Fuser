@@ -298,7 +298,7 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
                 at::cuda::current_device()) == cudaSuccess,
             "RD3.unroll could not read CUDA memory clock");
       }
-      std::string state_base = "reduction.inner_unroll.v1\n";
+      std::string state_base = "reduction.inner_unroll.v2\n";
       state_base += "reduction_numel=" +
           std::to_string(total_reduction_numel) + '\n';
       state_base += "vector_width=" + std::to_string(vect_factor) + '\n';

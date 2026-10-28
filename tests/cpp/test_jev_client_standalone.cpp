@@ -954,11 +954,16 @@ int main() {
         "IP3.prefetch Remote lost a hierarchy request or continuation");
   }
   {
-    // Exercise the exact RD3 helpers used by the scheduler with a target
-    // above the former 65,536 cap, then choose a small downstream unroll.
-    auto replies = innerRangeReplies("RD3.unroll", 70'000, 70'000);
-    const size_t unroll_requests = replies.size();
-    auto remainder_replies = innerRangeReplies("RD3.remainder_u", 70'000, 1);
+    // One concrete target Choice replaces the six-stage, 255-way hierarchy.
+    // The downstream remainder hierarchy remains independent and can still
+    // choose a smaller actual unroll factor.
+    auto remainder_replies = innerRangeReplies("RD3.remainder_u", 16, 1);
+    std::vector<std::string> replies = {
+        "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"RD3.unroll\":{"
+        "\"type\":\"choice\",\"choice\":\"u16\",\"confidence\":1.0,"
+        "\"probabilities\":{\"u1\":0.0,\"u2\":0.0,\"u4\":0.0,"
+        "\"u8\":0.0,\"u16\":1.0}}},"
+        "\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}"};
     replies.insert(
         replies.end(), remainder_replies.begin(), remainder_replies.end());
     FakeServer server(std::move(replies));
@@ -966,16 +971,16 @@ int main() {
     const std::string before = readFile(path);
     const int64_t target =
         nvfuser::reduction::non_tma::chooseInnerUnrollTarget(
-            "reduction.inner_unroll.v1\nreduction_numel=70000\n",
+            "reduction.inner_unroll.v2\nreduction_numel=70000\n",
             70'000,
             0,
             nvfuser::scheduler::jev::Mode::Remote);
-    require(target == 70'000, "RD3 Remote lost high target continuation");
+    require(target == 16, "RD3 Remote did not select the concrete cap");
     const int64_t remainder =
         nvfuser::reduction::non_tma::chooseInnerRemainderRange(
             "RD3.remainder_u",
             "reduction.inner_remainder_u.v1\nafter_vect=70000\n"
-            "target_inner_unroll=70000\n",
+            "target_inner_unroll=16\n",
             1,
             target,
             0,
@@ -983,14 +988,44 @@ int main() {
     require(remainder == 1, "RD3 Remote lost a small downstream factor");
     const std::string delta = readFile(path).substr(before.size());
     require(
-        unroll_requests >= 2 && remainder_replies.size() >= 2 &&
-            delta.find("\"selected\":\"u70000\"") != std::string::npos &&
+        remainder_replies.size() == 1 &&
+            delta.find("\"selected\":\"u16\"") != std::string::npos &&
             delta.find("\"selected\":\"u1\"") != std::string::npos &&
             server.request().find("RD3.unroll") != std::string::npos &&
             server.request().find("RD3.remainder_u") != std::string::npos &&
-            server.request().find("range_high=70000") != std::string::npos,
-        "RD3 Remote omitted a high-range or downstream request");
+            server.request().find("candidate_cap=16") != std::string::npos &&
+            server.request().find("u32") == std::string::npos,
+        "RD3 Remote omitted the compact target or downstream request");
   }
+  ::setenv("NVFUSER_JEV_MODE", "record", 1);
+  {
+    const std::string before = readFile(path);
+    require(
+        nvfuser::reduction::non_tma::chooseInnerUnrollTarget(
+            "reduction.inner_unroll.v2\nreduction_numel=70000\n",
+            70'000, 4, nvfuser::scheduler::jev::Mode::Record) == 4,
+        "RD3 Record did not preserve the offered native target");
+    const std::string offered = readFile(path).substr(before.size());
+    require(offered.find("\"selected\":\"u4\"") != std::string::npos,
+            "RD3 Record omitted its single concrete Choice");
+    const std::string before_skip = readFile(path);
+    require(
+        nvfuser::reduction::non_tma::chooseInnerUnrollTarget(
+            "reduction.inner_unroll.v2\nreduction_numel=70000\n",
+            70'000, 3, nvfuser::scheduler::jev::Mode::Record) == 3 &&
+            nvfuser::reduction::non_tma::chooseInnerUnrollTarget(
+                "reduction.inner_unroll.v2\nreduction_numel=70000\n",
+                70'000, 32, nvfuser::scheduler::jev::Mode::Record) == 32,
+        "RD3 Record changed a native target outside the compact menu");
+    const std::string skipped = readFile(path).substr(before_skip.size());
+    require(
+        skipped.find("native_target_outside_compact_menu") !=
+                std::string::npos &&
+            skipped.find("\"selected\":\"u3\"") == std::string::npos &&
+            skipped.find("\"selected\":\"u32\"") == std::string::npos,
+        "RD3 Record did not declare native-only continuation");
+  }
+  ::setenv("NVFUSER_JEV_MODE", "remote", 1);
   {
     FakeServer server(
         "{\"model\":\"nvfuser-analysis-v1\",\"answers\":{\"RD2.unroll\":{"

@@ -6014,6 +6014,41 @@ TEST_F(Gpu1Test, JevAlternateInnerGrid_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// A large 2D inner reduction reaches RD3's concrete target menu and leaves
+// enough work for the later remainder planner to exercise nontrivial unroll.
+// The alternate HTTP probe forces u8 or u16 and validates against ATen.
+TEST_F(Gpu1Test, JevCompactInnerUnrollTarget_CUDA) {
+  constexpr int output_size = 160;
+  constexpr int reduction_size = 262144;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->schedule_3d);
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // A 64-element reduction has a complete one-CTA remainder plan for every
 // offered target. On SM89 the native target is 256 threads; force the fully
 // checked 64-thread plan and compare both against the same ATen reduction.
