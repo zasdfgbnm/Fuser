@@ -7147,6 +7147,67 @@ TEST_F(Gpu1Test, JevAlternateInner3dPersistentWidth_CUDA) {
       results.heuristic_params->lparams);
 }
 
+// The two small 3D persistent reductions retain native hard singleton choices.
+// Other IP6 choices still use the Record or Remote path selected by the harness.
+namespace {
+void runJevInner3dHardSingleton(const std::vector<int64_t>& input_shape) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn(input_shape, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::InnerPersistent);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  ASSERT_NE(native, nullptr);
+  ASSERT_NE(results.heuristic_params, nullptr);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(
+        native->lparams.toString(),
+        results.heuristic_params->lparams.toString());
+  }
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+} // namespace
+
+TEST_F(Gpu1Test, JevInner3dHardWidthSingleton_CUDA) {
+  runJevInner3dHardSingleton({64, 32, 4});
+}
+
+TEST_F(Gpu1Test, JevInner3dHardRegisterSingleton_CUDA) {
+  runJevInner3dHardSingleton({4, 256, 16});
+}
+
 // The API may lower empirical outer reduction unrolling after the selected
 // vector width, wave cap, occupancy and warp target have been fixed.
 TEST_F(Gpu1Test, JevAlternateInner3dPersistentOuterUnroll_CUDA) {

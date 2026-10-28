@@ -171,9 +171,18 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def server_site(row: dict[str, Any]) -> str | None:
+    request = row.get("request")
+    questions = request.get("questions") if isinstance(request, dict) else None
+    if isinstance(questions, dict) and len(questions) == 1:
+        return next(iter(questions))
+    return row.get("site") if isinstance(row.get("site"), str) else None
+
+
 def check_no_choice(
     record: dict[str, Any], remote: dict[str, Any], server_log: Path,
     report: dict[str, Any], case_key: str, site: str, selected: str,
+    reason: str | None = None, source: str | None = None,
 ) -> dict[str, Any]:
     # A structural singleton is a completed computeHeuristics outcome. It
     # must appear in both native outcome streams and nowhere on the Choice
@@ -196,7 +205,9 @@ def check_no_choice(
             row.get("mode") != mode or
             row.get("case_key") != case_key or
             row.get("selected") != selected or
-            not row.get("reason") or not row.get("selection_source")
+            not row.get("reason") or not row.get("selection_source") or
+            (reason is not None and row.get("reason") != reason) or
+            (source is not None and row.get("selection_source") != source)
             for row in matching
         ):
             raise ValueError(
@@ -204,8 +215,35 @@ def check_no_choice(
         evidence[mode] = {"outcome_log": str(outcome_log),
                           "outcome_sha256": file_hash(outcome_log),
                           "no_choice": matching[0]}
-    if any(row.get("site") == site for row in read_jsonl(server_log)):
+    if any(server_site(row) == site for row in read_jsonl(server_log)):
         raise ValueError(f"API server received a singleton Choice at {site}")
+    return evidence
+
+
+def check_prior_choice(
+    record: dict[str, Any], remote: dict[str, Any], server_log: Path,
+    request_site: str, prior_site: str, selected: str,
+) -> dict[str, Any]:
+    expected = {"site": prior_site, "choice": selected}
+    evidence = {}
+    for mode, run in (("record", record), ("remote", remote)):
+        rows = [row for row in read_jsonl(Path(run["decision_log"]))
+                if row.get("site") == request_site]
+        if len(rows) != 1:
+            raise ValueError(f"expected one {mode} {request_site} Choice: {rows}")
+        prior = rows[0].get("state", {}).get("current_schedule", {}).get("prior_choices")
+        if not isinstance(prior, list) or prior.count(expected) != 1:
+            raise ValueError(f"{mode} {request_site} lacks prior {expected}: {prior}")
+        evidence[mode] = prior
+    rows = [row for row in read_jsonl(server_log)
+            if server_site(row) == request_site]
+    if len(rows) != 1:
+        raise ValueError(f"expected one API {request_site} request: {rows}")
+    prior = rows[0].get("request", {}).get("state", {}).get(
+        "current_schedule", {}).get("prior_choices")
+    if not isinstance(prior, list) or prior.count(expected) != 1:
+        raise ValueError(f"API {request_site} lacks prior {expected}: {prior}")
+    evidence["server"] = prior
     return evidence
 
 
@@ -217,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--site-prefix", required=True)
     parser.add_argument("--required-site")
     parser.add_argument("--expect-no-choice", metavar="SITE=SELECTED")
+    parser.add_argument("--expect-no-choice-reason")
+    parser.add_argument("--expect-no-choice-source")
+    parser.add_argument("--expect-prior-in", metavar="DOWNSTREAM_SITE")
+    parser.add_argument("--protocol", choices=("text-v1", "semantic-v2", "semantic-v3"))
     parser.add_argument("--analysis-only", action="store_true")
     parser.add_argument("--artifacts-root", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -238,6 +280,18 @@ def main(argv: list[str] | None = None) -> int:
             not no_choice_match["site"].startswith(args.site_prefix) or
             no_choice_match["site"] == args.required_site):
         parser.error("invalid no-choice site or selected ID")
+    if args.expect_no_choice is None and (
+            args.expect_no_choice_reason is not None or
+            args.expect_no_choice_source is not None or
+            args.expect_prior_in is not None):
+        parser.error("no-choice reason/source/prior requires --expect-no-choice")
+    if args.expect_prior_in is not None and (
+            REQUIRED_SITE.fullmatch(args.expect_prior_in) is None or
+            not args.expect_prior_in.startswith(args.site_prefix) or
+            args.expect_prior_in == no_choice_match["site"]):
+        parser.error("invalid downstream prior-choice site")
+    if args.expect_prior_in is not None and args.protocol != "semantic-v3":
+        parser.error("--expect-prior-in requires --protocol semantic-v3")
     if not args.binary.is_absolute() or not args.binary.is_file():
         parser.error("--binary must name an existing absolute test executable")
     if not args.artifacts_root.is_absolute():
@@ -253,6 +307,10 @@ def main(argv: list[str] | None = None) -> int:
         "required_site_prefix": args.site_prefix,
         "required_site": args.required_site,
         "expected_no_choice": args.expect_no_choice,
+        "expected_no_choice_reason": args.expect_no_choice_reason,
+        "expected_no_choice_source": args.expect_no_choice_source,
+        "expected_prior_in": args.expect_prior_in,
+        "protocol": args.protocol,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "binary": str(args.binary), "binary_sha256": file_hash(args.binary),
         "loader": str(loader), "loader_sha256": file_hash(loader),
@@ -274,7 +332,8 @@ def main(argv: list[str] | None = None) -> int:
         record = run_numeric(mode="record", binary=args.binary, names=names,
                              case_key=args.case_key, loader=loader, libraries=libraries,
                              directory=directory, port=None,
-                             analysis_only=args.analysis_only)
+                             analysis_only=args.analysis_only,
+                             protocol=args.protocol)
         manifest["runs"].append(record)
         manifest.pop("active_mode")
         write_manifest(manifest_path, manifest)
@@ -291,7 +350,8 @@ def main(argv: list[str] | None = None) -> int:
             remote = run_numeric(mode="remote", binary=args.binary, names=names,
                                  case_key=args.case_key, loader=loader, libraries=libraries,
                                  directory=directory, port=server.server_port,
-                                 analysis_only=args.analysis_only)
+                                 analysis_only=args.analysis_only,
+                                 protocol=args.protocol)
         finally:
             server.shutdown()
             thread.join()
@@ -316,7 +376,12 @@ def main(argv: list[str] | None = None) -> int:
         if no_choice_match is not None:
             manifest["no_choice_evidence"] = check_no_choice(
                 record, remote, server_log, report, args.case_key,
-                no_choice_match["site"], no_choice_match["selected"])
+                no_choice_match["site"], no_choice_match["selected"],
+                args.expect_no_choice_reason, args.expect_no_choice_source)
+            if args.expect_prior_in is not None:
+                manifest["prior_choice_evidence"] = check_prior_choice(
+                    record, remote, server_log, args.expect_prior_in,
+                    no_choice_match["site"], no_choice_match["selected"])
         manifest["status"] = ("analysis_and_decision_parity_pass" if args.analysis_only
                               else "numeric_and_decision_parity_pass")
         write_manifest(manifest_path, manifest)

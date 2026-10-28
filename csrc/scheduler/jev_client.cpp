@@ -714,6 +714,18 @@ void recordNoChoiceDecision(
   }
 }
 
+void recordHardSingletonDecision(
+    std::string_view site,
+    std::string_view selected,
+    std::string_view reason,
+    std::string_view selection_source) {
+  recordNoChoiceDecision(site, selected, reason, selection_source);
+  if (mode() != Mode::Off && semanticV3Enabled() &&
+      active_compute_scope != nullptr) {
+    active_compute_scope->recordSelectedChoice(site, selected);
+  }
+}
+
 void recordContextFallback(std::string_view reason) noexcept {
   try {
     if (mode() == Mode::Off || !semanticV3Enabled() || reason.empty()) return;

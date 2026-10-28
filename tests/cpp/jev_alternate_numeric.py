@@ -2274,20 +2274,19 @@ def check_alternate_report(report: dict[str, Any],
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed: {rows}")
         expected = [intended]
-        for nested_site, version, plan_key in (
-                ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1",
-                 "plan4"),
-                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1",
-                 "plan32")):
-            before, after, dependent = paired_state_rows(report, nested_site)
-            left = state_fields(before, version)
-            right = state_fields(after, version)
-            if (left[plan_key].split(",")[0] != "2" or
-                    right[plan_key].split(",")[0] != "1" or
-                    before["record"] != after["remote"] or
-                    sum(before["record"].values()) != 1):
-                raise ValueError(f"{nested_site} ignored the selected work split")
-            expected.extend(dependent)
+        before, after, dependent = paired_state_rows(report, "IP6.outer_unroll")
+        left = state_fields(before, "inner_persistent.3d_outer_unroll.v1")
+        right = state_fields(after, "inner_persistent.3d_outer_unroll.v1")
+        if (left["plan4"].split(",")[0] != "2" or
+                right["plan4"].split(",")[0] != "1" or
+                before["record"] != after["remote"] or
+                sum(before["record"].values()) != 1):
+            raise ValueError("IP6.outer_unroll ignored the selected work split")
+        expected.extend(dependent)
+        require_no_choice(
+            report, trace_paths, "IP6.reg_overhead", "r32",
+            ("only one hard-valid register allowance",) * 2,
+            ("hard_legal_singleton",) * 2)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected work-split dependencies: {issues}")
     elif require_inner3d_register_overhead:
@@ -2332,18 +2331,11 @@ def check_alternate_report(report: dict[str, Any],
             if (len(rows) != 1 or rows[0]["record"] != rows[0]["remote"] or
                     sum(rows[0]["record"].values()) != 1):
                 raise ValueError(f"upstream {upstream} changed with outer unroll: {rows}")
-        before, after, dependent = paired_state_rows(
-            report, "IP6.reg_overhead")
-        left = state_fields(
-            before, "inner_persistent.3d_register_overhead.v1")
-        right = state_fields(
-            after, "inner_persistent.3d_register_overhead.v1")
-        if (left.get("selected_outer_unroll") != "4" or
-                right.get("selected_outer_unroll") != "2" or
-                before["record"] != {"r32": 1} or
-                after["remote"] != {"r32": 1}):
-            raise ValueError("register plan ignored selected outer unroll")
-        if sorted(issues, key=str) != sorted([intended, *dependent], key=str):
+        require_no_choice(
+            report, trace_paths, "IP6.reg_overhead", "r32",
+            ("only one hard-valid register allowance",) * 2,
+            ("hard_legal_singleton",) * 2)
+        if issues != [intended]:
             raise ValueError(f"unexpected outer unroll comparison issues: {issues}")
     elif require_inner3d_width:
         if (site != "IP6.width" or event["native"] != "w4" or
@@ -2363,9 +2355,7 @@ def check_alternate_report(report: dict[str, Any],
                 ("IP6.warp", "inner_persistent.3d_warp_target.v1\n",
                  "inner_persistent.3d_warp_target.v3\n"),
                 ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1\n",
-                 "inner_persistent.3d_outer_unroll.v1\n"),
-                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1\n",
-                 "inner_persistent.3d_register_overhead.v1\n")):
+                 "inner_persistent.3d_outer_unroll.v1\n")):
             rows = [row for row in report["multiplicity"]
                     if row["site"] == nested_site]
             record_only = [row for row in rows
@@ -2405,6 +2395,10 @@ def check_alternate_report(report: dict[str, Any],
                 {"kind": "remote_only_state", "site": nested_site,
                  "request_sha256": remote_only[0]["request_sha256"]},
             ))
+        require_no_choice(
+            report, trace_paths, "IP6.reg_overhead", "r32",
+            ("only one hard-valid register allowance",) * 2,
+            ("hard_legal_singleton",) * 2)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected width-dependent issues: {issues}")
     elif require_inner3d_warp:
@@ -2422,16 +2416,17 @@ def check_alternate_report(report: dict[str, Any],
         if state.get("selected_wave_cap") != "4":
             raise ValueError(f"warp plan used an unexpected wave cap: {state}")
         expected = [intended]
-        for dependent_site, version in (
-                ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1"),
-                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1")):
-            before, after, replaced = paired_state_rows(report, dependent_site)
-            left = state_fields(before, version)
-            right = state_fields(after, version)
-            if (left.get("selected_warp_target") != "8" or
-                    right.get("selected_warp_target") != "16"):
-                raise ValueError(f"{dependent_site} ignored selected warp")
-            expected.extend(replaced)
+        before, after, replaced = paired_state_rows(report, "IP6.outer_unroll")
+        left = state_fields(before, "inner_persistent.3d_outer_unroll.v1")
+        right = state_fields(after, "inner_persistent.3d_outer_unroll.v1")
+        if (left.get("selected_warp_target") != "8" or
+                right.get("selected_warp_target") != "16"):
+            raise ValueError("IP6.outer_unroll ignored selected warp")
+        expected.extend(replaced)
+        require_no_choice(
+            report, trace_paths, "IP6.reg_overhead", "r32",
+            ("only one hard-valid register allowance",) * 2,
+            ("hard_legal_singleton",) * 2)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected 3D warp comparison issues: {issues}")
     elif require_inner3d_occupancy:
@@ -2464,16 +2459,17 @@ def check_alternate_report(report: dict[str, Any],
             {"kind": "remote_only_state", "site": "IP6.warp",
              "request_sha256": remote_warp[0]["request_sha256"]},
         ]
-        for dependent_site, version in (
-                ("IP6.outer_unroll", "inner_persistent.3d_outer_unroll.v1"),
-                ("IP6.reg_overhead", "inner_persistent.3d_register_overhead.v1")):
-            before, after, replaced = paired_state_rows(report, dependent_site)
-            left = state_fields(before, version)
-            right = state_fields(after, version)
-            if (left.get("selected_occupancy_target") != "28" or
-                    right.get("selected_occupancy_target") != "16"):
-                raise ValueError(f"{dependent_site} ignored selected occupancy")
-            expected.extend(replaced)
+        before, after, replaced = paired_state_rows(report, "IP6.outer_unroll")
+        left = state_fields(before, "inner_persistent.3d_outer_unroll.v1")
+        right = state_fields(after, "inner_persistent.3d_outer_unroll.v1")
+        if (left.get("selected_occupancy_target") != "28" or
+                right.get("selected_occupancy_target") != "16"):
+            raise ValueError("IP6.outer_unroll ignored selected occupancy")
+        expected.extend(replaced)
+        require_no_choice(
+            report, trace_paths, "IP6.reg_overhead", "r32",
+            ("only one hard-valid register allowance",) * 2,
+            ("hard_legal_singleton",) * 2)
         if sorted(issues, key=str) != sorted(expected, key=str):
             raise ValueError(f"unexpected dependent warp comparison issues: {issues}")
     elif require_iop3_inner_width:

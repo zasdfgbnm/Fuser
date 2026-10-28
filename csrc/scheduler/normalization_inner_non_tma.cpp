@@ -2383,8 +2383,21 @@ PersistentKernelProperties chooseInner3DVectorWidth(
       scheduler::jev::mode() == scheduler::jev::Mode::Record
       ? "w" + std::to_string(layout_max)
       : "";
-  const std::string selected = scheduler::jev::chooseDecision(
-      "IP6.width", state, options, native_choice);
+  std::string selected;
+  if (options.size() == 1) {
+    NVF_ERROR(
+        options.front().id == "w" + std::to_string(layout_max),
+        "The only hard-valid inner 3D width must be native");
+    selected = options.front().id;
+    scheduler::jev::recordHardSingletonDecision(
+        "IP6.width",
+        selected,
+        "only one hard-valid vector width",
+        "hard_legal_singleton");
+  } else {
+    selected = scheduler::jev::chooseDecision(
+        "IP6.width", state, options, native_choice);
+  }
   const auto option_it = std::find_if(
       options.begin(),
       options.end(),
@@ -2812,8 +2825,21 @@ std::unique_ptr<ReductionParams> chooseInner3DRegisterOverhead(
       scheduler::jev::mode() == scheduler::jev::Mode::Record
       ? "r" + std::to_string(native_overhead)
       : "";
-  const std::string selected = scheduler::jev::chooseDecision(
-      "IP6.reg_overhead", state, options, native_choice);
+  std::string selected;
+  if (options.size() == 1) {
+    NVF_ERROR(
+        options.front().id == "r" + std::to_string(native_overhead),
+        "The only hard-valid inner 3D register allowance must be native");
+    selected = options.front().id;
+    scheduler::jev::recordHardSingletonDecision(
+        "IP6.reg_overhead",
+        selected,
+        "only one hard-valid register allowance",
+        "hard_legal_singleton");
+  } else {
+    selected = scheduler::jev::chooseDecision(
+        "IP6.reg_overhead", state, options, native_choice);
+  }
   const auto option_it = std::find_if(
       options.begin(),
       options.end(),

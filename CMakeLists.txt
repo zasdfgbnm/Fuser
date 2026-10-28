@@ -1364,6 +1364,36 @@ if(BUILD_TEST)
     RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(inner_persistent
     "Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA" "IP")
+  add_test(NAME jev_remote_numeric_inner_hard_singleton_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dHardWidthSingleton_CUDA
+      --case-key jev_remote_numeric_inner_hard_singleton_width
+      --site-prefix IP --required-site IP6.waves
+      --protocol semantic-v3
+      --expect-no-choice IP6.width=w4
+      --expect-no-choice-reason "only one hard-valid vector width"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in IP6.waves
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_hard_singleton_width
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_hard_singleton_register
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dHardRegisterSingleton_CUDA
+      --case-key jev_remote_numeric_inner_hard_singleton_register
+      --site-prefix IP --required-site IP6.cta_floor
+      --protocol semantic-v3
+      --expect-no-choice IP6.reg_overhead=r32
+      --expect-no-choice-reason "only one hard-valid register allowance"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in IP6.cta_floor
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_hard_singleton_register
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
   add_jev_remote_numeric_test(outer_persistent
     "Gpu3Test.TemplateFunctionTypeMismatch" "OP")
   add_jev_remote_numeric_test(op_instance_norm_half
