@@ -207,6 +207,64 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation2_CUDA) {
             persistent_buffer_size_bit.persistent_buffer_size_bit);
   EXPECT_EQ(scheduler_utils::persistentProjectionLedgerJson(second_ledger),
             ledger_json);
+
+  const auto recompute =
+      reduction_scheduler_utils::persistentProjectionRecomputeEvidence(
+          &fusion, persistent_buffer_info);
+  ASSERT_EQ(recompute.projectable_buffers.size(), 1);
+  const auto& path = recompute.projectable_buffers[0];
+  EXPECT_EQ(path.buffer, tv1);
+  EXPECT_EQ(path.persistent_index, 0);
+  EXPECT_EQ(path.inputs, (std::vector<TensorView*>{tv0}));
+  EXPECT_EQ(path.persisted_inputs, (std::vector<TensorView*>{tv0}));
+  EXPECT_EQ(path.resolution_points, (std::vector<TensorView*>{tv5}));
+  EXPECT_THAT(path.persistent_uses, Contains(tv4));
+  ASSERT_EQ(path.recompute_expr_indices.size(), 1);
+  EXPECT_EQ(fusion.exprs()[path.recompute_expr_indices[0]], tv1->definition());
+  auto recompute_json =
+      reduction_scheduler_utils::persistentProjectionRecomputeJson(recompute);
+  EXPECT_NE(recompute_json.find(
+                "nvfuser.inner_persistent.projection_recompute.v1"),
+            std::string::npos);
+  EXPECT_EQ(recompute_json.find("0x"), std::string::npos);
+  EXPECT_EQ(
+      recompute_json,
+      reduction_scheduler_utils::persistentProjectionRecomputeJson(
+          reduction_scheduler_utils::persistentProjectionRecomputeEvidence(
+              &fusion, persistent_buffer_info)));
+}
+
+TEST_F(PersistentBufferTest, ProjectionRecomputeExp_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeSymbolicTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto* converted = castOp(DataType::Float, input);
+  auto* exponentials = exp(converted);
+  auto* sums = sum(exponentials, {1});
+  auto* sums_bcast = broadcast(sums, {false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto info = scheduler_utils::persistentBuffers(&fusion);
+  const auto evidence =
+      reduction_scheduler_utils::persistentProjectionRecomputeEvidence(
+          &fusion, info);
+  EXPECT_TRUE(evidence.projection_with_exp_op);
+  EXPECT_FALSE(evidence.projection_with_rng_op);
+  ASSERT_EQ(evidence.projectable_buffers.size(), 1);
+  const auto& path = evidence.projectable_buffers[0];
+  EXPECT_EQ(path.buffer, exponentials);
+  EXPECT_THAT(path.inputs, Contains(input));
+  EXPECT_THAT(path.persisted_inputs, Contains(input));
+  const auto fusion_exprs = fusion.exprs();
+  const auto exp_it = std::ranges::find(fusion_exprs, exponentials->definition());
+  ASSERT_NE(exp_it, fusion_exprs.end());
+  EXPECT_THAT(path.recompute_expr_indices,
+              Contains(std::distance(fusion_exprs.begin(), exp_it)));
+  EXPECT_EQ(
+      reduction_scheduler_utils::persistentProjectionRecomputeJson(evidence)
+          .find("0x"),
+      std::string::npos);
 }
 
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation3_CUDA) {
@@ -315,6 +373,21 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation3_CUDA) {
       nonprefix_sizes.projected_persistent_buffer_size_bit,
       aten_t0.size(1) * (dataTypeSizeBit(DataType::Float) +
                          dataTypeSizeBit(DataType::Half)));
+  const auto nonprefix_recompute =
+      reduction_scheduler_utils::persistentProjectionRecomputeEvidence(
+          &fusion, nonprefix_info);
+  ASSERT_EQ(nonprefix_recompute.projectable_buffers.size(), 1);
+  const auto& path = nonprefix_recompute.projectable_buffers[0];
+  EXPECT_EQ(path.buffer, tv7);
+  EXPECT_EQ(path.persistent_index, 1);
+  EXPECT_EQ(path.persisted_inputs, (std::vector<TensorView*>{tv5}));
+  EXPECT_EQ(path.resolution_points, (std::vector<TensorView*>{tv13}));
+  EXPECT_THAT(path.persistent_uses, Contains(tv12));
+  const auto fusion_exprs = fusion.exprs();
+  EXPECT_THAT(path.recompute_expr_indices,
+              Contains(std::distance(
+                  fusion_exprs.begin(),
+                  std::ranges::find(fusion_exprs, tv7->definition()))));
 }
 
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation4_CUDA) {

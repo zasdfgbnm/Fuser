@@ -7,8 +7,13 @@
 // clang-format on
 #include "scheduler/reduction_utils.h"
 
+#include <algorithm>
+#include <iterator>
 #include <limits>
+#include <locale>
 #include <ranges>
+#include <sstream>
+#include <unordered_map>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -1043,6 +1048,148 @@ std::vector<TensorView*> projectPersistentBuffers(
   PersistentBufferProjector pb_projector(
       fusion, persistent_info, project_to_inputs);
   return pb_projector.project();
+}
+
+PersistentProjectionRecomputeEvidence persistentProjectionRecomputeEvidence(
+    Fusion* fusion,
+    const scheduler_utils::PersistentBufferInfo& persistent_info) {
+  NVF_ERROR(fusion != nullptr, "Projection evidence requires a fusion");
+  NVF_ERROR(
+      persistent_info.persistent_buffers.size() ==
+          persistent_info.persistent_buffer_resolution_points.size(),
+      "Projection evidence requires one resolution list per buffer");
+  FusionGuard fg(fusion);
+  const auto reduction_tvs = scheduler_utils::getReductionTvs(fusion);
+  const auto exprs = fusion->exprs();
+  std::unordered_map<const Expr*, int64_t> expr_index;
+  expr_index.reserve(exprs.size());
+  for (int64_t i = 0; i < std::ssize(exprs); ++i) {
+    expr_index.emplace(exprs[i], i);
+  }
+
+  PersistentProjectionRecomputeEvidence evidence;
+  evidence.projection_with_exp_op = persistent_info.projection_with_exp_op;
+  evidence.projection_with_rng_op = persistent_info.projection_with_rng_op;
+  evidence.projectable_buffers.reserve(
+      persistent_info.projectable_persistent_buffers.size());
+  for (TensorView* buffer : persistent_info.projectable_persistent_buffers) {
+    const auto buffer_it = std::ranges::find(
+        persistent_info.persistent_buffers, buffer);
+    NVF_ERROR(
+        buffer_it != persistent_info.persistent_buffers.end(),
+        "Projectable buffer is missing from persistent buffers");
+    const int64_t index = std::distance(
+        persistent_info.persistent_buffers.begin(), buffer_it);
+    PersistentProjectionRecomputeEntry entry;
+    entry.buffer = buffer;
+    entry.persistent_index = index;
+    entry.inputs = ir_utils::inputTvsOf(buffer);
+    entry.resolution_points =
+        persistent_info.persistent_buffer_resolution_points[index];
+    for (TensorView* input : entry.inputs) {
+      if (std::ranges::find(
+              persistent_info.projectable_buffer_inputs, input) !=
+          persistent_info.projectable_buffer_inputs.end()) {
+        entry.persisted_inputs.push_back(input);
+      }
+    }
+
+    // Match the roots used by PersistentBufferProjector::projectToInputs.
+    entry.recompute_roots = fusion->inputs();
+    const auto [can_project, broadcast_tvs] =
+        scheduler_utils::canProjectToInputsWithoutReduction(
+            reduction_tvs, buffer);
+    if (can_project) {
+      entry.recompute_roots.insert(
+          entry.recompute_roots.end(),
+          broadcast_tvs.begin(),
+          broadcast_tvs.end());
+    }
+    const auto path = StmtSort::getExprsBetween(
+        {entry.recompute_roots.begin(), entry.recompute_roots.end()},
+        {buffer});
+    for (const Expr* expr : path) {
+      const auto found = expr_index.find(expr);
+      NVF_ERROR(
+          found != expr_index.end(),
+          "Projection recompute expression is absent from fusion order");
+      entry.recompute_expr_indices.push_back(found->second);
+    }
+
+    // Match PersistentBufferProjector::getPersistentUseOfBuffer. Every
+    // distinct non-reduction use causes one recomputation of the path above.
+    for (TensorView* resolution : entry.resolution_points) {
+      for (const auto& chain :
+           DependencyCheck::getAllDependencyChains(buffer, resolution)) {
+        const auto tv_chain = ir_utils::filterByType<TensorView>(chain);
+        if (std::ranges::any_of(tv_chain, [](TensorView* tv) {
+              return tv->hasReduction();
+            })) {
+          continue;
+        }
+        NVF_ERROR(
+            chain.size() >= 2,
+            "Projection persistent-use path is incomplete");
+        Val* use = chain[1];
+        if (std::ranges::find(entry.persistent_uses, use) ==
+            entry.persistent_uses.end()) {
+          entry.persistent_uses.push_back(use);
+        }
+      }
+    }
+    evidence.projectable_buffers.push_back(std::move(entry));
+  }
+  return evidence;
+}
+
+std::string persistentProjectionRecomputeJson(
+    const PersistentProjectionRecomputeEvidence& evidence) {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  const auto write_val = [&out](const Val* val) {
+    NVF_ERROR(val != nullptr, "Projection recompute evidence has a null Val");
+    out << '[' << static_cast<int64_t>(val->vtype()) << ',' << val->name()
+        << ']';
+  };
+  const auto write_vals = [&out, &write_val](const auto& vals) {
+    out << '[';
+    for (size_t i = 0; i < vals.size(); ++i) {
+      if (i != 0) out << ',';
+      write_val(vals[i]);
+    }
+    out << ']';
+  };
+  out << "{\"schema\":\"nvfuser.inner_persistent.projection_recompute.v1\","
+         "\"has_exp\":"
+      << (evidence.projection_with_exp_op ? "true" : "false")
+      << ",\"has_rng\":"
+      << (evidence.projection_with_rng_op ? "true" : "false")
+      << ",\"projectable_buffers\":[";
+  for (size_t i = 0; i < evidence.projectable_buffers.size(); ++i) {
+    const auto& entry = evidence.projectable_buffers[i];
+    if (i != 0) out << ',';
+    out << "{\"buffer\":";
+    write_val(entry.buffer);
+    out << ",\"persistent_index\":" << entry.persistent_index
+        << ",\"inputs\":";
+    write_vals(entry.inputs);
+    out << ",\"persisted_inputs\":";
+    write_vals(entry.persisted_inputs);
+    out << ",\"recompute_roots\":";
+    write_vals(entry.recompute_roots);
+    out << ",\"resolution_points\":";
+    write_vals(entry.resolution_points);
+    out << ",\"persistent_uses\":";
+    write_vals(entry.persistent_uses);
+    out << ",\"recompute_expr_indices\":[";
+    for (size_t j = 0; j < entry.recompute_expr_indices.size(); ++j) {
+      if (j != 0) out << ',';
+      out << entry.recompute_expr_indices[j];
+    }
+    out << "]}";
+  }
+  out << "]}";
+  return out.str();
 }
 
 ReductionType getReductionType(const std::vector<TensorView*>& reduction_tvs) {
