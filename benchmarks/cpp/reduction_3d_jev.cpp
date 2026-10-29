@@ -9,6 +9,7 @@
 #include <benchmarks/cpp/utils.h>
 
 #include <runtime/fusion_kernel_runtime.h>
+#include <scheduler/jev_client.h>
 #include <tests/cpp/utils.h>
 
 #include <ATen/ATen.h>
@@ -56,9 +57,14 @@ void runReduction3D(
   NVF_ERROR(
       params != nullptr && params->scheduler_type == SchedulerType::Reduction,
       "Expected one Reduction scheduler");
-  NVF_ERROR(
-      params->as<ReductionParams>()->schedule_3d,
-      "Expected a genuine 3D Reduction plan");
+  // Native scheduling must exercise the 3D plan used to select these cases.
+  // A Remote RD4 choice may legally flatten the same reduction to 2D; keep
+  // the ATen output check below for either model-selected schedule.
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Remote) {
+    NVF_ERROR(
+        params->as<ReductionParams>()->schedule_3d,
+        "Expected a genuine native 3D Reduction plan");
+  }
   NVF_ERROR(outputs.size() == 1);
   auto reference = input.sum(std::vector<int64_t>{0, 2});
   NVF_ERROR(
