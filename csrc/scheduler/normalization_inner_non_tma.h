@@ -28,7 +28,8 @@ using PersistentKernelProperties =
 std::unique_ptr<ReductionParams> getInnerPersistentHeuristics(
     Fusion* fusion,
     const PersistentKernelProperties& prop,
-    HeuristicDataCache* data_cache);
+    HeuristicDataCache* data_cache,
+    SchedulerRuntimeInfo& runtime_info);
 
 void scheduleInnerPersistent(Fusion* fusion, const ReductionParams* rparams);
 

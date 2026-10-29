@@ -49,7 +49,7 @@ bool CommunicationScheduler::canScheduleRunTime(
   return true;
 }
 
-std::unique_ptr<HeuristicParams> CommunicationScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> CommunicationScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

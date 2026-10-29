@@ -9,14 +9,164 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
+#include <string_view>
+#include <utility>
+
 #include "ir/printer.h"
 #include "multidevice/utils.h"
 #include "scheduler/cache_policy_refiner.h"
+#include "scheduler/jev_client.h"
+#include "scheduler/native_diagnostic_jsonl.h"
+#include "scheduler/pointwise_add_cta_continuation.h"
 #include "scheduler/registry.h"
 #include "scheduler/runtime_info.h"
 
 namespace nvfuser {
 namespace pointwise_utils {
+
+const char* semanticPointwiseEligibilityReason(
+    Fusion* fusion,
+    std::string_view snapshot,
+    bool semantic_v3) {
+  // v2 requests have a 64 KiB limit after candidates are added. v3 captures
+  // at most 1 MiB of invocation input and allows an 8 MiB complete request.
+  if (snapshot.empty()) {
+    return "semantic_graph_snapshot_unavailable";
+  }
+  if (snapshot.size() > (semantic_v3 ? 1024 * 1024 : 8192)) {
+    return "semantic_graph_snapshot_too_large";
+  }
+  if (fusion == nullptr || fusion->inputs().empty() ||
+      fusion->outputs().empty()) {
+    return "semantic_graph_missing_tensors";
+  }
+  for (Val* input : fusion->inputs()) {
+    if (!input->isA<TensorView>()) {
+      return "semantic_graph_scalar_input";
+    }
+  }
+  for (Val* output : fusion->outputs()) {
+    if (!output->isA<TensorView>() ||
+        fusion->getOutputAlias(output).type != AllocationType::New) {
+      return "semantic_graph_output_or_alias";
+    }
+  }
+  // Fusion::print(false) renders loop domains, while ExpressionEvaluator
+  // binds runtime tensor dimensions to logical domains. The equality check
+  // must include intermediate TVs, not only fusion inputs and outputs.
+  for (Val* val : fusion->vals()) {
+    if (!val->isA<TensorView>()) {
+      continue;
+    }
+    const auto* tv = val->as<TensorView>();
+    const auto& logical = tv->getLogicalDomain();
+    const auto& loop = tv->getLoopDomain();
+    if (tv->hasDeviceMesh() || tv->isCpuScalar()) {
+      return "semantic_graph_sharded_or_cpu_scalar";
+    }
+    if (tv->getMemoryType() != MemoryType::Global &&
+        tv->getMemoryType() != MemoryType::Local) {
+      return "semantic_graph_memory_type";
+    }
+    if (tv->dtype() != DataType::Float && tv->dtype() != DataType::Half) {
+      return "semantic_graph_dtype";
+    }
+    if (logical.empty() || logical != loop ||
+        tv->getMaybeAllocationDomain() != logical ||
+        !tv->domain()->allExprs().empty()) {
+      return "semantic_graph_hidden_domain_transform";
+    }
+    for (size_t i = 0; i < logical.size(); ++i) {
+      const auto* id = logical[i];
+      if (id->isReduction() || id->isStride() || id->isSymbolic() ||
+          id->isDeviceDim() || id->hasExpandedExtent() ||
+          id->isParallelized() ||
+          (!id->isIteration() && !id->isBroadcast())) {
+        return "semantic_graph_unsupported_axis";
+      }
+    }
+    // Contiguity affects native vectorization limits, but does not change
+    // logical extents. Runtime sizes and strides are part of the snapshot;
+    // the semantic mock only derives extents and checks native summaries.
+    // BroadcastOp may introduce a logical axis, so root==logical is not
+    // required. Domain transforms are excluded by allExprs() above.
+  }
+  // IrPrinter emits exactly fusion->exprs(). Restrict this set to the mock's
+  // proven unary/binary/broadcast/set grammar; other ops stay native.
+  for (Expr* expr : fusion->exprs()) {
+    if (expr->isA<BroadcastOp>()) {
+      continue;
+    }
+    if (expr->isA<LoadStoreOp>()) {
+      const auto* op = expr->as<LoadStoreOp>();
+      if (op->opType() == LoadStoreOpType::Set &&
+          op->cacheOp() == CacheOp::Unspecified) {
+        continue;
+      }
+    }
+    if (expr->isA<UnaryOp>()) {
+      const auto* op = expr->as<UnaryOp>();
+      if (op->getUnaryOpType() == UnaryOpType::Neg ||
+          op->getUnaryOpType() == UnaryOpType::Erf ||
+          op->getUnaryOpType() == UnaryOpType::Tanh) {
+        if (op->out()->isA<TensorView>()) {
+          continue;
+        }
+      }
+      if (op->getUnaryOpType() == UnaryOpType::Cast &&
+          ((op->in()->dtype() == DataType::Half &&
+            op->out()->dtype() == DataType::Float) ||
+           (op->in()->dtype() == DataType::Float &&
+            op->out()->dtype() == DataType::Half) ||
+           (op->in()->isConstScalar() &&
+            op->out()->dtype() == DataType::Float))) {
+        continue;
+      }
+    }
+    if (expr->isA<BinaryOp>()) {
+      const auto* op = expr->as<BinaryOp>();
+      if (op->out()->isA<TensorView>() &&
+          (op->getBinaryOpType() == BinaryOpType::Add ||
+           op->getBinaryOpType() == BinaryOpType::Sub ||
+           op->getBinaryOpType() == BinaryOpType::Mul ||
+           op->getBinaryOpType() == BinaryOpType::Div)) {
+        continue;
+      }
+    }
+    return "semantic_graph_unsupported_operator";
+  }
+  return nullptr;
+}
+
+std::string semanticPointwiseWorkload(
+    int64_t sm_count,
+    const cudaDeviceProp* device) {
+  const auto snapshot = scheduler::jev::computeInvocationInputSnapshot();
+  NVF_ERROR(
+      !snapshot.empty(),
+      "PointWise semantic request has no complete computeHeuristics snapshot: ",
+      scheduler::jev::computeInvocationInputUnavailableReason());
+  std::string workload =
+      "{\"fusion_and_runtime\":" + scheduler::jev::jsonQuote(snapshot) +
+      ",\"snapshot_format\":\"nvfuser.compute_invocation_input.v1\"";
+  workload += ",\"hardware\":{\"sm_count\":" + std::to_string(sm_count) +
+      ",\"device_name\":" + scheduler::jev::jsonQuote(device->name) +
+      ",\"compute_capability_major\":" + std::to_string(device->major) +
+      ",\"compute_capability_minor\":" + std::to_string(device->minor) +
+      ",\"warp_size\":" + std::to_string(device->warpSize) +
+      ",\"max_threads_per_block\":" +
+      std::to_string(device->maxThreadsPerBlock) + ",\"max_threads_per_sm\":" +
+      std::to_string(device->maxThreadsPerMultiProcessor) +
+      ",\"max_threads_x\":" + std::to_string(device->maxThreadsDim[0]) +
+      ",\"max_threads_y\":" + std::to_string(device->maxThreadsDim[1]) +
+      ",\"registers_per_sm\":" + std::to_string(device->regsPerMultiprocessor) +
+      ",\"shared_memory_per_sm_bytes\":" +
+      std::to_string(device->sharedMemPerMultiprocessor) +
+      ",\"max_grid_x\":" + std::to_string(device->maxGridSize[0]) +
+      ",\"max_grid_y\":" + std::to_string(device->maxGridSize[1]) + "}}";
+  return workload;
+}
 
 TensorView* getReferenceTensor(Fusion* fusion) {
   FusionGuard fg(fusion);
@@ -174,13 +324,74 @@ std::optional<FusionRuntimeProperties> getFusionRuntimeProperties(
   return prop;
 }
 
+TmaBreakPointSearch getTmaBreakPointSearch(
+    const FusionRuntimeProperties& prop,
+    HeuristicDataCache* data_cache) {
+  const auto& largest_out = prop.largest_out;
+  const auto index_type = prop.index_type;
+  auto broadcast_info_entry = HeuristicDataCacheEntry<
+      HeuristicCompileTime::BroadcastMultiples>(
+      data_cache, [&largest_out, &index_type]() {
+        return std::make_unique<scheduler_utils::BroadcastMultipleInformation>(
+            scheduler_utils::getBroadcastMultiples(largest_out, index_type));
+      });
+  const auto& info = broadcast_info_entry.get();
+  const auto& extents = prop.elem_counts;
+  NVF_ERROR_EQ(extents.size(), info.broadcast_multiples.size());
+
+  TmaBreakPointSearch search;
+  search.state = "pointwise.tma_breakpoint.v1\n";
+  auto append = [&](std::string_view key, const auto& value) {
+    search.state += std::string(key) + '=';
+    for (size_t i = 0; i < value.size(); ++i) {
+      if (i != 0) {
+        search.state += ',';
+      }
+      search.state += std::to_string(value[i]);
+    }
+    search.state += '\n';
+  };
+  std::vector<int64_t> disjoint;
+  std::vector<int64_t> lhs;
+  std::vector<int64_t> rhs;
+  for (size_t i = 0; i < extents.size(); ++i) {
+    disjoint.push_back(
+        scheduler_utils::breakIsDisjoint(info.view_disjoint_set_ids, i));
+    lhs.push_back(info.broadcast_multiples[i].lhs_multiple);
+    rhs.push_back(info.broadcast_multiples[i].rhs_multiple);
+  }
+  append("elements", extents);
+  append("disjoint", disjoint);
+  append("lhs_bit_multiples", lhs);
+  append("rhs_bit_multiples", rhs);
+
+  // bp0 is the existing one-dimensional fallback, even when no split is
+  // view-disjoint. Other candidates need a real left and right side.
+  search.candidates.emplace_back();
+  int64_t right_count = 1;
+  for (int64_t i = static_cast<int64_t>(extents.size()) - 1; i >= 1; --i) {
+    right_count *= extents[i];
+    if (!disjoint[i] || prop.n_elems / right_count <= 1) {
+      continue;
+    }
+    BreakPointInfo candidate;
+    candidate.break_point = static_cast<int>(i);
+    candidate.right_elem_count = right_count;
+    candidate.is_outer_broadcast_dominated = lhs[i] < rhs[i];
+    search.candidates.push_back(candidate);
+  }
+  return search;
+}
+
 BreakPointInfo getBreakPoint(
     Fusion* fusion,
     const FusionRuntimeProperties& prop,
     HeuristicDataCache* data_cache,
     bool is_tma,
     int64_t max_vect_factor,
-    int64_t kThreadX) {
+    int64_t kThreadX,
+    bool native_default_1d,
+    bool exact_sm89_add2x16) {
   BreakPointInfo result;
 
   // Calculate dtype_sum_bit from fusion inputs/outputs
@@ -214,6 +425,233 @@ BreakPointInfo getBreakPoint(
   result.flip_grid_binding = false;
   result.right_elem_count = 0;
   result.is_outer_broadcast_dominated = false;
+
+  // PW2's choice includes both the split and the BID binding. Keep the view
+  // and nonempty-left checks in nvFuser: they define which plans are legal.
+  // The request carries measurements only, never the native winning plan.
+  const auto jev_mode =
+      is_tma ? scheduler::jev::Mode::Off : scheduler::jev::mode();
+  const bool bounded_add = exact_sm89_add2x16 && !is_tma &&
+      scheduler::jev::semanticV3Enabled() && ref_loop.size() == 2 &&
+      elem_counts == std::vector<int64_t>{2, 16} && n_elems == 32 &&
+      max_vect_factor == 4 && kThreadX == 128 &&
+      prop.index_type == PrimDataType::Int32 &&
+      scheduler_utils::breakIsDisjoint(view_disjoint_sets, 1) &&
+      broadcast_bit_multiples[1].lhs_multiple >=
+          broadcast_bit_multiples[1].rhs_multiple;
+  struct JevBreakpointRequest {
+    std::string state;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::vector<BreakPointInfo> plans;
+  };
+  auto make_jev_request = [&]() {
+    JevBreakpointRequest request;
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    if (bounded_add) {
+      request.state = "pointwise.breakpoint.v4\n";
+    } else if (semantic_v3) {
+      request.state = "pointwise.breakpoint.v3\n";
+    } else {
+      request.state = "pointwise.breakpoint.v2\n";
+    }
+    std::vector<int64_t> disjoint;
+    std::vector<int64_t> lhs;
+    std::vector<int64_t> rhs;
+    disjoint.reserve(ref_loop.size());
+    lhs.reserve(ref_loop.size());
+    rhs.reserve(ref_loop.size());
+    for (const auto i : arange(ref_loop.size())) {
+      disjoint.push_back(
+          scheduler_utils::breakIsDisjoint(view_disjoint_sets, i));
+      lhs.push_back(broadcast_bit_multiples[i].lhs_multiple);
+      rhs.push_back(broadcast_bit_multiples[i].rhs_multiple);
+    }
+    auto append_vector = [&](std::string_view name, const auto& values) {
+      request.state += std::string(name) + '=';
+      for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+          request.state += ',';
+        }
+        request.state += std::to_string(values[i]);
+      }
+      request.state += '\n';
+    };
+    append_vector("elements", elem_counts);
+    append_vector("disjoint", disjoint);
+    append_vector("lhs_bit_multiples", lhs);
+    append_vector("rhs_bit_multiples", rhs);
+    request.state += "dtype_sum_bits=" + std::to_string(dtype_sum_bit) + '\n';
+    request.state +=
+        "max_vectorization=" + std::to_string(max_vect_factor) + '\n';
+    request.state += "warp_size=" +
+        std::to_string(at::cuda::getCurrentDeviceProperties()->warpSize) + '\n';
+    request.state += "l2_cache_bytes=" +
+        std::to_string(at::cuda::getCurrentDeviceProperties()->l2CacheSize) +
+        '\n';
+    // The ordinary scheduler's small-workload preference is part of PW2's
+    // native answer after PW2.entry was removed. Expose every operand so a
+    // stateless service can replay that preference from this request alone.
+    request.state += "n_elems=" + std::to_string(n_elems) + '\n';
+    request.state +=
+        "sm_count=" + std::to_string(prop.device_multiprocessor_count) + '\n';
+    request.state += "default_cta_threads=" + std::to_string(kThreadX);
+    if (bounded_add) {
+      request.state += "\ncarrier=sm89_fp32_add_2x16";
+      request.state += "\nindex_type=11";
+      request.state += "\nwidth_choices=w1,w2,w4";
+      request.state += "\nexpr_count=1";
+      request.state += "\nunroll_max_cap=64";
+      request.state += "\nunroll_expr_width_budget=8192";
+      request.state += "\ngrid_split_status=none_for_carrier";
+    }
+
+    // The ordinary consequence describes PW2's local geometry. The exact Add
+    // carrier also gives a compact bounded descendant grammar without running
+    // those descendants; named PW3 sites are possible future choices.
+    auto append_option = [&](std::string id,
+                             std::string description,
+                             const BreakPointInfo& plan) {
+      std::string consequence;
+      if (semantic_v3) {
+        scheduler::native_diagnostic::Object effect;
+        effect.add("break_point", static_cast<int64_t>(plan.break_point));
+        // bp0 has no 2D split: all work belongs to its sole 1D domain.
+        effect.add(
+            "left_elems",
+            plan.break_point == 0 ? 0 : n_elems / plan.right_elem_count);
+        effect.add(
+            "right_elems",
+            plan.break_point == 0 ? n_elems : plan.right_elem_count);
+        effect.add(
+            "grid_binding",
+            plan.break_point == 0
+                ? "one_dimensional"
+                : (plan.flip_grid_binding ? "flipped" : "normal"));
+        effect.add(
+            "outer_broadcast_dominated", plan.is_outer_broadcast_dominated);
+        if (bounded_add) {
+          const auto bounded =
+              pointwise::non_tma::addBreakpointContinuation(plan.break_point);
+          NVF_ERROR(
+              bounded.has_value(),
+              "PW2 exact Add continuation lost its bounded descendant menu");
+          const bool two_dimensional = plan.break_point == 1;
+          scheduler::native_diagnostic::Object grammar;
+          grammar.add("schema", "nvfuser.pw2.add2x16.v1");
+          grammar.add("plan_scope", "ordinary_pointwise_branch");
+          grammar.addRaw("width_choices", "[\"w1\",\"w2\",\"w4\"]");
+          grammar.add("width_count", bounded->width_count);
+          grammar.add(
+              "cta_choice_site",
+              two_dimensional ? "PW3.launch" : "PW3.cta_1d");
+          grammar.add(
+              "cta_choices_kind",
+              two_dimensional ? "integer_range" : "warp_powers_of_two");
+          grammar.add(
+              "cta_range_low", two_dimensional ? int64_t{1} : int64_t{32});
+          grammar.add("cta_range_high", int64_t{128});
+          grammar.add("cta_count_per_width", bounded->cta_count_per_width);
+          grammar.add("terminal_leaf_count", bounded->terminal_leaf_count);
+          grammar.add("max_unroll_bound", bounded->max_unroll_bound);
+          grammar.add(
+              "unroll_choices_kind",
+              two_dimensional ? "integer_1_to_B_or_no_choice"
+                              : "no_choice_u1");
+          grammar.add("cta_y_formula", two_dimensional ? "floor(128/X)" : "1");
+          if (two_dimensional) {
+            grammar.add("preliminary_left_formula", "ceil(2/Y)");
+            grammar.add("preliminary_right_formula", "ceil(ceil(16/W)/X)");
+            grammar.add(
+                "unroll_bound_formula",
+                "min(max(1,L*R),64,max(1,floor(8192/E/W)))");
+            grammar.add("post_unroll_right_formula", "ceil(R/U)");
+            grammar.add(
+                "effective_grid_x_formula",
+                plan.flip_grid_binding ? "L" : "ceil(R/U)");
+            grammar.add(
+                "effective_grid_y_formula",
+                plan.flip_grid_binding ? "ceil(R/U)" : "L");
+            grammar.add("right_coverage_formula", "ceil(R/U)*X*W*U");
+            grammar.add("right_tail_formula", "right_coverage-16");
+          } else {
+            grammar.add("unroll_bound_formula", "ceil(floor(32/W)/X)");
+            grammar.add(
+                "effective_grid_x_formula", "ceil(ceil(ceil(32/W)/X)/U)");
+            grammar.add("effective_grid_y_formula", "1");
+            grammar.add("right_coverage_formula", "grid_x*X*W*U");
+            grammar.add("right_tail_formula", "right_coverage-32");
+          }
+          grammar.add("grid_split_status", "none_for_carrier");
+          effect.addRaw("continuation", grammar.str());
+        }
+        effect.addRaw(
+            "pending_choices",
+            bounded_add && plan.break_point == 0
+                ? "[\"PW3.width\",\"PW3.cta_1d\"]"
+                : plan.break_point == 0
+                ? "[\"PW3.width\",\"PW3.cta_1d\",\"PW3.unroll\"]"
+                : "[\"PW3.width\",\"PW3.launch\",\"PW3.unroll\"]");
+        consequence = effect.str();
+      }
+      request.options.push_back(
+          {std::move(id), std::move(description), std::move(consequence)});
+      request.plans.push_back(plan);
+    };
+    append_option("bp0", "Use one-dimensional scheduling", BreakPointInfo{});
+    int64_t right_count = 1;
+    for (int64_t i = static_cast<int64_t>(ref_loop.size()) - 1; i >= 1; --i) {
+      right_count *= elem_counts[i];
+      if (!disjoint[i] || n_elems / right_count <= 1) {
+        continue;
+      }
+      BreakPointInfo plan;
+      plan.break_point = static_cast<int>(i);
+      plan.right_elem_count = right_count;
+      plan.is_outer_broadcast_dominated = lhs[i] < rhs[i];
+      const std::string prefix = "bp" + std::to_string(i);
+      append_option(
+          prefix + "_normal",
+          "Split at axis " + std::to_string(i) + ", normal BID binding",
+          plan);
+      plan.flip_grid_binding = true;
+      append_option(
+          prefix + "_flip",
+          "Split at axis " + std::to_string(i) + ", flipped BID binding",
+          plan);
+    }
+    return request;
+  };
+
+  if (jev_mode == scheduler::jev::Mode::Remote) {
+    auto request = make_jev_request();
+    const auto selected =
+        scheduler::jev::chooseDecision("PW2", request.state, request.options);
+    for (size_t i = 0; i < request.options.size(); ++i) {
+      if (request.options[i].id != selected) {
+        continue;
+      }
+      const auto& plan = request.plans[i];
+      NVF_ERROR(
+          plan.break_point == 0 ||
+              (scheduler_utils::breakIsDisjoint(
+                   view_disjoint_sets, plan.break_point) &&
+               n_elems / plan.right_elem_count > 1),
+          "Remote PW2 choice violated a native legality guard");
+      return plan;
+    }
+    NVF_ERROR(false, "Remote PW2 choice is not in its candidate set");
+  }
+
+  // The original ordinary scheduler skips 2D analysis for small workloads.
+  // Record its resulting bp0 directly, while still presenting the same legal
+  // 1D and 2D alternatives that Remote can choose among. Off mode keeps the
+  // call-site's original early return and TMA never uses this preference.
+  if (jev_mode == scheduler::jev::Mode::Record && native_default_1d) {
+    auto request = make_jev_request();
+    (void)scheduler::jev::chooseDecision(
+        "PW2", request.state, request.options, "bp0");
+    return result;
+  }
 
   // Figure out break point position
   // How much would this transfer cost if it was done as a 1-D schedule
@@ -311,6 +749,16 @@ BreakPointInfo getBreakPoint(
     result.is_outer_broadcast_dominated = lhs_bit_multiple < rhs_bit_multiple;
   }
 
+  if (jev_mode == scheduler::jev::Mode::Record) {
+    auto request = make_jev_request();
+    const auto native_choice = result.break_point == 0
+        ? std::string("bp0")
+        : "bp" + std::to_string(result.break_point) +
+            (result.flip_grid_binding ? "_flip" : "_normal");
+    (void)scheduler::jev::chooseDecision(
+        "PW2", request.state, request.options, native_choice);
+  }
+
   return result;
 }
 
@@ -318,7 +766,9 @@ BlockGridConfig getBlockGridConfig(
     const FusionRuntimeProperties& prop,
     const BreakPointInfo& bp_info,
     int64_t max_vect_factor,
-    int64_t kThreadX) {
+    int64_t kThreadX,
+    bool block_quantization,
+    bool exact_add2x16_continuation) {
   BlockGridConfig result;
 
   // Copy break point information
@@ -336,17 +786,333 @@ BlockGridConfig getBlockGridConfig(
   // Calculate thread/grid dimensions if we have a 2D break point
   if (result.break_point > 0 && result.right_elem_count > 0) {
     const int64_t n_elems = prop.n_elems;
-    int64_t threads_per_warp =
-        (int64_t)at::cuda::getCurrentDeviceProperties()->warpSize;
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    int64_t threads_per_warp = (int64_t)device->warpSize;
 
     int64_t cur_left_elem_count = n_elems / result.right_elem_count;
 
-    // Start bdimx with 1 warp, increase if split is divisible
+    // Keep the native launch available for block quantization and for a
+    // conservative fallback if its preliminary resource proof fails. It is
+    // never sent to the model as a preference.
     int64_t after_vect = ceilDiv(result.right_elem_count, max_vect_factor);
+    const auto jev_mode = scheduler::jev::mode();
     result.bdimx = std::min(after_vect, threads_per_warp);
     while (result.bdimx * 2 <= kThreadX && result.bdimx * 2 <= after_vect &&
            after_vect % (result.bdimx * 2) == 0) {
       result.bdimx *= 2;
+    }
+    if (jev_mode != scheduler::jev::Mode::Off && !block_quantization) {
+      NVF_ERROR(
+          n_elems > 0 && result.right_elem_count > 0 && max_vect_factor > 0 &&
+              threads_per_warp > 0 && threads_per_warp <= kThreadX &&
+              kThreadX == 128 && result.right_elem_count <= n_elems &&
+              n_elems % result.right_elem_count == 0,
+          "PW3.launch requires valid two-dimensional extents and CTA bounds");
+
+      // Symbolic splits and predicated tails permit irregular TIDx values.
+      // Filter the structural domain against the physical CTA and the
+      // preliminary grid before offering a model any alternatives. Later
+      // unroll can only shrink the grid; if this filter excludes the native
+      // plan, retain the original native path instead of making an incomplete
+      // pre-unroll proof into a rejection.
+      std::vector<scheduler::jev::ChoiceOption> options;
+      options.reserve(kThreadX);
+      for (int64_t candidate = 1; candidate <= kThreadX; ++candidate) {
+        const int64_t threads_y = kThreadX / candidate;
+        const int64_t physical_threads = candidate * threads_y;
+        const int64_t grid_left = ceilDiv(cur_left_elem_count, threads_y);
+        const int64_t grid_right = ceilDiv(after_vect, candidate);
+        const int64_t grid_x =
+            result.flip_grid_binding ? grid_left : grid_right;
+        const int64_t grid_y =
+            result.flip_grid_binding ? grid_right : grid_left;
+        if (candidate > device->maxThreadsDim[0] ||
+            threads_y > device->maxThreadsDim[1] ||
+            physical_threads > device->maxThreadsPerBlock ||
+            physical_threads > device->maxThreadsPerMultiProcessor ||
+            grid_x > device->maxGridSize[0] ||
+            std::min<int64_t>(grid_y, 65535) > device->maxGridSize[1]) {
+          continue;
+        }
+        options.push_back(
+            {"x" + std::to_string(candidate),
+             "Use " + std::to_string(candidate) + " TIDx threads"});
+      }
+      const bool semantic = scheduler::jev::semanticProtocolEnabled();
+      const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+      const bool native_in_menu =
+          std::any_of(options.begin(), options.end(), [&](const auto& option) {
+            return option.id == "x" + std::to_string(result.bdimx);
+          });
+      // The legacy text-v1 server has no device-axis fields for a partial
+      // menu. The v3 state below carries the exact limits needed to replay
+      // the hard filter; v2 already carries them in its structured workload.
+      const char* skip_reason = options.empty() ? "empty_hard_cta_menu"
+          : !native_in_menu                     ? "native_2d_cta_preflight"
+          : !semantic && !semantic_v3 &&
+                  options.size() != static_cast<size_t>(kThreadX)
+          ? "text_v1_requires_full_hard_cta_menu"
+          : nullptr;
+      if (skip_reason != nullptr) {
+        if (jev_mode == scheduler::jev::Mode::Record) {
+          scheduler::jev::recordCoverageSkip("PW3.launch", skip_reason);
+        }
+      } else {
+        if (semantic_v3) {
+          // Preserve the v2 local preview. The exact Add carrier additionally
+          // carries a bounded formula for every downstream unroll leaf.
+          for (auto& option : options) {
+            const int64_t candidate = std::stoll(option.id.substr(1));
+            const int64_t threads_y = kThreadX / candidate;
+            const int64_t grid_left = ceilDiv(cur_left_elem_count, threads_y);
+            const int64_t grid_right = ceilDiv(after_vect, candidate);
+            const int64_t idle_right =
+                (candidate - after_vect % candidate) % candidate;
+            const int64_t idle_left =
+                (threads_y - cur_left_elem_count % threads_y) % threads_y;
+            const int64_t tail_elements =
+                (max_vect_factor - result.right_elem_count % max_vect_factor) %
+                max_vect_factor;
+            option.consequence_json =
+                "{\"threads_x\":" + std::to_string(candidate) +
+                ",\"threads_y\":" + std::to_string(threads_y) +
+                ",\"actual_cta_threads\":" +
+                std::to_string(candidate * threads_y) +
+                ",\"right_vector_iterations\":" + std::to_string(after_vect) +
+                ",\"preliminary_grid_left\":" + std::to_string(grid_left) +
+                ",\"preliminary_grid_right\":" + std::to_string(grid_right) +
+                ",\"preliminary_grid_x\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_left : grid_right) +
+                ",\"preliminary_grid_y\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_right : grid_left) +
+                ",\"preliminary_grid_y_exceeds_split_threshold\":" +
+                std::string(
+                    (result.flip_grid_binding ? grid_right : grid_left) > 65535
+                        ? "true"
+                        : "false") +
+                ",\"idle_right_vector_lanes_last_cta\":" +
+                std::to_string(idle_right) +
+                ",\"idle_left_rows_last_cta\":" + std::to_string(idle_left) +
+                ",\"right_tail_elements_last_vector\":" +
+                std::to_string(tail_elements) +
+                ",\"unroll_status\":\"" +
+                (exact_add2x16_continuation ? "bounded_by_candidate"
+                                             : "pending") +
+                "\",\"grid_split_status\":\"" +
+                (exact_add2x16_continuation ? "none_for_carrier" : "pending") +
+                "\"}";
+            if (exact_add2x16_continuation) {
+              const auto continuation =
+                  pointwise::non_tma::addLaunch2DContinuation(
+                      cur_left_elem_count,
+                      result.right_elem_count,
+                      max_vect_factor,
+                      candidate,
+                      /*expression_count=*/1);
+              NVF_ERROR(
+                  continuation.has_value() &&
+                      continuation->threads_y == threads_y &&
+                      continuation->preliminary_grid_left == grid_left &&
+                      continuation->preliminary_grid_right == grid_right,
+                  "PW3.launch exact Add continuation differs from source "
+                  "preliminary geometry");
+              using scheduler::native_diagnostic::Object;
+              Object grammar;
+              grammar.add("schema", "nvfuser.pw3.launch.add2x16.v1");
+              grammar.add("plan_scope", "ordinary_pointwise_branch");
+              grammar.add("left_elems", cur_left_elem_count);
+              grammar.add("right_elems", result.right_elem_count);
+              grammar.add("vector_width", max_vect_factor);
+              grammar.add("threads_x", candidate);
+              grammar.add("threads_y", threads_y);
+              grammar.add("preliminary_grid_left", grid_left);
+              grammar.add("preliminary_grid_right", grid_right);
+              grammar.add(
+                  "unroll_total_blocks",
+                  continuation->preliminary_grid_left *
+                      continuation->preliminary_grid_right);
+              grammar.add("unroll_bound", continuation->unroll_bound);
+              grammar.add(
+                  "unroll_choices_kind",
+                  continuation->unroll_bound == 1 ? "no_choice"
+                                                  : "bounded_choice");
+              grammar.add("unroll_range_low", int64_t{1});
+              grammar.add("unroll_range_high", continuation->unroll_bound);
+              grammar.add(
+                  "unroll_bound_formula",
+                  "min(max(1,L*R),64,max(1,floor(8192/E/W)))");
+              grammar.add("post_unroll_right_formula", "ceil(R/U)");
+              grammar.add(
+                  "effective_grid_x_formula",
+                  result.flip_grid_binding ? "L" : "ceil(R/U)");
+              grammar.add(
+                  "effective_grid_y_formula",
+                  result.flip_grid_binding ? "ceil(R/U)" : "L");
+              grammar.add(
+                  "right_coverage_formula", "ceil(R/U)*X*W*U");
+              grammar.add("right_tail_formula", "right_coverage-16");
+              grammar.add("grid_split_status", "none_for_carrier");
+              option.consequence_json.pop_back();
+              option.consequence_json +=
+                  ",\"continuation\":" + grammar.str() +
+                  ",\"pending_choices\":" +
+                  (continuation->unroll_bound == 1
+                       ? std::string("[]}")
+                       : std::string("[\"PW3.unroll\"]}"));
+            }
+          }
+        }
+        std::string state;
+        if (semantic) {
+          state = "{\"schema\":\"nvfuser.systemone.semantic_decision.v2\"";
+          state +=
+              ",\"objective\":\"Minimize expected runtime by choosing "
+              "a legal 2D CTA thread split for this fusion; balance right-axis "
+              "vector work, left-axis grid coverage, CTA occupancy, and idle "
+              "or "
+              "tail lanes.\"";
+          state += ",\"workload\":" +
+              semanticPointwiseWorkload(
+                       prop.device_multiprocessor_count, device);
+          state +=
+              ",\"partial_schedule\":{\"scheduler\":\"ordinary_pointwise\"";
+          state += ",\"breakpoint_analysis_requested\":true,\"break_point\":" +
+              std::to_string(result.break_point) + ",\"flip_grid_binding\":" +
+              std::string(result.flip_grid_binding ? "true" : "false") +
+              ",\"left_elems\":" + std::to_string(cur_left_elem_count) +
+              ",\"right_elems\":" + std::to_string(result.right_elem_count) +
+              ",\"outer_broadcast_dominated\":" +
+              std::string(
+                       result.is_outer_broadcast_dominated ? "true" : "false") +
+              ",\"vector_width\":" + std::to_string(max_vect_factor) +
+              ",\"vector_width_already_selected\":true,\"unroll\":\"pending\","
+              "\"grid_splitting\":\"pending\",\"grid_x_axis\":\"" +
+              std::string(result.flip_grid_binding ? "left" : "right") +
+              "\",\"grid_y_axis\":\"" +
+              std::string(result.flip_grid_binding ? "right" : "left") + "\"}";
+          state += ",\"decision\":{\"kind\":\"cta_split_2d\"";
+          state += ",\"n_elems\":" + std::to_string(n_elems) +
+              ",\"cta_threads_cap\":" + std::to_string(kThreadX) +
+              ",\"grid_y_split_threshold\":65535" + ",\"candidates\":[";
+          for (size_t i = 0; i < options.size(); ++i) {
+            const int64_t candidate = std::stoll(options[i].id.substr(1));
+            const int64_t threads_y = kThreadX / candidate;
+            const int64_t grid_left = ceilDiv(cur_left_elem_count, threads_y);
+            const int64_t grid_right = ceilDiv(after_vect, candidate);
+            const int64_t idle_right =
+                (candidate - after_vect % candidate) % candidate;
+            const int64_t idle_left =
+                (threads_y - cur_left_elem_count % threads_y) % threads_y;
+            const int64_t tail_elements =
+                (max_vect_factor - result.right_elem_count % max_vect_factor) %
+                max_vect_factor;
+            if (i != 0)
+              state += ',';
+            state +=
+                "{\"id\":\"x" + std::to_string(candidate) +
+                "\",\"threads_x\":" + std::to_string(candidate) +
+                ",\"threads_y\":" + std::to_string(threads_y) +
+                ",\"actual_cta_threads\":" +
+                std::to_string(candidate * threads_y) +
+                ",\"right_vector_iterations\":" + std::to_string(after_vect) +
+                ",\"preliminary_grid_left\":" + std::to_string(grid_left) +
+                ",\"preliminary_grid_right\":" + std::to_string(grid_right) +
+                ",\"preliminary_grid_x\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_left : grid_right) +
+                ",\"preliminary_grid_y\":" +
+                std::to_string(
+                    result.flip_grid_binding ? grid_right : grid_left) +
+                ",\"preliminary_grid_y_exceeds_split_threshold\":" +
+                std::string(
+                    (result.flip_grid_binding ? grid_right : grid_left) > 65535
+                        ? "true"
+                        : "false") +
+                ",\"idle_right_vector_lanes_last_cta\":" +
+                std::to_string(idle_right) +
+                ",\"idle_left_rows_last_cta\":" + std::to_string(idle_left) +
+                ",\"right_tail_elements_last_vector\":" +
+                std::to_string(tail_elements) + '}';
+          }
+          state += "]}}";
+        } else if (semantic_v3) {
+          state = exact_add2x16_continuation ? "pointwise.launch.v3\n"
+                                             : "pointwise.launch.v2\n";
+          state += "n_elems=" + std::to_string(n_elems) + '\n';
+          state +=
+              "right_elems=" + std::to_string(result.right_elem_count) + '\n';
+          state += "vector_width=" + std::to_string(max_vect_factor) + '\n';
+          state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
+          state += "cta_threads=" + std::to_string(kThreadX) + '\n';
+          state += "break_point=" + std::to_string(result.break_point) + '\n';
+          state += "flip_grid_binding=" +
+              std::to_string(static_cast<int>(result.flip_grid_binding)) + '\n';
+          state += "max_threads_x=" +
+              std::to_string(device->maxThreadsDim[0]) + '\n';
+          state += "max_threads_y=" +
+              std::to_string(device->maxThreadsDim[1]) + '\n';
+          state += "max_threads_per_block=" +
+              std::to_string(device->maxThreadsPerBlock) + '\n';
+          state += "max_threads_per_sm=" +
+              std::to_string(device->maxThreadsPerMultiProcessor) + '\n';
+          state += "max_grid_x=" + std::to_string(device->maxGridSize[0]) + '\n';
+          state += "max_grid_y=" + std::to_string(device->maxGridSize[1]) + '\n';
+          state += "grid_y_split_threshold=65535\n";
+          state += exact_add2x16_continuation
+              ? "unroll_status=bounded_by_candidate\n"
+              : "unroll_status=pending\n";
+          state += exact_add2x16_continuation
+              ? "grid_split_status=none_for_carrier\n"
+              : "grid_split_status=pending\n";
+          if (exact_add2x16_continuation) {
+            state += "carrier=sm89_fp32_add_2x16\n";
+            state += "expr_count=1\n";
+            state += "unroll_max_cap=64\n";
+            state += "unroll_expr_width_budget=8192\n";
+            state += "left_elems=2\n";
+          }
+        } else {
+          state = "pointwise.launch.v1\n";
+          state += "n_elems=" + std::to_string(n_elems) + '\n';
+          state +=
+              "right_elems=" + std::to_string(result.right_elem_count) + '\n';
+          state += "vector_width=" + std::to_string(max_vect_factor) + '\n';
+          state += "warp_size=" + std::to_string(threads_per_warp) + '\n';
+          state += "cta_threads=" + std::to_string(kThreadX) + '\n';
+        }
+        const std::string native_choice =
+            jev_mode == scheduler::jev::Mode::Record
+            ? "x" + std::to_string(result.bdimx)
+            : std::string();
+        const auto selected = semantic
+            ? scheduler::jev::chooseSemanticDecision(
+                  "PW3.launch",
+                  state,
+                  "Choose the legal 2D CTA thread split for this fusion. "
+                  "The breakpoint, grid binding, and vector width are already "
+                  "selected. Compare every candidate's CTA threads, "
+                  "preliminary grid coverage, grid X/Y binding and the 65535 "
+                  "grid Y split threshold, vector work, and idle or tail "
+                  "lanes. Later unroll and grid splitting can change the "
+                  "launch; return one listed split for expected runtime.",
+                  options,
+                  native_choice)
+            : scheduler::jev::chooseDecision(
+                  "PW3.launch", state, options, native_choice);
+        bool matched = false;
+        for (const auto& option : options) {
+          if (selected == option.id) {
+            result.bdimx = std::stoll(option.id.substr(1));
+            matched = true;
+            break;
+          }
+        }
+        NVF_ERROR(matched, "PW3.launch response is outside hard CTA bounds");
+      }
+    } else if (jev_mode == scheduler::jev::Mode::Record && block_quantization) {
+      scheduler::jev::recordCoverageSkip("PW3.launch", "block_quantization");
     }
     result.bdimy = kThreadX / result.bdimx;
     result.gdim_left = ceilDiv(cur_left_elem_count, result.bdimy);

@@ -9,9 +9,16 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
+#include <iterator>
+#include <optional>
+#include <string>
+#include <vector>
+
 #include "instrumentation.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
@@ -74,7 +81,8 @@ std::unique_ptr<ReductionParams> gridOuterPersistentHeuristic(
           total_reduction_numel,
           total_iteration_numel,
           (int64_t)vectorize_factor,
-          max_persistent_buffer_size_bit);
+          max_persistent_buffer_size_bit,
+          true);
 
   NVF_ERROR(outer_params.has_value(), "No valid config found");
 
@@ -148,20 +156,10 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
     const bool project_to_input,
     const PrimDataType index_type) {
   // Set some targets for parallelization
-  const int64_t n_elems = total_reduction_numel * total_iteration_numel;
   const auto dev_prop = at::cuda::getCurrentDeviceProperties();
 
   const int64_t device_multiprocessor_count =
       (int64_t)dev_prop->multiProcessorCount;
-
-  // If it fits in l2, we just want to make sure each warp uses 256Bits. Set
-  // minimum warp as 16 threads instead of 32 as if we have a small reduction
-  // dim going a bit smaller than 32 usually helps.
-  const int64_t warp_size =
-      n_elems * max_input_dtype_size_bit * n_tensor_inputs <
-          dev_prop->l2CacheSize * 8
-      ? (int64_t)256 / max_input_dtype_size_bit
-      : 16;
 
   const auto register_file_size_bit =
       dev_prop->regsPerBlock * scheduler_utils::bits_per_register;
@@ -220,112 +218,456 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
   };
   NormOuterParams params;
 
-  // set iter_unroll_factor
-  // This controls vectorized load/store along the iteration dimension.
-  // The kernel calls block reduction [iter_unroll_factor] times.
-  // Test shows performance regression when iter_unroll_factor > 1 due to
-  // the high cost of calling block reduction multiple times per block.
-  params.iter_unroll_factor.set(1l);
-  params.iter_unroll_factor.finalize();
-
-  // set redu_unroll_factor
-  // This controls unroll along the reduction dimension.
-  // For case InstanceNormFP32 of [256, 28, 28, 128], if unroll 2, register
-  // usage increased from 89 to 118 but the occupancy is not changed. However,
-  // the bandwidth is dropped from 1029 GB/s to 840 GB/s due to more stalled
-  // warps. Unroll by 4 increased performance for some cases but has regression
-  // in many others. So we set redu_unroll_factor to 1.
-  params.redu_unroll_factor.set(1l);
-  params.redu_unroll_factor.finalize();
-
-  // set bdimx
-  // Start from warp_size, and decrease it until we can make more than 4 waves
-  const int64_t bdimx_max =
-      max_multi_reduction_factor / params.iter_unroll_factor.get();
-  int64_t tmp_bdimx = std::min(bdimx_max, warp_size);
-  if (tmp_bdimx < warp_size) {
-    tmp_bdimx = scheduler_utils::lastPow2(tmp_bdimx);
-  }
-  // check if we can make more than 4 waves to hide memory access latency.
-  // InstanceNormFP32 of [32, 32, 32, 128] increased from 618 to 770 GB/s
-  int64_t num_CTAs = ceilDiv(
-      total_iteration_numel, tmp_bdimx * params.iter_unroll_factor.get());
-  while (
-      num_CTAs < 4l * device_multiprocessor_count &&
-      tmp_bdimx >= 2l *
-              normalization_scheduler_utils::PreferredLaunchConfig::kMinBdimx) {
-    tmp_bdimx /= 2l;
-    num_CTAs = ceilDiv(
-        total_iteration_numel, tmp_bdimx * params.iter_unroll_factor.get());
-  }
-  // we are not finalizing bdimx here, because we may need to change it later if
-  // bdimy is very small
-  params.bdimx.set(tmp_bdimx);
-
-  // set bdimy and batches_per_block
-  // These two parameters controls the reduction. Each reduction is split into
-  // [batches_per_block] serial reductions and a block reduction along [bdimy].
-  // Test shows setting a serial workload larger than 8 improves performance
-  // since it reduces inter-threads communication.
-  const int64_t batches_per_block_min = std::min(8l, total_reduction_numel);
-
-  // A minimum of 128 threads in a block ensures the four warp schedulers are
-  // fully utilized even in cases where only one CTA is active per SM.
+  // The seed TIDx is a performance preference. Every offered seed is expanded
+  // to a complete block plan and checked against the native register bound.
+  struct BlockPlan {
+    int64_t bdimx;
+    int64_t bdimy;
+    int64_t batches_per_block;
+    int64_t gdimx;
+  };
   const int64_t min_threads_in_block = 128l;
-
-  // A maximum of 256 threads in a block ensures each thread can use up to 255
-  // registers.
   const int64_t max_threads_in_block = 256l;
-
-  // Split reduction domain into redu_unroll_factor, bdimy, and
-  // batches_per_block. redu_unroll_factor is already finalized, so the problem
-  // changes to split after_unroll into bdimy and batches_per_block. The
-  // strategy is: prioritize divisible splits and search for bdimy in a fixed
-  // range under the constraint of batches_per_block_min.
-  const int64_t after_unroll =
-      total_reduction_numel / params.redu_unroll_factor.get();
-  const int64_t bdimy_max = std::min(
-      ceilDiv(after_unroll, batches_per_block_min),
-      max_threads_in_block / params.bdimx.get());
-  const int64_t bdimy_min =
-      std::min(bdimy_max, min_threads_in_block / params.bdimx.get());
-  const int64_t bdimy_step =
-      std::max(1l, device_warp_size / params.bdimx.get());
-  NVF_ERROR(
-      device_warp_size % params.bdimx.get() == 0,
-      "bdimx is no divisible by warp_size. bdimx= ",
-      params.bdimx.get());
-
-  auto maybeNextDivisibleFactor =
-      [&after_unroll, &bdimy_step, &bdimy_max](int64_t cur) {
-        auto next = cur + bdimy_step;
-        while (next <= bdimy_max && after_unroll % next) {
-          next += bdimy_step;
+  const auto make_block_plan = [&](int64_t seed_bdimx, int64_t iter_unroll,
+                                   int64_t redu_unroll)
+      -> std::optional<BlockPlan> {
+    if (seed_bdimx < 1 || iter_unroll < 1 || redu_unroll < 1 ||
+        redu_unroll > total_reduction_numel ||
+        total_reduction_numel % redu_unroll != 0 ||
+        seed_bdimx > max_multi_reduction_factor / iter_unroll ||
+        device_warp_size % seed_bdimx != 0) {
+      return std::nullopt;
+    }
+    const int64_t after_unroll = total_reduction_numel / redu_unroll;
+    const int64_t batches_per_block_min = std::min(8l, after_unroll);
+    const int64_t bdimy_max = std::min(
+        ceilDiv(after_unroll, batches_per_block_min),
+        max_threads_in_block / seed_bdimx);
+    if (bdimy_max < 1) {
+      return std::nullopt;
+    }
+    const int64_t bdimy_min =
+        std::min(bdimy_max, min_threads_in_block / seed_bdimx);
+    const int64_t bdimy_step =
+        std::max(1l, device_warp_size / seed_bdimx);
+    auto maybe_next_divisible = [&](int64_t cur) {
+      auto next = cur + bdimy_step;
+      while (next <= bdimy_max && after_unroll % next) {
+        next += bdimy_step;
+      }
+      return std::min(next, bdimy_max);
+    };
+    int64_t bdimy = bdimy_min;
+    int64_t batch = ceilDiv(after_unroll, bdimy);
+    while (bdimy < bdimy_max) {
+      const int64_t next_bdimy = maybe_next_divisible(bdimy);
+      const int64_t next_batch = ceilDiv(after_unroll, next_bdimy);
+      if (next_batch < batches_per_block_min) {
+        break;
+      }
+      bdimy = next_bdimy;
+      batch = next_batch;
+    }
+    const int64_t final_bdimx = seed_bdimx * bdimy < min_threads_in_block
+        ? min_threads_in_block / bdimy
+        : seed_bdimx;
+    // Compare against the register quotient before multiplying. In
+    // particular, promoting a narrow seed to the 128-thread minimum may
+    // increase bdimx beyond the seed's capacity.
+    if (final_bdimx > max_multi_reduction_factor / iter_unroll) {
+      return std::nullopt;
+    }
+    return BlockPlan{
+        final_bdimx,
+        bdimy,
+        batch,
+        ceilDiv(total_iteration_numel, final_bdimx * iter_unroll)};
+  };
+  // The native TIDy search stops at the largest useful reduction split. Its
+  // earlier splits are also valid complete block plans: they trade parallel
+  // reduction lanes for more serial batches. Keep the native last plan as the
+  // default, and expose the preceding plans through the same OP3.cta Choice.
+  const auto make_block_candidates = [&](int64_t seed_bdimx,
+                                         int64_t iter_unroll,
+                                         int64_t redu_unroll) {
+    std::vector<BlockPlan> candidates;
+    const auto native =
+        make_block_plan(seed_bdimx, iter_unroll, redu_unroll);
+    if (!native.has_value()) {
+      return candidates;
+    }
+    const int64_t after_unroll = total_reduction_numel / redu_unroll;
+    const int64_t min_batch = std::min(8l, after_unroll);
+    const int64_t y_max = std::min(
+        ceilDiv(after_unroll, min_batch),
+        max_threads_in_block / seed_bdimx);
+    const int64_t y_min =
+        std::min(y_max, min_threads_in_block / seed_bdimx);
+    const int64_t y_step =
+        std::max(1l, device_warp_size / seed_bdimx);
+    const auto append = [&](int64_t y) {
+      const int64_t x = seed_bdimx * y < min_threads_in_block
+          ? min_threads_in_block / y
+          : seed_bdimx;
+      const int64_t batch = ceilDiv(after_unroll, y);
+      if (x > max_multi_reduction_factor / iter_unroll ||
+          x * y > max_threads_in_block || batch < min_batch) {
+        return;
+      }
+      candidates.push_back(BlockPlan{
+          x,
+          y,
+          batch,
+          ceilDiv(total_iteration_numel, x * iter_unroll)});
+    };
+    for (int64_t y = y_min; y < native->bdimy; y += y_step) {
+      // The native search visits the initial split, then only exact divisors
+      // on this stride. Retain its earlier splits as alternate plans.
+      if (y == y_min || after_unroll % y == 0) {
+        append(y);
+      }
+    }
+    // Eight serial batches are a performance target, not a hard constraint.
+    // The initial native split can be below it (e.g. 49 / 7 = 7), so keep
+    // the already-validated native plan without the alternate-plan filter.
+    candidates.push_back(*native);
+    NVF_ERROR(
+        !candidates.empty() && candidates.back().bdimx == native->bdimx &&
+            candidates.back().bdimy == native->bdimy &&
+            candidates.back().batches_per_block == native->batches_per_block &&
+            candidates.back().gdimx == native->gdimx,
+        "Outer persistent CTA candidates lost the native block plan");
+    return candidates;
+  };
+  const auto plan_id = [](const BlockPlan& plan) {
+    return "x" + std::to_string(plan.bdimx) + "_y" +
+        std::to_string(plan.bdimy) + "_b" +
+        std::to_string(plan.batches_per_block);
+  };
+  // Enumerate the same checked plans that the later OP3.cta Choice will
+  // expose, without retaining the seed or its native last-valid split.
+  const auto complete_block_frontier = [&](int64_t iter_unroll,
+                                           int64_t redu_unroll) {
+    std::vector<BlockPlan> plans;
+    for (int64_t seed = 1;
+         seed <= std::min(
+             max_multi_reduction_factor / iter_unroll, device_warp_size);
+         seed *= 2) {
+      for (const auto& plan :
+           make_block_candidates(seed, iter_unroll, redu_unroll)) {
+        const std::string id = plan_id(plan);
+        if (std::none_of(plans.begin(), plans.end(), [&](const BlockPlan& prior) {
+              return plan_id(prior) == id;
+            })) {
+          plans.push_back(plan);
         }
-        return std::min(next, bdimy_max);
-      };
-  int64_t tmp_bdimy = bdimy_min;
-  int64_t tmp_batch = ceilDiv(after_unroll, tmp_bdimy);
-  while (tmp_bdimy < bdimy_max) {
-    int64_t next_bdimy = maybeNextDivisibleFactor(tmp_bdimy);
-    int64_t next_batch = ceilDiv(after_unroll, next_bdimy);
-    if (next_batch >= batches_per_block_min) {
-      tmp_bdimy = next_bdimy;
-      tmp_batch = next_batch;
+      }
+    }
+    std::sort(plans.begin(), plans.end(), [&](const auto& lhs, const auto& rhs) {
+      return plan_id(lhs) < plan_id(rhs);
+    });
+    return plans;
+  };
+
+  const auto jev_mode = scheduler::jev::mode();
+  // Reduction unrolling is an empirical choice. The old factor of one was
+  // selected after measured regressions at two and four, not by a scheduling
+  // constraint. Each offered factor divides the reduction and has a complete
+  // one-SM block plan for the native iteration factor of one. The chosen
+  // factor is applied before either downstream Choice menu is constructed.
+  int64_t selected_redu_unroll = 1;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t factor : {1l, 2l, 4l}) {
+      if (factor > total_reduction_numel ||
+          total_reduction_numel % factor != 0) {
+        continue;
+      }
+      bool has_complete_plan = false;
+      for (int64_t seed = 1;
+           seed <= std::min(max_multi_reduction_factor, device_warp_size);
+           seed *= 2) {
+        if (make_block_plan(seed, 1, factor).has_value()) {
+          has_complete_plan = true;
+          break;
+        }
+      }
+      if (has_complete_plan) {
+        options.push_back({
+            "r" + std::to_string(factor),
+            "Unroll " + std::to_string(factor) +
+                " reduction elements per thread with a complete block plan"});
+      }
+    }
+    NVF_ERROR(!options.empty(), "No legal outer persistent reduction factor");
+    if (options.size() == 1) {
+      NVF_ERROR(
+          options.front().id == "r1",
+          "Native outer persistent reduction factor missing from singleton menu");
+      scheduler::jev::recordHardSingletonDecision(
+          "OP3.redu_unroll",
+          "r1",
+          "only one hard-valid reduction unroll factor",
+          "hard_legal_singleton");
     } else {
-      break;
+      const std::string state =
+          "outer_persistent.redu_unroll.v1\nreduction_numel=" +
+          std::to_string(total_reduction_numel) + "\niteration_numel=" +
+          std::to_string(total_iteration_numel) + "\nvector_width=" +
+          std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+          std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
+          std::to_string(device_warp_size) + "\nregister_file_bits=" +
+          std::to_string(scheduler_utils::register_file_size_bit);
+      const std::string choice = scheduler::jev::chooseDecision(
+          "OP3.redu_unroll",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "r1" : "");
+      const auto option_it = std::find_if(
+          options.begin(),
+          options.end(),
+          [&](const auto& option) { return option.id == choice; });
+      NVF_ERROR(
+          option_it != options.end(),
+          "Unknown outer persistent reduction factor");
+      selected_redu_unroll = std::stoll(choice.substr(1));
     }
   }
-  params.bdimy.set(tmp_bdimy);
-  params.bdimy.finalize();
-  params.batches_per_block.set(tmp_batch);
-  params.batches_per_block.finalize();
+  params.redu_unroll_factor.set(selected_redu_unroll);
+  params.redu_unroll_factor.finalize();
 
-  // final check on bdimx to avoid small threads_in_block
-  if (params.bdimx.get() * params.bdimy.get() < min_threads_in_block) {
-    params.bdimx.set(min_threads_in_block / params.bdimy.get());
+  // The analyzed vector width is the alignment bound. The additional
+  // divisibility check keeps every offered vectorized iteration tile complete.
+  // A factor is offered only if some complete CTA plan fits one SM's register
+  // budget. The model chooses a factor before the selected factor's OP3.cta
+  // request is formed, so speculative plans never produce nested Choice logs.
+  int64_t selected_iter_unroll = 1;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    constexpr size_t kMaxOp3UnrollConsequences = 2 * 1024 * 1024;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::vector<int64_t> factors;
+    size_t consequence_bytes = 0;
+    for (int64_t factor = 1;
+         factor <= (int64_t)vectorize_factor &&
+         factor <= total_iteration_numel;
+         factor *= 2) {
+      if (total_iteration_numel % factor != 0) {
+        continue;
+      }
+      bool has_complete_plan = false;
+      for (int64_t seed = 1;
+           seed <= std::min(
+               max_multi_reduction_factor / factor, device_warp_size);
+           seed *= 2) {
+        if (make_block_plan(
+                seed, factor, params.redu_unroll_factor.get()).has_value()) {
+          has_complete_plan = true;
+          break;
+        }
+      }
+      if (has_complete_plan) {
+        scheduler::jev::ChoiceOption option{
+            "u" + std::to_string(factor),
+            "Vectorize " + std::to_string(factor) +
+                " iteration elements per thread with a valid block plan"};
+        if (semantic_v3) {
+          const auto plans = complete_block_frontier(
+              factor, params.redu_unroll_factor.get());
+          NVF_ERROR(
+              !plans.empty(),
+              "Outer iteration factor lost its complete CTA frontier");
+          std::string consequence =
+              "{\"scope\":\"conditional_local_cta_frontier\","
+              "\"later_choice_sites\":[\"OP3.cta\"],\"plans\":[";
+          for (const auto& plan : plans) {
+            if (consequence.back() != '[') {
+              consequence += ',';
+            }
+            const int64_t grid_ctas_per_sm =
+                ceilDiv(plan.gdimx, device_multiprocessor_count);
+            // The resource estimate is the same source heuristic budget used
+            // by the hard one-SM guard, not allocated register usage.
+            const int64_t estimated_persistent_bits =
+                max_persistent_buffer_size_bit * plan.bdimx * factor;
+            consequence +=
+                "{\"id\":\"" + plan_id(plan) + "\",\"block_x\":" +
+                std::to_string(plan.bdimx) + ",\"block_y\":" +
+                std::to_string(plan.bdimy) +
+                ",\"serial_reduction_batches\":" +
+                std::to_string(plan.batches_per_block) + ",\"grid_x\":" +
+                std::to_string(plan.gdimx) + ",\"cta_threads\":" +
+                std::to_string(plan.bdimx * plan.bdimy) +
+                ",\"grid_ctas_per_sm_ceil\":" +
+                std::to_string(grid_ctas_per_sm) +
+                ",\"estimated_persistent_bits\":" +
+                std::to_string(estimated_persistent_bits) + '}';
+          }
+          option.consequence_json = std::move(consequence) + "]}";
+          consequence_bytes += option.consequence_json.size();
+        }
+        options.push_back(std::move(option));
+        factors.push_back(factor);
+      }
+    }
+    NVF_ERROR(!options.empty(), "No legal outer persistent iteration factor");
+    if (semantic_v3 && consequence_bytes > kMaxOp3UnrollConsequences) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "OP3.unroll complete CTA frontier exceeds the 2 MiB site limit");
+      scheduler::jev::recordCoverageSkip(
+          "OP3.unroll", "complete CTA frontier exceeds the 2 MiB site limit");
+    } else {
+      const std::string legacy_state =
+          (params.redu_unroll_factor.get() == 1
+               ? "outer_persistent.iter_unroll.v1\n"
+               : "outer_persistent.iter_unroll.v2\nredu_unroll=" +
+                     std::to_string(params.redu_unroll_factor.get()) + "\n") +
+          "reduction_numel=" +
+          std::to_string(total_reduction_numel) + "\niteration_numel=" +
+          std::to_string(total_iteration_numel) + "\nvector_width=" +
+          std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+          std::to_string(max_persistent_buffer_size_bit) + "\nwarp_size=" +
+          std::to_string(device_warp_size) + "\nregister_file_bits=" +
+          std::to_string(scheduler_utils::register_file_size_bit);
+      const std::string state = semantic_v3
+          ? "outer_persistent.iter_unroll.v3\nredu_unroll=" +
+                std::to_string(params.redu_unroll_factor.get()) +
+                "\nreduction_numel=" + std::to_string(total_reduction_numel) +
+                "\niteration_numel=" + std::to_string(total_iteration_numel) +
+                "\nvector_width=" + std::to_string(vectorize_factor) +
+                "\npersistent_buffer_bits=" +
+                std::to_string(max_persistent_buffer_size_bit) +
+                "\nmax_input_dtype_bits=" +
+                std::to_string(max_input_dtype_size_bit) +
+                "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+                "\nsm_count=" + std::to_string(device_multiprocessor_count) +
+                "\nl2_cache_bytes=" + std::to_string(dev_prop->l2CacheSize) +
+                "\nwarp_size=" + std::to_string(device_warp_size) +
+                "\nregister_file_bits=" +
+                std::to_string(scheduler_utils::register_file_size_bit)
+          : legacy_state;
+      const std::string choice = scheduler::jev::chooseDecision(
+          "OP3.unroll",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "u1" : "");
+      const auto option_it = std::find_if(
+          options.begin(),
+          options.end(),
+          [&](const auto& option) { return option.id == choice; });
+      NVF_ERROR(
+          option_it != options.end(),
+          "Unknown outer persistent iteration factor");
+      selected_iter_unroll =
+          factors.at(std::distance(options.begin(), option_it));
+    }
   }
+  params.iter_unroll_factor.set(selected_iter_unroll);
+  params.iter_unroll_factor.finalize();
+
+  // Start from warp_size, and decrease it until we can make more than 4 waves.
+  const int64_t bdimx_max =
+      max_multi_reduction_factor / params.iter_unroll_factor.get();
+  std::optional<BlockPlan> selected_plan;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Fit in L2: target 256 bits per warp. Otherwise use 16 lanes. This is a
+    // soft preference; the remote service receives only the measurements.
+    const int64_t n_elems =
+        total_reduction_numel * total_iteration_numel;
+    const int64_t warp_size =
+        n_elems * max_input_dtype_size_bit * n_tensor_inputs <
+            dev_prop->l2CacheSize * 8
+        ? (int64_t)256 / max_input_dtype_size_bit
+        : 16;
+    int64_t tmp_bdimx = std::min(bdimx_max, warp_size);
+    if (tmp_bdimx < warp_size) {
+      tmp_bdimx = scheduler_utils::lastPow2(tmp_bdimx);
+    }
+    // InstanceNormFP32 of [32, 32, 32, 128] improved from 618 to 770 GB/s
+    // when TIDx was reduced to expose four waves.
+    int64_t num_ctas = ceilDiv(
+        total_iteration_numel,
+        tmp_bdimx * params.iter_unroll_factor.get());
+    while (
+        num_ctas < 4l * device_multiprocessor_count &&
+        tmp_bdimx >= 2l *
+                normalization_scheduler_utils::PreferredLaunchConfig::kMinBdimx) {
+      tmp_bdimx /= 2l;
+      num_ctas = ceilDiv(
+          total_iteration_numel,
+          tmp_bdimx * params.iter_unroll_factor.get());
+    }
+    selected_plan = make_block_plan(
+        tmp_bdimx,
+        params.iter_unroll_factor.get(),
+        params.redu_unroll_factor.get());
+    NVF_ERROR(selected_plan.has_value(), "Invalid native outer persistent block plan");
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::vector<BlockPlan> plans;
+    for (int64_t seed = 1;
+         seed <= std::min(bdimx_max, device_warp_size);
+         seed *= 2) {
+      for (const auto& plan : make_block_candidates(
+               seed,
+               params.iter_unroll_factor.get(),
+               params.redu_unroll_factor.get())) {
+        const std::string id = plan_id(plan);
+        if (std::any_of(
+                options.begin(),
+                options.end(),
+                [&](const auto& option) { return option.id == id; })) {
+          continue;
+        }
+        options.push_back({
+            id,
+            "Use blockDim=(" + std::to_string(plan.bdimx) + "," +
+                std::to_string(plan.bdimy) + ") and " +
+                std::to_string(plan.batches_per_block) +
+                " serial reduction batches over " +
+                std::to_string(plan.gdimx) + " iteration CTAs"});
+        plans.push_back(plan);
+      }
+    }
+    NVF_ERROR(!options.empty(), "No legal outer persistent block plan");
+    const std::string state =
+        "outer_persistent.block_cta.v4\nredu_unroll=" +
+        std::to_string(params.redu_unroll_factor.get()) +
+        "\niter_unroll=" +
+        std::to_string(params.iter_unroll_factor.get()) +
+        "\nvector_width=" + std::to_string(vectorize_factor) + "\n" +
+        "reduction_numel=" +
+        std::to_string(total_reduction_numel) + "\niteration_numel=" +
+        std::to_string(total_iteration_numel) + "\npersistent_buffer_bits=" +
+        std::to_string(max_persistent_buffer_size_bit) +
+        "\nmax_input_dtype_bits=" +
+        std::to_string(max_input_dtype_size_bit) + "\nn_tensor_inputs=" +
+        std::to_string(n_tensor_inputs) + "\nsm_count=" +
+        std::to_string(device_multiprocessor_count) + "\nl2_cache_bytes=" +
+        std::to_string(dev_prop->l2CacheSize) + "\nwarp_size=" +
+        std::to_string(device_warp_size) + "\nregister_file_bits=" +
+        std::to_string(scheduler_utils::register_file_size_bit);
+    const std::string native_choice =
+        jev_mode == scheduler::jev::Mode::Record ? plan_id(*selected_plan) : "";
+    const std::string choice = scheduler::jev::chooseDecision(
+        "OP3.cta", state, options, native_choice);
+    const auto option_it = std::find_if(
+        options.begin(),
+        options.end(),
+        [&](const auto& option) { return option.id == choice; });
+    NVF_ERROR(option_it != options.end(), "Unknown outer persistent block plan");
+    selected_plan = plans.at(std::distance(options.begin(), option_it));
+  }
+
+  params.bdimx.set(selected_plan->bdimx);
   params.bdimx.finalize();
+  params.bdimy.set(selected_plan->bdimy);
+  params.bdimy.finalize();
+  params.batches_per_block.set(selected_plan->batches_per_block);
+  params.batches_per_block.finalize();
 
   // make sure all paras are set
   params.verify();
@@ -347,7 +689,7 @@ std::unique_ptr<ReductionParams> outerPersistentHeuristic(
   // copy to ReductionParams
   auto rparams = std::make_unique<ReductionParams>(
       OuterPersistentKernelScheduler::schedulerType());
-  auto gdimx = ceilDiv(total_iteration_numel, params.bdimx.get());
+  auto gdimx = selected_plan->gdimx;
   rparams->batches_per_block_inner_reduction = params.batches_per_block.get();
   rparams->persistent_kernel = true;
   rparams->project_persistent_buffers = project_to_input;
@@ -658,7 +1000,7 @@ bool OuterPersistentKernelScheduler::canScheduleRunTime(
 }
 
 std::unique_ptr<HeuristicParams> OuterPersistentKernelScheduler::
-    computeHeuristics(
+    computeHeuristicsImpl(
         Fusion* fusion,
         SchedulerRuntimeInfo& runtime_info,
         HeuristicDataCache* data_cache) {

@@ -8,12 +8,35 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <fstream>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+#include <unistd.h>
+
+#include <ATen/cuda/CUDAContext.h>
+
+#include "debug.h"
 #include "fusion.h"
 #include "ir/interface_nodes.h"
+#include "options.h"
 #include "ops/all_ops.h"
 #include "optimization_pass.h"
 #include "preseg_passes/mark_aliases_prepare.h"
 #include "runtime/fusion_executor_cache.h"
+#include "scheduler/compile_time_info.h"
+#include "scheduler/compute_invocation_input.h"
+#include "scheduler/jev_client.h"
+#include "scheduler/native_diagnostic_jsonl.h"
+#include "scheduler/pointwise_add_cta_continuation.h"
+#include "scheduler/pointwise_backend_route.h"
+#include "scheduler/pointwise_non_tma.h"
+#include "scheduler/pointwise_tma.h"
+#include "scheduler/pointwise_utils.h"
+#include "scheduler/runtime_info.h"
 #include "scheduler/tools/domain_map.h"
 #include "scheduler/tools/inlining.h"
 #include "tests/cpp/utils.h"
@@ -35,6 +58,28 @@ class PointwiseTestP : public NVFuserFixtureParamTest<ParamType> {
 };
 
 namespace {
+
+class ScopedTestEnv {
+ public:
+  ScopedTestEnv(std::string name, const char* value) : name_(std::move(name)) {
+    if (const char* previous = std::getenv(name_.c_str())) {
+      previous_ = previous;
+    }
+    NVF_CHECK(::setenv(name_.c_str(), value, 1) == 0);
+  }
+
+  ~ScopedTestEnv() {
+    if (previous_.has_value()) {
+      ::setenv(name_.c_str(), previous_->c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
 
 int64_t getVecSizeForPointwise(const FusionExecutorCache& executor_cache) {
   FusionKernelRuntime* runtime = executor_cache.getMostRecentKernelRuntime();
@@ -72,6 +117,309 @@ class DomainMapUnitTest : public scheduler_tools::DomainMap {
 };
 
 } // namespace
+
+TEST_F(PointwiseTest, JevSemanticGraphEligibility) {
+  constexpr std::string_view snapshot = "complete invocation snapshot";
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  auto* other = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addInput(other);
+  auto* broadcasted = broadcast(input, {true, false});
+  fusion.addOutput(add(broadcasted, other));
+
+  // A normal broadcast may add a logical dimension without a hidden domain
+  // transform. It must remain available to the strict semantic graph path.
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(&fusion, snapshot),
+      nullptr);
+  EXPECT_STREQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(&fusion, {}),
+      "semantic_graph_snapshot_unavailable");
+  EXPECT_STREQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(8193, 'x')),
+      "semantic_graph_snapshot_too_large");
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(8193, 'x'), true),
+      nullptr);
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(1024 * 1024, 'x'), true),
+      nullptr);
+  EXPECT_STREQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, std::string(1024 * 1024 + 1, 'x'), true),
+      "semantic_graph_snapshot_too_large");
+}
+
+TEST_F(PointwiseTest, JevIrMetadataV2CapturesPointwiseEligibilityFacts) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  auto* other = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addInput(other);
+  auto* broadcasted = broadcast(input, {true, false});
+  fusion.addOutput(add(broadcasted, other));
+
+  const auto metadata =
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion);
+  ASSERT_TRUE(metadata.available());
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr("\"schema\":\"nvfuser.compute_ir_meta.v2\""));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"memory_type\":\"global\""));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"dtype\":\"float\""));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"in_fusion_vals\":true"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"has_device_mesh\":false"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_cpu_scalar\":false"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"domain_expr_count\":0"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_iteration\":true"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_broadcast\":true"));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"kind\":\"broadcast\",\"op\":null,\"cache\":null"));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"kind\":\"binary\",\"op\":\"add\",\"cache\":null"));
+  Fusion clone(fusion);
+  EXPECT_EQ(
+      metadata.text,
+      scheduler::compute_invocation_input::captureIrMetadata(&clone).text);
+}
+
+TEST_F(PointwiseTest, JevIrMetadataV2ExposesUnsupportedPointwiseFeatures) {
+  using scheduler::compute_invocation_input::captureIrMetadata;
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    auto* intermediate = add(input, input);
+    intermediate->setMemoryType(MemoryType::Shared);
+    fusion.addOutput(add(intermediate, input));
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(
+        metadata.text, testing::HasSubstr("\"memory_type\":\"shared\""));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_memory_type");
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(add(input, input));
+    input->split(0, 4);
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(metadata.text, testing::HasSubstr("\"domain_expr_count\":1"));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_hidden_domain_transform");
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(add(input, input));
+    input->axis(0)->parallelize(ParallelType::TIDx);
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_parallelized\":true"));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_unsupported_axis");
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(exp(input));
+    const auto metadata = captureIrMetadata(&fusion);
+    ASSERT_TRUE(metadata.available());
+    EXPECT_THAT(
+        metadata.text,
+        testing::HasSubstr(
+            "\"kind\":\"unary\",\"op\":\"exp\",\"cache\":null"));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, "snapshot"),
+        "semantic_graph_unsupported_operator");
+  }
+}
+
+TEST_F(PointwiseTest, JevSemanticGraphRejectsHiddenTransformsAndOps) {
+  constexpr std::string_view snapshot = "complete invocation snapshot";
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(add(input, input));
+    input->split(0, 4);
+    EXPECT_NE(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, snapshot),
+        nullptr);
+  }
+  {
+    Fusion fusion;
+    FusionGuard fg(&fusion);
+    auto* input = makeContigTensor(1);
+    fusion.addInput(input);
+    fusion.addOutput(exp(input));
+    EXPECT_STREQ(
+        pointwise_utils::semanticPointwiseEligibilityReason(&fusion, snapshot),
+        "semantic_graph_unsupported_operator");
+  }
+}
+
+TEST_F(PointwiseTest, JevSemanticGraphAcceptsNoncontiguousInput) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input =
+      TensorViewBuilder().ndims(2).contiguity({false, true}).build();
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  EXPECT_EQ(
+      pointwise_utils::semanticPointwiseEligibilityReason(
+          &fusion, "complete invocation snapshot"),
+      nullptr);
+}
+
+TEST_F(PointwiseTest, JevSemanticV3UnsupportedGraphFallsBackBeforeChoice_CUDA) {
+  char log_path[] = "/tmp/nvfuser-pw3-unsupported-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+  ScopedTestEnv invalid_port("NVFUSER_JEV_PORT", "0");
+
+  Fusion unsupported;
+  FusionGuard fg(&unsupported);
+  auto* input = makeContigTensor(1);
+  unsupported.addInput(input);
+  unsupported.addOutput(exp(input));
+  const auto tensor = at::empty(
+      {16388}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&unsupported, {tensor});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::PointWise);
+  const auto compute = [&](const char* configured_mode) {
+    ScopedTestEnv mode("NVFUSER_JEV_MODE", configured_mode);
+    return scheduler->computeHeuristics(&unsupported, runtime_info);
+  };
+  const auto native = compute("off");
+  const auto recorded = compute("record");
+  const auto remote = compute("remote");
+  ASSERT_NE(native, nullptr);
+  ASSERT_NE(recorded, nullptr);
+  ASSERT_NE(remote, nullptr);
+  EXPECT_EQ(native->toString(), recorded->toString());
+  EXPECT_EQ(native->toString(), remote->toString());
+
+  std::ifstream log_file(log_path);
+  std::stringstream records;
+  records << log_file.rdbuf();
+  EXPECT_THAT(
+      records.str(), ::testing::HasSubstr("\"kind\":\"context_fallback\""));
+  EXPECT_THAT(
+      records.str(),
+      ::testing::HasSubstr(
+          "\"reason\":\"semantic_graph_unsupported_operator\""));
+  if (recorded->as<PointwiseParams>()->use_tma_load) {
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW4.width\""));
+  } else {
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW2\""));
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW3.width\""));
+    EXPECT_THAT(
+        records.str(),
+        ::testing::HasSubstr(
+            "\"kind\":\"coverage_skip\",\"site\":\"PW3.unroll\""));
+  }
+  EXPECT_THAT(
+      records.str(), ::testing::Not(::testing::HasSubstr("\"request\":")));
+
+  std::ifstream outcome_file(std::string(log_path) + ".outcome.jsonl");
+  std::stringstream outcomes;
+  outcomes << outcome_file.rdbuf();
+  EXPECT_THAT(
+      outcomes.str(),
+      ::testing::HasSubstr("\"kind\":\"no_choice\""));
+  EXPECT_THAT(
+      outcomes.str(),
+      ::testing::HasSubstr("\"site\":\"PW1\""));
+
+  Fusion supported;
+  FusionGuard supported_guard(&supported);
+  auto* supported_input = makeContigTensor(1);
+  supported.addInput(supported_input);
+  supported.addOutput(add(supported_input, supported_input));
+  SchedulerRuntimeInfo supported_info(&supported, {tensor});
+  {
+    ScopedTestEnv mode("NVFUSER_JEV_MODE", "remote");
+    try {
+      (void)scheduler->computeHeuristics(&supported, supported_info);
+      FAIL() << "Supported semantic-v3 graph bypassed the remote Choice";
+    } catch (const std::runtime_error& error) {
+      EXPECT_THAT(
+          error.what(),
+          ::testing::HasSubstr("NVFUSER_JEV_PORT must be an integer"));
+    }
+  }
+}
+
+// A non-CTA-multiple extent exercises the 1D tail for every offered warp
+// count. The alternate numeric harness runs this with native x128 and forced
+// x32/x64 choices through the same scheduler and checks the ATen result.
+TEST_F(PointwiseTest, JevAlternateOneDimensionalCta_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(1);
+  fusion.addInput(input);
+  TensorView* output = add(input, input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor tensor = at::randn({16388}, options);
+  auto result = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  const auto* params = result.heuristic_params->as<PointwiseParams>();
+  ASSERT_EQ(params->break_point, 0);
+  ASSERT_EQ(params->vectorization_factor, 4);
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+}
 
 TEST_F(PointwiseTest, VectorizeStrideContiguity2D) {
   auto fusion_ptr = std::make_unique<Fusion>();
@@ -1470,6 +1818,1740 @@ int64_t getVectorizationFactor(const FusionExecutorCache& executor_cache) {
       ->vectorization_factor;
 }
 } // namespace tma_check
+
+// The native small-workload rule still selects bp0, but its choice is now
+// recorded at PW2 with the raw threshold inputs and legal 2D alternatives.
+TEST_F(PointwiseTest, SmallPointwiseDirectBreakpointChoiceRecord) {
+  char log_path[] = "/tmp/nvfuser-pw2-direct-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {2, 16}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  const auto params = pointwise::non_tma::getPointwiseHeuristics(
+      &fusion, runtime_info, nullptr, *prop);
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->break_point, 0);
+
+  std::ifstream log_file(log_path);
+  std::stringstream log_output;
+  log_output << log_file.rdbuf();
+  const std::string records = log_output.str();
+  EXPECT_THAT(records, ::testing::HasSubstr("\"site\":\"PW2\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"selected\":\"bp0\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("pointwise.breakpoint.v2"));
+  EXPECT_THAT(records, ::testing::HasSubstr("n_elems=32"));
+  EXPECT_THAT(
+      records,
+      ::testing::HasSubstr(
+          "sm_count=" + std::to_string(prop->device_multiprocessor_count)));
+  EXPECT_THAT(records, ::testing::HasSubstr("default_cta_threads=128"));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"bp1_normal\""));
+  EXPECT_THAT(
+      records, ::testing::Not(::testing::HasSubstr("\"site\":\"PW2.entry\"")));
+}
+
+// The small Add carrier offers bp0 and both legal bindings at bp1. The v3
+// candidate cards expose local geometry and possible PW3 descendants, while
+// the actual Remote answer may choose any of the hard-legal alternatives.
+TEST_F(PointwiseTest, JevBreakpointCandidateEffects_CUDA) {
+  char local_path[] = "/tmp/nvfuser-pw2-effects-XXXXXX";
+  struct FileCleanup {
+    const char* path = nullptr;
+    ~FileCleanup() {
+      if (path != nullptr) {
+        ::unlink(path);
+        ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+      }
+    }
+  } file_cleanup;
+  const auto jev_mode = scheduler::jev::mode();
+  std::optional<ScopedTestEnv> local_log;
+  const char* log_path = std::getenv("NVFUSER_JEV_LOG");
+  if (jev_mode != scheduler::jev::Mode::Off &&
+      (log_path == nullptr || *log_path == '\0')) {
+    const int fd = ::mkstemp(local_path);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    file_cleanup.path = local_path;
+    local_log.emplace("NVFUSER_JEV_LOG", local_path);
+    log_path = local_path;
+  }
+  std::streampos log_start = 0;
+  std::streampos outcome_start = 0;
+  std::string outcome_path;
+  if (log_path != nullptr) {
+    std::ifstream existing_log(log_path, std::ios::ate);
+    if (existing_log.good()) {
+      log_start = existing_log.tellg();
+    }
+    const char* outcome_override = std::getenv("NVFUSER_JEV_OUTCOME_LOG");
+    outcome_path = outcome_override != nullptr && *outcome_override != '\0'
+        ? outcome_override
+        : std::string(log_path) + ".outcome.jsonl";
+    std::ifstream existing_outcomes(outcome_path, std::ios::ate);
+    if (existing_outcomes.good()) {
+      outcome_start = existing_outcomes.tellg();
+    }
+  }
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::randn(
+      {2, 16}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::PointWise);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedTestEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  ASSERT_NE(native, nullptr);
+  EXPECT_EQ(native->as<PointwiseParams>()->break_point, 0);
+  auto results = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  ASSERT_NE(results.heuristic_params, nullptr);
+  const auto* params = results.heuristic_params->as<PointwiseParams>();
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(native->lparams, results.heuristic_params->lparams);
+  }
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    ASSERT_NE(log_path, nullptr);
+    std::ifstream decision_log(log_path);
+    ASSERT_TRUE(decision_log.good());
+    decision_log.seekg(log_start);
+    std::string row;
+    std::string pw2_row;
+    std::string width_row;
+    std::string cta_1d_row;
+    std::string launch_row;
+    std::string unroll_row;
+    bool saw_unroll_choice = false;
+    while (std::getline(decision_log, row)) {
+      if (row.rfind("{\"site\":\"PW2\",", 0) == 0) {
+        ASSERT_TRUE(pw2_row.empty());
+        pw2_row = row;
+      }
+      if (row.rfind("{\"site\":\"PW3.cta_1d\",", 0) == 0) {
+        ASSERT_TRUE(cta_1d_row.empty());
+        cta_1d_row = row;
+      }
+      if (row.rfind("{\"site\":\"PW3.width\",", 0) == 0) {
+        ASSERT_TRUE(width_row.empty());
+        width_row = row;
+      }
+      if (row.rfind("{\"site\":\"PW3.launch\",", 0) == 0) {
+        ASSERT_TRUE(launch_row.empty());
+        launch_row = row;
+      }
+      saw_unroll_choice |=
+          row.rfind("{\"site\":\"PW3.unroll\",", 0) == 0;
+      if (row.rfind("{\"site\":\"PW3.unroll\",", 0) == 0) {
+        unroll_row = row;
+      }
+    }
+    ASSERT_FALSE(pw2_row.empty());
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    const bool exact_carrier_device =
+        std::string_view(device->name) == "NVIDIA GeForce RTX 4090" &&
+        device->major == 8 && device->minor == 9 &&
+        device->multiProcessorCount == 128 && device->warpSize == 32;
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            exact_carrier_device ? "pointwise.breakpoint.v4"
+                                 : "pointwise.breakpoint.v3"));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"break_point\":0,\"left_elems\":0,\"right_elems\":32,"
+            "\"grid_binding\":\"one_dimensional\""));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"break_point\":1,\"left_elems\":2,\"right_elems\":16,"
+            "\"grid_binding\":\"normal\""));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"break_point\":1,\"left_elems\":2,\"right_elems\":16,"
+            "\"grid_binding\":\"flipped\""));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            exact_carrier_device
+                ? "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\"]"
+                : "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\","
+                  "\"PW3.unroll\"]"));
+    EXPECT_THAT(
+        pw2_row,
+        ::testing::HasSubstr(
+            "\"pending_choices\":[\"PW3.width\",\"PW3.launch\",\"PW3."
+            "unroll\"]"));
+    if (exact_carrier_device) {
+      EXPECT_LT(pw2_row.size(), 8u * 1024u * 1024u);
+      for (const auto* id : {"bp0", "bp1_normal", "bp1_flip"}) {
+        const std::string option_id = "\"id\":\"" + std::string(id) + "\"";
+        const auto begin = pw2_row.find(option_id);
+        ASSERT_NE(begin, std::string::npos);
+        const auto next =
+            pw2_row.find("\"id\":\"bp", begin + option_id.size());
+        const std::string card = pw2_row.substr(begin, next - begin);
+        const bool two_dimensional = std::string_view(id) != "bp0";
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"schema\":\"nvfuser.pw2.add2x16.v1\""));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"width_choices\":[\"w1\",\"w2\",\"w4\"]"));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"cta_count_per_width\":" +
+                std::to_string(two_dimensional ? 128 : 3)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"terminal_leaf_count\":" +
+                std::to_string(two_dimensional ? 642 : 9)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"max_unroll_bound\":" +
+                std::to_string(two_dimensional ? 16 : 1)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                two_dimensional
+                    ? "\"pending_choices\":[\"PW3.width\",\"PW3.launch\","
+                      "\"PW3.unroll\"]"
+                    : "\"pending_choices\":[\"PW3.width\",\"PW3.cta_1d\"]"));
+        if (two_dimensional) {
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"effective_grid_x_formula\":\"" +
+                  std::string(
+                      std::string_view(id) == "bp1_flip" ? "L"
+                                                         : "ceil(R/U)") +
+                  "\""));
+        }
+      }
+    }
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
+      EXPECT_EQ(params->break_point, 0);
+      EXPECT_FALSE(saw_unroll_choice);
+      ASSERT_FALSE(cta_1d_row.empty());
+      std::ifstream outcome_log(outcome_path);
+      ASSERT_TRUE(outcome_log.good());
+      outcome_log.seekg(outcome_start);
+      bool saw_singleton = false;
+      while (std::getline(outcome_log, row)) {
+        saw_singleton |=
+            row.find("\"site\":\"PW3.unroll\"") != std::string::npos &&
+            row.find("\"selected\":\"u1\"") != std::string::npos &&
+            row.find("bounded model menu contains only u1") !=
+                std::string::npos;
+      }
+      EXPECT_TRUE(saw_singleton);
+    } else if (
+        pw2_row.find("\"selected\":\"bp1_normal\"") != std::string::npos) {
+      EXPECT_EQ(params->break_point, 1);
+      EXPECT_FALSE(params->flip_grid_binding);
+    } else if (pw2_row.find("\"selected\":\"bp1_flip\"") != std::string::npos) {
+      EXPECT_EQ(params->break_point, 1);
+      EXPECT_TRUE(params->flip_grid_binding);
+    } else {
+      EXPECT_THAT(pw2_row, ::testing::HasSubstr("\"selected\":\"bp0\""));
+      EXPECT_EQ(params->break_point, 0);
+    }
+
+    if (exact_carrier_device) {
+      ASSERT_FALSE(width_row.empty());
+      EXPECT_THAT(width_row, ::testing::HasSubstr("pointwise.width.v2"));
+      EXPECT_THAT(
+          width_row,
+          ::testing::HasSubstr(
+              "\"selected\":\"w" +
+              std::to_string(params->vectorization_factor) + "\""));
+      for (const int64_t offered_width : {1L, 2L, 4L}) {
+        const std::string option_id =
+            "\"id\":\"w" + std::to_string(offered_width) + "\"";
+        const auto begin = width_row.find(option_id);
+        ASSERT_NE(begin, std::string::npos);
+        const auto next =
+            width_row.find("\"id\":\"w", begin + option_id.size());
+        const std::string card = width_row.substr(begin, next - begin);
+        const bool two_dimensional = params->break_point == 1;
+        const int64_t leaves = !two_dimensional
+            ? 3
+            : offered_width == 1 ? 237 : offered_width == 2 ? 208 : 197;
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"schema\":\"nvfuser.pw3.width.add2x16.v1\""));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"terminal_leaf_count\":" + std::to_string(leaves)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"cta_count\":" +
+                std::to_string(two_dimensional ? 128 : 3)));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                "\"grid_binding\":\"" +
+                std::string(
+                    !two_dimensional ? "one_dimensional"
+                                     : params->flip_grid_binding ? "flipped"
+                                                                 : "normal") +
+                "\""));
+        EXPECT_THAT(
+            card,
+            ::testing::HasSubstr(
+                two_dimensional
+                    ? "\"pending_choices\":[\"PW3.launch\",\"PW3.unroll\"]"
+                    : "\"pending_choices\":[\"PW3.cta_1d\"]"));
+      }
+    }
+    if (params->break_point == 0) {
+      ASSERT_FALSE(cta_1d_row.empty());
+      ASSERT_NE(results.kernel_executor, nullptr);
+      const auto launch = results.kernel_executor->lastLaunchParams();
+      const int64_t threads = params->lparams.bdimx();
+      const int64_t width = params->vectorization_factor;
+      EXPECT_EQ(launch.gdimx(), 1);
+      EXPECT_EQ(launch.gdimy(), 1);
+      EXPECT_EQ(launch.bdimx(), threads);
+      EXPECT_EQ(launch.bdimy(), 1);
+      EXPECT_EQ(params->unroll_factor_inner, 1);
+      EXPECT_THAT(
+          cta_1d_row,
+          ::testing::HasSubstr(
+              "\"tail_right_positions\":" +
+              std::to_string(threads * width - 32)));
+      if (exact_carrier_device) {
+        EXPECT_THAT(
+            cta_1d_row, ::testing::HasSubstr("pointwise.launch_1d.v2"));
+        for (const int64_t offered_threads : {32L, 64L, 128L}) {
+          const std::string option_id =
+              "\"id\":\"x" + std::to_string(offered_threads) + "\"";
+          const auto begin = cta_1d_row.find(option_id);
+          ASSERT_NE(begin, std::string::npos);
+          const auto next =
+              cta_1d_row.find("\"id\":\"x", begin + option_id.size());
+          const std::string candidate = cta_1d_row.substr(begin, next - begin);
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"final_pointwise_plan\":{\"tag\":\"Pointwise "
+                  "heuristics\",\"break_point\":0,\"split_block\":false,"
+                  "\"symbolic_1d_cta\":" +
+                  std::string(offered_threads == 128 ? "false" : "true")));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"vectorization_factor\":" + std::to_string(width)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"unroll_factor_outer\":1,\"unroll_factor_inner\":1"));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"raw_launch\":{\"grid_x\":-1,\"grid_y\":-1,"
+                  "\"grid_z\":-1,\"block_x\":" +
+                  std::to_string(offered_threads)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"effective_launch\":{\"grid_x\":1,\"grid_y\":1,"
+                  "\"grid_z\":1,\"block_x\":" +
+                  std::to_string(offered_threads) + ",\"block_y\":1,"));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"right_work\":{\"right_elems\":32,"
+                  "\"right_positions_per_cta\":" +
+                  std::to_string(offered_threads * width)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"tail_right_positions\":" +
+                  std::to_string(offered_threads * width - 32)));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr(
+                  "\"pending_choices\":[],\"continuation\":{"
+                  "\"schema\":\"nvfuser.pw3.cta_1d.add2x16.v1\","));
+          EXPECT_THAT(
+              candidate, ::testing::HasSubstr("\"unroll_bound\":1"));
+          EXPECT_THAT(
+              candidate,
+              ::testing::HasSubstr("\"unroll_kind\":\"no_choice\""));
+          if (offered_threads == threads) {
+            scheduler::native_diagnostic::Object actual_plan;
+            actual_plan.add("tag", params->tag);
+            actual_plan.add("break_point", params->break_point);
+            actual_plan.add("split_block", params->split_block);
+            actual_plan.add("symbolic_1d_cta", params->symbolic_1d_cta);
+            actual_plan.add("split_grid_y_dim", params->split_grid_y_dim);
+            actual_plan.add("flip_grid_binding", params->flip_grid_binding);
+            actual_plan.add(
+                "vectorization_factor", params->vectorization_factor);
+            actual_plan.add("vectorize_casts", params->vectorize_casts);
+            actual_plan.add(
+                "unroll_factor_outer", params->unroll_factor_outer);
+            actual_plan.add(
+                "unroll_factor_inner", params->unroll_factor_inner);
+            actual_plan.add("use_tma_load", params->use_tma_load);
+            actual_plan.add("use_tma_store", params->use_tma_store);
+            actual_plan.add("tma_domain_inner", params->tma_domain_inner);
+            actual_plan.add("tma_tile_outer", params->tma_tile_outer);
+            actual_plan.add("tma_tile_inner", params->tma_tile_inner);
+            if (params->cparams.index_type.has_value()) {
+              actual_plan.add(
+                  "index_type",
+                  static_cast<int64_t>(*params->cparams.index_type));
+            } else {
+              actual_plan.addRaw("index_type", "null");
+            }
+            EXPECT_THAT(
+                candidate,
+                ::testing::HasSubstr(
+                    "\"final_pointwise_plan\":" + actual_plan.str()));
+          }
+        }
+      }
+    }
+
+    if (params->break_point == 1) {
+      ASSERT_FALSE(launch_row.empty());
+      ASSERT_NE(results.kernel_executor, nullptr);
+      const int64_t width = params->vectorization_factor;
+      const int64_t x = params->lparams.bdimx();
+      const int64_t y = 128 / x;
+      const int64_t left = (2 + y - 1) / y;
+      const int64_t right_vectors = (16 + width - 1) / width;
+      const int64_t right = (right_vectors + x - 1) / x;
+      const int64_t u = params->unroll_factor_inner;
+      const int64_t final_right = (right + u - 1) / u;
+      const auto launch = results.kernel_executor->lastLaunchParams();
+      EXPECT_EQ(params->unroll_factor_outer, 1);
+      EXPECT_EQ(launch.bdimx(), x);
+      EXPECT_EQ(launch.bdimy(), y);
+      EXPECT_EQ(
+          launch.gdimx(), params->flip_grid_binding ? left : final_right);
+      EXPECT_EQ(
+          launch.gdimy(), params->flip_grid_binding ? final_right : left);
+      EXPECT_FALSE(params->split_grid_y_dim);
+      if (exact_carrier_device) {
+        EXPECT_THAT(launch_row, ::testing::HasSubstr("pointwise.launch.v3"));
+        EXPECT_LT(launch_row.size(), 8u * 1024u * 1024u);
+        for (int64_t offered_x = 1; offered_x <= 128; ++offered_x) {
+          const std::string offered_id =
+              "\"id\":\"x" + std::to_string(offered_x) + "\"";
+          const auto offered_begin = launch_row.find(offered_id);
+          ASSERT_NE(offered_begin, std::string::npos);
+          const auto offered_next = launch_row.find(
+              "\"id\":\"x", offered_begin + offered_id.size());
+          const std::string card =
+              launch_row.substr(offered_begin, offered_next - offered_begin);
+          const int64_t offered_y = 128 / offered_x;
+          const int64_t offered_left = (2 + offered_y - 1) / offered_y;
+          const int64_t offered_right =
+              (right_vectors + offered_x - 1) / offered_x;
+          const int64_t bound = offered_left * offered_right;
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"threads_x\":" + std::to_string(offered_x) +
+                  ",\"threads_y\":" + std::to_string(offered_y)));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"preliminary_grid_left\":" +
+                  std::to_string(offered_left) +
+                  ",\"preliminary_grid_right\":" +
+                  std::to_string(offered_right)));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"unroll_bound\":" + std::to_string(bound)));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"unroll_choices_kind\":\"" +
+                  std::string(bound == 1 ? "no_choice" : "bounded_choice") +
+                  "\""));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"effective_grid_x_formula\":\"" +
+                  std::string(
+                      params->flip_grid_binding ? "L" : "ceil(R/U)") +
+                  "\""));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  "\"effective_grid_y_formula\":\"" +
+                  std::string(
+                      params->flip_grid_binding ? "ceil(R/U)" : "L") +
+                  "\""));
+          EXPECT_THAT(
+              card,
+              ::testing::HasSubstr(
+                  bound == 1 ? "\"pending_choices\":[]"
+                             : "\"pending_choices\":[\"PW3.unroll\"]"));
+        }
+        const std::string selected_id =
+            "\"id\":\"x" + std::to_string(x) + "\"";
+        const auto begin = launch_row.find(selected_id);
+        ASSERT_NE(begin, std::string::npos);
+        const auto next =
+            launch_row.find("\"id\":\"x", begin + selected_id.size());
+        const std::string selected_card =
+            launch_row.substr(begin, next - begin);
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"unroll_bound\":" + std::to_string(left * right)));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"preliminary_grid_left\":" + std::to_string(left)));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"preliminary_grid_right\":" + std::to_string(right)));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                "\"schema\":\"nvfuser.pw3.launch.add2x16.v1\""));
+        EXPECT_THAT(
+            selected_card,
+            ::testing::HasSubstr(
+                left * right == 1
+                    ? "\"pending_choices\":[]"
+                    : "\"pending_choices\":[\"PW3.unroll\"]"));
+        if (left * right == 1) {
+          EXPECT_FALSE(saw_unroll_choice);
+          std::ifstream outcomes(outcome_path);
+          ASSERT_TRUE(outcomes.good());
+          outcomes.seekg(outcome_start);
+          bool saw_u1_no_choice = false;
+          while (std::getline(outcomes, row)) {
+            saw_u1_no_choice |=
+                row.find("\"kind\":\"no_choice\"") !=
+                    std::string::npos &&
+                row.find("\"site\":\"PW3.unroll\"") !=
+                    std::string::npos &&
+                row.find("\"selected\":\"u1\"") != std::string::npos;
+          }
+          EXPECT_TRUE(saw_u1_no_choice);
+        } else {
+          ASSERT_FALSE(unroll_row.empty());
+          const std::string unroll_id =
+              "\"id\":\"u" + std::to_string(u) + "\"";
+          const auto unroll_begin = unroll_row.find(unroll_id);
+          ASSERT_NE(unroll_begin, std::string::npos);
+          const auto unroll_next = unroll_row.find(
+              "\"id\":\"u", unroll_begin + unroll_id.size());
+          const std::string unroll_card =
+              unroll_row.substr(unroll_begin, unroll_next - unroll_begin);
+          scheduler::native_diagnostic::Object actual_plan;
+          actual_plan.add("tag", params->tag);
+          actual_plan.add("break_point", params->break_point);
+          actual_plan.add("split_block", params->split_block);
+          actual_plan.add("symbolic_1d_cta", params->symbolic_1d_cta);
+          actual_plan.add("split_grid_y_dim", params->split_grid_y_dim);
+          actual_plan.add("flip_grid_binding", params->flip_grid_binding);
+          actual_plan.add("vectorization_factor", params->vectorization_factor);
+          actual_plan.add("vectorize_casts", params->vectorize_casts);
+          actual_plan.add("unroll_factor_outer", params->unroll_factor_outer);
+          actual_plan.add("unroll_factor_inner", params->unroll_factor_inner);
+          actual_plan.add("use_tma_load", params->use_tma_load);
+          actual_plan.add("use_tma_store", params->use_tma_store);
+          actual_plan.add("tma_domain_inner", params->tma_domain_inner);
+          actual_plan.add("tma_tile_outer", params->tma_tile_outer);
+          actual_plan.add("tma_tile_inner", params->tma_tile_inner);
+          if (params->cparams.index_type.has_value()) {
+            actual_plan.add(
+                "index_type",
+                static_cast<int64_t>(*params->cparams.index_type));
+          } else {
+            actual_plan.addRaw("index_type", "null");
+          }
+          EXPECT_THAT(
+              unroll_card,
+              ::testing::HasSubstr(
+                  "\"final_pointwise_plan\":" + actual_plan.str()));
+          EXPECT_THAT(
+              unroll_card,
+              ::testing::HasSubstr(
+                  "\"effective_launch\":{\"grid_x\":" +
+                  std::to_string(launch.gdimx()) +
+                  ",\"grid_y\":" + std::to_string(launch.gdimy()) +
+                  ",\"grid_z\":1,\"block_x\":" + std::to_string(x) +
+                  ",\"block_y\":" + std::to_string(y) +
+                  ",\"block_z\":1}"));
+          EXPECT_THAT(
+              unroll_card,
+              ::testing::HasSubstr(
+                  "\"tail_right_positions\":" +
+                  std::to_string(final_right * x * width * u - 16)));
+        }
+      }
+    }
+
+    // The forced bp1_normal/w1/x1 path makes PW3.unroll terminal for this
+    // ordinary branch. Compare its selected effect with the physical launch,
+    // since the heuristic's raw grid dimensions are intentionally unset.
+    if (jev_mode == scheduler::jev::Mode::Remote &&
+        params->break_point == 1 && !params->flip_grid_binding &&
+        params->vectorization_factor == 1 && params->lparams.bdimx() == 1 &&
+        params->lparams.bdimy() == 128) {
+      ASSERT_FALSE(unroll_row.empty());
+      const int64_t unroll = params->unroll_factor_inner;
+      const int64_t grid_x = (16 + unroll - 1) / unroll;
+      EXPECT_EQ(params->unroll_factor_outer, 1);
+      EXPECT_THAT(
+          unroll_row,
+          ::testing::HasSubstr(
+              "\"selected\":\"u" + std::to_string(unroll) + "\""));
+      ASSERT_NE(results.kernel_executor, nullptr);
+      const auto launch = results.kernel_executor->lastLaunchParams();
+      EXPECT_EQ(launch.gdimx(), grid_x);
+      EXPECT_EQ(launch.gdimy(), 1);
+      EXPECT_EQ(launch.gdimz(), 1);
+      EXPECT_EQ(launch.bdimx(), 1);
+      EXPECT_EQ(launch.bdimy(), 128);
+      EXPECT_EQ(launch.bdimz(), 1);
+      const std::string candidate_id =
+          "\"id\":\"u" + std::to_string(unroll) + "\"";
+      const auto begin = unroll_row.find(candidate_id);
+      ASSERT_NE(begin, std::string::npos);
+      const auto next = unroll_row.find("\"id\":\"u", begin + candidate_id.size());
+      const std::string candidate = unroll_row.substr(begin, next - begin);
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"plan_scope\":\"ordinary_pointwise_branch\","
+              "\"final_pointwise_plan\":{\"tag\":\"Pointwise heuristics\","
+              "\"break_point\":1,"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"tma_domain_inner\":-1,\"tma_tile_outer\":-1,"
+              "\"tma_tile_inner\":-1,\"index_type\":11}"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"index_type_provenance\":\"source_hard_analysis\","
+              "\"raw_launch\":{\"grid_x\":-1,\"grid_y\":-1,"
+              "\"grid_z\":-1,\"block_x\":1,\"block_y\":128,"
+              "\"block_z\":-1,\"dynamic_smem_bytes\":0}"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"effective_launch\":{\"grid_x\":" +
+              std::to_string(grid_x) +
+              ",\"grid_y\":1,\"grid_z\":1,\"block_x\":1,\"block_y\":128,"
+              "\"block_z\":1}"));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"unroll_factor_outer\":1,\"unroll_factor_inner\":" +
+              std::to_string(unroll)));
+      EXPECT_THAT(
+          candidate,
+          ::testing::HasSubstr(
+              "\"right_work\":{\"right_elems\":16,"
+              "\"right_positions_per_cta\":" +
+              std::to_string(unroll) + ",\"right_ctas\":" +
+              std::to_string(grid_x) + ",\"covered_right_positions\":" +
+              std::to_string(grid_x * unroll) +
+              ",\"tail_right_positions\":" +
+              std::to_string(grid_x * unroll - 16) + "}"));
+      EXPECT_THAT(candidate, ::testing::HasSubstr("\"pending_choices\":[]"));
+    }
+  }
+}
+
+TEST_F(PointwiseTest, AddCtaBoundedContinuation) {
+  using pointwise::non_tma::addCtaContinuation;
+  for (const int64_t width : {1L, 2L, 4L}) {
+    for (const int64_t threads : {32L, 64L, 128L}) {
+      const auto c = addCtaContinuation(32, width, threads, 1);
+      ASSERT_TRUE(c.has_value()) << width << ',' << threads;
+      EXPECT_EQ(c->source_total_blocks, 1);
+      EXPECT_EQ(c->unroll_bound, 1);
+      EXPECT_EQ(c->effective_grid_x, 1);
+      EXPECT_EQ(c->covered_right_positions, threads * width);
+      EXPECT_EQ(c->tail_right_positions, threads * width - 32);
+    }
+  }
+  EXPECT_FALSE(addCtaContinuation(34, 1, 32, 1).has_value());
+  EXPECT_FALSE(addCtaContinuation(32, 8, 32, 1).has_value());
+  EXPECT_FALSE(addCtaContinuation(32, 1, 16, 1).has_value());
+  EXPECT_FALSE(addCtaContinuation(32, 1, 32, 2).has_value());
+}
+
+TEST_F(PointwiseTest, AddLaunch2DBoundedContinuation) {
+  using pointwise::non_tma::addBreakpointContinuation;
+  using pointwise::non_tma::addLaunch2DContinuation;
+  using pointwise::non_tma::addWidthContinuation;
+  const auto one_dimensional_branch = addBreakpointContinuation(0);
+  ASSERT_TRUE(one_dimensional_branch.has_value());
+  EXPECT_EQ(one_dimensional_branch->width_count, 3);
+  EXPECT_EQ(one_dimensional_branch->cta_count_per_width, 3);
+  EXPECT_EQ(one_dimensional_branch->terminal_leaf_count, 9);
+  EXPECT_EQ(one_dimensional_branch->max_unroll_bound, 1);
+  const auto two_dimensional_branch = addBreakpointContinuation(1);
+  ASSERT_TRUE(two_dimensional_branch.has_value());
+  EXPECT_EQ(two_dimensional_branch->width_count, 3);
+  EXPECT_EQ(two_dimensional_branch->cta_count_per_width, 128);
+  EXPECT_EQ(two_dimensional_branch->terminal_leaf_count, 642);
+  EXPECT_EQ(two_dimensional_branch->max_unroll_bound, 16);
+  EXPECT_FALSE(addBreakpointContinuation(2).has_value());
+  for (const int64_t width : {1L, 2L, 4L}) {
+    const auto one_dimensional = addWidthContinuation(0, width);
+    ASSERT_TRUE(one_dimensional.has_value());
+    EXPECT_EQ(one_dimensional->cta_count, 3);
+    EXPECT_EQ(one_dimensional->terminal_leaf_count, 3);
+    EXPECT_EQ(one_dimensional->max_unroll_bound, 1);
+    int64_t terminal_count = 0;
+    for (int64_t x = 1; x <= 128; ++x) {
+      const auto c = addLaunch2DContinuation(2, 16, width, x, 1);
+      ASSERT_TRUE(c.has_value()) << width << ',' << x;
+      const int64_t y = 128 / x;
+      const int64_t left = (2 + y - 1) / y;
+      const int64_t right = ((16 + width - 1) / width + x - 1) / x;
+      EXPECT_EQ(c->threads_y, y);
+      EXPECT_EQ(c->preliminary_grid_left, left);
+      EXPECT_EQ(c->preliminary_grid_right, right);
+      EXPECT_EQ(c->unroll_bound, left * right);
+      for (int64_t u = 1; u <= c->unroll_bound; ++u) {
+        const int64_t final_right = (right + u - 1) / u;
+        EXPECT_EQ(c->rightGridAfterUnroll(u), final_right);
+        EXPECT_EQ(c->coveredRightPositions(x, width, u),
+                  final_right * x * width * u);
+        EXPECT_GE(c->coveredRightPositions(x, width, u), 16);
+        ++terminal_count;
+      }
+    }
+    EXPECT_EQ(terminal_count, width == 1 ? 237 : width == 2 ? 208 : 197);
+    const auto two_dimensional = addWidthContinuation(1, width);
+    ASSERT_TRUE(two_dimensional.has_value());
+    EXPECT_EQ(two_dimensional->cta_count, 128);
+    EXPECT_EQ(two_dimensional->terminal_leaf_count, terminal_count);
+    EXPECT_EQ(two_dimensional->max_unroll_bound,
+              width == 1 ? 16 : width == 2 ? 8 : 4);
+  }
+  EXPECT_FALSE(addWidthContinuation(2, 1).has_value());
+  EXPECT_FALSE(addWidthContinuation(0, 8).has_value());
+  EXPECT_FALSE(addLaunch2DContinuation(3, 16, 1, 1, 1).has_value());
+  EXPECT_FALSE(addLaunch2DContinuation(2, 16, 8, 1, 1).has_value());
+  EXPECT_FALSE(addLaunch2DContinuation(2, 16, 1, 129, 1).has_value());
+  EXPECT_FALSE(addLaunch2DContinuation(2, 16, 1, 1, 2).has_value());
+}
+
+TEST_F(PointwiseTest, AddCtaNonzeroStorageOffsetKeepsConditionalPreview_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (std::string_view(device->name) != "NVIDIA GeForce RTX 4090" ||
+      device->major != 8 || device->minor != 9 ||
+      device->multiProcessorCount != 128 || device->warpSize != 32) {
+    GTEST_SKIP() << "The bounded Add continuation is scoped to RTX 4090";
+  }
+  char log_path[] = "/tmp/nvfuser-pw3-cta-offset-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto backing = at::randn(
+      {36}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  const auto tensor = backing.narrow(0, 4, 32).view({2, 16});
+  ASSERT_EQ(tensor.storage_offset(), 4);
+  ASSERT_EQ(tensor.stride(0), 16);
+  ASSERT_EQ(tensor.stride(1), 1);
+  auto results = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+
+  std::ifstream decisions(log_path);
+  ASSERT_TRUE(decisions.good());
+  std::string row;
+  bool saw_breakpoint = false;
+  bool saw_width = false;
+  bool saw_cta = false;
+  while (std::getline(decisions, row)) {
+    if (row.rfind("{\"site\":\"PW2\",", 0) == 0) {
+      saw_breakpoint = true;
+      EXPECT_THAT(row, ::testing::HasSubstr("pointwise.breakpoint.v3"));
+      EXPECT_THAT(
+          row,
+          ::testing::Not(::testing::HasSubstr("nvfuser.pw2.add2x16.v1")));
+    }
+    if (row.rfind("{\"site\":\"PW3.width\",", 0) == 0) {
+      saw_width = true;
+      EXPECT_THAT(row, ::testing::HasSubstr("pointwise.width.v1"));
+      EXPECT_THAT(
+          row,
+          ::testing::Not(::testing::HasSubstr(
+              "nvfuser.pw3.width.add2x16.v1")));
+    }
+    if (row.rfind("{\"site\":\"PW3.cta_1d\",", 0) != 0) {
+      continue;
+    }
+    saw_cta = true;
+    EXPECT_THAT(row, ::testing::HasSubstr("pointwise.launch_1d.v1"));
+    EXPECT_THAT(row, ::testing::Not(::testing::HasSubstr(
+                         "nvfuser.pw3.cta_1d.add2x16.v1")));
+  }
+  EXPECT_TRUE(saw_breakpoint);
+  EXPECT_TRUE(saw_width);
+  EXPECT_TRUE(saw_cta);
+}
+
+// The two structured protocols must describe the same conditional work for
+// each offered width and 1D CTA. The v3 wrapper retains the text state used
+// by the deterministic API parser and carries these previews per candidate.
+TEST_F(PointwiseTest, PointwiseCandidatePreviewsMatchSemanticV2_CUDA) {
+  char log_path[] = "/tmp/nvfuser-pw3-preview-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {16388}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+  const std::string hardware =
+      "{\"sm_count\":" + std::to_string(prop->device_multiprocessor_count) +
+      "}";
+
+  auto read_log = [&]() {
+    std::ifstream stream(log_path);
+    std::stringstream contents;
+    contents << stream.rdbuf();
+    return contents.str();
+  };
+  auto run_record = [&](const char* protocol) {
+    ScopedTestEnv protocol_env("NVFUSER_JEV_PROTOCOL", protocol);
+    const std::string before = read_log();
+    scheduler::jev::ComputeHeuristicsScope scope(
+        "one-dimensional add with 16388 float elements", {}, hardware);
+    auto params = pointwise::non_tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop);
+    NVF_CHECK(params != nullptr);
+    NVF_CHECK(params->break_point == 0);
+    const std::pair<int64_t, int64_t> plan{
+        params->vectorization_factor, params->lparams.bdimx()};
+    scope.complete("PointWise");
+    return std::pair{read_log().substr(before.size()), plan};
+  };
+  const auto [v2_records, v2_plan] = run_record("semantic-v2");
+  const auto [v3_records, v3_plan] = run_record("semantic-v3");
+  EXPECT_EQ(v2_plan, v3_plan);
+  EXPECT_EQ(v2_plan, (std::pair<int64_t, int64_t>{4, 128}));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("pointwise.width.v1"));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("pointwise.launch_1d.v1"));
+
+  const auto site_row = [](const std::string& records, const std::string& site) {
+    std::istringstream stream(records);
+    std::string row;
+    while (std::getline(stream, row)) {
+      if (row.find("\"site\":\"" + site + "\"") != std::string::npos) {
+        return row;
+      }
+    }
+    return std::string();
+  };
+  for (const auto& [site, ids] : {
+           std::pair<const char*, std::vector<const char*>>{
+               "PW3.width", {"w1", "w2", "w4"}},
+           {"PW3.cta_1d", {"x32", "x64", "x128"}}}) {
+    const std::string v2_row = site_row(v2_records, site);
+    const std::string v3_row = site_row(v3_records, site);
+    ASSERT_FALSE(v2_row.empty()) << site;
+    ASSERT_FALSE(v3_row.empty()) << site;
+    for (const char* id : ids) {
+      const std::string marker = "{\"id\":\"" + std::string(id) + "\"";
+      const size_t v2_start = v2_row.find(marker);
+      const size_t v3_start = v3_row.find(marker);
+      ASSERT_NE(v2_start, std::string::npos) << site << ' ' << id;
+      ASSERT_NE(v3_start, std::string::npos) << site << ' ' << id;
+      const size_t v2_fields = v2_start + marker.size() + 1;
+      const size_t v2_end = v2_row.find('}', v2_fields);
+      const std::string consequence = "\"consequence\":{";
+      const size_t v3_fields = v3_row.find(consequence, v3_start);
+      ASSERT_NE(v3_fields, std::string::npos) << site << ' ' << id;
+      const size_t v3_values = v3_fields + consequence.size();
+      const size_t v3_end = v3_row.find('}', v3_values);
+      ASSERT_NE(v2_end, std::string::npos);
+      ASSERT_NE(v3_end, std::string::npos);
+      const std::string pending = ",\"unroll_status\":\"pending\"";
+      const std::string v3_fields_without_status =
+          v3_row.substr(v3_values, v3_end - v3_values);
+      ASSERT_GE(v3_fields_without_status.size(), pending.size());
+      EXPECT_EQ(
+          v3_fields_without_status.substr(
+              v3_fields_without_status.size() - pending.size()),
+          pending);
+      EXPECT_EQ(
+          v2_row.substr(v2_fields, v2_end - v2_fields),
+          v3_fields_without_status.substr(
+              0, v3_fields_without_status.size() - pending.size()))
+          << site << ' ' << id;
+    }
+  }
+}
+
+// A logical right side just beyond the device's grid-X limit filters x1 but
+// retains the native CTA. No tensor allocation is needed to exercise the
+// exact hard menu and its conditional 2D preview.
+TEST_F(PointwiseTest, PointwiseLaunchPartialMenuSemanticV3_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  ASSERT_GT(device->maxGridSize[0], 128);
+  char log_path[] = "/tmp/nvfuser-pw3-launch-preview-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  const int64_t right_elems =
+      (static_cast<int64_t>(device->maxGridSize[0]) + 1) * 4 + 2;
+  pointwise_utils::FusionRuntimeProperties prop;
+  prop.n_elems = right_elems * 2;
+  prop.device_multiprocessor_count = device->multiProcessorCount;
+  pointwise_utils::BreakPointInfo bp;
+  bp.break_point = 1;
+  bp.right_elem_count = right_elems;
+  const std::string hardware =
+      "{\"sm_count\":" + std::to_string(prop.device_multiprocessor_count) +
+      "}";
+  auto read_log = [&]() {
+    std::ifstream stream(log_path);
+    std::stringstream contents;
+    contents << stream.rdbuf();
+    return contents.str();
+  };
+  auto run_record = [&](const char* protocol) {
+    ScopedTestEnv protocol_env("NVFUSER_JEV_PROTOCOL", protocol);
+    const std::string before = read_log();
+    scheduler::jev::ComputeHeuristicsScope scope(
+        "synthetic large two-dimensional pointwise", {}, hardware);
+    const auto config =
+        pointwise_utils::getBlockGridConfig(prop, bp, 4, 128, false);
+    scope.complete("PointWise");
+    return std::pair{read_log().substr(before.size()), config};
+  };
+  const auto [text_records, text_config] = run_record("text-v1");
+  const auto [v2_records, v2_config] = run_record("semantic-v2");
+  const auto [v3_records, v3_config] = run_record("semantic-v3");
+  const std::string before_off = read_log();
+  pointwise_utils::BlockGridConfig off_config;
+  {
+    ScopedTestEnv off_mode("NVFUSER_JEV_MODE", "off");
+    off_config = pointwise_utils::getBlockGridConfig(prop, bp, 4, 128, false);
+  }
+  EXPECT_EQ(off_config.bdimx, v3_config.bdimx);
+  EXPECT_EQ(read_log(), before_off);
+  EXPECT_EQ(text_config.bdimx, v2_config.bdimx);
+  EXPECT_EQ(text_config.bdimx, v3_config.bdimx);
+  EXPECT_EQ(text_config.bdimy, v3_config.bdimy);
+  EXPECT_THAT(
+      text_records,
+      ::testing::HasSubstr("text_v1_requires_full_hard_cta_menu"));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("pointwise.launch.v2"));
+  EXPECT_THAT(
+      v3_records,
+      ::testing::HasSubstr(
+          "max_grid_x=" + std::to_string(device->maxGridSize[0])));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("unroll_status=pending"));
+  EXPECT_THAT(v3_records, ::testing::HasSubstr("grid_split_status=pending"));
+
+  const auto site_row = [](const std::string& records) {
+    std::istringstream stream(records);
+    std::string row;
+    while (std::getline(stream, row)) {
+      if (row.find("\"site\":\"PW3.launch\"") != std::string::npos &&
+          row.find("\"kind\":\"coverage_skip\"") == std::string::npos) {
+        return row;
+      }
+    }
+    return std::string();
+  };
+  const std::string v2_row = site_row(v2_records);
+  const std::string v3_row = site_row(v3_records);
+  ASSERT_FALSE(v2_row.empty());
+  ASSERT_FALSE(v3_row.empty());
+  EXPECT_EQ(v2_row.find("{\"id\":\"x1\""), std::string::npos);
+  EXPECT_EQ(v3_row.find("{\"id\":\"x1\""), std::string::npos);
+  const auto preview_fields = [](const std::string& row, const char* id,
+                                 bool semantic_v3) {
+    const std::string marker = "{\"id\":\"" + std::string(id) + "\"";
+    const size_t candidate = row.find(marker);
+    NVF_CHECK(candidate != std::string::npos, "missing 2D CTA candidate ", id);
+    if (semantic_v3) {
+      const std::string key = "\"consequence\":{";
+      const size_t start = row.find(key, candidate);
+      NVF_CHECK(start != std::string::npos, "missing 2D CTA consequence ", id);
+      const size_t fields = start + key.size();
+      const size_t end = row.find(",\"unroll_status\":\"pending\"", fields);
+      NVF_CHECK(end != std::string::npos, "missing pending 2D CTA unroll ", id);
+      return row.substr(fields, end - fields);
+    }
+    const size_t fields = candidate + marker.size() + 1;
+    const size_t end = row.find('}', fields);
+    NVF_CHECK(end != std::string::npos, "incomplete v2 2D CTA preview ", id);
+    return row.substr(fields, end - fields);
+  };
+  for (const char* id : {"x2", "x32", "x128"}) {
+    EXPECT_EQ(
+        preview_fields(v2_row, id, false),
+        preview_fields(v3_row, id, true)) << id;
+  }
+  EXPECT_THAT(
+      v3_row,
+      ::testing::HasSubstr(
+          "\"unroll_status\":\"pending\",\"grid_split_status\":\"pending\""));
+}
+
+// Call the TMA heuristic directly so this checks candidate analysis on any
+// CUDA device without compiling or executing a Hopper kernel.
+TEST_F(PointwiseTest, TmaBreakpointPreflightDebugOnlyFinalPlan) {
+  char log_path[] = "/tmp/nvfuser-pw4-preflight-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {32, 4096}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  HeuristicDataCache parent_cache;
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, &parent_cache);
+  ASSERT_TRUE(prop.has_value());
+  const auto structural = pointwise_utils::getTmaBreakPointSearch(*prop, nullptr);
+  EXPECT_EQ(structural.candidates.size(), 2);
+
+  DebugDumpOptionsGuard debug_options;
+  DebugDumpOptionsGuard::getCurOptions().set(DebugDumpOption::SchedulerDebug);
+  std::stringstream preview_debug;
+  pointwise::tma::TmaBreakPointAvailability preview;
+  {
+    DebugStreamGuard debug_guard(preview_debug);
+    preview = pointwise::tma::getTmaBreakPointAvailability(
+        &fusion, runtime_info, *prop);
+  }
+  EXPECT_EQ(preview.state, structural.state);
+  ASSERT_EQ(preview.options.size(), preview.plans.size());
+  ASSERT_EQ(
+      preview.options.size(), preview.materialized_layout_widths.size());
+  ASSERT_EQ(
+      preview.options.size(), preview.remote_unavailability_reasons.size());
+  ASSERT_EQ(preview.options.size(), 2);
+  EXPECT_EQ(preview.options[0].id, "bp0");
+  EXPECT_EQ(preview.options[1].id, "bp1");
+  EXPECT_EQ(
+      preview.options[0].description,
+      "Flatten to the one-dimensional TMA domain");
+  EXPECT_EQ(preview.options[1].description, "Split before loop axis 1");
+  const auto positive_menu = pointwise::tma::remoteRouteableTmaBreakPoints(
+      preview,
+      prop->n_elems,
+      prop->elem_counts.size(),
+      prop->min_dtype_size_bit_for_vectorization);
+  EXPECT_FALSE(positive_menu.remote_filter_applied);
+  EXPECT_EQ(positive_menu.state, preview.state);
+  ASSERT_EQ(positive_menu.options.size(), preview.options.size());
+  for (size_t i = 0; i < preview.options.size(); ++i) {
+    EXPECT_EQ(positive_menu.options[i].id, preview.options[i].id);
+    EXPECT_EQ(
+        positive_menu.options[i].description,
+        preview.options[i].description);
+  }
+  for (size_t i = 0; i < preview.options.size(); ++i) {
+    EXPECT_EQ(
+        preview.options[i].id,
+        "bp" + std::to_string(preview.plans[i].break_point));
+    EXPECT_TRUE(preview.remote_unavailability_reasons[i].empty());
+  }
+  // The same source-used routeability gate separates a materializable bp0
+  // from a Remote-reachable continuation at the divisor replay boundary.
+  EXPECT_TRUE(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 1LL << 40, 0, 4, 32)
+          .empty());
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, (1LL << 40) + 1, 0, 4, 32),
+      "extent exceeds bounded divisor replay");
+  EXPECT_TRUE(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, (1LL << 40) + 1, 1, 4, 32)
+          .empty());
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          33, 131072, 1, 4, 32),
+      "more than 32 loop dimensions");
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 131072, 1, 3, 32),
+      "PW4.width layout and byte bounds must be powers of two in 1..128");
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 131072, 1, 4, 3),
+      "PW4.width layout and byte bounds must be powers of two in 1..128");
+  EXPECT_EQ(
+      pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+          2, 131072, 1, 1, 4),
+      "PW4.width layout is below the required byte floor");
+  EXPECT_TRUE(preview_debug.str().empty());
+  std::ifstream preview_log(log_path);
+  std::stringstream preview_rows;
+  preview_rows << preview_log.rdbuf();
+  EXPECT_TRUE(preview_rows.str().empty());
+  std::ifstream preview_outcome(std::string(log_path) + ".outcome.jsonl");
+  std::stringstream preview_events;
+  preview_events << preview_outcome.rdbuf();
+  EXPECT_TRUE(preview_events.str().empty());
+
+  // PW1 uses these exact cache-free native projections before asking its
+  // backend Choice. Neither preview may write to the caller's cache or log.
+  std::stringstream parent_preview_debug;
+  std::unique_ptr<PointwiseParams> native_tma_baseline;
+  std::unique_ptr<PointwiseParams> ordinary_baseline;
+  {
+    DebugStreamGuard debug_guard(parent_preview_debug);
+    scheduler::jev::ScopedNativeDecisions native_scope;
+    native_tma_baseline =
+        pointwise::tma::getNativePointwiseHeuristicsPreview(
+            &fusion, runtime_info, *prop);
+    ordinary_baseline = pointwise::non_tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop, /*emit_debug=*/false);
+  }
+  ASSERT_NE(native_tma_baseline, nullptr);
+  ASSERT_NE(ordinary_baseline, nullptr);
+  EXPECT_TRUE(parent_preview_debug.str().empty());
+  EXPECT_FALSE(parent_cache.hasEntry(
+      HeuristicCompileTime::ResizeVectorizationFactors::EntryType));
+  std::ifstream parent_log(log_path);
+  std::stringstream parent_rows;
+  parent_rows << parent_log.rdbuf();
+  EXPECT_TRUE(parent_rows.str().empty());
+
+  std::stringstream debug_output;
+  std::unique_ptr<PointwiseParams> params;
+  {
+    DebugStreamGuard debug_guard(debug_output);
+    params = pointwise::tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop);
+  }
+  ASSERT_NE(params, nullptr);
+  EXPECT_TRUE(params->sameAs(native_tma_baseline.get()));
+  for (const auto parallel_type : {
+           ParallelType::BIDx,
+           ParallelType::BIDy,
+           ParallelType::BIDz,
+           ParallelType::TIDx,
+           ParallelType::TIDy,
+           ParallelType::TIDz}) {
+    EXPECT_EQ(
+        params->lparams.getRawVal(parallel_type),
+        native_tma_baseline->lparams.getRawVal(parallel_type));
+  }
+  const std::string marker = "==== Pointwise TMA Scheduler Heuristics ====";
+  const std::string output = debug_output.str();
+  const size_t first = output.find(marker);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(output.find(marker, first + marker.size()), std::string::npos);
+  EXPECT_THAT(
+      output,
+      ::testing::HasSubstr(
+          "break_point: " + std::to_string(params->break_point) + "\n"));
+
+  std::ifstream log_file(log_path);
+  std::stringstream log_output;
+  log_output << log_file.rdbuf();
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.breakpoint\""));
+  EXPECT_THAT(
+      log_output.str(),
+      ::testing::HasSubstr("pointwise.tma_breakpoint.v1"));
+  EXPECT_THAT(
+      log_output.str(),
+      ::testing::Not(
+          ::testing::HasSubstr("pointwise.tma_breakpoint.v2")));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.tile_inner\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.tile_outer\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"site\":\"PW4.width\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp0\""));
+  EXPECT_THAT(log_output.str(), ::testing::HasSubstr("\"bp1\""));
+  EXPECT_THAT(
+      log_output.str(),
+      ::testing::HasSubstr("\"candidates\":[\"bp0\",\"bp1\"]"));
+
+  // In remote mode a deliberately invalid port stops after candidate
+  // preflight. This checks that the preflight did not seed the shared
+  // breakpoint-dependent vectorization cache even on a non-resize fusion.
+  HeuristicDataCache cache;
+  ScopedTestEnv remote_mode("NVFUSER_JEV_MODE", "remote");
+  ScopedTestEnv invalid_port("NVFUSER_JEV_PORT", "0");
+  std::stringstream remote_preview_debug;
+  pointwise::tma::TmaBreakPointAvailability remote_preview;
+  {
+    DebugStreamGuard debug_guard(remote_preview_debug);
+    remote_preview = pointwise::tma::getTmaBreakPointAvailability(
+        &fusion, runtime_info, *prop);
+  }
+  ASSERT_EQ(remote_preview.options.size(), preview.options.size());
+  ASSERT_EQ(remote_preview.plans.size(), preview.plans.size());
+  ASSERT_EQ(
+      remote_preview.remote_unavailability_reasons.size(),
+      preview.remote_unavailability_reasons.size());
+  for (size_t i = 0; i < preview.options.size(); ++i) {
+    EXPECT_EQ(remote_preview.options[i].id, preview.options[i].id);
+    EXPECT_EQ(
+        remote_preview.options[i].description,
+        preview.options[i].description);
+    EXPECT_EQ(
+        remote_preview.plans[i].break_point, preview.plans[i].break_point);
+    EXPECT_EQ(
+        remote_preview.remote_unavailability_reasons[i],
+        preview.remote_unavailability_reasons[i]);
+  }
+  EXPECT_TRUE(remote_preview_debug.str().empty());
+  std::ifstream remote_preview_log(log_path);
+  std::stringstream remote_preview_rows;
+  remote_preview_rows << remote_preview_log.rdbuf();
+  EXPECT_EQ(remote_preview_rows.str(), log_output.str());
+  try {
+    (void)pointwise::tma::getPointwiseHeuristics(
+        &fusion, runtime_info, &cache, *prop);
+    FAIL() << "Remote breakpoint Choice unexpectedly accepted port zero";
+  } catch (const std::runtime_error& error) {
+    EXPECT_THAT(
+        error.what(),
+        ::testing::HasSubstr("NVFUSER_JEV_PORT must be an integer"));
+  }
+  EXPECT_FALSE(cache.hasEntry(
+      HeuristicCompileTime::ResizeVectorizationFactors::EntryType));
+}
+
+TEST_F(PointwiseTest, BackendParentFirstRouting) {
+  using pointwise::BackendRouteAction;
+  using scheduler::jev::Mode;
+  const auto route = pointwise::pointwiseBackendRoute;
+  EXPECT_EQ(
+      route(Mode::Record, true, true, true, true),
+      BackendRouteAction::OfferChoice);
+  EXPECT_EQ(
+      route(Mode::Record, true, false, true, true),
+      BackendRouteAction::PreserveNativeTma);
+  EXPECT_EQ(
+      route(Mode::Record, true, false, false, true),
+      BackendRouteAction::PreserveNativeTma);
+  EXPECT_EQ(
+      route(Mode::Remote, true, false, true, true),
+      BackendRouteAction::OfferChoice);
+  EXPECT_EQ(
+      route(Mode::Remote, true, false, false, true),
+      BackendRouteAction::OrdinaryOnly);
+  EXPECT_EQ(
+      route(Mode::Record, false, false, true, true),
+      BackendRouteAction::PreserveNativeOrdinary);
+  EXPECT_EQ(
+      route(Mode::Record, false, false, false, true),
+      BackendRouteAction::OrdinaryOnly);
+  EXPECT_EQ(
+      route(Mode::Record, false, false, true, false),
+      BackendRouteAction::NoPlan);
+  EXPECT_EQ(
+      route(Mode::Remote, false, false, true, false),
+      BackendRouteAction::TmaOnly);
+}
+
+// The SM89 host can construct both source baselines and the exact PW1 wire
+// without claiming that a Hopper-only TMA kernel executed there.
+TEST_F(PointwiseTest, BackendParentFirstV2Request) {
+  char local_path[] = "/tmp/nvfuser-pw1-v2-XXXXXX";
+  const char* log_path = std::getenv("NVFUSER_JEV_PW1_FIXTURE_LOG");
+  bool cleanup = false;
+  if (log_path == nullptr || *log_path == '\0') {
+    const int fd = ::mkstemp(local_path);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    log_path = local_path;
+    cleanup = true;
+  }
+  struct FileCleanup {
+    const char* path;
+    bool cleanup;
+    ~FileCleanup() {
+      if (cleanup) {
+        ::unlink(path);
+      }
+    }
+  } file_cleanup{log_path, cleanup};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {32, 4096}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  std::unique_ptr<PointwiseParams> tma_baseline;
+  std::unique_ptr<PointwiseParams> ordinary_baseline;
+  pointwise::tma::TmaBreakPointAvailability remote_tma;
+  {
+    scheduler::jev::ScopedNativeDecisions native_scope;
+    tma_baseline = pointwise::tma::getNativePointwiseHeuristicsPreview(
+        &fusion, runtime_info, *prop);
+    auto materialized = pointwise::tma::getTmaBreakPointAvailability(
+        &fusion, runtime_info, *prop);
+    remote_tma = pointwise::tma::remoteRouteableTmaBreakPoints(
+        materialized,
+        prop->n_elems,
+        prop->elem_counts.size(),
+        prop->min_dtype_size_bit_for_vectorization);
+    ordinary_baseline = pointwise::non_tma::getPointwiseHeuristics(
+        &fusion, runtime_info, nullptr, *prop, /*emit_debug=*/false);
+  }
+  ASSERT_NE(tma_baseline, nullptr);
+  ASSERT_NE(ordinary_baseline, nullptr);
+  ASSERT_EQ(remote_tma.options.size(), 2);
+  EXPECT_EQ(
+      pointwise::choosePointwiseBackend(
+          *prop,
+          remote_tma,
+          *tma_baseline,
+          "source_native_projection",
+          *ordinary_baseline,
+          "tma"),
+      "tma");
+  std::ifstream request_log(log_path);
+  std::stringstream rows;
+  rows << request_log.rdbuf();
+  EXPECT_THAT(rows.str(), ::testing::HasSubstr("\"site\":\"PW1\""));
+  EXPECT_THAT(rows.str(), ::testing::HasSubstr("pointwise.tma_preference.v2"));
+  EXPECT_THAT(
+      rows.str(), ::testing::HasSubstr("tma_remote_breakpoints=bp0,bp1"));
+  EXPECT_THAT(
+      rows.str(), ::testing::HasSubstr("ordinary_baseline_available=1"));
+  EXPECT_THAT(
+      rows.str(), ::testing::HasSubstr("\"candidates\":[\"tma\",\"ordinary\"]"));
+  EXPECT_THAT(
+      rows.str(),
+      ::testing::Not(::testing::HasSubstr("\"site\":\"PW4.")));
+  EXPECT_THAT(
+      rows.str(),
+      ::testing::Not(::testing::HasSubstr("\"site\":\"PW3.")));
+
+  char v3_path[] = "/tmp/nvfuser-pw1-v3-XXXXXX";
+  const char* v3_log_path = std::getenv("NVFUSER_JEV_PW1_V3_FIXTURE_LOG");
+  bool cleanup_v3 = false;
+  if (v3_log_path == nullptr || *v3_log_path == '\0') {
+    const int v3_fd = ::mkstemp(v3_path);
+    ASSERT_GE(v3_fd, 0);
+    ::close(v3_fd);
+    v3_log_path = v3_path;
+    cleanup_v3 = true;
+  }
+  struct V3Cleanup {
+    const char* path;
+    bool cleanup;
+    ~V3Cleanup() {
+      if (cleanup) {
+        ::unlink(path);
+        ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+      }
+    }
+  } v3_cleanup{v3_log_path, cleanup_v3};
+  {
+    ScopedTestEnv v3_protocol("NVFUSER_JEV_PROTOCOL", "semantic-v3");
+    ScopedTestEnv v3_log("NVFUSER_JEV_LOG", v3_log_path);
+    const std::string hardware = "{\"sm_count\":" +
+        std::to_string(prop->device_multiprocessor_count) + "}";
+    scheduler::jev::ComputeHeuristicsScope scope(
+        "source-only TMA and ordinary baseline projections", {}, hardware);
+    EXPECT_EQ(
+        pointwise::choosePointwiseBackend(
+            *prop,
+            remote_tma,
+            *tma_baseline,
+            "source_native_projection",
+            *ordinary_baseline,
+            "tma"),
+        "tma");
+    scope.complete("PointWise");
+  }
+  std::ifstream v3_request(v3_log_path);
+  std::stringstream v3_rows;
+  v3_rows << v3_request.rdbuf();
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("\"consequence\""));
+  EXPECT_THAT(
+      v3_rows.str(), ::testing::HasSubstr("\"baseline_projection\""));
+  EXPECT_THAT(
+      v3_rows.str(),
+      ::testing::HasSubstr(
+          "\"baseline_kind\":\"source_native_projection\""));
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("\"pending_choices\""));
+  EXPECT_THAT(
+      v3_rows.str(),
+      ::testing::HasSubstr("\"pending_choices_kind\":\"possible_descendants\""));
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("PW4.breakpoint"));
+  EXPECT_THAT(v3_rows.str(), ::testing::HasSubstr("PW3.unroll"));
+}
+
+TEST_F(PointwiseTest, BackendParentFirstOrdinaryNumeric_CUDA) {
+  if (at::cuda::getCurrentDeviceProperties()->major >= 9) {
+    GTEST_SKIP() << "The ordinary-only control requires a pre-Hopper GPU";
+  }
+  char log_path[] = "/tmp/nvfuser-pw1-ordinary-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  EnableOptionsGuard::getCurOptions().set(EnableOption::TmaPointwise);
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::randn(
+      {32, 4096}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  std::unique_ptr<HeuristicParams> off_params;
+  {
+    ScopedTestEnv off_mode("NVFUSER_JEV_MODE", "off");
+    auto scheduler =
+        SchedulerEntry::makeSchedulerInstance(SchedulerType::PointWise);
+    off_params = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto result = scheduleAndRun(&fusion, SchedulerType::PointWise, {tensor});
+  ASSERT_NE(off_params, nullptr);
+  ASSERT_NE(result.heuristic_params, nullptr);
+  const auto* recorded = result.heuristic_params->as<PointwiseParams>();
+  const auto* off = off_params->as<PointwiseParams>();
+  EXPECT_FALSE(recorded->use_tma_load);
+  EXPECT_TRUE(recorded->sameAs(off));
+  for (const auto parallel_type : {
+           ParallelType::BIDx,
+           ParallelType::BIDy,
+           ParallelType::BIDz,
+           ParallelType::TIDx,
+           ParallelType::TIDy,
+           ParallelType::TIDz}) {
+    EXPECT_EQ(
+        recorded->lparams.getRawVal(parallel_type),
+        off->lparams.getRawVal(parallel_type));
+  }
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {tensor + tensor},
+      __LINE__,
+      __FILE__);
+
+  std::ifstream request_log(log_path);
+  std::stringstream requests;
+  requests << request_log.rdbuf();
+  EXPECT_THAT(requests.str(), ::testing::HasSubstr("\"site\":\"PW2\""));
+  EXPECT_THAT(
+      requests.str(),
+      ::testing::Not(::testing::HasSubstr("\"site\":\"PW1\"")));
+  std::ifstream outcome_log(std::string(log_path) + ".outcome.jsonl");
+  std::stringstream outcomes;
+  outcomes << outcome_log.rdbuf();
+  EXPECT_THAT(
+      outcomes.str(), ::testing::HasSubstr("\"site\":\"PW1\""));
+  EXPECT_THAT(outcomes.str(), ::testing::HasSubstr("\"kind\":\"no_choice\""));
+}
+
+// Inject route operands above the bp0 divisor-replay cap without allocating a
+// terabyte tensor. This exercises the same filter used by live PW4.breakpoint
+// and retains an exact v2 request for the matching server parser.
+TEST_F(PointwiseTest, TmaBreakpointRemoteMenuFiltering) {
+  constexpr int64_t right_elems = 1LL << 38;
+  constexpr int64_t n_elems = 5 * right_elems;
+  pointwise::tma::TmaBreakPointAvailability materialized;
+  materialized.state =
+      "pointwise.tma_breakpoint.v1\n"
+      "elements=5," +
+      std::to_string(right_elems) +
+      "\ndisjoint=1,1\nlhs_bit_multiples=0,32\nrhs_bit_multiples=32,32\n";
+  materialized.options = {
+      {"bp0", "Flatten to the one-dimensional TMA domain"},
+      {"bp1", "Split before loop axis 1"}};
+  materialized.plans = {{}, {1, false, right_elems, false}};
+  materialized.materialized_layout_widths = {4, 4};
+  for (const auto& plan : materialized.plans) {
+    materialized.remote_unavailability_reasons.emplace_back(
+        pointwise::tma::tmaBreakPointRemoteRouteabilityReason(
+            2, n_elems, plan.break_point, 4, 32));
+  }
+  const auto filtered = pointwise::tma::remoteRouteableTmaBreakPoints(
+      materialized, n_elems, 2, 32);
+  EXPECT_TRUE(filtered.remote_filter_applied);
+  ASSERT_EQ(filtered.options.size(), 1);
+  EXPECT_EQ(filtered.options[0].id, "bp1");
+  EXPECT_EQ(filtered.options[0].description, "Split before loop axis 1");
+  ASSERT_EQ(filtered.plans.size(), 1);
+  EXPECT_EQ(filtered.plans[0].break_point, 1);
+  EXPECT_EQ(
+      pointwise::tma::tmaRecordBreakPointCoverageReason(
+          materialized, filtered, "bp0"),
+      "native TMA breakpoint has no Remote-reachable PW4 continuation");
+  EXPECT_TRUE(
+      pointwise::tma::tmaRecordBreakPointCoverageReason(
+          materialized, filtered, "bp1")
+          .empty());
+  EXPECT_THAT(
+      filtered.state,
+      ::testing::HasSubstr(
+          "pointwise.tma_breakpoint.v2\nelements=5," +
+          std::to_string(right_elems)));
+  EXPECT_THAT(
+      filtered.state,
+      ::testing::HasSubstr(
+          "n_elems=" + std::to_string(n_elems) +
+          "\nloop_axes=2\nmin_dtype_bits=32\n"
+          "materialized_layout_widths=bp0:4,bp1:4\n"
+          "remote_max_loop_axes=32\n"
+          "bp0_replay_max_elems=1099511627776\nwidth_max=128\n"));
+
+  auto all_excluded = materialized;
+  for (auto& reason : all_excluded.remote_unavailability_reasons) {
+    reason = "more than 32 loop dimensions";
+  }
+  const auto empty_menu = pointwise::tma::remoteRouteableTmaBreakPoints(
+      all_excluded, n_elems, 33, 32);
+  EXPECT_TRUE(empty_menu.remote_filter_applied);
+  EXPECT_TRUE(empty_menu.options.empty());
+  EXPECT_TRUE(empty_menu.plans.empty());
+  EXPECT_EQ(
+      pointwise::tma::tmaRecordBreakPointCoverageReason(
+          materialized, empty_menu, "bp1"),
+      "native TMA breakpoint has no Remote-reachable PW4 continuation");
+
+  char local_path[] = "/tmp/nvfuser-pw4-route-XXXXXX";
+  const char* log_path = std::getenv("NVFUSER_JEV_ROUTE_FIXTURE_LOG");
+  bool cleanup = false;
+  if (log_path == nullptr || *log_path == '\0') {
+    const int fd = ::mkstemp(local_path);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+    log_path = local_path;
+    cleanup = true;
+  }
+  struct FileCleanup {
+    const char* path;
+    bool cleanup;
+    ~FileCleanup() {
+      if (cleanup) {
+        ::unlink(path);
+      }
+    }
+  } file_cleanup{log_path, cleanup};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+  EXPECT_EQ(
+      scheduler::jev::chooseDecision(
+          "PW4.breakpoint", filtered.state, filtered.options, "bp1"),
+      "bp1");
+  std::ifstream request_log(log_path);
+  std::stringstream records;
+  records << request_log.rdbuf();
+  EXPECT_THAT(records.str(), ::testing::HasSubstr("pointwise.tma_breakpoint.v2"));
+  EXPECT_THAT(
+      records.str(),
+      ::testing::HasSubstr("\"candidates\":[\"bp1\"]"));
+}
+
+// Exercise the 1D target menu without compiling a Hopper-only TMA kernel.
+TEST_F(PointwiseTest, TmaDomainTargetCompletePlanAnalysis) {
+  char log_path[] = "/tmp/nvfuser-pw4-domain-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+    }
+  } file_cleanup{log_path};
+  ScopedTestEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedTestEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {131072}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  const auto params = pointwise::tma::getPointwiseHeuristics(
+      &fusion, runtime_info, nullptr, *prop);
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->break_point, 0);
+  EXPECT_EQ(params->tma_domain_inner, 512);
+
+  std::ifstream log_file(log_path);
+  std::stringstream log_output;
+  log_output << log_file.rdbuf();
+  const std::string records = log_output.str();
+  const std::string site = "\"site\":\"PW4.domain_inner\"";
+  const size_t first = records.find(site);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(records.find(site, first + site.size()), std::string::npos);
+  EXPECT_THAT(records, ::testing::HasSubstr("\"t256\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"t512\""));
+  EXPECT_THAT(records, ::testing::HasSubstr("\"t1024\""));
+}
+
+// The external harness runs this same analysis once in record and once with
+// the loopback API. No TMA kernel is compiled or launched on pre-Hopper GPUs.
+TEST_F(PointwiseTest, TmaDomainTargetExternalModeAnalysis) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(1);
+  fusion.addInput(input);
+  fusion.addOutput(add(input, input));
+  const auto tensor = at::empty(
+      {131072}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto prop = pointwise_utils::getFusionRuntimeProperties(
+      &fusion, runtime_info, nullptr);
+  ASSERT_TRUE(prop.has_value());
+
+  const auto params = pointwise::tma::getPointwiseHeuristics(
+      &fusion, runtime_info, nullptr, *prop);
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->break_point, 0);
+  EXPECT_EQ(params->tma_domain_inner, 512);
+}
 
 // Non-parameterized TMA pointwise test fixture (for TEST_F)
 class TmaPointwiseTestF : public PointwiseTest {

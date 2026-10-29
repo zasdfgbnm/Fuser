@@ -7,7 +7,12 @@
 // clang-format on
 #include "scheduler/normalization_utils.h"
 
+#include <algorithm>
+#include <limits>
+#include <locale>
 #include <ranges>
+#include <sstream>
+#include <string>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -19,6 +24,7 @@
 #include "iter_visitor.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/runtime_info.h"
@@ -378,6 +384,400 @@ std::optional<std::tuple<int64_t, int64_t, bool>> reduceWorkOfLastBlock(
   return std::nullopt;
 }
 
+struct GridTailPlan {
+  int64_t gdimy;
+  int64_t buffer_size;
+  bool reduce_last_block_work;
+};
+
+struct GridBasePlan {
+  PreferredLaunchConfig launch;
+  GridTailPlan tail;
+};
+
+std::string gridBasePlanId(const GridBasePlan& plan) {
+  return "x" + std::to_string(plan.launch.gdimx()) + "_y" +
+      std::to_string(plan.launch.gdimy()) + "_b" +
+      std::to_string(plan.launch.bdimx());
+}
+
+// Check the fully adjusted plan, including the actual BIDy extent derived by
+// the schedule from the persistent batch. The historical search estimates
+// register use using the unadjusted grid, so it may accept a plan that is not
+// suitable for an alternate Choice. That plan remains the native fallback.
+bool isHardValidGridBasePlan(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor) {
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto& base = plan.launch;
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), plan.tail.buffer_size);
+  return base.gdimx() <=
+          std::min<int64_t>(
+              scheduler_utils::x_grid_limit, dev_prop->maxGridSize[0]) &&
+      plan.tail.gdimy <=
+          std::min<int64_t>(
+              scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+      actual_gdimy <=
+          std::min<int64_t>(
+              scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+      base.bdimx() * base.bdimy() <= dev_prop->maxThreadsPerBlock &&
+      ceilDiv(ceilDiv(total_iteration_numel, vectorize_factor), base.bdimx()) >=
+          base.gdimx();
+}
+
+bool isSafeGridBasePlan(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit) {
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel,
+      plan.launch.bdimy(),
+      plan.tail.buffer_size);
+  return isHardValidGridBasePlan(
+             plan,
+             total_reduction_numel,
+             total_iteration_numel,
+             vectorize_factor) &&
+      checkIfWithinRegisterSpace(
+             total_reduction_numel,
+             persistent_buffer_size_bit,
+             vectorize_factor,
+             plan.launch.bdimy(),
+             actual_gdimy);
+}
+
+// Offer at most one plan just outside the native no-spill preference. The
+// persistent buffer and fixed overhead must fit the physical per-thread and
+// per-CTA register limits; only the conservative index-cache estimate may
+// spill by another 16 registers. CUDA's generated code handles those spills.
+// This does not alter the native first-good search or runtime eligibility.
+bool isBoundedRegisterGridBasePlan(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit) {
+  if (!isHardValidGridBasePlan(
+          plan,
+          total_reduction_numel,
+          total_iteration_numel,
+          vectorize_factor)) {
+    return false;
+  }
+  const auto& base = plan.launch;
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), plan.tail.buffer_size);
+  if (checkIfWithinRegisterSpace(
+          total_reduction_numel,
+          persistent_buffer_size_bit,
+          vectorize_factor,
+          base.bdimy(),
+          actual_gdimy)) {
+    return false;
+  }
+  const auto pb_factor = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), actual_gdimy);
+  const auto buffer_bits =
+      ceilDiv(ceilDiv(persistent_buffer_size_bit, base.bdimy()), actual_gdimy) *
+      vectorize_factor;
+  const auto buffer_regs = ceilDiv(buffer_bits, sizeof(int) * 8);
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto physical_regs = std::min<int64_t>(
+      scheduler_utils::max_registers_per_thread,
+      dev_prop->regsPerBlock / (base.bdimx() * base.bdimy()));
+  return buffer_regs + scheduler_utils::register_overhead <= physical_regs &&
+      buffer_regs <= getAvailableRegisterCount(pb_factor) + 16;
+}
+
+GridBasePlan chooseGridBasePlan(
+    const GridBasePlan& native,
+    const std::vector<GridBasePlan>& safe_plans,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit) {
+  const auto native_id = gridBasePlanId(native);
+  if (safe_plans.size() < 2 ||
+      std::none_of(
+          safe_plans.begin(), safe_plans.end(), [&](const auto& plan) {
+            return gridBasePlanId(plan) == native_id;
+          })) {
+    return native;
+  }
+
+  std::vector<scheduler::jev::ChoiceOption> options;
+  options.reserve(safe_plans.size());
+  for (const auto& plan : safe_plans) {
+    options.push_back({
+        gridBasePlanId(plan),
+        "Use grid=(" + std::to_string(plan.launch.gdimx()) + "," +
+            std::to_string(plan.launch.gdimy()) + ") and block=(" +
+            std::to_string(plan.launch.bdimx()) + "," +
+            std::to_string(plan.launch.bdimy()) + ")"});
+  }
+
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const std::string state =
+      "outer_persistent.grid_base.v2\nreduction_numel=" +
+      std::to_string(total_reduction_numel) + "\niteration_numel=" +
+      std::to_string(total_iteration_numel) + "\nvector_width=" +
+      std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+      std::to_string(persistent_buffer_size_bit) + "\nsm_count=" +
+      std::to_string(dev_prop->multiProcessorCount) + "\nsm_major=" +
+      std::to_string(dev_prop->major) + "\nsm_minor=" +
+      std::to_string(dev_prop->minor) + "\nmax_grid_x=" +
+      std::to_string(dev_prop->maxGridSize[0]) + "\nmax_grid_y=" +
+      std::to_string(dev_prop->maxGridSize[1]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(dev_prop->maxThreadsPerBlock) + "\nregs_per_block=" +
+      std::to_string(dev_prop->regsPerBlock);
+  const std::string selected = scheduler::jev::chooseDecision(
+      "OP2.base",
+      state,
+      options,
+      scheduler::jev::mode() == scheduler::jev::Mode::Record ? native_id : "");
+  const auto chosen = std::find_if(
+      safe_plans.begin(), safe_plans.end(), [&](const auto& plan) {
+        return gridBasePlanId(plan) == selected;
+      });
+  NVF_ERROR(chosen != safe_plans.end(), "Unknown grid outer base plan");
+  return *chosen;
+}
+
+std::string gridTailPlanId(const GridTailPlan& plan) {
+  return "y" + std::to_string(plan.gdimy) + "_b" +
+      std::to_string(plan.buffer_size);
+}
+
+// Only the last-block batch adjustment is a Choice here. The native search
+// still chooses the base grid/CTA configuration, which is also used by
+// canScheduleRunTime. Every offered adjustment is a complete schedulable
+// (gridDim.y, persistent batch, unswitch policy) plan for that base.
+std::optional<GridTailPlan> chooseGridTailAdjustment(
+    const PreferredLaunchConfig& base,
+    int64_t total_reduction_numel,
+    int64_t total_iteration_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit,
+    int64_t native_gdimy,
+    int64_t native_buffer_size,
+    bool native_reduced) {
+  const auto jev_mode = scheduler::jev::mode();
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  // SM7.5 has a separate native rule; all SM7 runtime eligibility also checks
+  // iteration divisibility. Keep those architectures entirely native.
+  if (jev_mode == scheduler::jev::Mode::Off || dev_prop->major < 8) {
+    return std::nullopt;
+  }
+
+  const int64_t num_sms = dev_prop->multiProcessorCount;
+  if (base.gdimx() >
+          std::min<int64_t>(scheduler_utils::x_grid_limit, dev_prop->maxGridSize[0]) ||
+      base.bdimx() * base.bdimy() > dev_prop->maxThreadsPerBlock) {
+    return std::nullopt;
+  }
+
+  std::vector<GridTailPlan> plans;
+  int64_t gdimy = base.gdimy();
+  int64_t buffer_size =
+      getMinPersistentBufferSize(total_reduction_numel, base.bdimy(), gdimy);
+  const int64_t min_gdimy = static_cast<int64_t>((double)gdimy * 0.9);
+  const int64_t iteration_blocks = ceilDiv(
+      ceilDiv(total_iteration_numel, vectorize_factor), base.bdimx());
+  // The native preference stops at the first sufficiently small tail. A
+  // bounded menu also prevents a gridDim.y=1 tail from generating an
+  // unbounded sequence of oversized batches. If it misses the native winner,
+  // this site stays native for that shape.
+  int64_t inspected = 0;
+  while (inspected++ < 128 && gdimy >= min_gdimy &&
+         checkIfWithinRegisterSpace(
+             total_reduction_numel,
+             persistent_buffer_size_bit,
+             vectorize_factor,
+             base.bdimy(),
+             gdimy)) {
+    // The schedule derives its actual BIDy extent from the batch factor.
+    // The base launch estimate may overstate that extent by one block.
+    const int64_t actual_gdimy = getMinPersistentBufferSize(
+        total_reduction_numel, base.bdimy(), buffer_size);
+    if (gdimy <=
+            std::min<int64_t>(
+                scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+        actual_gdimy <=
+            std::min<int64_t>(
+                scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) &&
+        // The native estimate uses the grid extent. Bound the actual batch as
+        // well before offering a larger buffer to the model.
+        ceilDiv(
+            ceilDiv(
+                ceilDiv(persistent_buffer_size_bit, base.bdimy()),
+                actual_gdimy) * vectorize_factor,
+            32l) <= 220l - buffer_size &&
+        iteration_blocks >= ceilDiv(ceilDiv(num_sms, 2l), actual_gdimy)) {
+      const bool reduced = getLastBlockWorkRatio(
+                               total_reduction_numel,
+                               base.bdimy(),
+                               buffer_size) < 0.25;
+      plans.push_back({gdimy, buffer_size, reduced});
+    }
+    ++buffer_size;
+    gdimy = getMinPersistentBufferSize(
+        total_reduction_numel, base.bdimy(), buffer_size);
+  }
+
+  // The native plan is already known to have passed runtime eligibility. If
+  // the stronger actual-grid check above excludes it, preserve native output.
+  const auto native_it = std::find_if(
+      plans.begin(), plans.end(), [&](const GridTailPlan& plan) {
+        return plan.gdimy == native_gdimy &&
+            plan.buffer_size == native_buffer_size;
+      });
+  if (plans.size() < 2 || native_it == plans.end()) {
+    return std::nullopt;
+  }
+  NVF_ERROR(
+      native_it->reduce_last_block_work == native_reduced,
+      "Grid tail native unswitch policy does not match the offered plan");
+
+  std::vector<scheduler::jev::ChoiceOption> options;
+  options.reserve(plans.size());
+  for (const auto& plan : plans) {
+    options.push_back({
+        gridTailPlanId(plan),
+        "Use gridDim.y=" + std::to_string(plan.gdimy) +
+            ", persistent batch=" + std::to_string(plan.buffer_size) +
+            (plan.reduce_last_block_work ? ", fully unswitch batch"
+                                         : ", unswitch up to 4")});
+  }
+  const std::string state =
+      "outer_persistent.grid_tail.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) + "\niteration_numel=" +
+      std::to_string(total_iteration_numel) + "\nvector_width=" +
+      std::to_string(vectorize_factor) + "\npersistent_buffer_bits=" +
+      std::to_string(persistent_buffer_size_bit) + "\nbase_gdimx=" +
+      std::to_string(base.gdimx()) + "\nbase_gdimy=" +
+      std::to_string(base.gdimy()) + "\nbase_bdimx=" +
+      std::to_string(base.bdimx()) + "\nbase_bdimy=" +
+      std::to_string(base.bdimy()) + "\nsm_count=" +
+      std::to_string(num_sms) + "\nmax_grid_x=" +
+      std::to_string(dev_prop->maxGridSize[0]) + "\nmax_grid_y=" +
+      std::to_string(dev_prop->maxGridSize[1]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(dev_prop->maxThreadsPerBlock);
+  const std::string native_choice =
+      jev_mode == scheduler::jev::Mode::Record ? gridTailPlanId(*native_it)
+                                               : "";
+  const auto selected = scheduler::jev::chooseDecision(
+      "OP2.tail", state, options, native_choice);
+  const auto choice_it = std::find_if(
+      plans.begin(), plans.end(), [&](const GridTailPlan& plan) {
+        return gridTailPlanId(plan) == selected;
+      });
+  NVF_ERROR(choice_it != plans.end(), "Unknown grid outer tail plan");
+  return *choice_it;
+}
+
+// Unswitching changes only the serial persistent-buffer split in
+// scheduleReductionTV. The batch, BIDy extent, CTA, and persistent storage
+// estimate have already been fixed by the grid plan. Smaller positive factors
+// are legal even when the batch is not divisible: the existing factor-four
+// path already relies on a predicated remainder. Never offer a factor larger
+// than the native one, so an alternate cannot increase static unswitch size.
+int64_t chooseGridUnswitchFactor(
+    const GridBasePlan& plan,
+    int64_t total_reduction_numel,
+    int64_t vectorize_factor,
+    int64_t persistent_buffer_size_bit,
+    int64_t native_factor) {
+  const auto& base = plan.launch;
+  const auto& tail = plan.tail;
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Off ||
+      dev_prop->major < 8 || tail.buffer_size < 2 ||
+      native_factor < 2 || native_factor > tail.buffer_size) {
+    return native_factor;
+  }
+
+  const auto actual_gdimy = getMinPersistentBufferSize(
+      total_reduction_numel, base.bdimy(), tail.buffer_size);
+  const auto expected_native =
+      getLastBlockWorkRatio(
+          total_reduction_numel, base.bdimy(), tail.buffer_size) < 0.25
+      ? tail.buffer_size
+      : std::min(4l, tail.buffer_size);
+  // The selected OP2 plan may come from the historical native search rather
+  // than its stronger alternate-menu checks. Preserve that native plan if its
+  // final schedule does not satisfy the independent Choice safety bounds.
+  if (native_factor != expected_native || actual_gdimy < 1 ||
+      actual_gdimy >
+          std::min<int64_t>(
+              scheduler_utils::y_grid_limit, dev_prop->maxGridSize[1]) ||
+      base.bdimx() * base.bdimy() > dev_prop->maxThreadsPerBlock ||
+      !checkIfWithinRegisterSpace(
+          total_reduction_numel,
+          persistent_buffer_size_bit,
+          vectorize_factor,
+          base.bdimy(),
+          actual_gdimy)) {
+    return native_factor;
+  }
+
+  std::vector<int64_t> factors;
+  for (const int64_t factor : {1l, 2l, 4l, 8l}) {
+    if (factor <= native_factor) {
+      factors.push_back(factor);
+    }
+  }
+  if (factors.back() != native_factor) {
+    factors.push_back(native_factor);
+  }
+  if (factors.size() < 2) {
+    return native_factor;
+  }
+
+  std::vector<scheduler::jev::ChoiceOption> options;
+  options.reserve(factors.size());
+  for (const auto factor : factors) {
+    options.push_back({
+        "u" + std::to_string(factor),
+        "Unswitch " + std::to_string(factor) +
+            " reduction elements in each persistent batch"});
+  }
+  const std::string state =
+      "outer_persistent.unswitch.v1\nreduction_numel=" +
+      std::to_string(total_reduction_numel) + "\npersistent_buffer_bits=" +
+      std::to_string(persistent_buffer_size_bit) + "\nvector_width=" +
+      std::to_string(vectorize_factor) + "\nblock_x=" +
+      std::to_string(base.bdimx()) + "\nblock_y=" +
+      std::to_string(base.bdimy()) + "\ngrid_y=" +
+      std::to_string(actual_gdimy) + "\npersistent_batch=" +
+      std::to_string(tail.buffer_size) + "\nsm_major=" +
+      std::to_string(dev_prop->major) + "\nmax_grid_y=" +
+      std::to_string(dev_prop->maxGridSize[1]) +
+      "\nmax_threads_per_block=" +
+      std::to_string(dev_prop->maxThreadsPerBlock);
+  const auto selected = scheduler::jev::chooseDecision(
+      "OP2.unswitch",
+      state,
+      options,
+      scheduler::jev::mode() == scheduler::jev::Mode::Record
+          ? "u" + std::to_string(native_factor)
+          : "");
+  const auto selected_factor = std::find_if(
+      factors.begin(), factors.end(), [&](int64_t factor) {
+        return "u" + std::to_string(factor) == selected;
+      });
+  NVF_ERROR(
+      selected_factor != factors.end(),
+      "Unknown outer persistent unswitch factor");
+  return *selected_factor;
+}
+
 } // namespace
 
 // Iterate configurations from largest blockDim.x and smallest
@@ -388,8 +788,52 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
     int64_t total_reduction_numel,
     int64_t total_iteration_numel,
     int64_t vectorize_factor,
-    int64_t persistent_buffer_size_bit) {
+    int64_t persistent_buffer_size_bit,
+    bool allow_jev_tail_choice) {
   PreferredLaunchConfig launch_cfg;
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const auto max_int = std::numeric_limits<int64_t>::max();
+  const bool offer_base_choice =
+      allow_jev_tail_choice && scheduler::jev::mode() != scheduler::jev::Mode::Off &&
+      dev_prop->major >= 8 && dev_prop->major <= 20 &&
+      dev_prop->minor <= 9 && dev_prop->multiProcessorCount >= 2 &&
+      // Fewer than 128 topology bases (two block shapes × two grid halves).
+      // The Jev client accepts no more than 255 Choice options.
+      dev_prop->multiProcessorCount <= 1024 && vectorize_factor > 0 &&
+      vectorize_factor <= 128 &&
+      (vectorize_factor & (vectorize_factor - 1)) == 0 &&
+      total_iteration_numel % vectorize_factor == 0 &&
+      total_reduction_numel <= max_int / 256 &&
+      total_iteration_numel <= max_int / (128 * 16) &&
+      persistent_buffer_size_bit <= max_int / 256;
+  std::optional<GridBasePlan> native_base;
+
+  const auto finalize = [&](const GridBasePlan& plan) {
+    const auto& base = plan.launch;
+    const auto& tail = plan.tail;
+    const auto launch_params = LaunchParams(
+        base.gdimx(),
+        tail.gdimy,
+        LaunchParams::UNINITIALIZED_VAL,
+        base.bdimx(),
+        base.bdimy(),
+        LaunchParams::UNINITIALIZED_VAL);
+    const int64_t native_unswitch_factor = tail.reduce_last_block_work
+        ? tail.buffer_size
+        : std::min(4l, tail.buffer_size);
+    const int64_t unswitch_factor = offer_base_choice
+        ? chooseGridUnswitchFactor(
+              plan,
+              total_reduction_numel,
+              vectorize_factor,
+              persistent_buffer_size_bit,
+              native_unswitch_factor)
+        : native_unswitch_factor;
+    return GridOuterNormalizationParams{
+        .launch_params = launch_params,
+        .persistent_buffer_factor = tail.buffer_size,
+        .unswitch_factor = unswitch_factor};
+  };
 
   // The launch config starts with the largest blockDim.x, which may
   // be larger than the iteration size. Decrease it until it doesn't
@@ -490,30 +934,103 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
           *gdimy_pb_size;
     }
 
-    // Acceptable configuration found
-    auto launch_params = LaunchParams(
-        launch_cfg.gdimx(),
-        adjusted_gdimy,
-        LaunchParams::UNINITIALIZED_VAL,
-        launch_cfg.bdimx(),
-        launch_cfg.bdimy(),
-        LaunchParams::UNINITIALIZED_VAL);
+    GridBasePlan plan{
+        launch_cfg,
+        {adjusted_gdimy, adjusted_buffer_size, last_block_work_reduced}};
+    if (offer_base_choice) {
+      native_base = plan;
+      break;
+    }
 
-    // If the last block is sufficiently reduced, unswitch the whole
-    // persistent buffer. Otherwise, unswitch by a factor of 4.
-    int64_t unswitch_factor = last_block_work_reduced
-        ? adjusted_buffer_size
-        : std::min(4l, adjusted_buffer_size);
-
-    GridOuterNormalizationParams params = {
-        .launch_params = launch_params,
-        .persistent_buffer_factor = adjusted_buffer_size,
-        .unswitch_factor = unswitch_factor};
-    return params;
+    if (allow_jev_tail_choice) {
+      auto chosen_tail = chooseGridTailAdjustment(
+          plan.launch,
+          total_reduction_numel,
+          total_iteration_numel,
+          vectorize_factor,
+          persistent_buffer_size_bit,
+          plan.tail.gdimy,
+          plan.tail.buffer_size,
+          plan.tail.reduce_last_block_work);
+      if (chosen_tail.has_value()) {
+        plan.tail = *chosen_tail;
+      }
+    }
+    return finalize(plan);
   }
 
-  // No valid config found. Return launch_cfg, which should be marked
-  // as invalid
+  if (native_base.has_value()) {
+    // The original scan above determines eligibility and its first preferred
+    // base. Once eligible, offer every base in the existing 16/8-thread ×
+    // SM-grid topology that can cover the iteration domain and pass the final
+    // grid/register checks. The scan's uneven-iteration and first-good-tail
+    // filters are performance preferences, so they do not prune this menu.
+    std::vector<GridBasePlan> safe_base_plans;
+    std::optional<GridBasePlan> bounded_register_plan;
+    PreferredLaunchConfig candidate_cfg;
+    const auto native_id = gridBasePlanId(*native_base);
+    while (!candidate_cfg.isInvalid()) {
+      if (candidate_cfg.bdimx() <= max_bdimx) {
+        const auto initial_buffer = getMinPersistentBufferSize(
+            total_reduction_numel,
+            candidate_cfg.bdimy(),
+            candidate_cfg.gdimy());
+        GridBasePlan candidate{
+            candidate_cfg,
+            {candidate_cfg.gdimy(),
+             initial_buffer,
+             getLastBlockWorkRatio(
+                 total_reduction_numel,
+                 candidate_cfg.bdimy(),
+                 initial_buffer) < 0.25}};
+        if (gridBasePlanId(candidate) == native_id) {
+          candidate = *native_base;
+        }
+        if (isSafeGridBasePlan(
+                candidate,
+                total_reduction_numel,
+                total_iteration_numel,
+                vectorize_factor,
+                persistent_buffer_size_bit)) {
+          safe_base_plans.push_back(candidate);
+        } else if (!bounded_register_plan.has_value() &&
+                   gridBasePlanId(candidate) != native_id &&
+                   isBoundedRegisterGridBasePlan(
+                       candidate,
+                       total_reduction_numel,
+                       total_iteration_numel,
+                       vectorize_factor,
+                       persistent_buffer_size_bit)) {
+          bounded_register_plan = candidate;
+        }
+      }
+      candidate_cfg.moveToNextConfig();
+    }
+    if (bounded_register_plan.has_value()) {
+      safe_base_plans.push_back(*bounded_register_plan);
+    }
+    auto chosen_base = chooseGridBasePlan(
+        *native_base,
+        safe_base_plans,
+        total_reduction_numel,
+        total_iteration_numel,
+        vectorize_factor,
+        persistent_buffer_size_bit);
+    auto chosen_tail = chooseGridTailAdjustment(
+        chosen_base.launch,
+        total_reduction_numel,
+        total_iteration_numel,
+        vectorize_factor,
+        persistent_buffer_size_bit,
+        chosen_base.tail.gdimy,
+        chosen_base.tail.buffer_size,
+        chosen_base.tail.reduce_last_block_work);
+    if (chosen_tail.has_value()) {
+      chosen_base.tail = *chosen_tail;
+    }
+    return finalize(chosen_base);
+  }
+  // No valid config found. Return launch_cfg, which should be marked invalid.
   NVF_ERROR(launch_cfg.isInvalid());
   return std::nullopt;
 }
@@ -764,7 +1281,9 @@ namespace {
 // shared memory size due to this round up.
 int64_t roundUpSharedMemory(
     int64_t tv_buffer_size_bit,
-    int64_t data_type_size_bit) {
+    int64_t data_type_size_bit,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads) {
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
   int64_t max_threads_per_block = (int64_t)dev_prop->maxThreadsPerBlock;
   int64_t max_smem_bit = 0;
@@ -780,10 +1299,18 @@ int64_t roundUpSharedMemory(
       continue;
     }
     int64_t after_vect = dim_size / vectorize_factor;
-    // For shared memory persistence, heuristic always uses maximum threads
-    // per block
-    int64_t threads_per_block = max_threads_per_block;
-    int64_t persistent_batch = ceilDiv(after_vect, threads_per_block);
+    // The ordinary eligibility estimate uses the maximum thread count. A
+    // candidate uses the warp-padded TIDx of the reduction TV; a buffer with
+    // a larger extent may need more threads after its own split. Never let a
+    // smaller buffer make the estimate smaller than the launched TIDx.
+    int64_t persistent_batch = candidate_batch > 0
+        ? candidate_batch
+        : ceilDiv(after_vect, max_threads_per_block);
+    int64_t threads_per_block =
+        candidate_batch > 0
+        ? std::max(
+              ceilDiv(after_vect, persistent_batch), candidate_padded_threads)
+        : max_threads_per_block;
     max_smem_bit = std::max(
         max_smem_bit,
         persistent_batch * vectorize_factor * threads_per_block *
@@ -794,7 +1321,9 @@ int64_t roundUpSharedMemory(
 int64_t sharedMemoryRoundUpOverheadBit(
     SchedulerRuntimeInfo& runtime_info,
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
-    const bool project_to_inputs) {
+    const bool project_to_inputs,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads) {
   auto buffers = project_to_inputs
       ? persistent_buffer_info.projectable_buffer_inputs
       : persistent_buffer_info.persistent_buffers;
@@ -806,7 +1335,10 @@ int64_t sharedMemoryRoundUpOverheadBit(
             buffer, runtime_info, persistent_buffer_info);
     // Required shared memory size if store that tensor in shared memory
     int64_t buffer_size_smem = roundUpSharedMemory(
-        logical_buffer_size_bit, dataTypeSizeBit(buffer->getDataType()));
+        logical_buffer_size_bit,
+        dataTypeSizeBit(buffer->getDataType()),
+        candidate_batch,
+        candidate_padded_threads);
     // The difference is counted as roundup overhead
     total_smem_overhead_bit += (buffer_size_smem - logical_buffer_size_bit);
   }
@@ -814,35 +1346,196 @@ int64_t sharedMemoryRoundUpOverheadBit(
 }
 } // namespace
 
+int64_t getMaxSharedMemorySizeBitForPersistentBuffer(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    const bool project_to_inputs,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads) {
+  NVF_ERROR(
+      candidate_batch == 0 || candidate_padded_threads > 0,
+      "Candidate batch requires positive padded TIDx");
+  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  int64_t smem_overhead_bit =
+      scheduler_utils::getReductionSmemWorkspaceBit(fusion, reduction_tvs);
+
+  smem_overhead_bit += sharedMemoryRoundUpOverheadBit(
+      runtime_info,
+      persistent_buffer_info,
+      project_to_inputs,
+      candidate_batch,
+      candidate_padded_threads);
+
+  smem_overhead_bit += scheduler_utils::static_smem_usage_in_bits;
+
+  return (int64_t)dev_prop->sharedMemPerBlockOptin * 8 - smem_overhead_bit;
+}
+
 int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     const std::vector<TensorView*>& reduction_tvs,
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
     const bool can_use_smem_persistent,
-    const bool project_to_inputs) {
-  // Init to register file size, which is half of the full register file size
-  int64_t available_persistent_buffer_size_bit =
-      scheduler_utils::register_file_size_bit;
-  // shared memory persistent is not implemented for 3D inner reduction
+    const bool project_to_inputs,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads) {
+  NVF_ERROR(
+      candidate_batch == 0 || candidate_padded_threads > 0,
+      "Candidate batch requires positive padded TIDx");
+  // Shared memory persistence is not implemented for 3D inner reduction.
   if (!can_use_smem_persistent) {
-    return available_persistent_buffer_size_bit;
+    return scheduler_utils::register_file_size_bit;
   }
-  const auto dev_prop = at::cuda::getCurrentDeviceProperties();
-  int64_t smem_overhead_bit =
-      scheduler_utils::getReductionSmemWorkspaceBit(fusion, reduction_tvs);
+  return std::max(
+      scheduler_utils::register_file_size_bit,
+      getMaxSharedMemorySizeBitForPersistentBuffer(
+          fusion,
+          runtime_info,
+          reduction_tvs,
+          persistent_buffer_info,
+          project_to_inputs,
+          candidate_batch,
+          candidate_padded_threads));
+}
 
-  smem_overhead_bit += sharedMemoryRoundUpOverheadBit(
-      runtime_info, persistent_buffer_info, project_to_inputs);
+PersistentProjectionCapacityEvidence persistentProjectionCapacityEvidence(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    const scheduler_utils::PersistentBufferSizeReturn& sizes,
+    bool can_use_shared_persistence) {
+  NVF_ERROR(fusion != nullptr, "Projection capacity requires a fusion");
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  PersistentProjectionCapacityEvidence evidence;
+  evidence.can_use_shared_persistence = can_use_shared_persistence;
+  evidence.register_capacity_bits = scheduler_utils::register_file_size_bit;
+  evidence.shared_memory_per_block_optin_bits =
+      static_cast<int64_t>(device->sharedMemPerBlockOptin) * 8;
+  evidence.max_threads_per_block = device->maxThreadsPerBlock;
+  // The native helper returns the register cap immediately for non-shared
+  // persistence. Do not evaluate shared-memory analyses on that branch just
+  // to produce optional evidence; they are neither used nor guaranteed valid.
+  if (can_use_shared_persistence) {
+    evidence.max_vectorization_bits = getMaxVectorizationSizeInBit();
+    evidence.reduction_workspace_bits =
+        scheduler_utils::getReductionSmemWorkspaceBit(fusion, reduction_tvs);
+  }
+  evidence.static_shared_bits = scheduler_utils::static_smem_usage_in_bits;
 
-  smem_overhead_bit += scheduler_utils::static_smem_usage_in_bits;
+  const auto fill_branch = [&](bool projected,
+                               int64_t required_bits,
+                               PersistentProjectionCapacityBranch& branch) {
+    branch.project_to_inputs = projected;
+    branch.required_bits = required_bits;
+    if (!can_use_shared_persistence) {
+      branch.available_bits = evidence.register_capacity_bits;
+      branch.margin_bits = branch.available_bits - branch.required_bits;
+      NVF_ERROR(
+          branch.available_bits ==
+              getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+                  fusion,
+                  runtime_info,
+                  reduction_tvs,
+                  persistent_buffer_info,
+                  can_use_shared_persistence,
+                  projected),
+          "Register-only projection capacity disagrees with native hard gate");
+      return;
+    }
+    const auto& buffers = projected
+        ? persistent_buffer_info.projectable_buffer_inputs
+        : persistent_buffer_info.persistent_buffers;
+    int64_t raw_roundup_overhead = 0;
+    branch.roundup_buffers.reserve(buffers.size());
+    for (TensorView* buffer : buffers) {
+      const int64_t logical_bits =
+          scheduler_utils::getPersistentBufferSizeBitOfTensor(
+              buffer, runtime_info, persistent_buffer_info);
+      const int64_t dtype_bits = dataTypeSizeBit(buffer->getDataType());
+      const int64_t rounded_bits =
+          roundUpSharedMemory(logical_bits, dtype_bits, 0, 0);
+      raw_roundup_overhead += rounded_bits - logical_bits;
+      branch.roundup_buffers.push_back(
+          {buffer, logical_bits, dtype_bits, rounded_bits});
+    }
+    branch.roundup_overhead_bits =
+        alignSharedMemoryBits(raw_roundup_overhead);
+    NVF_ERROR(
+        branch.roundup_overhead_bits == sharedMemoryRoundUpOverheadBit(
+            runtime_info, persistent_buffer_info, projected, 0, 0),
+        "Projection roundup operands disagree with native capacity");
+    branch.shared_capacity_bits =
+        evidence.shared_memory_per_block_optin_bits -
+        evidence.reduction_workspace_bits - branch.roundup_overhead_bits -
+        evidence.static_shared_bits;
+    branch.available_bits =
+        std::max(evidence.register_capacity_bits, branch.shared_capacity_bits);
+    NVF_ERROR(
+        branch.available_bits ==
+            getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+                fusion,
+                runtime_info,
+                reduction_tvs,
+                persistent_buffer_info,
+                can_use_shared_persistence,
+                projected),
+        "Projection capacity operands disagree with native hard gate");
+    branch.margin_bits = branch.available_bits - branch.required_bits;
+  };
+  fill_branch(false, sizes.persistent_buffer_size_bit, evidence.keep);
+  fill_branch(
+      true,
+      sizes.projected_persistent_buffer_size_bit,
+      evidence.project);
+  return evidence;
+}
 
-  int64_t available_shared_memory_size_bit =
-      (int64_t)dev_prop->sharedMemPerBlockOptin * 8 - smem_overhead_bit;
-
-  available_persistent_buffer_size_bit = std::max(
-      available_persistent_buffer_size_bit, available_shared_memory_size_bit);
-  return available_persistent_buffer_size_bit;
+std::string persistentProjectionCapacityJson(
+    const PersistentProjectionCapacityEvidence& evidence) {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  out << "{\"schema\":\"nvfuser.inner_persistent.projection_capacity.v1\","
+         "\"can_use_shared\":"
+      << (evidence.can_use_shared_persistence ? "true" : "false")
+      << ",\"register_capacity_bits\":" << evidence.register_capacity_bits
+      << ",\"shared_memory_per_block_optin_bits\":"
+      << evidence.shared_memory_per_block_optin_bits
+      << ",\"max_threads_per_block\":" << evidence.max_threads_per_block
+      << ",\"max_vectorization_bits\":" << evidence.max_vectorization_bits
+      << ",\"reduction_workspace_bits\":"
+      << evidence.reduction_workspace_bits
+      << ",\"static_shared_bits\":" << evidence.static_shared_bits;
+  const auto write_branch = [&out](
+                                const char* name,
+                                const PersistentProjectionCapacityBranch& branch) {
+    out << ",\"" << name << "\":{\"required_bits\":"
+        << branch.required_bits
+        << ",\"roundup_overhead_bits\":" << branch.roundup_overhead_bits
+        << ",\"shared_capacity_bits\":" << branch.shared_capacity_bits
+        << ",\"available_bits\":" << branch.available_bits
+        << ",\"margin_bits\":" << branch.margin_bits
+        << ",\"roundup_buffers\":[";
+    for (size_t i = 0; i < branch.roundup_buffers.size(); ++i) {
+      const auto& buffer = branch.roundup_buffers[i];
+      NVF_ERROR(buffer.buffer != nullptr, "Null projection roundup buffer");
+      if (i != 0) out << ',';
+      out << "{\"val_key\":["
+          << static_cast<int64_t>(buffer.buffer->vtype()) << ','
+          << buffer.buffer->name() << "],\"logical_bits\":"
+          << buffer.logical_bits << ",\"dtype_bits\":"
+          << buffer.dtype_bits << ",\"rounded_shared_bits\":"
+          << buffer.rounded_shared_bits << '}';
+    }
+    out << "]}";
+  };
+  write_branch("keep", evidence.keep);
+  write_branch("project", evidence.project);
+  out << '}';
+  return out.str();
 }
 
 // Returns BufferProjectionStrategy based on buffer size, hardware, and fusion
@@ -931,7 +1624,8 @@ PersistentKernelProperties getPersistentKernelProperties(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    SchedulerType scheduler_type) {
+    SchedulerType scheduler_type,
+    bool enable_jev_projection) {
   FUSER_PERF_SCOPE(
       "normalization_scheduler_utils::getPersistentKernelProperties");
 
@@ -1005,14 +1699,152 @@ PersistentKernelProperties getPersistentKernelProperties(
   // reducing buffer size is larger than the pains of recalculations.
   bool can_use_smem_persistent =
       properties.inner_most_dimension_numel == properties.total_reduction_numel;
-  auto project_strategy = isProjectBufferToInputs(
-      fusion,
-      runtime_info,
-      reduction_tvs,
-      persistent_buffer_info,
-      persistent_buffer_size_info,
-      scheduler_type,
-      can_use_smem_persistent);
+  // Keep the shared projection helper fully native: canScheduleRunTime also
+  // calls it, and scheduler eligibility must not depend on the API. This
+  // Choice is made only while building the final InnerPersistent heuristics.
+  const auto jev_mode =
+      enable_jev_projection && scheduler_type == SchedulerType::InnerPersistent
+      ? scheduler::jev::mode()
+      : scheduler::jev::Mode::Off;
+  BufferProjectionStrategy project_strategy;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    project_strategy = isProjectBufferToInputs(
+        fusion,
+        runtime_info,
+        reduction_tvs,
+        persistent_buffer_info,
+        persistent_buffer_size_info,
+        scheduler_type,
+        can_use_smem_persistent);
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const int64_t original_bits =
+        persistent_buffer_size_info.persistent_buffer_size_bit;
+    const int64_t projected_bits =
+        persistent_buffer_size_info.projected_persistent_buffer_size_bit;
+    const bool projection_exists = !persistent_buffer_info.has_view_ops &&
+        projected_bits > 0 && projected_bits < original_bits;
+    bool both_plans_legal = false;
+    if (!projection_exists) {
+      if (jev_mode == scheduler::jev::Mode::Remote) {
+        project_strategy = BufferProjectionStrategy::NoProjectOtherReasons;
+      }
+    } else {
+      const int64_t original_capacity =
+          getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+              fusion,
+              runtime_info,
+              reduction_tvs,
+              persistent_buffer_info,
+              can_use_smem_persistent,
+              /*project_to_inputs=*/false);
+      if (original_bits > original_capacity) {
+        // The unprojected plan cannot fit. Preserve this native hard gate,
+        // including its precedence over the RNG recomputation test.
+        if (jev_mode == scheduler::jev::Mode::Remote) {
+          project_strategy = BufferProjectionStrategy::ProjectToInputs;
+        }
+      } else if (persistent_buffer_info.projection_with_rng_op) {
+        if (jev_mode == scheduler::jev::Mode::Remote) {
+          project_strategy = BufferProjectionStrategy::NoProjectOtherReasons;
+        }
+      } else {
+        // A model must never select a projected layout that cannot fit its
+        // own storage overhead. canScheduleRunTime enforces the native plan;
+        // this check covers an alternative that it did not choose.
+        const int64_t projected_capacity =
+            getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+                fusion,
+                runtime_info,
+                reduction_tvs,
+                persistent_buffer_info,
+                can_use_smem_persistent,
+                /*project_to_inputs=*/true);
+        both_plans_legal = projected_bits <= projected_capacity;
+        if (!both_plans_legal && jev_mode == scheduler::jev::Mode::Remote) {
+          project_strategy = BufferProjectionStrategy::NoProjectOtherReasons;
+        }
+      }
+    }
+
+    if (both_plans_legal) {
+      // The source's remaining preference is entirely empirical: recompute
+      // cheap operations, but retain exp buffers below a device-ratio-specific
+      // threshold. Send the raw hardware facts so the server can derive the
+      // ratio and preference without a native winner in the request.
+      const auto* device = at::cuda::getCurrentDeviceProperties();
+      const int device_index = at::cuda::current_device();
+      int memory_clock_khz = 0;
+      int gpu_clock_khz = 0;
+      cudaDeviceGetAttribute(
+          &memory_clock_khz, cudaDevAttrMemoryClockRate, device_index);
+      cudaDeviceGetAttribute(
+          &gpu_clock_khz, cudaDevAttrClockRate, device_index);
+      const bool source_evidence = scheduler::jev::semanticV3Enabled();
+      std::string state =
+          std::string(source_evidence ? "inner_persistent.projection.v2"
+                                      : "inner_persistent.projection.v1") +
+          "\noriginal_bits=" +
+          std::to_string(original_bits) + "\nprojected_bits=" +
+          std::to_string(projected_bits) + "\nprojection_has_exp=" +
+          (persistent_buffer_info.projection_with_exp_op ? "1" : "0") +
+          "\nsm_count=" + std::to_string(device->multiProcessorCount) +
+          "\nsm_major=" + std::to_string(device->major) +
+          "\nsm_minor=" + std::to_string(device->minor) +
+          "\nmemory_bus_bits=" + std::to_string(device->memoryBusWidth) +
+          "\nmemory_clock_khz=" + std::to_string(memory_clock_khz) +
+          "\ngpu_clock_khz=" + std::to_string(gpu_clock_khz);
+      if (source_evidence) {
+        scheduler_utils::PersistentProjectionLedger ledger;
+        const auto ledger_sizes = scheduler_utils::persistentBufferSizeBit(
+            fusion, runtime_info, persistent_buffer_info, data_cache, &ledger);
+        NVF_ERROR(
+            ledger_sizes.persistent_buffer_size_bit == original_bits &&
+                ledger_sizes.projected_persistent_buffer_size_bit ==
+                    projected_bits,
+            "Projection source ledger differs from native buffer maxima");
+        const auto recompute =
+            reduction_scheduler_utils::persistentProjectionRecomputeEvidence(
+                fusion, persistent_buffer_info);
+        const auto capacity = persistentProjectionCapacityEvidence(
+            fusion,
+            runtime_info,
+            reduction_tvs,
+            persistent_buffer_info,
+            persistent_buffer_size_info,
+            can_use_smem_persistent);
+        state += "\noriginal_buffer_count=" +
+            std::to_string(persistent_buffer_info.persistent_buffers.size()) +
+            "\nprojectable_input_count=" +
+            std::to_string(
+                persistent_buffer_info.projectable_buffer_inputs.size()) +
+            "\nsource_has_view_ops=" +
+            std::string(persistent_buffer_info.has_view_ops ? "1" : "0") +
+            "\nprojection_ledger_json=" +
+            scheduler_utils::persistentProjectionLedgerJson(ledger) +
+            "\nprojection_recompute_json=" +
+            reduction_scheduler_utils::persistentProjectionRecomputeJson(
+                recompute) +
+            "\nprojection_capacity_json=" +
+            persistentProjectionCapacityJson(capacity);
+      }
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"project", "Recompute persistent buffers from cached inputs"},
+          {"keep", "Keep the original persistent buffers"}};
+      std::string native_choice;
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        native_choice = project_strategy == BufferProjectionStrategy::ProjectToInputs
+            ? "project"
+            : "keep";
+      }
+      const std::string selected = scheduler::jev::chooseDecision(
+          "IP1.projection", state, options, native_choice);
+      project_strategy = selected == "project"
+          ? BufferProjectionStrategy::ProjectToInputs
+          : BufferProjectionStrategy::NoProjectToAvoidRecompute;
+    }
+  }
   bool project_persistent_buffers =
       (project_strategy == BufferProjectionStrategy::ProjectToInputs);
   bool disable_project_to_avoid_recompute =

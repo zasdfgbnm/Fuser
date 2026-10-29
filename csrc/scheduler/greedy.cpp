@@ -8,6 +8,7 @@
 
 #include "scheduler/greedy.h"
 
+#include <limits>
 #include <ranges>
 #include <vector>
 
@@ -26,7 +27,9 @@
 #include "ops/all_ops.h"
 #include "options.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
+#include "scheduler/native_diagnostic_jsonl.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/cub_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -136,6 +139,39 @@ void GreedyParams::transferProducerParams(
 }
 
 namespace {
+
+// Describe the same CUB allocation that made a Scan batch hard-legal. The
+// register estimate is diagnostic for every candidate, including the native
+// one; it is not an additional eligibility check.
+std::string scanBatchResourceConsequence(
+    int64_t scan_count,
+    int64_t batch,
+    int64_t threads,
+    int64_t item_bytes,
+    int64_t required_storage,
+    int64_t registers_per_block) {
+  scheduler::native_diagnostic::Object effect;
+  effect.add("schema", "nvfuser.gr1.scan_batch.resources.v1");
+  effect.add("scan_count", scan_count);
+  effect.add("items_per_thread", batch);
+  effect.add("threads_x", threads);
+  effect.add("cub_temp_storage_bytes", required_storage);
+  effect.add(
+      "cub_aligned_shared_bytes", (required_storage + 127) / 128 * 128);
+  const __int128 bytes = static_cast<__int128>(batch) * item_bytes *
+      (scan_count == 1 ? 1 : 2 * scan_count);
+  const __int128 estimated_registers =
+      (scan_count == 1 ? bytes / 4 : (bytes + 3) / 4) + 20;
+  if (estimated_registers <= std::numeric_limits<int64_t>::max()) {
+    effect.add(
+        "estimated_registers_per_thread",
+        static_cast<int64_t>(estimated_registers));
+  } else {
+    effect.addRaw("estimated_registers_per_thread", "null");
+  }
+  effect.add("register_budget_per_thread", registers_per_block / threads);
+  return effect.str();
+}
 
 // Utility function to get the total size of the given IDs if all
 // extents are statically known
@@ -856,6 +892,15 @@ class HeuristicsBuilder : private IterVisitor {
     params_ = std::make_unique<GreedyParams>();
     params_->cparams.index_type = runtime_info.getIndexType();
 
+    const auto constrained_ops = getAllConstrainedOps(fusion);
+    single_scan_ = constrained_ops.size() == 1 &&
+        constrained_ops.front()->isA<ScanOp>();
+    single_argsort_ = constrained_ops.size() == 1 &&
+        constrained_ops.front()->isA<ArgsortOp>();
+    single_scatter_ = constrained_ops.size() == 1 &&
+        constrained_ops.front()->isA<ScatterOp>();
+    multi_scan_batch_ = chooseMultiScanBatch(constrained_ops);
+
     traverse(fusion);
   }
 
@@ -863,7 +908,10 @@ class HeuristicsBuilder : private IterVisitor {
     addHeuristicsFor(
         ir_utils::getTvOutput(argsort),
         ir_utils::getTvOutput(argsort)->getLogicalDomain(),
-        {argsort->dim()});
+        {argsort->dim()},
+        /*consumer=*/nullptr,
+        /*allow_scan_choice=*/false,
+        /*argsort_input=*/ir_utils::getTvInput(argsort));
   }
 
   // TODO: Support batching
@@ -875,7 +923,11 @@ class HeuristicsBuilder : private IterVisitor {
     addHeuristicsFor(
         ir_utils::getTvOutput(scan),
         ir_utils::getTvOutput(scan)->getLogicalDomain(),
-        {scan->dim()});
+        {scan->dim()},
+        /*consumer=*/nullptr,
+        /*allow_scan_choice=*/single_scan_,
+        /*argsort_input=*/nullptr,
+        multi_scan_batch_);
   }
 
   void handle(ScatterOp* scatter) override {
@@ -887,12 +939,23 @@ class HeuristicsBuilder : private IterVisitor {
     // ConstrainedOpScheduler::handle(ScatterOp*).
     auto out_tv = ir_utils::getTvOutput(scatter);
     auto inp_tv = ir_utils::getTvInput(scatter);
-    addHeuristicsFor(out_tv, out_tv->domain()->initialLoop(), {scatter->dim()});
+    const auto shared_batch = chooseSingleScatterBatch(scatter);
+    addHeuristicsFor(
+        out_tv,
+        out_tv->domain()->initialLoop(),
+        {scatter->dim()},
+        /*consumer=*/nullptr,
+        /*allow_scan_choice=*/false,
+        /*argsort_input=*/nullptr,
+        shared_batch);
     addHeuristicsFor(
         inp_tv,
         TensorDomain::noReductions(inp_tv->getLogicalDomain()),
         {scatter->dim()},
-        out_tv);
+        out_tv,
+        /*allow_scan_choice=*/false,
+        /*argsort_input=*/nullptr,
+        shared_batch);
   }
 
   void handle(TopKOp* topk) override {
@@ -906,6 +969,299 @@ class HeuristicsBuilder : private IterVisitor {
         TensorDomain::noReductions(inp_tv->getLogicalDomain()),
         {topk->dim()},
         out_tv);
+  }
+
+  // Two to four compatible Scan calls use the same TIDx extent. Offer one
+  // shared batch after checking their combined CUB storage and a conservative
+  // register budget for every Scan input and output. Other mixes keep their
+  // native independent batches until their full plans are proven.
+  std::optional<int64_t> chooseMultiScanBatch(
+      const std::vector<Expr*>& constrained_ops) {
+    const auto jev_mode = scheduler::jev::mode();
+    const auto scan_count = constrained_ops.size();
+    if (jev_mode == scheduler::jev::Mode::Off || scan_count < 2) {
+      return std::nullopt;
+    }
+    const bool all_scans = std::ranges::all_of(constrained_ops, [](Expr* op) {
+      return op->isA<ScanOp>();
+    });
+    if (!all_scans) {
+      if (jev_mode == scheduler::jev::Mode::Record &&
+          std::ranges::any_of(constrained_ops, [](Expr* op) {
+            return op->isA<ScanOp>();
+          })) {
+        scheduler::jev::recordCoverageSkip(
+            "GR1.multi_scan_batch",
+            "mixed constrained operations have no joint batch proof");
+      }
+      return std::nullopt;
+    }
+    if (scan_count > 4) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "GR1.multi_scan_batch",
+            "more than four Scans are outside the checked joint batch domain");
+      }
+      return std::nullopt;
+    }
+
+    auto* first = constrained_ops.front()->as<ScanOp>();
+    auto* first_tv = ir_utils::getTvOutput(first);
+    auto extent_of = [&](TensorView* tv, int64_t dim)
+        -> std::optional<int64_t> {
+      auto value = runtime_info_.expressionEvaluator().evaluate(
+          tv->getLogicalDomain().at(dim)->extent());
+      return value.hasValue() ? std::optional<int64_t>(value.as<int64_t>())
+                              : std::nullopt;
+    };
+    const auto extent = extent_of(first_tv, first->dim());
+    if (!extent.has_value() || *extent <= 0) {
+      return std::nullopt;
+    }
+    for (Expr* op : constrained_ops) {
+      auto* scan = op->as<ScanOp>();
+      auto* tv = ir_utils::getTvOutput(scan);
+      if (scan->dim() != first->dim() || tv->dtype() != first_tv->dtype() ||
+          tv->getLogicalDomain().size() !=
+              first_tv->getLogicalDomain().size() ||
+          extent_of(tv, scan->dim()) != extent) {
+        return std::nullopt;
+      }
+    }
+
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+    const int64_t max_threads_x = dev_prop->maxThreadsDim[0];
+    const int64_t warp_size = dev_prop->warpSize;
+    const int64_t item_bytes = dataTypeSizeByte(first_tv->dtype());
+    const int64_t registers = dev_prop->regsPerBlock;
+    const int64_t shmem = dev_prop->sharedMemPerBlock;
+    if (max_threads <= 0 || max_threads_x <= 0 || item_bytes <= 0 ||
+        item_bytes >
+            std::numeric_limits<int64_t>::max() /
+                (2 * static_cast<int64_t>(scan_count))) {
+      return std::nullopt;
+    }
+    const int64_t native_batch = ceilDiv(*extent, max_threads);
+    const int64_t native_threads = ceilDiv(*extent, native_batch);
+    auto storage_fits = [&](int64_t threads, int64_t batch, int64_t& required) {
+      scheduler_tools::CubSharedMemoryBuffer storage;
+      for (size_t i = 0; i < scan_count; ++i) {
+        storage.registerScan(threads, batch, first_tv->dtype());
+      }
+      required = storage.getTotalSizeInBytes();
+      return required <= shmem && (required + 127) / 128 * 128 <= shmem;
+    };
+    int64_t native_storage = 0;
+    if (native_threads > max_threads_x ||
+        !storage_fits(native_threads, native_batch, native_storage)) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "Unable to prove native multi-Scan CUB capacity");
+      return std::nullopt;
+    }
+
+    std::vector<scheduler::jev::ChoiceOption> options;
+    const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+    auto add_option = [&](int64_t batch, int64_t threads, int64_t required_storage) {
+      const auto scope = scan_count == 2
+          ? "both Scan ops"
+          : scan_count == 3 ? "all three Scan ops" : "all four Scan ops";
+      scheduler::jev::ChoiceOption option{
+          "b" + std::to_string(batch),
+          "Use " + std::to_string(batch) +
+              " items per thread for " + scope + " with " +
+              std::to_string(threads) + " TIDx threads"};
+      if (semantic_v3) {
+        option.consequence_json = scanBatchResourceConsequence(
+            scan_count, batch, threads, item_bytes, required_storage,
+            registers);
+      }
+      options.push_back(std::move(option));
+    };
+    add_option(native_batch, native_threads, native_storage);
+    const int64_t bytes_per_item =
+        2 * static_cast<int64_t>(scan_count) * item_bytes;
+    for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+      if (native_batch > std::numeric_limits<int64_t>::max() / factor) {
+        continue;
+      }
+      const int64_t batch = native_batch * factor;
+      if (*extent % batch != 0) {
+        continue;
+      }
+      const int64_t threads = *extent / batch;
+      if (warp_size != 32 || threads < warp_size ||
+          threads > max_threads || threads > max_threads_x ||
+          threads % warp_size != 0 ||
+          batch > (255 - 20) * 4 / bytes_per_item) {
+        continue;
+      }
+      const int64_t estimated_registers =
+          ceilDiv(batch * bytes_per_item, int64_t{4}) + 20;
+      int64_t required_storage = 0;
+      if (estimated_registers > 255 ||
+          estimated_registers > registers / threads ||
+          !storage_fits(threads, batch, required_storage)) {
+        continue;
+      }
+      add_option(batch, threads, required_storage);
+    }
+
+    const std::string state =
+        "greedy.multi_scan_batch.v1\nscan_count=" +
+        std::to_string(scan_count) + "\nextent=" +
+        std::to_string(*extent) +
+        "\nmax_threads_per_block=" + std::to_string(max_threads) +
+        "\nmax_threads_x=" + std::to_string(max_threads_x) +
+        "\nwarp_size=" + std::to_string(warp_size) +
+        "\nitem_bytes=" + std::to_string(item_bytes) +
+        "\nregs_per_block=" + std::to_string(registers) +
+        "\nsmem_per_block_bytes=" + std::to_string(shmem);
+    const auto selected = scheduler::jev::chooseDecision(
+        "GR1.multi_scan_batch",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? options.front().id : "");
+    const auto option_it = std::find_if(
+        options.begin(),
+        options.end(),
+        [&](const auto& option) { return option.id == selected; });
+    NVF_ERROR(option_it != options.end(), "Unknown multi-Scan batch");
+    return std::stoll(selected.substr(1));
+  }
+
+  // Scatter has two coupled parameter tuples: the output/index/src loop and
+  // the input/output-copy loop. A single exact Scatter with equally sized
+  // constrained domains can use one batch for both without changing the
+  // launch topology or introducing a partial serial tail.
+  std::optional<int64_t> chooseSingleScatterBatch(ScatterOp* scatter) {
+    const auto jev_mode = scheduler::jev::mode();
+    if (!single_scatter_ || jev_mode == scheduler::jev::Mode::Off ||
+        !scatter->exactSizes()) {
+      return std::nullopt;
+    }
+
+    auto out_tv = ir_utils::getTvOutput(scatter);
+    auto inp_tv = ir_utils::getTvInput(scatter);
+    auto index_tv = scatter->index()->as<TensorView>();
+    // The native scheduler keeps fusion outputs and their inputs in global
+    // memory. A non-global Scatter may need shared storage not priced here.
+    if (!out_tv->isFusionOutput()) {
+      return std::nullopt;
+    }
+
+    const auto dim = scatter->dim();
+    auto extent_of = [&](const std::vector<IterDomain*>& ids)
+        -> std::optional<int64_t> {
+      auto value = runtime_info_.expressionEvaluator().evaluate(
+          ids.at(dim)->extent());
+      if (!value.hasValue()) {
+        return std::nullopt;
+      }
+      return value.as<int64_t>();
+    };
+    const auto output_extent = extent_of(out_tv->domain()->initialLoop());
+    const auto input_extent =
+        extent_of(TensorDomain::noReductions(inp_tv->getLogicalDomain()));
+    const auto index_extent =
+        extent_of(TensorDomain::noReductions(index_tv->getLogicalDomain()));
+    if (!output_extent.has_value() || !input_extent.has_value() ||
+        !index_extent.has_value() || *output_extent <= 0 ||
+        *output_extent != *input_extent || *output_extent != *index_extent) {
+      return std::nullopt;
+    }
+    if (scatter->src()->isA<TensorView>()) {
+      const auto source_extent = extent_of(TensorDomain::noReductions(
+          scatter->src()->as<TensorView>()->getLogicalDomain()));
+      if (source_extent != output_extent) {
+        return std::nullopt;
+      }
+    }
+
+    const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+    const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+    const int64_t max_threads_x = dev_prop->maxThreadsDim[0];
+    const int64_t warp_size = dev_prop->warpSize;
+    const int64_t input_bytes = dataTypeSizeByte(inp_tv->dtype());
+    const int64_t output_bytes = dataTypeSizeByte(out_tv->dtype());
+    const int64_t index_bytes = dataTypeSizeByte(index_tv->dtype());
+    const int64_t source_bytes = dataTypeSizeByte(scatter->src()->dtype());
+    const int64_t registers = dev_prop->regsPerBlock;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    std::vector<int64_t> batches;
+    if (*output_extent > 0 && max_threads > 0 && max_threads_x > 0 &&
+        input_bytes > 0 && output_bytes > 0 && index_bytes == 8 &&
+        source_bytes > 0) {
+      const int64_t native_batch = ceilDiv(*output_extent, max_threads);
+      const int64_t native_threads = ceilDiv(*output_extent, native_batch);
+      auto add_option = [&](int64_t batch, int64_t threads) {
+        options.push_back({
+            "b" + std::to_string(batch),
+            "Use " + std::to_string(batch) +
+                " Scatter items per thread with " +
+                std::to_string(threads) + " TIDx threads"});
+        batches.push_back(batch);
+      };
+      if (native_threads <= max_threads_x) {
+        add_option(native_batch, native_threads);
+        for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+          if (native_batch > std::numeric_limits<int64_t>::max() / factor) {
+            continue;
+          }
+          const int64_t batch = native_batch * factor;
+          if (*output_extent % batch != 0) {
+            continue;
+          }
+          const int64_t threads = *output_extent / batch;
+          // All four per-item values may be live near the Scatter. Count
+          // their bytes as registers and reserve twenty more per thread.
+          const int64_t bytes_per_item =
+              input_bytes + output_bytes + index_bytes + source_bytes;
+          if (warp_size != 32 || threads < warp_size ||
+              threads > max_threads || threads > max_threads_x ||
+              threads % warp_size != 0 ||
+              batch > (255 - 20) * 4 / bytes_per_item) {
+            continue;
+          }
+          const int64_t estimated_registers =
+              ceilDiv(batch * bytes_per_item, int64_t{4}) + 20;
+          if (estimated_registers > 255 ||
+              estimated_registers > registers / threads) {
+            continue;
+          }
+          add_option(batch, threads);
+        }
+      }
+    }
+
+    if (options.empty()) {
+      NVF_ERROR(
+          jev_mode != scheduler::jev::Mode::Remote,
+          "Unable to prove native Greedy Scatter CTA capacity");
+      return std::nullopt;
+    }
+    const std::string state =
+        "greedy.scatter_batch.v1\nextent=" + std::to_string(*output_extent) +
+        "\nmax_threads_per_block=" + std::to_string(max_threads) +
+        "\nmax_threads_x=" + std::to_string(max_threads_x) +
+        "\nwarp_size=" + std::to_string(warp_size) +
+        "\ninput_bytes=" + std::to_string(input_bytes) +
+        "\noutput_bytes=" + std::to_string(output_bytes) +
+        "\nindex_bytes=" + std::to_string(index_bytes) +
+        "\nsource_bytes=" + std::to_string(source_bytes) +
+        "\nregs_per_block=" + std::to_string(registers);
+    const auto selected = scheduler::jev::chooseDecision(
+        "GR1.scatter_batch",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? options.front().id : "");
+    const auto option_it = std::find_if(
+        options.begin(),
+        options.end(),
+        [&](const auto& option) { return option.id == selected; });
+    NVF_ERROR(option_it != options.end(), "Unknown Greedy Scatter batch");
+    return batches.at(std::distance(options.begin(), option_it));
   }
 
   // Make sure a given tensor has some heuristics parameters
@@ -924,7 +1280,10 @@ class HeuristicsBuilder : private IterVisitor {
       TensorView* constrained_tv,
       const std::vector<IterDomain*>& domain_to_schedule,
       const std::vector<int64_t>& constrained_id_offsets,
-      TensorView* consumer = nullptr) {
+      TensorView* consumer = nullptr,
+      bool allow_scan_choice = false,
+      TensorView* argsort_input = nullptr,
+      std::optional<int64_t> batch_override = std::nullopt) {
     const bool as_consumer = consumer == nullptr;
 
     int64_t size_of_constrained_ids = 1;
@@ -945,7 +1304,212 @@ class HeuristicsBuilder : private IterVisitor {
     const int64_t bdim =
         at::cuda::getCurrentDeviceProperties()->maxThreadsPerBlock;
 
-    auto batch_size = ceilDiv(size_of_constrained_ids, bdim);
+    auto batch_size = batch_override.value_or(ceilDiv(size_of_constrained_ids, bdim));
+
+    // With exactly one constrained Scan, its batch alone sets TIDx and its
+    // Group extent. Other constrained ops may have coupled TIDx or CUB
+    // storage requirements, so they retain their native parameters here.
+    const auto jev_mode = scheduler::jev::mode();
+    if (allow_scan_choice && jev_mode != scheduler::jev::Mode::Off) {
+      const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+      const int64_t warp_size = dev_prop->warpSize;
+      const int64_t item_bytes = dataTypeSizeByte(constrained_tv->dtype());
+      const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+      const int64_t registers = dev_prop->regsPerBlock;
+      const int64_t shmem = dev_prop->sharedMemPerBlock;
+      std::vector<scheduler::jev::ChoiceOption> options;
+      std::vector<int64_t> batches;
+
+      auto storage_fits = [&](int64_t threads, int64_t batch, int64_t& required) {
+        scheduler_tools::CubSharedMemoryBuffer scan_storage;
+        scan_storage.registerScan(threads, batch, constrained_tv->dtype());
+        required = scan_storage.getScanTotalSizeInBytes();
+        return required <= shmem && (required + 127) / 128 * 128 <= shmem;
+      };
+      const bool semantic_v3 = scheduler::jev::semanticV3Enabled();
+      auto add_option = [&](int64_t batch, int64_t threads, int64_t required_storage) {
+        scheduler::jev::ChoiceOption option{
+            "b" + std::to_string(batch),
+            "Use " + std::to_string(batch) +
+                " scan items per thread with " +
+                std::to_string(threads) + " TIDx threads"};
+        if (semantic_v3) {
+          option.consequence_json = scanBatchResourceConsequence(
+              1, batch, threads, item_bytes, required_storage, registers);
+        }
+        options.push_back(std::move(option));
+        batches.push_back(batch);
+      };
+
+      if (size_of_constrained_ids > 0 && max_threads > 0 &&
+          batch_size > 0 && item_bytes > 0) {
+        const int64_t native_threads =
+            ceilDiv(size_of_constrained_ids, batch_size);
+        // The native batch remains a choice even if its last Group item is
+        // a padded tail. Only alternatives require exact divisibility.
+        int64_t native_storage = 0;
+        if (storage_fits(native_threads, batch_size, native_storage)) {
+          add_option(batch_size, native_threads, native_storage);
+          for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+            if (batch_size > std::numeric_limits<int64_t>::max() / factor) {
+              continue;
+            }
+            const int64_t candidate_batch = batch_size * factor;
+            if (size_of_constrained_ids % candidate_batch != 0) {
+              continue;
+            }
+            const int64_t threads =
+                size_of_constrained_ids / candidate_batch;
+            // Warp-aligned blocks use the CUB BlockScan storage path whose
+            // estimate is checked against actual static SMEM in test_scan.
+            if (warp_size != 32 || threads < warp_size ||
+                threads > max_threads || threads % warp_size != 0 ||
+                candidate_batch > (255 - 20) * 4 / item_bytes) {
+              continue;
+            }
+            const int64_t estimated_registers =
+                candidate_batch * item_bytes / 4 + 20;
+            int64_t required_storage = 0;
+            if (estimated_registers > 255 ||
+                estimated_registers > registers / threads ||
+                !storage_fits(threads, candidate_batch, required_storage)) {
+              continue;
+            }
+            add_option(candidate_batch, threads, required_storage);
+          }
+        }
+      }
+
+      // If this narrow proof cannot cover even the native plan, preserve
+      // record/off behavior and fail closed for a remote request.
+      if (options.empty()) {
+        NVF_ERROR(
+            jev_mode != scheduler::jev::Mode::Remote,
+            "Unable to prove native Greedy Scan CUB capacity");
+      } else {
+        const std::string state =
+            "greedy.scan_batch.v1\nextent=" +
+            std::to_string(size_of_constrained_ids) +
+            "\nmax_threads_per_block=" + std::to_string(max_threads) +
+            "\nwarp_size=" + std::to_string(warp_size) +
+            "\nitem_bytes=" + std::to_string(item_bytes) +
+            "\nregs_per_block=" + std::to_string(registers) +
+            "\nsmem_per_block_bytes=" + std::to_string(shmem);
+        const auto selected = scheduler::jev::chooseDecision(
+            "GR1.scan_batch",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? options.front().id
+                                                      : "");
+        const auto option_it = std::find_if(
+            options.begin(),
+            options.end(),
+            [&](const auto& option) { return option.id == selected; });
+        NVF_ERROR(option_it != options.end(), "Unknown Greedy Scan batch");
+        batch_size = batches.at(std::distance(options.begin(), option_it));
+      }
+    }
+
+    // A single Argsort has no other constrained op with a coupled TIDx
+    // extent. Keep all runtime eligibility and the original batch unchanged
+    // in Off mode; the Choice only ranks complete, candidate-checked plans.
+    if (single_argsort_ && argsort_input != nullptr &&
+        jev_mode != scheduler::jev::Mode::Off) {
+      const auto* dev_prop = at::cuda::getCurrentDeviceProperties();
+      const int64_t max_threads = dev_prop->maxThreadsPerBlock;
+      const int64_t max_threads_x = dev_prop->maxThreadsDim[0];
+      const int64_t warp_size = dev_prop->warpSize;
+      const int64_t key_bytes = dataTypeSizeByte(argsort_input->dtype());
+      const int64_t index_bytes = dataTypeSizeByte(constrained_tv->dtype());
+      const int64_t registers = dev_prop->regsPerBlock;
+      const int64_t shmem = dev_prop->sharedMemPerBlock;
+      std::vector<scheduler::jev::ChoiceOption> options;
+      std::vector<int64_t> batches;
+
+      auto storage_fits = [&](int64_t threads, int64_t batch) {
+        scheduler_tools::CubSharedMemoryBuffer storage;
+        storage.registerArgsort(threads, batch, argsort_input->dtype());
+        const int64_t required = storage.getTotalSizeInBytes();
+        return required <= shmem && (required + 127) / 128 * 128 <= shmem;
+      };
+      auto add_option = [&](int64_t candidate_batch, int64_t threads) {
+        options.push_back({
+            "b" + std::to_string(candidate_batch),
+            "Use " + std::to_string(candidate_batch) +
+                " argsort items per thread with " +
+                std::to_string(threads) + " TIDx threads"});
+        batches.push_back(candidate_batch);
+      };
+
+      if (size_of_constrained_ids > 0 && max_threads > 0 && batch_size > 0 &&
+          key_bytes > 0 && index_bytes == 8) {
+        const int64_t native_threads =
+            ceilDiv(size_of_constrained_ids, batch_size);
+        // The native plan may have a padded last Group item. Alternatives
+        // must divide the Argsort extent exactly so CUB receives a full tile.
+        if (native_threads <= max_threads_x &&
+            storage_fits(native_threads, batch_size)) {
+          add_option(batch_size, native_threads);
+          for (const int64_t factor : {int64_t{2}, int64_t{4}}) {
+            if (batch_size > std::numeric_limits<int64_t>::max() / factor) {
+              continue;
+            }
+            const int64_t candidate_batch = batch_size * factor;
+            if (size_of_constrained_ids % candidate_batch != 0) {
+              continue;
+            }
+            const int64_t threads =
+                size_of_constrained_ids / candidate_batch;
+            // Argsort retains input keys, temporary CUB keys and int64
+            // indices. Reserve 20 more registers for unrelated kernel work.
+            const int64_t bytes_per_item = 2 * key_bytes + index_bytes;
+            if (warp_size != 32 || threads < warp_size ||
+                threads > max_threads || threads > max_threads_x ||
+                threads % warp_size != 0 ||
+                candidate_batch > (255 - 20) * 4 / bytes_per_item) {
+              continue;
+            }
+            const int64_t estimated_registers =
+                ceilDiv(candidate_batch * bytes_per_item, int64_t{4}) + 20;
+            if (estimated_registers > 255 ||
+                estimated_registers > registers / threads ||
+                !storage_fits(threads, candidate_batch)) {
+              continue;
+            }
+            add_option(candidate_batch, threads);
+          }
+        }
+      }
+
+      if (options.empty()) {
+        NVF_ERROR(
+            jev_mode != scheduler::jev::Mode::Remote,
+            "Unable to prove native Greedy Argsort CUB capacity");
+      } else {
+        const std::string state =
+            "greedy.argsort_batch.v1\nextent=" +
+            std::to_string(size_of_constrained_ids) +
+            "\nmax_threads_per_block=" + std::to_string(max_threads) +
+            "\nmax_threads_x=" + std::to_string(max_threads_x) +
+            "\nwarp_size=" + std::to_string(warp_size) +
+            "\nkey_bytes=" + std::to_string(key_bytes) +
+            "\nindex_bytes=" + std::to_string(index_bytes) +
+            "\nregs_per_block=" + std::to_string(registers) +
+            "\nsmem_per_block_bytes=" + std::to_string(shmem);
+        const auto selected = scheduler::jev::chooseDecision(
+            "GR1.argsort_batch",
+            state,
+            options,
+            jev_mode == scheduler::jev::Mode::Record ? options.front().id
+                                                      : "");
+        const auto option_it = std::find_if(
+            options.begin(),
+            options.end(),
+            [&](const auto& option) { return option.id == selected; });
+        NVF_ERROR(option_it != options.end(), "Unknown Greedy Argsort batch");
+        batch_size = batches.at(std::distance(options.begin(), option_it));
+      }
+    }
 
     if (as_consumer) {
       NVF_ERROR(
@@ -964,6 +1528,10 @@ class HeuristicsBuilder : private IterVisitor {
   SchedulerRuntimeInfo& runtime_info_;
 
   std::unique_ptr<GreedyParams> params_;
+  bool single_scan_ = false;
+  bool single_argsort_ = false;
+  bool single_scatter_ = false;
+  std::optional<int64_t> multi_scan_batch_;
 };
 
 // Propagate all reshape transformations throughout the fusion.
@@ -1550,7 +2118,7 @@ bool GreedyScheduler::canScheduleRunTime(
   return RunTimeChecker::run(fusion, runtime_info);
 }
 
-std::unique_ptr<HeuristicParams> GreedyScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> GreedyScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {

@@ -160,7 +160,8 @@ std::optional<GridOuterNormalizationParams> getGridOuterNormalizationParams(
     int64_t total_reduction_numel,
     int64_t total_iteration_numel,
     int64_t vectorize_factor,
-    int64_t persistent_buffer_size_bit);
+    int64_t persistent_buffer_size_bit,
+    bool allow_jev_tail_choice = false);
 
 //! check iter type of each domain in inner and outer reduction tvs
 //! inner reduction must be [I,I,...R,R]
@@ -242,11 +243,14 @@ struct PersistentKernelProperties {
     return ss.str();
   }
 };
+// enable_jev_projection is only for final InnerPersistent computeHeuristics
+// on a guaranteed non-TMA path. Other callers retain native analysis.
 PersistentKernelProperties getPersistentKernelProperties(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    SchedulerType heuristic);
+    SchedulerType heuristic,
+    bool enable_jev_projection = false);
 
 // Verify the presence of a reduction TensorView connected to a Fusion input
 void checkReductionTvForScheduling(Fusion* fusion, TensorView* ref_red_tv);
@@ -305,7 +309,65 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
     const std::vector<TensorView*>& reduction_tvs,
     const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
     const bool can_use_smem_persistent,
-    const bool project_to_inputs);
+    const bool project_to_inputs,
+    // Zero preserves the native max-thread padding estimate. A candidate
+    // supplies its batch and warp-padded TIDx for per-buffer capacity bounds.
+    int64_t candidate_batch = 0,
+    int64_t candidate_padded_threads = 0);
+
+// Pure shared-memory capacity for a particular inner-persistent CTA plan.
+// Unlike getMaxRegOrSharedMemorySizeBitForPersistentBuffer, this cannot let
+// register capacity mask an overfull shared-memory allocation.
+int64_t getMaxSharedMemorySizeBitForPersistentBuffer(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    bool project_to_inputs,
+    int64_t candidate_batch,
+    int64_t candidate_padded_threads);
+
+// Passive operands of the exact IP1 keep/project capacity checks. The branch
+// rows use the same candidate_batch=0 estimate as the native projection gate.
+// These are source capacity estimates, not ptxas registers or occupancy.
+struct PersistentProjectionRoundupBuffer {
+  TensorView* buffer = nullptr;
+  int64_t logical_bits = 0;
+  int64_t dtype_bits = 0;
+  int64_t rounded_shared_bits = 0;
+};
+
+struct PersistentProjectionCapacityBranch {
+  bool project_to_inputs = false;
+  std::vector<PersistentProjectionRoundupBuffer> roundup_buffers;
+  int64_t required_bits = 0;
+  int64_t roundup_overhead_bits = 0;
+  int64_t shared_capacity_bits = 0;
+  int64_t available_bits = 0;
+  int64_t margin_bits = 0;
+};
+
+struct PersistentProjectionCapacityEvidence {
+  bool can_use_shared_persistence = false;
+  int64_t register_capacity_bits = 0;
+  int64_t shared_memory_per_block_optin_bits = 0;
+  int64_t max_threads_per_block = 0;
+  int64_t max_vectorization_bits = 0;
+  int64_t reduction_workspace_bits = 0;
+  int64_t static_shared_bits = 0;
+  PersistentProjectionCapacityBranch keep;
+  PersistentProjectionCapacityBranch project;
+};
+
+PersistentProjectionCapacityEvidence persistentProjectionCapacityEvidence(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    const scheduler_utils::PersistentBufferSizeReturn& sizes,
+    bool can_use_shared_persistence);
+std::string persistentProjectionCapacityJson(
+    const PersistentProjectionCapacityEvidence& evidence);
 
 enum class BufferProjectionStrategy {
   // Recompute persistent buffers from inputs, only need to cache inputs in

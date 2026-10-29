@@ -12,6 +12,9 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -20,6 +23,8 @@
 #include "ops/arith.h"
 #include "runtime/executor_params.h"
 #include "scheduler/cache_policy_refiner.h"
+#include "scheduler/jev_client.h"
+#include "scheduler/normalization_tma_prefetch_choice.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -60,6 +65,8 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
   params->vectorize_load_smem_to_regs = true;
   // Issue ldg (load global) instructions early to hide memory latency
   params->pre_load_ldg_tvs = true;
+
+  const auto jev_mode = scheduler::jev::mode();
 
   // Configure reduction domain structure: [persistent_batch_size, bdimx, vect]
   // Prioritize vectorization for memory access efficiency
@@ -102,8 +109,165 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
       n_compute_warp_groups * n_rows_per_compute_warp_group;
   const int64_t smem_limited_stages =
       (int64_t)dev_prop->sharedMemPerBlockOptin * 8 / smem_size_bit;
-  const int64_t n_stages = std::min(smem_limited_stages, iter_limited_stages);
-  if (n_stages >= 2 && bdimx == 128) {
+  const int64_t native_n_stages =
+      std::min(smem_limited_stages, iter_limited_stages);
+  const bool native_warp_specialized =
+      native_n_stages >= 2 && bdimx == 128;
+  bool use_warp_specialized = native_warp_specialized;
+  const bool basic_smem_fits =
+      prop.max_persistent_buffer_size_bit <=
+      (int64_t)dev_prop->sharedMemPerBlockOptin * 8;
+  const bool warp_specialized_legal =
+      native_warp_specialized && dev_prop->major >= 9 &&
+      bdimx * (n_compute_warp_groups + 1) <= max_threads_per_cta &&
+      sm_count <= dev_prop->maxGridSize[0];
+  const bool native_tma_plan_hard_valid =
+      basic_smem_fits &&
+      (!native_warp_specialized || warp_specialized_legal);
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // A projected input that exceeds the opt-in shared-memory capacity cannot
+    // form even the basic TMA plan. Preserve the old path in record mode and
+    // fail closed before a remote answer could select an invalid candidate.
+    // The basic TMA schedule works with the same width and persistent batch.
+    // Only the warp-specialized plan needs the extra producer warp group,
+    // static CTA, circular-buffer stages, and one-CTA-per-SM grid. These
+    // resource and topology checks are native hard gates, not model choices.
+    if (!basic_smem_fits) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IP2.tma_mode", "basic TMA shared-memory estimate exceeds capacity");
+      } else {
+        NVF_ERROR(false, "No hard-valid inner TMA mode fits shared memory");
+      }
+    } else if (jev_mode == scheduler::jev::Mode::Record &&
+        native_warp_specialized && !warp_specialized_legal) {
+      scheduler::jev::recordCoverageSkip(
+          "IP2.tma_mode", "native warp-specialized plan is outside hard bounds");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options = {{
+          "basic", "Use multiwave TMA without circular buffering"}};
+      if (warp_specialized_legal) {
+        options.push_back({
+            "ws", "Use warp-specialized TMA with circular buffering"});
+      }
+      const std::string state =
+          "inner_persistent.tma_mode.v1\nreduction_numel=" +
+          std::to_string(total_redu_count) + "\niteration_numel=" +
+          std::to_string(total_iter_count) + "\nvector_width=" +
+          std::to_string(params->vectorization_factor) +
+          "\npersistent_batch_size=" +
+          std::to_string(params->persistent_batch_size) +
+          "\ncompute_bdimx=" + std::to_string(bdimx) +
+          "\npersistent_buffer_bits=" +
+          std::to_string(prop.max_persistent_buffer_size_bit) +
+          "\nwarp_size=" + std::to_string(warp_size) + "\nsm_count=" +
+          std::to_string(sm_count) + "\nsm_major=" +
+          std::to_string(dev_prop->major) + "\nmax_threads_per_block=" +
+          std::to_string(max_threads_per_cta) + "\nmax_grid_x=" +
+          std::to_string(dev_prop->maxGridSize[0]) +
+          "\nsmem_per_block_bytes=" +
+          std::to_string(dev_prop->sharedMemPerBlockOptin);
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? (native_warp_specialized ? "ws" : "basic")
+          : "";
+      use_warp_specialized = scheduler::jev::chooseDecision(
+                                 "IP2.tma_mode", state, options, native_choice) ==
+          "ws";
+    }
+  }
+  int64_t selected_n_stages = native_n_stages;
+  if (use_warp_specialized && jev_mode != scheduler::jev::Mode::Off) {
+    // Each candidate is bounded by both native resource ceilings. Keep every
+    // small stage count and sample larger counts geometrically; the native
+    // maximum is always offered, even when it is not a power of two.
+    std::vector<scheduler::jev::ChoiceOption> stage_options;
+    auto add_stage = [&](int64_t stages) {
+      stage_options.push_back({
+          "s" + std::to_string(stages),
+          "Use " + std::to_string(stages) +
+              " stages for warp-specialized TMA circular buffering"});
+    };
+    for (int64_t stages = 2; stages <= std::min<int64_t>(16, native_n_stages);
+         ++stages) {
+      add_stage(stages);
+    }
+    for (int64_t stages = 32; stages < native_n_stages;) {
+      add_stage(stages);
+      if (stages > native_n_stages / 2) {
+        break;
+      }
+      stages *= 2;
+    }
+    if (native_n_stages > 16) {
+      add_stage(native_n_stages);
+    }
+    const std::string stage_state =
+        "inner_persistent.tma_stages.v1\niteration_numel=" +
+        std::to_string(total_iter_count) + "\nsm_count=" +
+        std::to_string(sm_count) + "\npersistent_buffer_bits=" +
+        std::to_string(prop.max_persistent_buffer_size_bit) +
+        "\nsmem_per_block_bytes=" +
+        std::to_string(dev_prop->sharedMemPerBlockOptin);
+    const std::string native_stage_choice =
+        jev_mode == scheduler::jev::Mode::Record
+        ? "s" + std::to_string(native_n_stages)
+        : "";
+    const std::string selected_stage_choice = scheduler::jev::chooseDecision(
+        "IP3.stages", stage_state, stage_options, native_stage_choice);
+    selected_n_stages = std::stoll(selected_stage_choice.substr(1));
+  }
+  int64_t selected_prefetch_distance = selected_n_stages - 1;
+  if (use_warp_specialized && jev_mode != scheduler::jev::Mode::Off) {
+    // The stage choice already fits the native iteration and shared-memory
+    // ceilings. Prefetch changes only the partition of those stages between
+    // load-ahead and reuse; keep the WS topology and its hard gates native.
+    if (!basic_smem_fits || !warp_specialized_legal ||
+        selected_n_stages < 2 || selected_n_stages > native_n_stages) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip(
+            "IP3.prefetch", "warp-specialized TMA plan is outside hard bounds");
+      } else {
+        NVF_ERROR(false, "Cannot prove inner TMA prefetch Choice hard bounds");
+      }
+    } else if (selected_n_stages == 2) {
+      // The only positive distance below two stages is the native one.
+      scheduler::jev::recordNoChoiceDecision(
+          "IP3.prefetch",
+          "p1",
+          "two stages have one positive prefetch distance",
+          "native_two_stage_prefetch");
+    } else if (selected_n_stages > 256) {
+      selected_prefetch_distance =
+          chooseLargePrefetchDistance(selected_n_stages);
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> prefetch_options;
+      auto add_prefetch = [&](int64_t distance) {
+        prefetch_options.push_back({
+            "p" + std::to_string(distance),
+            "Prefetch TMA " + std::to_string(distance) +
+                " iteration(s) ahead"});
+      };
+      // A positive prefetch preserves the existing TMA load-ahead pipeline.
+      // The generic circular-buffer API also admits zero, but this scheduler
+      // has no proof that the WS TMA issue order remains safe without it.
+      for (int64_t distance = 1; distance < selected_n_stages; ++distance) {
+        add_prefetch(distance);
+      }
+      const std::string prefetch_state =
+          "inner_persistent.tma_prefetch.v1\nstage_count=" +
+          std::to_string(selected_n_stages);
+      const std::string selected_prefetch = scheduler::jev::chooseDecision(
+          "IP3.prefetch",
+          prefetch_state,
+          prefetch_options,
+          jev_mode == scheduler::jev::Mode::Record
+              ? "p" + std::to_string(selected_n_stages - 1)
+              : "");
+      selected_prefetch_distance = std::stoll(selected_prefetch.substr(1));
+    }
+  }
+  if (use_warp_specialized) {
     gdimx = sm_count;
     bdimy = n_compute_warp_groups;
     bdimz = 1; // warp specialized kernel requires static CTA shape
@@ -131,7 +295,9 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
           kWarpSpecializationPaddedThreads);
     }
     CircularBufferOptions circular_buffer_options{
-        .type = ws, .stage = n_stages, .prefetch = n_stages - 1};
+        .type = ws,
+        .stage = selected_n_stages,
+        .prefetch = selected_prefetch_distance};
     params->circular_buffer_options = circular_buffer_options;
     params->is_circular_buffer_regs_cached = true;
     // Set launch parameters
@@ -150,6 +316,74 @@ std::unique_ptr<InnerNormTmaParams> getInnerPersistentHeuristics(
     params->cparams.compute_bdimx = compute_bdimx;
     params->cparams.compute_bdimy = compute_bdimy;
     params->cparams.compute_bdimz = compute_bdimz;
+  }
+
+  // setupPersistentSchedule projects buffers before cacheInputs. An ordinary
+  // input is not a persistent buffer, so projecting persistent buffers cannot
+  // remove its existing direct uses. The shared cacheability predicate proves
+  // that at least one such use becomes an LDG cache in either TMA mode.
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    auto persistent_info_entry =
+        HeuristicDataCacheEntry<HeuristicCompileTime::PersistentBufferInfo>(
+            data_cache, [&fusion]() {
+              return std::make_unique<scheduler_utils::PersistentBufferInfo>(
+                  scheduler_utils::persistentBuffers(fusion));
+            });
+    const auto& persistent_info = persistent_info_entry.get();
+    std::unordered_set<TensorView*> persistent_inputs{
+        persistent_info.projectable_buffer_inputs.begin(),
+        persistent_info.projectable_buffer_inputs.end()};
+    for (auto* buffer : persistent_info.persistent_buffers) {
+      if (buffer->isFusionInput()) {
+        persistent_inputs.insert(buffer);
+      }
+    }
+    int64_t ldg_inputs = 0;
+    int64_t tma_inputs = 0;
+    for (auto* input : fusion->inputs()) {
+      auto* tv = dynamic_cast<TensorView*>(input);
+      if (tv == nullptr) {
+        continue;
+      }
+      if (!scheduler_utils::canCacheFusionInput(tv)) {
+        continue;
+      }
+      if (persistent_inputs.contains(tv)) {
+        ++tma_inputs;
+      } else {
+        ++ldg_inputs;
+      }
+    }
+    const char* skip_reason = nullptr;
+    if (ldg_inputs > 0 && tma_inputs == 0) {
+      skip_reason = "no cacheable TMA input remains for inner persistent schedule";
+    } else if (ldg_inputs > 0 && !native_tma_plan_hard_valid) {
+      skip_reason = "native TMA mode exceeds basic or warp-specialized hard bounds";
+    }
+    if (skip_reason != nullptr) {
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        scheduler::jev::recordCoverageSkip("IP3.ldg_preload", skip_reason);
+      } else {
+        NVF_ERROR(false, "Cannot prove inner TMA LDG preload Choice: ", skip_reason);
+      }
+    } else if (ldg_inputs > 0) {
+      const std::vector<scheduler::jev::ChoiceOption> options = {
+          {"pre", "Keep ordinary LDG inputs outside aggressive inlineMost"},
+          {"inline", "Include ordinary LDG inputs in aggressive inlineMost"}};
+      const std::string state =
+          "inner_persistent.tma_ldg_preload.v1\nldg_inputs=" +
+          std::to_string(ldg_inputs) + "\ntma_inputs=" +
+          std::to_string(tma_inputs) + "\nreduction_numel=" +
+          std::to_string(total_redu_count) + "\niteration_numel=" +
+          std::to_string(total_iter_count);
+      params->pre_load_ldg_tvs = scheduler::jev::chooseDecision(
+                                      "IP3.ldg_preload",
+                                      state,
+                                      options,
+                                      jev_mode == scheduler::jev::Mode::Record
+                                          ? "pre"
+                                          : "") == "pre";
+    }
   }
 
   // Set index type

@@ -13,6 +13,7 @@
 
 #include "instrumentation.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/normalization_inner_projection_route.h"
 #include "scheduler/normalization_inner_non_tma.h"
 #include "scheduler/normalization_inner_tma.h"
 #include "scheduler/normalization_utils.h"
@@ -196,34 +197,55 @@ bool InnerPersistentKernelScheduler::canScheduleRunTime(
 }
 
 std::unique_ptr<HeuristicParams> InnerPersistentKernelScheduler::
-    computeHeuristics(
+    computeHeuristicsImpl(
         Fusion* fusion,
         SchedulerRuntimeInfo& runtime_info,
         HeuristicDataCache* data_cache) {
   FUSER_PERF_SCOPE("InnerPersistentKernelScheduler::computeHeuristics");
 
-  // Get properties of the fusion
-  const auto& prop =
+  // On a potential TMA route, calculate native properties first so IP1 cannot
+  // alter TMA admission. The cached reduction, vectorization, and buffer
+  // facts are independent of the projection preference.
+  const int device_major = at::cuda::getCurrentDeviceProperties()->major;
+  const bool tma_option = isOptionEnabled(EnableOption::TmaInnerPersistent);
+  const auto jev_mode = scheduler::jev::mode();
+  const auto initial_route = normalization_inner::projectionPropertyRoute(
+      device_major, tma_option, jev_mode, /*non_tma_selected=*/false);
+  const auto native_prop =
       normalization_scheduler_utils::getPersistentKernelProperties(
           fusion,
           runtime_info,
           data_cache,
-          InnerPersistentKernelScheduler::schedulerType());
+          InnerPersistentKernelScheduler::schedulerType(),
+          initial_route.enable_projection_on_initial_properties);
 
-  // Check if TMA can be used
-  bool use_tma = mayUseTma(fusion, prop) &&
-      isOptionEnabled(EnableOption::TmaInnerPersistent);
+  const bool use_tma =
+      initial_route.may_attempt_tma && mayUseTma(fusion, native_prop);
 
   std::unique_ptr<HeuristicParams> rparams = nullptr;
   if (use_tma) {
     rparams = normalization_inner::tma::getInnerPersistentHeuristics(
-        fusion, prop, data_cache);
+        fusion, native_prop, data_cache);
   }
 
   // Fallback to non-TMA scheduler if TMA is not applicable
   if (rparams == nullptr) {
-    rparams = normalization_inner::non_tma::getInnerPersistentHeuristics(
-        fusion, prop, data_cache);
+    const auto fallback_route = normalization_inner::projectionPropertyRoute(
+        device_major, tma_option, jev_mode, /*non_tma_selected=*/true);
+    if (fallback_route.recompute_projection_on_non_tma_fallback) {
+      const auto non_tma_prop =
+          normalization_scheduler_utils::getPersistentKernelProperties(
+              fusion,
+              runtime_info,
+              data_cache,
+              InnerPersistentKernelScheduler::schedulerType(),
+              /*enable_jev_projection=*/true);
+      rparams = normalization_inner::non_tma::getInnerPersistentHeuristics(
+          fusion, non_tma_prop, data_cache, runtime_info);
+    } else {
+      rparams = normalization_inner::non_tma::getInnerPersistentHeuristics(
+          fusion, native_prop, data_cache, runtime_info);
+    }
   }
 
   NVF_ERROR(rparams != nullptr);

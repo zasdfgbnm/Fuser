@@ -11,10 +11,14 @@
 
 #include "instrumentation.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/compute_invocation_input.h"
 #include "scheduler/debug_utils.h"
 #include "scheduler/greedy.h"
 #include "scheduler/heuristic.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/matmul_utils.h"
+#include "scheduler/native_outcome.h"
+#include "scheduler/native_plan_fields.h"
 #include "scheduler/registry_utils.h"
 #include "scheduler/resize.h"
 #include "scheduler/runtime_info.h"
@@ -24,6 +28,45 @@
 namespace nvfuser {
 
 namespace {
+std::string jevHardwareSnapshot() {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device == nullptr)
+    return {};
+  scheduler::native_diagnostic::Object hardware;
+  // The v3 decision envelope carries a separately versioned hardware object.
+  // Its resource limits let the server verify local hard menus without
+  // changing the fusion/runtime snapshot or historical text protocols.
+  hardware.add("schema", "nvfuser.hardware.v2");
+  hardware.add("sm_count", static_cast<int64_t>(device->multiProcessorCount));
+  hardware.add("device_name", device->name);
+  hardware.add("compute_capability_major", static_cast<int64_t>(device->major));
+  hardware.add("compute_capability_minor", static_cast<int64_t>(device->minor));
+  hardware.add("warp_size", static_cast<int64_t>(device->warpSize));
+  hardware.add(
+      "max_threads_per_block",
+      static_cast<int64_t>(device->maxThreadsPerBlock));
+  hardware.add(
+      "max_threads_per_sm",
+      static_cast<int64_t>(device->maxThreadsPerMultiProcessor));
+  hardware.add(
+      "registers_per_sm", static_cast<int64_t>(device->regsPerMultiprocessor));
+  hardware.add(
+      "registers_per_block", static_cast<int64_t>(device->regsPerBlock));
+  hardware.add(
+      "shared_memory_per_sm_bytes",
+      static_cast<int64_t>(device->sharedMemPerMultiprocessor));
+  hardware.add(
+      "shared_memory_per_block_optin_bytes",
+      static_cast<int64_t>(device->sharedMemPerBlockOptin));
+  hardware.add("l2_cache_bytes", static_cast<int64_t>(device->l2CacheSize));
+  hardware.add("max_threads_x", static_cast<int64_t>(device->maxThreadsDim[0]));
+  hardware.add("max_threads_y", static_cast<int64_t>(device->maxThreadsDim[1]));
+  hardware.add("max_grid_x", static_cast<int64_t>(device->maxGridSize[0]));
+  hardware.add("max_grid_y", static_cast<int64_t>(device->maxGridSize[1]));
+  hardware.add("max_grid_z", static_cast<int64_t>(device->maxGridSize[2]));
+  return hardware.str();
+}
+
 //! A Utility for checking both dynamic and static part of
 //!  can schedule
 bool checkCanSchedule(Fusion* fusion, SchedulerType scheduler_type) {
@@ -129,6 +172,122 @@ bool checkCanSchedule(Fusion* fusion, SchedulerType scheduler_type) {
 }
 
 } // namespace
+
+std::unique_ptr<HeuristicParams> SchedulerEntry::computeHeuristics(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    HeuristicDataCache* data_cache) {
+  scheduler::compute_invocation_input::Snapshot input_snapshot;
+  const bool trace_enabled = scheduler::jev::computeTraceEnabled();
+  const bool jev_active = scheduler::jev::mode() != scheduler::jev::Mode::Off;
+  const bool semantic_v2_enabled =
+      jev_active && scheduler::jev::semanticProtocolEnabled();
+  const bool semantic_v3_enabled =
+      jev_active && scheduler::jev::semanticV3Enabled();
+  const bool semantic_enabled = semantic_v2_enabled || semantic_v3_enabled;
+  if (trace_enabled || semantic_enabled) {
+    input_snapshot =
+        scheduler::compute_invocation_input::capture(
+            fusion,
+            runtime_info,
+            semantic_v3_enabled
+                ? scheduler::compute_invocation_input::Format::V2
+                : scheduler::compute_invocation_input::Format::V1);
+  }
+  std::string hardware_json;
+  if (semantic_v3_enabled && input_snapshot.available()) {
+    try {
+      hardware_json = jevHardwareSnapshot();
+    } catch (...) {
+      // A v3 request without hardware must not be sent to the model.
+    }
+  }
+  scheduler::jev::ComputeHeuristicsScope compute_scope(
+      input_snapshot.text,
+      !trace_enabled && !semantic_enabled
+          ? "not_captured"
+          : (input_snapshot.available()
+                 ? std::string_view{}
+                 : scheduler::compute_invocation_input::reasonName(
+                       input_snapshot.reason)),
+      hardware_json);
+  std::unique_ptr<HeuristicParams> params;
+  if (semantic_v3_enabled &&
+      (!input_snapshot.available() || hardware_json.empty())) {
+    const std::string_view fallback_reason = !input_snapshot.available()
+        ? scheduler::compute_invocation_input::reasonName(input_snapshot.reason)
+        : "hardware_snapshot_unavailable";
+    scheduler::jev::recordNoChoiceDecision(
+        "semantic-v3",
+        "native",
+        fallback_reason,
+        "incomplete_context_gate");
+    scheduler::jev::recordContextFallback(fallback_reason);
+    scheduler::jev::ScopedNativeDecisions native_decisions;
+    params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
+  } else {
+    params = computeHeuristicsImpl(fusion, runtime_info, data_cache);
+  }
+  if (params != nullptr && scheduler::native_diagnostic::enabled()) {
+    // All serialization, including a potentially throwing toString(), is
+    // isolated from the native scheduler result.
+    try {
+      using scheduler::native_diagnostic::Outcome;
+      Outcome outcome;
+      outcome.compute_invocation_id =
+          std::string(compute_scope.invocationId());
+      outcome.scheduler_type = nvfuser::toString(params->scheduler_type);
+      outcome.tag = params->tag;
+      outcome.heuristic_text = params->toString();
+      auto description =
+          scheduler::native_diagnostic::describeSchedulerFields(*params);
+      outcome.params_kind = std::move(description.params_kind);
+      outcome.scheduler_fields_json = std::move(description.fields_json);
+      const auto& launch = params->lparams;
+      outcome.launch = {
+          launch.getRawVal(ParallelType::BIDx),
+          launch.getRawVal(ParallelType::BIDy),
+          launch.getRawVal(ParallelType::BIDz),
+          launch.getRawVal(ParallelType::TIDx),
+          launch.getRawVal(ParallelType::TIDy),
+          launch.getRawVal(ParallelType::TIDz),
+          launch.smem()};
+      const auto& compile = params->cparams;
+      if (compile.index_type.has_value()) {
+        outcome.compile.index_type = static_cast<int64_t>(*compile.index_type);
+      }
+      outcome.compile.maxrregcount = compile.maxrregcount;
+      outcome.compile.enable_magic_zero = compile.enable_magic_zero;
+      outcome.compile.enable_ptxas_verbose = compile.enable_ptxas_verbose;
+      if (compile.device.has_value()) {
+        outcome.compile.device = compile.device->str();
+      }
+      outcome.compile.include_paths = compile.include_paths;
+      outcome.compile.block_x = compile.bdimx;
+      outcome.compile.block_y = compile.bdimy;
+      outcome.compile.block_z = compile.bdimz;
+      outcome.compile.compute_block_x = compile.compute_bdimx;
+      outcome.compile.compute_block_y = compile.compute_bdimy;
+      outcome.compile.compute_block_z = compile.compute_bdimz;
+      scheduler::native_diagnostic::recordOutcome(outcome);
+    } catch (...) {
+      // Observability is never a condition for a successful native schedule.
+    }
+  }
+  if (compute_scope.observing()) {
+    try {
+      std::string scheduler_type = params == nullptr ? "null" : "unavailable";
+      if (params != nullptr) {
+        scheduler_type = nvfuser::toString(params->scheduler_type);
+      }
+      compute_scope.complete(scheduler_type);
+    } catch (...) {
+      // Even scheduler-name formatting must not affect a successful return.
+      compute_scope.complete("unavailable");
+    }
+  }
+  return params;
+}
 
 // Dispatch heuristic type to the right derived class of scheduler entry.
 // Scheduler entries are stateless so it's a lightweight class to dispatch to

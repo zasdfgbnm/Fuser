@@ -10,8 +10,13 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
+#include <string>
+#include <vector>
+
 #include "ir/utils.h"
 #include "scheduler/cache_policy_refiner.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -31,47 +36,133 @@ std::unique_ptr<TmaOuterReductionParams> getReductionHeuristics(
   // TODO: These heuristics are stubbed out based on the manual test
   // (TmaOuterReductionManualTest::Basic). They need proper tuning.
 
-  // 2D thread block: TIDx covers iteration, TIDy covers reduction
+  // 2D thread block: TIDx covers iteration, TIDy covers reduction.
   const int64_t bdimx = 32;
-  const int64_t bdimy = 16;
+  int64_t bdimy = 16;
+  const auto jev_mode = scheduler::jev::mode();
 
   // Compute TMA tile sizes based on available shared memory budget.
   // Each input tensor gets a tma_tile_r * tma_tile_i tile in smem.
   // Reserve space for block reduction workspace and static smem.
   auto dev_prop = at::cuda::getCurrentDeviceProperties();
+  const int64_t shared_mem_per_block =
+      static_cast<int64_t>(dev_prop->sharedMemPerBlockOptin);
   const int64_t dtype_bytes = props.max_dtype_size_bit_for_vectorization / 8;
   const int64_t threads_per_block = bdimx * bdimy;
   const int64_t smem_overhead =
       alignSharedMemoryBytes(threads_per_block * dtype_bytes) +
       kSharedMemoryAlignmentBytes;
-  const int64_t smem_bytes =
-      (int64_t)dev_prop->sharedMemPerBlockOptin - smem_overhead;
+  const int64_t smem_bytes = shared_mem_per_block - smem_overhead;
   const int64_t n_inputs = std::max(props.n_tensor_inputs, (int64_t)1);
   const int64_t smem_per_input = smem_bytes / n_inputs;
-
-  // Start with default tile sizes and shrink if they exceed the per-input
-  // smem budget. Tile sizes must remain multiples of thread block dims.
-  int64_t tma_tile_i = 128;
-  int64_t tma_tile_r = 128;
-  while (tma_tile_r * tma_tile_i * dtype_bytes > smem_per_input &&
-         tma_tile_r > bdimy) {
-    tma_tile_r /= 2;
-  }
-  while (tma_tile_r * tma_tile_i * dtype_bytes > smem_per_input &&
-         tma_tile_i > bdimx) {
-    tma_tile_i /= 2;
-  }
-
-  NVF_ERROR(tma_tile_i % bdimx == 0);
-  NVF_ERROR(tma_tile_r % bdimy == 0);
-
-  const int64_t iter_unroll_factor = tma_tile_i / bdimx;
 
   // Grid dimension for parallelizing the outer reduction across CTAs.
   // Modeled after the manual test: clamp lastPow2(outer_size / 256) to [1, 8].
   const int64_t outer_size = props.total_reduction_numel;
-  int64_t grdim = std::max<int64_t>(
-      1, std::min<int64_t>(8, scheduler_utils::lastPow2(outer_size / 256)));
+  int64_t tma_tile_i = 0;
+  int64_t tma_tile_r = 0;
+  int64_t grdim = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Keep the original preference only for off and record. The remote
+    // request carries the measurements needed to reproduce it independently.
+    tma_tile_i = 128;
+    tma_tile_r = 128;
+    while (tma_tile_r * tma_tile_i * dtype_bytes > smem_per_input &&
+           tma_tile_r > bdimy) {
+      tma_tile_r /= 2;
+    }
+    while (tma_tile_r * tma_tile_i * dtype_bytes > smem_per_input &&
+           tma_tile_i > bdimx) {
+      tma_tile_i /= 2;
+    }
+    grdim = std::max<int64_t>(
+        1, std::min<int64_t>(8, scheduler_utils::lastPow2(outer_size / 256)));
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    NVF_ERROR(outer_size > 0 && dtype_bytes > 0 && n_inputs > 0);
+    struct Plan {
+      int64_t y;
+      int64_t i;
+      int64_t r;
+      int64_t g;
+      std::string id() const {
+        return "y" + std::to_string(y) + "_i" + std::to_string(i) +
+            "_r" + std::to_string(r) + "_g" + std::to_string(g);
+      }
+    };
+    // TIDx remains one warp; the supported TIDy, TMA boxes and grid values
+    // are powers of two. Bound reduction unroll by the manual schedule's 8.
+    const auto legal = [&](const Plan& plan) {
+      if (bdimx * plan.y > dev_prop->maxThreadsPerBlock ||
+          plan.i % bdimx != 0 || plan.r % plan.y != 0 ||
+          plan.r / plan.y > 8 || plan.i * dtype_bytes % 16 != 0 ||
+          plan.g > dev_prop->maxGridSize[1] ||
+          plan.g > ceilDiv(outer_size, plan.r)) {
+        return false;
+      }
+      const int64_t overhead =
+          alignSharedMemoryBytes(bdimx * plan.y * dtype_bytes) +
+          kSharedMemoryAlignmentBytes;
+      const int64_t bytes_per_input =
+          alignSharedMemoryBytes(plan.i * plan.r * dtype_bytes);
+      return bytes_per_input * n_inputs + overhead <= shared_mem_per_block;
+    };
+    std::vector<Plan> plans;
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t y : {8, 16}) {
+      for (int64_t i : {32, 64, 128}) {
+        for (int64_t r : {16, 32, 64, 128}) {
+          for (int64_t g : {1, 2, 4, 8}) {
+            Plan plan{y, i, r, g};
+            if (!legal(plan)) {
+              continue;
+            }
+            options.push_back(
+                {plan.id(),
+                 "CTA 32x" + std::to_string(y) + "; TMA tile " +
+                     std::to_string(r) + "x" + std::to_string(i) +
+                     "; reduction grid " + std::to_string(g)});
+            plans.push_back(plan);
+          }
+        }
+      }
+    }
+    NVF_ERROR(!plans.empty(), "RD7.plan has no hard-valid candidate");
+    const Plan native{16, tma_tile_i, tma_tile_r, grdim};
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? native.id()
+        : std::string();
+    if (jev_mode == scheduler::jev::Mode::Record && !legal(native)) {
+      scheduler::jev::recordCoverageSkip(
+          "RD7.plan", "native plan exceeds conservative candidate bounds");
+    } else {
+      std::string state = "reduction.tma_outer_plan.v1\n";
+      state += "outer_size=" + std::to_string(outer_size) + '\n';
+      state += "dtype_bytes=" + std::to_string(dtype_bytes) + '\n';
+      state += "n_inputs=" + std::to_string(n_inputs) + '\n';
+      state += "smem_per_block_bytes=" +
+          std::to_string(shared_mem_per_block) + '\n';
+      state += "max_threads_per_block=" +
+          std::to_string(dev_prop->maxThreadsPerBlock) + '\n';
+      state += "max_grid_y=" + std::to_string(dev_prop->maxGridSize[1]) + '\n';
+      const auto selected = scheduler::jev::chooseDecision(
+          "RD7.plan", state, options, native_choice);
+      const auto it = std::find_if(
+          plans.begin(), plans.end(), [&](const Plan& plan) {
+            return selected == plan.id();
+          });
+      NVF_ERROR(it != plans.end(), "RD7.plan response is outside hard bounds");
+      bdimy = it->y;
+      tma_tile_i = it->i;
+      tma_tile_r = it->r;
+      grdim = it->g;
+    }
+  }
+
+  NVF_ERROR(tma_tile_i % bdimx == 0);
+  NVF_ERROR(tma_tile_r % bdimy == 0);
+  const int64_t iter_unroll_factor = tma_tile_i / bdimx;
 
   auto params = std::make_unique<TmaOuterReductionParams>();
   params->bdimx = bdimx;

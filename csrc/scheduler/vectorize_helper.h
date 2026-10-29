@@ -360,6 +360,15 @@ int64_t getVectorizationFactorTransposeGroup(
     const std::vector<TensorView*>& vec_tv,
     int64_t max_vectorization);
 
+// Runtime sizes of each group's mapped contiguous inner region, before the
+// vector-width and per-thread cap are applied.
+std::vector<int64_t> getTransposeGroupContiguousInnerSizes(
+    SchedulerRuntimeInfo& runtime_info,
+    TensorView* reference,
+    int64_t inner_most_dim,
+    const std::vector<int64_t>& dims_to_merge,
+    const std::vector<TensorView*>& vec_tv);
+
 //! Find the break point for vectorization. Here, we vectorize either
 //! the innermost reduction or iteration domains. We use the producer
 //! of the reduction as a reference of the vectorization

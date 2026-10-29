@@ -8,14 +8,23 @@
 
 #include "scheduler/resize.h"
 
+#include <ATen/cuda/CUDAContext.h>
+
+#include <array>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <ranges>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "debug.h"
 #include "instrumentation.h"
 #include "ir/utils.h"
 #include "scheduler/cache_policy_refiner.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/mark_aliases.h"
 #include "scheduler/pointwise_utils.h"
 #include "scheduler/registry_utils.h"
@@ -25,6 +34,8 @@
 #include "scheduler/tools/loop_domain_scheduler.h"
 #include "scheduler/tools/resize_utils.h"
 #include "scheduler/tools/static_repeat.h"
+#include "scheduler/utils.h"
+#include "scheduler/vectorize_helper.h"
 #include "val_graph_visitor.h"
 
 namespace nvfuser {
@@ -60,6 +71,421 @@ std::pair<TensorView*, int64_t> getLargestTensor(
   }
   return std::make_pair(largest_tv, max_num_elms);
 }
+
+struct DirectPadReorderConsequences {
+  std::string skip;
+  std::string keep;
+  std::string reference_tv;
+  std::string input_tv;
+  std::array<int64_t, 3> read_strides;
+  std::array<int64_t, 3> write_strides;
+  int64_t read_elements;
+  int64_t write_elements;
+};
+
+// Bind the two local reorder effects to a deliberately small graph subset.
+// The server independently derives the same facts from the v2 invocation
+// snapshot; this check merely prevents an unsupported graph from claiming
+// that the producer has a complete candidate preview.
+std::optional<DirectPadReorderConsequences> directPadReorderConsequencesUnchecked(
+    Fusion* fusion,
+    TensorView* reference,
+    TensorView* largest_input,
+    SchedulerRuntimeInfo& runtime_info,
+    int64_t width) {
+  if (!scheduler::jev::computeInvocationInputSnapshot().starts_with(
+          "nvfuser.compute_invocation_input.v2\n") ||
+      width < 1 || width > 128 || (width & (width - 1)) != 0 ||
+      fusion->inputs().size() != 1 || fusion->outputs().size() != 1 ||
+      fusion->allTvs().size() != 2 || fusion->exprs().size() != 1 ||
+      largest_input == nullptr || reference == nullptr ||
+      fusion->inputs().front() != largest_input ||
+      fusion->outputs().front() != reference) {
+    return std::nullopt;
+  }
+  auto* pad = dynamic_cast<PadOp*>(fusion->exprs().front());
+  if (pad == nullptr || pad->in() != largest_input ||
+      pad->out() != reference || pad->inputs().size() != 8 ||
+      pad->outputs().size() != 1 || !pad->value()->isConstScalar() ||
+      pad->value()->dtype() != DataType::Float ||
+      pad->getPaddedAxes() != std::vector<int64_t>{2}) {
+    return std::nullopt;
+  }
+  const auto& alias = fusion->getOutputAlias(reference);
+  if (alias.type != AllocationType::New || alias.aliased_io != nullptr ||
+      alias.visibility != OutputVisibility::kVisible) {
+    return std::nullopt;
+  }
+  const auto plain_tv = [](TensorView* tv, size_t domain_expr_count) {
+    if (tv->dtype() != DataType::Float ||
+        tv->getMemoryType() != MemoryType::Global || tv->hasDeviceMesh() ||
+        tv->isCpuScalar() || tv->getLogicalDomain().size() != 3 ||
+        tv->getLoopDomain() != tv->getLogicalDomain() ||
+        tv->domain()->allExprs().size() != domain_expr_count ||
+        tv->getContiguity().size() != 3 ||
+        !std::ranges::all_of(tv->getContiguity(), [](const auto& contiguous) {
+          return contiguous.has_value() && *contiguous;
+        })) {
+      return false;
+    }
+    return std::ranges::all_of(
+        tv->getLogicalDomain(), [](const IterDomain* axis) {
+          return axis->isIteration() && !axis->isReduction() &&
+              !axis->isBroadcast() && !axis->isStride() &&
+              !axis->isSymbolic() && !axis->isDeviceDim() &&
+              !axis->hasExpandedExtent() && !axis->isParallelized() &&
+              axis->extent()->isConstScalar();
+        });
+  };
+  if (!plain_tv(largest_input, 0) || !plain_tv(reference, 1) ||
+      fusion->vals().count(largest_input) == 0 ||
+      fusion->vals().count(reference) == 0 ||
+      !largest_input->hasAllocation() || reference->hasAllocation() ||
+      reference->getMaybeAllocationDomain() !=
+          reference->getLogicalDomain()) {
+    return std::nullopt;
+  }
+  const auto& input_axes = largest_input->getLogicalDomain();
+  const auto& allocation = largest_input->getMaybeAllocationDomain();
+  if (allocation.size() != 3 || allocation[0] != input_axes[1] ||
+      allocation[1] != input_axes[0] || allocation[2] != input_axes[2]) {
+    return std::nullopt;
+  }
+  const auto& output_axes = reference->getLogicalDomain();
+  if (output_axes[0]->definition() != nullptr ||
+      output_axes[1]->definition() != nullptr ||
+      output_axes[2]->definition() == nullptr ||
+      !output_axes[2]->definition()->isA<Resize>()) {
+    return std::nullopt;
+  }
+  const auto widths = pad->getPadWidths();
+  if (widths.size() != 6) {
+    return std::nullopt;
+  }
+  std::array<int64_t, 3> input_shape{}, output_shape{};
+  for (size_t axis = 0; axis < 3; ++axis) {
+    auto input_extent =
+        runtime_info.expressionEvaluator().evaluate(input_axes[axis]->extent());
+    auto output_extent =
+        runtime_info.expressionEvaluator().evaluate(output_axes[axis]->extent());
+    if (!input_extent.hasValue() || !output_extent.hasValue()) {
+      return std::nullopt;
+    }
+    input_shape[axis] = input_extent.as<int64_t>();
+    output_shape[axis] = output_extent.as<int64_t>();
+    if (input_shape[axis] <= 0 || output_shape[axis] <= 0) {
+      return std::nullopt;
+    }
+  }
+  int64_t right_pad = 0;
+  for (size_t index = 0; index < widths.size(); ++index) {
+    if (!widths[index]->isConstScalar() ||
+        widths[index]->dtype() != DataType::Index) {
+      return std::nullopt;
+    }
+    auto amount = runtime_info.expressionEvaluator().evaluate(widths[index]);
+    if (!amount.hasValue() || amount.as<int64_t>() < 0 ||
+        (index != 5 && amount.as<int64_t>() != 0)) {
+      return std::nullopt;
+    }
+    if (index == 5) {
+      right_pad = amount.as<int64_t>();
+    }
+  }
+  if (right_pad <= 0 || output_shape[0] != input_shape[0] ||
+      output_shape[1] != input_shape[1] ||
+      input_shape[2] > std::numeric_limits<int64_t>::max() - right_pad ||
+      output_shape[2] != input_shape[2] + right_pad ||
+      input_shape[2] % width != 0 || output_shape[2] % width != 0 ||
+      runtime_info.getAlignmentSizeBit(largest_input) <
+          static_cast<size_t>(width * 32)) {
+    return std::nullopt;
+  }
+  const auto checked_product = [](const std::array<int64_t, 3>& shape)
+      -> std::optional<int64_t> {
+    int64_t count = 1;
+    for (int64_t extent : shape) {
+      if (count > std::numeric_limits<int64_t>::max() / extent) {
+        return std::nullopt;
+      }
+      count *= extent;
+    }
+    return count;
+  };
+  const auto read_elements = checked_product(input_shape);
+  const auto write_elements = checked_product(output_shape);
+  if (!read_elements || !write_elements || *write_elements < *read_elements) {
+    return std::nullopt;
+  }
+  const auto& allocation_strides =
+      runtime_info.getInputAllocationStrides(largest_input);
+  if (allocation_strides.size() != 3) {
+    return std::nullopt;
+  }
+  std::array<int64_t, 3> read_strides{};
+  int64_t dense_stride = 1;
+  for (int64_t i = 2; i >= 0; --i) {
+    if (allocation_strides.at(i) != dense_stride) {
+      return std::nullopt;
+    }
+    const size_t logical_axis = i == 0 ? 1 : i == 1 ? 0 : 2;
+    read_strides[logical_axis] = dense_stride;
+    if (dense_stride >
+        std::numeric_limits<int64_t>::max() / input_shape[logical_axis]) {
+      return std::nullopt;
+    }
+    dense_stride *= input_shape[logical_axis];
+  }
+  // The v2 snapshot exposes ATen's storage offset and logical strides.
+  // SchedulerRuntimeInfo's allocation strides alone do not prove either.
+  const auto& input_value =
+      runtime_info.expressionEvaluator().evaluate(largest_input);
+  if (!input_value.is<at::Tensor>()) {
+    return std::nullopt;
+  }
+  const auto& tensor = input_value.as<at::Tensor>();
+  if (!tensor.defined() || !tensor.is_cuda() ||
+      tensor.scalar_type() != at::kFloat || tensor.storage_offset() != 0 ||
+      tensor.dim() != 3) {
+    return std::nullopt;
+  }
+  for (int64_t axis = 0; axis < 3; ++axis) {
+    if (tensor.size(axis) != input_shape.at(axis) ||
+        tensor.stride(axis) != read_strides.at(axis)) {
+      return std::nullopt;
+    }
+  }
+  std::array<int64_t, 3> write_strides{
+      output_shape[1] * output_shape[2], output_shape[2], 1};
+  const auto native_permutation = scheduler_utils::reorderDomainLike(
+      {reference->getLoopDomain().begin(),
+       reference->getLoopDomain().begin() + 2},
+      allocation);
+  if (native_permutation != std::vector<int64_t>{1, 0}) {
+    return std::nullopt;
+  }
+  const auto three = [](const std::array<int64_t, 3>& values) {
+    return '[' + std::to_string(values[0]) + ',' +
+        std::to_string(values[1]) + ',' + std::to_string(values[2]) + ']';
+  };
+  const std::string common =
+      "\"reference_tv\":\"T" + std::to_string(reference->name()) +
+      "\",\"input_tv\":\"T" + std::to_string(largest_input->name()) +
+      "\",\"read_elements\":" + std::to_string(*read_elements) +
+      ",\"write_elements\":" + std::to_string(*write_elements) +
+      ",\"pad_fill_elements\":" +
+      std::to_string(*write_elements - *read_elements) +
+      ",\"innermost_axis\":2,\"width\":" + std::to_string(width);
+  const auto effect = [&](const std::array<int64_t, 3>& order) {
+    const std::array<int64_t, 3> read{
+        read_strides.at(order[0]),
+        read_strides.at(order[1]),
+        read_strides.at(order[2])};
+    const std::array<int64_t, 3> write{
+        write_strides.at(order[0]),
+        write_strides.at(order[1]),
+        write_strides.at(order[2])};
+    return "{" + common + ",\"loop_axis_order\":" + three(order) +
+        ",\"read_stride_by_loop\":" + three(read) +
+        ",\"write_stride_by_loop\":" + three(write) + '}';
+  };
+  return DirectPadReorderConsequences{
+      effect({0, 1, 2}),
+      effect({1, 0, 2}),
+      "T" + std::to_string(reference->name()),
+      "T" + std::to_string(largest_input->name()),
+      read_strides,
+      write_strides,
+      *read_elements,
+      *write_elements};
+}
+
+std::optional<DirectPadReorderConsequences> directPadReorderConsequences(
+    Fusion* fusion,
+    TensorView* reference,
+    TensorView* largest_input,
+    SchedulerRuntimeInfo& runtime_info,
+    int64_t width) {
+  try {
+    return directPadReorderConsequencesUnchecked(
+        fusion, reference, largest_input, runtime_info, width);
+  } catch (const std::exception&) {
+    // This is only an optional model preview. Preserve the native schedule
+    // when runtime geometry or graph mapping cannot be proved here.
+    return std::nullopt;
+  }
+}
+
+// RS1.cta is terminal in computeHeuristics. Describe the exact candidate
+// ResizeParams and the no-split launch produced by the selected width and
+// reorder branch. The source owns index-type analysis; the other values are
+// independently reconstructible from the v2 invocation snapshot.
+std::string directPadCtaConsequence(
+    const DirectPadReorderConsequences& pad,
+    const ResizeParams& candidate) {
+  NVF_ERROR(
+      !candidate.split_grid_x_dim && candidate.cta_threads > 0 &&
+          candidate.vectorization_factor > 0 &&
+          candidate.cparams.index_type.has_value() &&
+          (candidate.largest_input == -1 || candidate.largest_input == 0),
+      "Direct Pad CTA preview requires a complete no-split Resize plan");
+  const std::array<int64_t, 3> order =
+      candidate.largest_input == 0 ? std::array<int64_t, 3>{1, 0, 2}
+                                   : std::array<int64_t, 3>{0, 1, 2};
+  const auto three = [](const std::array<int64_t, 3>& values) {
+    return '[' + std::to_string(values[0]) + ',' +
+        std::to_string(values[1]) + ',' + std::to_string(values[2]) + ']';
+  };
+  const auto in_loop_order = [&](const std::array<int64_t, 3>& strides) {
+    return three(
+        {strides.at(order[0]), strides.at(order[1]), strides.at(order[2])});
+  };
+  const int64_t vector_iterations =
+      ceilDiv(pad.write_elements, candidate.vectorization_factor);
+  const int64_t grid_x =
+      ceilDiv(vector_iterations, candidate.cta_threads);
+  return "{\"final_resize_plan\":{\"index_type\":" +
+      std::to_string(static_cast<int64_t>(*candidate.cparams.index_type)) +
+      ",\"largest_input\":" + std::to_string(candidate.largest_input) +
+      ",\"vectorization_factor\":" +
+      std::to_string(candidate.vectorization_factor) +
+      ",\"cta_threads\":" + std::to_string(candidate.cta_threads) +
+      ",\"split_grid_x_dim\":false},"
+      "\"index_type_provenance\":\"source_hard_analysis\","
+      "\"reference_tv\":\"" + pad.reference_tv +
+      "\",\"input_tv\":\"" + pad.input_tv +
+      "\",\"loop_axis_order\":" + three(order) +
+      ",\"read_stride_by_loop\":" + in_loop_order(pad.read_strides) +
+      ",\"write_stride_by_loop\":" + in_loop_order(pad.write_strides) +
+      ",\"read_elements\":" + std::to_string(pad.read_elements) +
+      ",\"write_elements\":" + std::to_string(pad.write_elements) +
+      ",\"pad_fill_elements\":" +
+      std::to_string(pad.write_elements - pad.read_elements) +
+      ",\"output_vector_iterations\":" +
+      std::to_string(vector_iterations) +
+      ",\"block_x\":" + std::to_string(candidate.cta_threads) +
+      ",\"grid_x\":" + std::to_string(grid_x) +
+      ",\"grid_y\":1,\"pending_choices\":[]}";
+}
+
+struct DirectPadCtaLimits {
+  int64_t max_output_elements;
+  int64_t layout_max;
+  int64_t vector_width;
+  int64_t warp_size;
+  int64_t max_threads_x;
+  int64_t max_threads_per_block;
+  int64_t max_grid_x;
+};
+
+// The same physical CTA admission is used by the reorder preview and the
+// actual terminal CTA Choice. It depends only on fixed source analysis and
+// the candidate thread count, never on the native CTA preference.
+bool directPadCtaLegal(const DirectPadCtaLimits& limits, int64_t threads) {
+  if (threads < limits.warp_size || threads % limits.warp_size != 0 ||
+      threads > limits.max_threads_x ||
+      threads > limits.max_threads_per_block || limits.max_grid_x < 1) {
+    return false;
+  }
+  const int64_t grid_blocks = ceilDiv(limits.max_output_elements, threads);
+  const bool split_grid = grid_blocks > ResizeParams::max_gdimx;
+  return limits.max_output_elements >= 0 && limits.layout_max >= 1 &&
+      limits.vector_width >= 1 &&
+      limits.layout_max % limits.vector_width == 0 &&
+      (split_grid ? ResizeParams::max_gdimx <= limits.max_grid_x
+                  : grid_blocks <= limits.max_grid_x);
+}
+
+struct DirectPadTerminalLeaf {
+  std::string reorder_choice;
+  int64_t cta_threads;
+  std::string plan;
+};
+
+struct DirectPadTerminalPlans {
+  std::string skip;
+  std::string keep;
+  std::vector<int64_t> cta_threads;
+  std::vector<DirectPadTerminalLeaf> leaves;
+};
+
+// Each reorder alternative has the same hard-valid CTA domain but a
+// different final largest_input and loop-axis order. Build complete terminal
+// Resize plans without issuing any descendant model request.
+std::optional<DirectPadTerminalPlans> directPadTerminalPlans(
+    const DirectPadReorderConsequences& pad,
+    const ResizeParams& base,
+    const DirectPadCtaLimits& limits) {
+  if (!base.cparams.index_type.has_value() ||
+      base.vectorization_factor != limits.vector_width) {
+    return std::nullopt;
+  }
+  DirectPadTerminalPlans plans;
+  for (int64_t threads : {64, 128, 256}) {
+    if (!directPadCtaLegal(limits, threads)) {
+      continue;
+    }
+    if (ceilDiv(limits.max_output_elements, threads) >
+        ResizeParams::max_gdimx) {
+      // The terminal CTA preview describes only a physical BIDx grid.
+      // Preserve native coverage when any candidate needs a split grid.
+      return std::nullopt;
+    }
+    plans.cta_threads.push_back(threads);
+  }
+  if (plans.cta_threads.empty()) {
+    return std::nullopt;
+  }
+  const auto branch = [&](bool keep) {
+    std::string result = "{\"reorder_effect\":" +
+        (keep ? pad.keep : pad.skip) + ",\"terminal_continuations\":[";
+    bool first = true;
+    for (int64_t threads : plans.cta_threads) {
+      ResizeParams candidate(base);
+      candidate.largest_input = keep ? 0 : -1;
+      candidate.cta_threads = threads;
+      candidate.split_grid_x_dim = false;
+      const std::string plan = directPadCtaConsequence(pad, candidate);
+      plans.leaves.push_back({keep ? "keep" : "skip", threads, plan});
+      if (!first) {
+        result += ',';
+      }
+      first = false;
+      result += "{\"cta_choice\":\"t" + std::to_string(threads) +
+          "\",\"plan\":" + plan + '}';
+    }
+    return result + "],\"pending_choices\":[\"RS1.cta\"]}";
+  };
+  plans.skip = branch(false);
+  plans.keep = branch(true);
+  return plans;
+}
+
+std::string directPadWidthConsequence(
+    int64_t width,
+    const DirectPadTerminalPlans& terminal) {
+  std::string result = "{\"selected_width\":" + std::to_string(width) +
+      ",\"terminal_continuations\":[";
+  bool first = true;
+  for (const auto& leaf : terminal.leaves) {
+    if (!first) {
+      result += ',';
+    }
+    first = false;
+    result += "{\"reorder_choice\":\"" + leaf.reorder_choice +
+        "\",\"cta_choice\":\"t" + std::to_string(leaf.cta_threads) +
+        "\",\"plan\":" + leaf.plan + '}';
+  }
+  return result +
+      "],\"pending_choices\":[\"RS1.reorder\",\"RS1.cta\"]}";
+}
+
+struct DirectPadWidthPreview {
+  int64_t width;
+  DirectPadReorderConsequences pad;
+  DirectPadTerminalPlans terminal;
+  std::string consequence;
+};
 
 } // namespace
 
@@ -207,7 +633,7 @@ bool ResizeScheduler::canScheduleCompileTime(Fusion* fusion) {
   return true;
 }
 
-std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
+std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristicsImpl(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache) {
@@ -216,13 +642,11 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
   params->tag = "Resize heuristics";
   params->cparams.index_type = runtime_info.getIndexType();
 
-  const int64_t bdimx = 128;
-
   const auto& [largest_output, max_num_elms] =
       getLargestTensor(fusion->outputs(), runtime_info);
 
   params->split_grid_x_dim =
-      ceilDiv(max_num_elms, bdimx) > ResizeParams::max_gdimx;
+      ceilDiv(max_num_elms, params->cta_threads) > ResizeParams::max_gdimx;
 
   const auto largest_input =
       getLargestTensor(fusion->inputs(), runtime_info).first;
@@ -236,6 +660,39 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
     params->largest_input = -1;
   }
 
+  const auto jev_mode = scheduler::jev::mode();
+  std::string input_elements;
+  const bool semantic_v3_resize =
+      jev_mode != scheduler::jev::Mode::Off &&
+      scheduler::jev::semanticV3Enabled();
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Preserve original fusion-input indices: scalar inputs have no layout.
+    for (size_t input_index = 0; input_index < fusion->inputs().size();
+         ++input_index) {
+      auto* input = fusion->inputs().at(input_index);
+      if (!input->isA<TensorView>()) {
+        continue;
+      }
+      int64_t num_elms = 1;
+      for (auto* logical_id : input->as<TensorView>()->getLogicalDomain()) {
+        auto extent = runtime_info.expressionEvaluator().evaluate(
+            logical_id->extent());
+        NVF_ERROR(extent.hasValue(), "Error inferring extent of: ",
+                  logical_id->toString());
+        num_elms *= extent.as<int64_t>();
+      }
+      if (!input_elements.empty()) {
+        input_elements += ',';
+      }
+      input_elements +=
+          std::to_string(input_index) + ':' + std::to_string(num_elms);
+    }
+    if (input_elements.empty()) {
+      input_elements = "-";
+    }
+  }
+
   auto ref_tv_entry =
       HeuristicDataCacheEntry<HeuristicCompileTime::ReferenceTensors>(
           data_cache, [fusion]() {
@@ -246,11 +703,282 @@ std::unique_ptr<HeuristicParams> ResizeScheduler::computeHeuristics(
 
   // Only consider the innermost dimension to vectorize for now.
   // TODO: Consider vectorizing merged IDs, not just the innermost
-  params->vectorization_factor = vectorize_helper::getVectorizationFactor(
+  // The helper's layout/resize/alignment bound is a hard legality constraint.
+  // Resize currently has no additional soft width cap, so its native
+  // preference is exactly this bound. The helper may use gcd for Resize
+  // offsets, so a legal alternative must divide the bound, not merely be
+  // smaller than it. Neither the reference nor innermost axis may change.
+  const int64_t layout_max = vectorize_helper::getVectorizationFactor(
       runtime_info,
       ref_tv,
       data_cache,
       (int64_t)ref_tv->getLogicalDomain().size() - 1);
+  params->vectorization_factor = layout_max;
+  std::optional<DirectPadCtaLimits> cta_limits;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    const auto* device = at::cuda::getCurrentDeviceProperties();
+    cta_limits = DirectPadCtaLimits{
+        max_num_elms,
+        layout_max,
+        layout_max,
+        device->warpSize,
+        device->maxThreadsDim[0],
+        device->maxThreadsPerBlock,
+        device->maxGridSize[0]};
+  }
+
+  // A strict width preview includes every reachable reorder and no-split CTA
+  // leaf. If any width lacks that proof, keep v3 in native coverage instead of
+  // asking a stateless model to infer the missing descendant effects.
+  std::optional<std::vector<DirectPadWidthPreview>> direct_pad_widths;
+  if (semantic_v3_resize && layout_max >= 1 && layout_max <= 128 &&
+      largest_output == ref_tv &&
+      params->largest_input == 0) {
+    std::vector<DirectPadWidthPreview> previews;
+    bool complete = true;
+    for (int64_t width = 1; width <= layout_max; ++width) {
+      if (layout_max % width != 0) {
+        continue;
+      }
+      auto pad = directPadReorderConsequences(
+          fusion, ref_tv, largest_input, runtime_info, width);
+      if (!pad || pad->write_elements != max_num_elms) {
+        complete = false;
+        break;
+      }
+      ResizeParams candidate(*params);
+      candidate.vectorization_factor = width;
+      auto limits = *cta_limits;
+      limits.vector_width = width;
+      auto terminal = directPadTerminalPlans(*pad, candidate, limits);
+      if (!terminal) {
+        complete = false;
+        break;
+      }
+      const std::string consequence =
+          directPadWidthConsequence(width, *terminal);
+      previews.push_back(
+          {width, std::move(*pad), std::move(*terminal), consequence});
+    }
+    if (complete && !previews.empty()) {
+      direct_pad_widths = std::move(previews);
+    }
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    NVF_ERROR(
+        layout_max >= 1 && layout_max <= 128,
+        "RS1.width layout limit must be in 1..128");
+
+    if (semantic_v3_resize && !direct_pad_widths) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.width",
+          "direct rank-3 right Pad width continuations are unavailable");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options;
+      for (int64_t width = 1; width <= layout_max; ++width) {
+        if (layout_max % width != 0) {
+          continue;
+        }
+        std::string consequence;
+        if (direct_pad_widths) {
+          const auto& preview = direct_pad_widths->at(options.size());
+          NVF_ERROR(
+              preview.width == width,
+              "RS1.width strict candidate order disagrees with hard widths");
+          consequence = preview.consequence;
+        }
+        options.push_back({
+            "w" + std::to_string(width),
+            "Vectorize " + std::to_string(width) + " element(s) per thread",
+            consequence});
+      }
+      const std::string state =
+          (direct_pad_widths ? "resize.width.v2\nlayout_max="
+                             : "resize.width.v1\nlayout_max=") +
+          std::to_string(layout_max) + "\ninput_elements=" + input_elements +
+          "\nmax_output_elements=" + std::to_string(max_num_elms) + '\n';
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? "w" + std::to_string(layout_max)
+          : std::string();
+      const std::string selected = scheduler::jev::chooseDecision(
+          "RS1.width", state, options, native_choice);
+      bool matched = false;
+      for (int64_t width = 1; width <= layout_max; ++width) {
+        if (layout_max % width != 0) {
+          continue;
+        }
+        if (selected == "w" + std::to_string(width)) {
+          params->vectorization_factor = width;
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "RS1.width response is outside native hard bounds");
+    }
+  }
+
+  std::optional<DirectPadReorderConsequences> direct_pad;
+  std::optional<DirectPadTerminalPlans> direct_pad_terminal;
+  if (cta_limits) {
+    cta_limits->vector_width = params->vectorization_factor;
+  }
+  if (semantic_v3_resize && direct_pad_widths) {
+    const auto preview = std::find_if(
+        direct_pad_widths->begin(),
+        direct_pad_widths->end(),
+        [&](const auto& candidate) {
+          return candidate.width == params->vectorization_factor;
+        });
+    NVF_ERROR(
+        preview != direct_pad_widths->end(),
+        "RS1.width selected width lacks a strict terminal continuation");
+    direct_pad = preview->pad;
+    direct_pad_terminal = preview->terminal;
+  } else if (semantic_v3_resize) {
+    direct_pad = directPadReorderConsequences(
+        fusion,
+        ref_tv,
+        largest_input,
+        runtime_info,
+        params->vectorization_factor);
+    if (direct_pad && largest_output == ref_tv &&
+        direct_pad->write_elements == max_num_elms &&
+        params->largest_input == 0) {
+      direct_pad_terminal =
+          directPadTerminalPlans(*direct_pad, *params, *cta_limits);
+    }
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // The target remains the first largest TensorView input selected above.
+    // Reordering only changes the outer loop-axis order in schedule(), so
+    // skipping it leaves the reference and innermost vectorized axis intact.
+    if (semantic_v3_resize && !direct_pad_terminal) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.reorder",
+          "direct rank-3 right Pad terminal continuation is unavailable");
+    } else {
+      std::vector<scheduler::jev::ChoiceOption> options{
+          {"skip",
+           "Keep the reference tensor's outer loop-axis order",
+           direct_pad_terminal ? direct_pad_terminal->skip : ""}};
+      if (largest_input != nullptr) {
+        options.push_back({
+            "keep",
+            "Reorder outer loop axes like the largest input",
+            direct_pad_terminal ? direct_pad_terminal->keep : ""});
+      }
+      const std::string state =
+          (direct_pad_terminal ? "resize.reorder.v3\ninput_elements="
+                               : "resize.reorder.v1\ninput_elements=") +
+          input_elements + '\n';
+      const std::string native_choice =
+          jev_mode == scheduler::jev::Mode::Record
+          ? (largest_input == nullptr ? "skip" : "keep")
+          : std::string();
+      const std::string selected = scheduler::jev::chooseDecision(
+          "RS1.reorder", state, options, native_choice);
+      if (selected == "skip") {
+        params->largest_input = -1;
+      } else {
+        NVF_ERROR(
+            selected == "keep" && largest_input != nullptr,
+            "RS1.reorder response is outside native hard bounds");
+      }
+    }
+  }
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Native analysis fixes the reference and bounds the already selected
+    // vector width. A CTA candidate only changes the final flattened split
+    // and its derived grid split.
+    if (semantic_v3_resize &&
+        (!direct_pad_terminal || !direct_pad ||
+         (params->largest_input != -1 && params->largest_input != 0))) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.cta", "direct rank-3 right Pad final plan is unavailable");
+      return params;
+    }
+    const int64_t warp_size = cta_limits->warp_size;
+    const int64_t max_threads_x = cta_limits->max_threads_x;
+    const int64_t max_threads_per_block = cta_limits->max_threads_per_block;
+    const int64_t max_grid_x = cta_limits->max_grid_x;
+    auto legal = [&](int64_t threads) {
+      return directPadCtaLegal(*cta_limits, threads);
+    };
+    if (semantic_v3_resize && jev_mode == scheduler::jev::Mode::Record &&
+        !legal(128)) {
+      scheduler::jev::recordCoverageSkip(
+          "RS1.cta", "native CTA is outside the hard-valid terminal menu");
+      return params;
+    }
+    if (!semantic_v3_resize) {
+      NVF_ERROR(legal(128), "RS1.cta native CTA is outside physical bounds");
+    }
+    bool has_split_grid_choice = false;
+    if (semantic_v3_resize) {
+      for (int64_t threads : {64, 128, 256}) {
+        has_split_grid_choice |= legal(threads) &&
+            ceilDiv(max_num_elms, threads) > ResizeParams::max_gdimx;
+      }
+    }
+    if (has_split_grid_choice) {
+      // The terminal preview below describes a single physical grid-X.
+      // A split-grid schedule has an additional serial outer loop.
+      scheduler::jev::recordCoverageSkip(
+          "RS1.cta", "direct Pad CTA has a split-grid continuation");
+      return params;
+    }
+    std::vector<int64_t> offered_threads;
+    if (direct_pad_terminal) {
+      offered_threads = direct_pad_terminal->cta_threads;
+    } else {
+      for (int64_t threads : {64, 128, 256}) {
+        if (legal(threads)) {
+          offered_threads.push_back(threads);
+        }
+      }
+    }
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t threads : offered_threads) {
+      ResizeParams candidate(*params);
+      candidate.cta_threads = threads;
+      candidate.split_grid_x_dim =
+          ceilDiv(max_num_elms, threads) > ResizeParams::max_gdimx;
+      options.push_back({
+          "t" + std::to_string(threads),
+          "Use " + std::to_string(threads) + " threads per Resize CTA",
+          direct_pad ? directPadCtaConsequence(*direct_pad, candidate) : ""});
+    }
+    const std::string state =
+        (direct_pad ? "resize.cta.v2\nmax_output_elements="
+                    : "resize.cta.v1\nmax_output_elements=") +
+        std::to_string(max_num_elms) + "\nlayout_max=" +
+        std::to_string(layout_max) + "\nvector_width=" +
+        std::to_string(params->vectorization_factor) + "\nwarp_size=" +
+        std::to_string(warp_size) + "\nmax_threads_x=" +
+        std::to_string(max_threads_x) + "\nmax_threads_per_block=" +
+        std::to_string(max_threads_per_block) + "\nmax_grid_x=" +
+        std::to_string(max_grid_x) + '\n';
+    const std::string selected = scheduler::jev::chooseDecision(
+        "RS1.cta",
+        state,
+        options,
+        jev_mode == scheduler::jev::Mode::Record ? "t128" : std::string());
+    bool matched = false;
+    for (int64_t threads : {64, 128, 256}) {
+      if (selected == "t" + std::to_string(threads) && legal(threads)) {
+        params->cta_threads = threads;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "RS1.cta response is outside physical bounds");
+    params->split_grid_x_dim =
+        ceilDiv(max_num_elms, params->cta_threads) > ResizeParams::max_gdimx;
+  }
 
   return params;
 }
@@ -486,7 +1214,7 @@ void ResizeScheduler::schedule(Fusion* fusion, const HeuristicParams* params) {
     ref_tv->reorder(permutation);
   }
 
-  const int64_t bdimx = 128;
+  const int64_t bdimx = resize_params->cta_threads;
 
   // Make sure the DID ID located at the outermost position
   auto outermost_pos = scheduler_utils::reorderDevicesToOuter(ref_tv);

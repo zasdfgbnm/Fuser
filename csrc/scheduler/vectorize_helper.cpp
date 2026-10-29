@@ -1216,6 +1216,25 @@ int64_t getVectorizationFactorTransposeGroup(
     const std::vector<TensorView*>& vec_tv,
     int64_t max_vectorization) {
   max_vectorization = scheduler_utils::maxVectorizationWidth(max_vectorization);
+  for (auto inner_size : getTransposeGroupContiguousInnerSizes(
+           runtime_info,
+           reference,
+           inner_most_dim,
+           dims_to_merge,
+           vec_tv)) {
+    max_vectorization = std::min(
+        max_vectorization,
+        scheduler_utils::maxVectorizationWidth(inner_size));
+  }
+  return max_vectorization;
+}
+
+std::vector<int64_t> getTransposeGroupContiguousInnerSizes(
+    SchedulerRuntimeInfo& runtime_info,
+    TensorView* reference,
+    int64_t inner_most_dim,
+    const std::vector<int64_t>& dims_to_merge,
+    const std::vector<TensorView*>& vec_tv) {
   std::vector<IterDomain*> virtual_innermost_dim;
   // find the virtual_innermost_dim in reference so we can later map
   // that to individual TensorView in vec_tv.
@@ -1240,6 +1259,8 @@ int64_t getVectorizationFactorTransposeGroup(
       vectorize_helper::ContiguousInnerDimensionsMapper::map(
           reference, virtual_innermost_dim)
           .getTvToContigMergeOfInnerSizeMap();
+  std::vector<int64_t> contiguous_sizes;
+  contiguous_sizes.reserve(vec_tv.size());
   for (auto tv : vec_tv) {
     auto inner_size_it = contig_inner_map.find(tv);
     int64_t tv_vectorize_factor = inner_size_it == contig_inner_map.end()
@@ -1247,12 +1268,9 @@ int64_t getVectorizationFactorTransposeGroup(
         : runtime_info.expressionEvaluator()
               .evaluate(inner_size_it->second)
               .as<int64_t>();
-    max_vectorization = std::min(
-        max_vectorization,
-        scheduler_utils::maxVectorizationWidth(tv_vectorize_factor));
+    contiguous_sizes.push_back(tv_vectorize_factor);
   }
-
-  return max_vectorization;
+  return contiguous_sizes;
 }
 
 int64_t getVectorizationBreakPointOfReductionProducer(

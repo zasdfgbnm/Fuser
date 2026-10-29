@@ -30,6 +30,10 @@ class PointwiseParams : public HeuristicParams {
   // Split block across left and right dimension
   bool split_block = false;
 
+  // The experimental 1D CTA choice needs a symbolic TIDx split so different
+  // launch dimensions can safely reuse the same scheduled kernel.
+  bool symbolic_1d_cta = false;
+
   // Split grid y dimension, if otherwise it would be too large
   bool split_grid_y_dim = false;
 
@@ -87,6 +91,7 @@ class PointwiseParams : public HeuristicParams {
     bool attr_equal = other->cparams == cparams &&
         other->break_point == break_point &&
         other->split_block == split_block &&
+        other->symbolic_1d_cta == symbolic_1d_cta &&
         other->split_grid_y_dim == split_grid_y_dim &&
         other->flip_grid_binding == flip_grid_binding &&
         other->vectorization_factor == vectorization_factor &&

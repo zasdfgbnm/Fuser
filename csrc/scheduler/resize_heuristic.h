@@ -28,6 +28,9 @@ class ResizeParams : public HeuristicParams {
 
   int64_t vectorization_factor = 1;
 
+  // Threads along the flattened output axis. The native preference is 128.
+  int64_t cta_threads = 128;
+
   static constexpr int64_t max_gdimx = (1L << 31) - 1L;
 
   using HeuristicParams::HeuristicParams;
@@ -41,7 +44,8 @@ class ResizeParams : public HeuristicParams {
     bool attr_equal = other->cparams == cparams &&
         other->split_grid_x_dim == split_grid_x_dim &&
         other->largest_input == largest_input &&
-        other->vectorization_factor == vectorization_factor;
+        other->vectorization_factor == vectorization_factor &&
+        other->cta_threads == cta_threads;
     return attr_equal;
   }
 
@@ -51,13 +55,15 @@ class ResizeParams : public HeuristicParams {
        << (tag.empty() ? "" : "Tag: ") << tag << " Resize Characteristics:\n"
        << " split grid x dim: " << split_grid_x_dim << "\n"
        << " index of largest input: " << largest_input << "\n"
-       << " vectorization factor: " << vectorization_factor << "\n";
+       << " vectorization factor: " << vectorization_factor << "\n"
+       << " CTA threads: " << cta_threads << "\n";
     ss << "====================================\n";
     return ss.str();
   }
 
   size_t hash() const override {
-    return c10::get_hash(split_grid_x_dim);
+    return c10::get_hash(
+        split_grid_x_dim, largest_input, vectorization_factor, cta_threads);
   }
 
   std::unique_ptr<HeuristicParams> clone() const override {

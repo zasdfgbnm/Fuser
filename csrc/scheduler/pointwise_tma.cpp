@@ -10,9 +10,12 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
+
 #include "exceptions.h"
 #include "ir/utils.h"
 #include "scheduler/debug_utils.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/pointwise_utils.h"
 #include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
@@ -90,11 +93,16 @@ int64_t getInputBitsPerElement(
   return bits_per_element;
 }
 
-std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
+std::unique_ptr<PointwiseParams> getPointwiseHeuristicsForBreakPoint(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    const pointwise_utils::FusionRuntimeProperties& prop) {
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise_utils::BreakPointInfo& bp_info,
+    scheduler::jev::Mode jev_mode,
+    bool* hard_valid = nullptr,
+    bool emit_debug = true,
+    int64_t tma_domain_inner_target = 512) {
   constexpr int64_t threads_per_warp = 32;
 
   auto params = std::make_unique<PointwiseParams>();
@@ -102,18 +110,6 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   params->cparams.index_type = prop.index_type;
   params->use_tma_load = true;
 
-  // ========== Step 0: Determine Break Point ==========
-  // The break point determines the scheduling strategy:
-  //
-  // break_point == 0: Use 1D scheduler
-  //   - All iteration domains are flattened into a single dimension
-  //   - This is then split into [tma_domain_outer, tma_domain_inner]
-  //
-  // break_point > 0: Use 2D scheduler
-  //   - Iteration domains are merged at the break point into two dimensions
-  //   - These directly correspond to [tma_domain_outer, tma_domain_inner]
-  auto bp_info = pointwise_utils::getBreakPoint(
-      fusion, prop, data_cache, /*is_tma =*/true);
   params->break_point = bp_info.break_point;
 
   // check which input is suitable for TMA load
@@ -138,7 +134,82 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // tma_domain_outer: Number of "rows" after splitting
   // The full TMA domain is now [tma_domain_outer, tma_domain_inner]
   // where tma_domain_outer * tma_domain_inner = n_elems
-  constexpr int64_t tma_domain_inner_target = 512;
+  // The one-dimensional row target is an empirical locality preference.
+  // Materialize each complete alternate plan with the native scheduler before
+  // offering it. Off-mode preflight uses no shared breakpoint-dependent cache
+  // and emits neither nested Choices nor SchedulerDebug output.
+  if (bp_info.break_point == 0 && jev_mode != scheduler::jev::Mode::Off &&
+      prop.n_elems > (1LL << 40)) {
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.domain_inner", "extent exceeds bounded divisor replay");
+    } else {
+      NVF_ERROR(false, "PW4.domain_inner extent exceeds bounded divisor replay");
+    }
+  }
+  if (bp_info.break_point == 0 && jev_mode != scheduler::jev::Mode::Off &&
+      prop.n_elems <= (1LL << 40)) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (const int64_t target : {256L, 512L, 1024L}) {
+      bool candidate_valid = false;
+      std::unique_ptr<PointwiseParams> candidate;
+      try {
+        candidate = getPointwiseHeuristicsForBreakPoint(
+            fusion,
+            runtime_info,
+            nullptr,
+            prop,
+            bp_info,
+            scheduler::jev::Mode::Off,
+            &candidate_valid,
+            /*emit_debug=*/false,
+            target);
+      } catch (const nvfError&) {
+        continue;
+      }
+      if (candidate == nullptr || !candidate_valid) {
+        continue;
+      }
+      const int64_t inner = candidate->tma_domain_inner;
+      options.push_back(
+          {"t" + std::to_string(target),
+           "Target " + std::to_string(target) +
+               " elements; TMA domain " + std::to_string(inner) + "x" +
+               std::to_string(prop.n_elems / inner)});
+    }
+
+    const auto native = std::find_if(
+        options.begin(), options.end(), [](const auto& option) {
+          return option.id == "t512";
+        });
+    if (jev_mode == scheduler::jev::Mode::Record && native == options.end()) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.domain_inner",
+          "native 512-element target is outside the complete-plan menu");
+    } else {
+      NVF_ERROR(
+          native != options.end(),
+          "PW4.domain_inner has no complete native TMA plan");
+      std::string state = "pointwise.tma_domain_inner.v1\n";
+      state += "n_elems=" + std::to_string(prop.n_elems) + '\n';
+      state += "min_dtype_bits=" +
+          std::to_string(prop.min_dtype_size_bit_for_vectorization) + '\n';
+      const auto selected = scheduler::jev::chooseDecision(
+          "PW4.domain_inner",
+          state,
+          options,
+          jev_mode == scheduler::jev::Mode::Record ? "t512" : std::string());
+      bool matched = false;
+      for (const auto& option : options) {
+        if (selected == option.id) {
+          tma_domain_inner_target = std::stoll(selected.substr(1));
+          matched = true;
+          break;
+        }
+      }
+      NVF_ERROR(matched, "PW4.domain_inner response is outside hard bounds");
+    }
+  }
 
   const int64_t tma_domain_inner = bp_info.break_point == 0
       ? scheduler_utils::getTmaDomainInner(
@@ -185,11 +256,12 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   constexpr int64_t cta_per_sm = 8;
   const int64_t bits_per_sm = scheduler_utils::getRequiredBitsInFlight();
   const int64_t bits_per_cta = bits_per_sm / cta_per_sm;
-  if (bits_per_element == 0) {
-    return nullptr;
-  }
-  const int64_t elements_per_cta = scheduler_utils::roundUpToN(
-      ceilDiv(bits_per_cta, bits_per_element), 1024);
+  // This occupancy target is a performance preference. Remote mode sends the
+  // raw measurements and lets the service recompute it.
+  const int64_t elements_per_cta = jev_mode == scheduler::jev::Mode::Remote
+      ? 0
+      : scheduler_utils::roundUpToN(
+            ceilDiv(bits_per_cta, bits_per_element), 1024);
 
   // ========== Step 3: Compute TMA Tile Dimensions ==========
   // TMA tiles define the tile size loaded by each TMA operation:
@@ -215,23 +287,243 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // tma_tile_inner: Actual tma tile in inner dimension
   // Start with warp size, then grow by powers of 2 until reaching
   // tma_tile_inner_max e.g. 16, 32, 64, 128, 256
-  int64_t tma_tile_inner = std::min(tma_tile_inner_max, threads_per_warp);
-  while (tma_tile_inner * 2 <= tma_tile_inner_max) {
-    tma_tile_inner *= 2;
+  int64_t tma_tile_inner = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    tma_tile_inner = std::min(tma_tile_inner_max, threads_per_warp);
+    while (tma_tile_inner * 2 <= tma_tile_inner_max) {
+      tma_tile_inner *= 2;
+    }
   }
 
-  // tma_tile_outer: Actual tma tile in outer dimension
-  // Compute to achieve target elements_per_cta, capped by tma_tile_outer_max
-  const int64_t tma_tile_outer = std::max(
-      1L, std::min(elements_per_cta / tma_tile_inner, tma_tile_outer_max));
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+  const int64_t max_dtype_bits = prop.max_dtype_size_bit_for_vectorization;
+  const int64_t max_grid_x_dim = device->maxGridSize[0];
+  const int64_t max_grid_y_dim = device->maxGridSize[1];
+  const int64_t smem_per_block_bytes = device->sharedMemPerBlockOptin;
+  const int64_t max_threads_per_block = device->maxThreadsPerBlock;
+  NVF_ERROR(
+      min_dtype_bits > 0 && max_dtype_bits > 0,
+      "PW4.tile requires positive dtype widths");
+  int64_t tma_input_count = 0;
+  int64_t smem_bits_per_element = 0;
+  const int64_t n_valid_dims =
+      scheduler_utils::nLogicalDims(prop.largest_out);
+  for (const auto* input : fusion->inputs()) {
+    const auto* tv = dynamic_cast<const TensorView*>(input);
+    if (tv != nullptr && isTvSuitableForTma(tv, n_valid_dims)) {
+      ++tma_input_count;
+      smem_bits_per_element +=
+          dataTypeSizeBit(tv->getDataType(), prop.index_type);
+    }
+  }
+  bool has_block_quantization = false;
+  bool requires_quant_width_two = false;
+  for (auto* op : ir_utils::getOpsOfType<BlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    requires_quant_width_two |= dataTypeSizeBit(
+        op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
+  }
+  for (auto* op : ir_utils::getOpsOfType<GroupedBlockQuantizationOp>(fusion)) {
+    has_block_quantization = true;
+    requires_quant_width_two |= dataTypeSizeBit(
+        op->quantizedOutput()->getDataType(), prop.index_type) % 8 != 0;
+  }
+
+  // The box's contiguous dimension must satisfy every TMA input's 16-byte
+  // alignment. The width bound also keeps the later vectorized split inside
+  // one tile. Small native boxes can be non-powers of two; larger native boxes
+  // grow from one warp by doubling. This complete bounded menu includes both.
+  auto legal_inner = [&](int64_t candidate) {
+    return candidate > 0 && candidate <= tma_tile_inner_max &&
+        candidate * min_dtype_bits % 128 == 0 &&
+        candidate >= 128 / max_dtype_bits &&
+        ceilDiv(tma_domain_inner, candidate) <= max_grid_x_dim;
+  };
+
+  // Compute the source outer preference only in off/record modes. In remote
+  // mode the service must derive it from the raw bandwidth measurements.
+  int64_t tma_tile_outer = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    tma_tile_outer = std::max(
+        1L, std::min(elements_per_cta / tma_tile_inner, tma_tile_outer_max));
+  }
+
+  // Count all TMA-loaded inputs for the shared-memory bound, including inputs
+  // excluded from the narrower bandwidth preference calculation above.
+  auto legal_outer = [&](int64_t inner, int64_t outer) {
+    if (inner <= 0 || outer <= 0 || outer > tma_tile_outer_max) {
+      return false;
+    }
+    const int64_t area = inner * outer;
+    const int64_t smem_upper_bytes =
+        ceilDiv(area * smem_bits_per_element, 8) +
+        128 * tma_input_count + 4096;
+    const int64_t bdimx = std::min(threads_per_warp, inner);
+    const int64_t bdimy = std::min(128L / bdimx, outer);
+    const int64_t grid_y = ceilDiv(tma_domain_outer, outer);
+    return smem_upper_bytes <= smem_per_block_bytes &&
+        bdimx * bdimy <= max_threads_per_block &&
+        (!has_block_quantization || grid_y <= max_grid_y_dim);
+  };
+  const int64_t first_outer = tma_tile_outer_max == 256 ? 2 : 1;
+  const int64_t minimum_outer = std::max(
+      first_outer,
+      has_block_quantization
+          ? ceilDiv(tma_domain_outer, max_grid_y_dim)
+          : 1L);
+  auto legal_inner_plan = [&](int64_t candidate) {
+    return legal_inner(candidate) &&
+        legal_outer(candidate, minimum_outer);
+  };
+
+  if (hard_valid != nullptr) {
+    *hard_valid = tma_domain_outer > 1 && bits_per_sm >= 8 &&
+        legal_inner_plan(tma_tile_inner) &&
+        tma_tile_outer >= first_outer &&
+        legal_outer(tma_tile_inner, tma_tile_outer);
+  }
+
+  bool route_tile_choices = jev_mode != scheduler::jev::Mode::Off;
+  if (jev_mode == scheduler::jev::Mode::Record) {
+    std::string skip_reason;
+    if (bits_per_sm < 8) {
+      skip_reason = "bandwidth estimate below one CTA target bit";
+    } else if (!legal_inner_plan(tma_tile_inner)) {
+      skip_reason = "native inner tile has no aligned, resource-valid TMA plan";
+    } else if ((tma_tile_outer < first_outer) ||
+               !legal_outer(tma_tile_inner, tma_tile_outer)) {
+      skip_reason = "native outer tile exceeds CTA, grid, or shared-memory bound";
+    }
+    if (!skip_reason.empty()) {
+      scheduler::jev::recordCoverageSkip("PW4.tile", skip_reason);
+      route_tile_choices = false;
+    }
+  }
+  if (jev_mode == scheduler::jev::Mode::Remote) {
+    NVF_ERROR(bits_per_sm >= 8, "PW4.tile bandwidth state has no legal CTA target");
+  }
+
+  if (route_tile_choices) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    for (int64_t candidate = 1;
+         candidate <= std::min<int64_t>(tma_tile_inner_max, 32);
+         ++candidate) {
+      if (legal_inner_plan(candidate)) {
+        options.push_back(
+            {"i" + std::to_string(candidate),
+             "TMA inner box " + std::to_string(candidate) + " elements"});
+      }
+    }
+    for (int64_t candidate = 64; candidate <= tma_tile_inner_max;
+         candidate *= 2) {
+      if (legal_inner_plan(candidate)) {
+        options.push_back(
+            {"i" + std::to_string(candidate),
+             "TMA inner box " + std::to_string(candidate) + " elements"});
+      }
+    }
+    NVF_ERROR(!options.empty(), "PW4.tile_inner has no hard-valid candidate");
+    std::string state = "pointwise.tma_tile_inner.v1\n";
+    state += "domain_inner=" + std::to_string(tma_domain_inner) + '\n';
+    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+    state += "max_dtype_bits=" + std::to_string(max_dtype_bits) + '\n';
+    state += "max_grid_x=" + std::to_string(max_grid_x_dim) + '\n';
+    state += "domain_outer=" + std::to_string(tma_domain_outer) + '\n';
+    state += "max_grid_y=" + std::to_string(max_grid_y_dim) + '\n';
+    state += "max_threads_per_block=" +
+        std::to_string(max_threads_per_block) + '\n';
+    state += "smem_per_block_bytes=" +
+        std::to_string(smem_per_block_bytes) + '\n';
+    state += "tma_input_count=" + std::to_string(tma_input_count) + '\n';
+    state += "has_block_quantization=" +
+        std::to_string(has_block_quantization) + '\n';
+    state += "bits_per_sm=" + std::to_string(bits_per_sm) + '\n';
+    state += "bits_per_element=" + std::to_string(bits_per_element) + '\n';
+    state += "smem_bits_per_element=" +
+        std::to_string(smem_bits_per_element) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "i" + std::to_string(tma_tile_inner)
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "PW4.tile_inner", state, options, native_choice);
+    bool matched = false;
+    for (const auto& option : options) {
+      if (selected == option.id) {
+        tma_tile_inner = std::stoll(selected.substr(1));
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW4.tile_inner response is outside hard bounds");
+  }
+
+  // Each candidate is a complete tile, CTA, and grid plan. Reserve space for
+  // per-input shared-memory alignment and scheduler bookkeeping. The bound is
+  // deliberately conservative because a larger tile can exceed the device's
+  // per-block shared-memory allocation even when each box dimension is legal.
+  if (route_tile_choices) {
+    std::vector<scheduler::jev::ChoiceOption> options;
+    // At outer_max=256, omit only one-row tiles: the native target is at least
+    // 1024 elements and inner <=256, so its preference is always >=4 here.
+    for (int64_t candidate = first_outer; candidate <= tma_tile_outer_max;
+         ++candidate) {
+      if (!legal_outer(tma_tile_inner, candidate)) {
+        continue;
+      }
+      const int64_t bdimx = std::min(threads_per_warp, tma_tile_inner);
+      const int64_t bdimy = std::min(128L / bdimx, candidate);
+      const int64_t grid_y = ceilDiv(tma_domain_outer, candidate);
+      options.push_back(
+          {"o" + std::to_string(candidate),
+           "TMA outer box " + std::to_string(candidate) +
+               "; CTA " + std::to_string(bdimx) + "x" +
+               std::to_string(bdimy) + "; grid " +
+               std::to_string(ceilDiv(tma_domain_inner, tma_tile_inner)) +
+               "x" + std::to_string(grid_y) +
+               "; split_y " + std::to_string(grid_y > max_grid_y_dim)});
+    }
+    NVF_ERROR(!options.empty(), "PW4.tile_outer has no hard-valid candidate");
+    std::string state = "pointwise.tma_tile_outer.v1\n";
+    state += "domain_inner=" + std::to_string(tma_domain_inner) + '\n';
+    state += "domain_outer=" + std::to_string(tma_domain_outer) + '\n';
+    state += "tile_inner=" + std::to_string(tma_tile_inner) + '\n';
+    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+    state += "max_dtype_bits=" + std::to_string(max_dtype_bits) + '\n';
+    state += "max_grid_x=" + std::to_string(max_grid_x_dim) + '\n';
+    state += "max_grid_y=" + std::to_string(max_grid_y_dim) + '\n';
+    state += "max_threads_per_block=" +
+        std::to_string(max_threads_per_block) + '\n';
+    state += "smem_per_block_bytes=" +
+        std::to_string(smem_per_block_bytes) + '\n';
+    state += "tma_input_count=" + std::to_string(tma_input_count) + '\n';
+    state += "has_block_quantization=" +
+        std::to_string(has_block_quantization) + '\n';
+    state += "bits_per_sm=" + std::to_string(bits_per_sm) + '\n';
+    state += "bits_per_element=" + std::to_string(bits_per_element) + '\n';
+    state += "smem_bits_per_element=" +
+        std::to_string(smem_bits_per_element) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "o" + std::to_string(tma_tile_outer)
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "PW4.tile_outer", state, options, native_choice);
+    bool matched = false;
+    for (const auto& option : options) {
+      if (selected == option.id) {
+        tma_tile_outer = std::stoll(selected.substr(1));
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW4.tile_outer response is outside hard bounds");
+  }
 
   params->tma_tile_inner = tma_tile_inner;
   params->tma_tile_outer = tma_tile_outer;
 
   // typical max gdimy is 65535, while max gdimx is 2^31 − 1 for most devices no
   // need to check for gdimx
-  const int64_t max_grid_y_dim =
-      at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
   int64_t gdimy = ceilDiv(tma_domain_outer, tma_tile_outer);
   params->split_grid_y_dim = gdimy > max_grid_y_dim;
 
@@ -259,24 +551,97 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
   // Don't limit vectorization factor by number of IO tensors or wave count
   // since some of inputs are TMA-loaded which uses shared memory instead of
   // registers.
-  params->vectorization_factor = vectorize_helper::getVectorizationFactor(
-      runtime_info,
-      prop.largest_out,
-      data_cache,
-      bp_info.break_point,
-      /*max_vectorization_size_in_bit=*/128,
-      prop.min_dtype_size_bit_for_vectorization,
-      prop.max_dtype_size_bit_for_vectorization,
-      /*n_vectorizable_tensors=*/-1,
-      /*n_waves=*/-1,
-      /*logical_reorder=*/
-      pointwise_utils::getLogicalReorderMap(
-          prop.largest_out, prop.has_reshapes, data_cache));
+  const auto logical_reorder_map = pointwise_utils::getLogicalReorderMap(
+      prop.largest_out, prop.has_reshapes, data_cache);
+  int64_t vectorization_factor = 0;
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    // Keep the original analysis in off and record modes. TMA disables both
+    // optional soft caps, so its native preference is the layout limit.
+    vectorization_factor = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        /*max_vectorization_size_in_bit=*/128,
+        prop.min_dtype_size_bit_for_vectorization,
+        prop.max_dtype_size_bit_for_vectorization,
+        /*n_vectorizable_tensors=*/-1,
+        /*n_waves=*/-1,
+        logical_reorder_map);
+  }
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    // Layout and alignment analysis is a correctness bound. It does not
+    // calculate the native preference in remote mode.
+    const int64_t layout_max = vectorize_helper::getVectorizationFactor(
+        runtime_info,
+        prop.largest_out,
+        data_cache,
+        bp_info.break_point,
+        /*max_vectorization_size_in_bit=*/128,
+        /*min_dtype_size_bit=*/-1,
+        /*max_dtype_size_bit=*/-1,
+        /*n_vectorizable_tensors=*/-1,
+        /*n_waves=*/-1,
+        logical_reorder_map);
+    const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+    const int64_t byte_min = min_dtype_bits < 8
+        ? scheduler_utils::safeDiv(8L, min_dtype_bits)
+        : 1;
+
+    // The PointWise wrapper caps block quantization at four and rejects
+    // sub-byte quantization below width two. Apply those same hard bounds to
+    // this menu so a remote choice cannot newly reject a schedulable fusion.
+    const int64_t hard_max =
+        has_block_quantization ? std::min<int64_t>(layout_max, 4) : layout_max;
+    const int64_t hard_min =
+        std::max<int64_t>(byte_min, requires_quant_width_two ? 2 : 1);
+    NVF_ERROR(
+        layout_max >= 1 && layout_max <= 128 &&
+            scheduler_utils::lastPow2(layout_max) == layout_max &&
+            scheduler_utils::lastPow2(byte_min) == byte_min,
+        "PW4.width layout and byte bounds must be powers of two in 1..128");
+
+    std::vector<scheduler::jev::ChoiceOption> options;
+    const int64_t first_width = std::min(hard_min, hard_max);
+    for (int64_t width = first_width; width <= hard_max; width *= 2) {
+      options.push_back(
+          {"w" + std::to_string(width),
+           "Vectorize " + std::to_string(width) + " element(s) per thread"});
+    }
+    // If the layout limit is below a native minimum, the existing source
+    // returns that limit and canScheduleRunTime decides whether to reject it.
+    std::string state = "pointwise.tma_width.v1\n";
+    state += "layout_max=" + std::to_string(layout_max) + '\n';
+    state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+    state += "max_dtype_bits=" +
+        std::to_string(prop.max_dtype_size_bit_for_vectorization) + '\n';
+    state += "n_vectorizable_tensors=" +
+        std::to_string(prop.vectorizable_inputs_outputs.size()) + '\n';
+    state += "has_block_quantization=" +
+        std::to_string(has_block_quantization) + '\n';
+    state += "requires_quant_width_two=" +
+        std::to_string(requires_quant_width_two) + '\n';
+    const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
+        ? "w" + std::to_string(std::min(vectorization_factor, hard_max))
+        : std::string();
+    const std::string selected = scheduler::jev::chooseDecision(
+        "PW4.width", state, options, native_choice);
+    bool matched = false;
+    for (int64_t width = first_width; width <= hard_max; width *= 2) {
+      if (selected == "w" + std::to_string(width)) {
+        vectorization_factor = width;
+        matched = true;
+        break;
+      }
+    }
+    NVF_ERROR(matched, "PW4.width response is outside native hard bounds");
+  }
+  params->vectorization_factor = vectorization_factor;
 
   // TMA store
   params->use_tma_store = false;
 
-  if (isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
+  if (emit_debug && isDebugDumpEnabled(DebugDumpOption::SchedulerDebug)) {
     debug() << "\n==== Pointwise TMA Scheduler Heuristics ====\n";
     debug() << "Domain sizes:\n";
     debug() << "  n_elems: " << prop.n_elems << "\n";
@@ -312,6 +677,310 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     debug() << "============================================\n";
   }
   return params;
+}
+
+std::string_view tmaBreakPointRemoteRouteabilityReason(
+    std::size_t loop_axes,
+    int64_t n_elems,
+    int64_t break_point,
+    int64_t layout_width,
+    int64_t min_dtype_bits) {
+  if (loop_axes > 32) {
+    return "more than 32 loop dimensions";
+  }
+  if (break_point == 0 && n_elems > (1LL << 40)) {
+    return "extent exceeds bounded divisor replay";
+  }
+  // The Off materialization uses the uncapped layout factor: its optional
+  // register and wave limits are disabled. This is the later PW4.width menu's
+  // layout_max, so checking it here does not compute another preference.
+  if (layout_width < 1 || layout_width > 128 ||
+      scheduler_utils::lastPow2(layout_width) != layout_width ||
+      min_dtype_bits <= 0 ||
+      (min_dtype_bits < 8 && 8 % min_dtype_bits != 0)) {
+    return "PW4.width layout and byte bounds must be powers of two in 1..128";
+  }
+  const int64_t byte_min = min_dtype_bits < 8 ? 8 / min_dtype_bits : 1;
+  if (scheduler_utils::lastPow2(byte_min) != byte_min) {
+    return "PW4.width layout and byte bounds must be powers of two in 1..128";
+  }
+  if (layout_width < byte_min) {
+    return "PW4.width layout is below the required byte floor";
+  }
+  return {};
+}
+
+namespace {
+
+TmaBreakPointAvailability materializeTmaBreakPointAvailability(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise_utils::TmaBreakPointSearch& search) {
+  TmaBreakPointAvailability result;
+  result.state = search.state;
+  const int64_t min_dtype_bits = prop.min_dtype_size_bit_for_vectorization;
+  const int64_t reference_dtype_bits =
+      dataTypeSizeBit(prop.largest_out->getDataType(), prop.index_type);
+  for (const auto& candidate : search.candidates) {
+    // The structural guards precede full native parameter construction.
+    if (candidate.break_point == 0) {
+      if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
+          prop.n_elems % (256 / min_dtype_bits) != 0) {
+        continue;
+      }
+      const auto inner = scheduler_utils::getTmaDomainInner(
+          prop.n_elems, 512, min_dtype_bits);
+      if (inner <= 1 || inner >= prop.n_elems) {
+        continue;
+      }
+    } else if (min_dtype_bits <= 0 || min_dtype_bits > 128 ||
+               candidate.right_elem_count < 256 / min_dtype_bits ||
+               prop.n_elems % candidate.right_elem_count != 0 ||
+               ((candidate.right_elem_count % 128) *
+                (reference_dtype_bits % 128)) % 128 != 0) {
+      continue;
+    }
+    bool hard_valid = false;
+    std::unique_ptr<PointwiseParams> materialized;
+    try {
+      // ResizeVectorizationFactors depends on break_point. Never seed a
+      // shared cache while inspecting alternatives, and emit no child Choice
+      // or SchedulerDebug output for a plan that may not be selected.
+      materialized = getPointwiseHeuristicsForBreakPoint(
+          fusion,
+          runtime_info,
+          nullptr,
+          prop,
+          candidate,
+          scheduler::jev::Mode::Off,
+          &hard_valid,
+          /*emit_debug=*/false);
+    } catch (const nvfError&) {
+      continue;
+    }
+    if (materialized == nullptr || !hard_valid) {
+      continue;
+    }
+    const auto id = "bp" + std::to_string(candidate.break_point);
+    result.options.push_back(
+        {id,
+         candidate.break_point == 0
+             ? "Flatten to the one-dimensional TMA domain"
+             : "Split before loop axis " +
+                   std::to_string(candidate.break_point)});
+    result.plans.push_back(candidate);
+    result.materialized_layout_widths.push_back(
+        materialized->vectorization_factor);
+    // Native Off materialization with hard_valid=true already proves the
+    // preferred domain/tile fits resource bounds. PW4.domain_inner retains
+    // that t512 option; PW4.tile_inner and PW4.tile_outer each retain at
+    // least one compatible candidate. PW4.width then has a nonempty menu if
+    // its source layout and byte constraints have the required form.
+    result.remote_unavailability_reasons.emplace_back(
+        tmaBreakPointRemoteRouteabilityReason(
+            prop.elem_counts.size(),
+            prop.n_elems,
+            candidate.break_point,
+            materialized->vectorization_factor,
+            min_dtype_bits));
+  }
+  return result;
+}
+
+} // namespace
+
+TmaBreakPointAvailability getTmaBreakPointAvailability(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop) {
+  // This public preview is for a future parent-first PW1 comparison. Both
+  // structural search and candidate materialization are cache independent.
+  const auto search = pointwise_utils::getTmaBreakPointSearch(prop, nullptr);
+  return materializeTmaBreakPointAvailability(
+      fusion, runtime_info, prop, search);
+}
+
+std::unique_ptr<PointwiseParams> getNativePointwiseHeuristicsPreview(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop) {
+  const auto native = pointwise_utils::getBreakPoint(
+      fusion, prop, nullptr, /*is_tma=*/true);
+  return getPointwiseHeuristicsForBreakPoint(
+      fusion,
+      runtime_info,
+      nullptr,
+      prop,
+      native,
+      scheduler::jev::Mode::Off,
+      nullptr,
+      /*emit_debug=*/false);
+}
+
+std::unique_ptr<PointwiseParams> getPointwiseHeuristicsPreviewForBreakPoint(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    const pointwise_utils::BreakPointInfo& break_point) {
+  return getPointwiseHeuristicsForBreakPoint(
+      fusion,
+      runtime_info,
+      nullptr,
+      prop,
+      break_point,
+      scheduler::jev::Mode::Off,
+      nullptr,
+      /*emit_debug=*/false);
+}
+
+TmaBreakPointAvailability remoteRouteableTmaBreakPoints(
+    const TmaBreakPointAvailability& materialized,
+    int64_t n_elems,
+    std::size_t loop_axes,
+    int64_t min_dtype_bits) {
+  NVF_ERROR(
+      materialized.options.size() == materialized.plans.size() &&
+          materialized.options.size() ==
+              materialized.materialized_layout_widths.size() &&
+          materialized.options.size() ==
+              materialized.remote_unavailability_reasons.size(),
+      "PW4.breakpoint availability vectors must remain aligned");
+  TmaBreakPointAvailability result;
+  std::string widths;
+  for (size_t i = 0; i < materialized.options.size(); ++i) {
+    if (i != 0) {
+      widths += ',';
+    }
+    widths += materialized.options[i].id + ':' +
+        std::to_string(materialized.materialized_layout_widths[i]);
+    if (!materialized.remote_unavailability_reasons[i].empty()) {
+      result.remote_filter_applied = true;
+      continue;
+    }
+    result.options.push_back(materialized.options[i]);
+    result.plans.push_back(materialized.plans[i]);
+    result.materialized_layout_widths.push_back(
+        materialized.materialized_layout_widths[i]);
+    result.remote_unavailability_reasons.emplace_back();
+  }
+  if (!result.remote_filter_applied) {
+    return materialized;
+  }
+  constexpr std::string_view v1_tag = "pointwise.tma_breakpoint.v1\n";
+  NVF_ERROR(
+      materialized.state.rfind(v1_tag, 0) == 0,
+      "PW4.breakpoint filtered menu requires the v1 base state");
+  result.state = "pointwise.tma_breakpoint.v2\n" +
+      materialized.state.substr(v1_tag.size());
+  result.state += "n_elems=" + std::to_string(n_elems) + '\n';
+  result.state += "loop_axes=" + std::to_string(loop_axes) + '\n';
+  result.state += "min_dtype_bits=" + std::to_string(min_dtype_bits) + '\n';
+  result.state += "materialized_layout_widths=" + widths + '\n';
+  result.state += "remote_max_loop_axes=32\n";
+  result.state += "bp0_replay_max_elems=" +
+      std::to_string(1LL << 40) + '\n';
+  result.state += "width_max=128\n";
+  return result;
+}
+
+std::string_view tmaRecordBreakPointCoverageReason(
+    const TmaBreakPointAvailability& materialized,
+    const TmaBreakPointAvailability& remote_menu,
+    std::string_view native_id) {
+  const auto contains = [native_id](const auto& options) {
+    return std::any_of(
+        options.begin(), options.end(), [&](const auto& option) {
+          return option.id == native_id;
+        });
+  };
+  if (contains(remote_menu.options)) {
+    return {};
+  }
+  return contains(materialized.options)
+      ? "native TMA breakpoint has no Remote-reachable PW4 continuation"
+      : "native TMA plan is outside the conservative complete-plan menu";
+}
+
+std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    HeuristicDataCache* data_cache,
+    const pointwise_utils::FusionRuntimeProperties& prop) {
+  const auto mode = scheduler::jev::mode();
+  if (mode == scheduler::jev::Mode::Off) {
+    const auto native = pointwise_utils::getBreakPoint(
+        fusion, prop, data_cache, /*is_tma=*/true);
+    return getPointwiseHeuristicsForBreakPoint(
+        fusion, runtime_info, data_cache, prop, native, mode);
+  }
+
+  // Build the legacy plan first in record mode. It preserves the existing
+  // fallback to ordinary pointwise when TMA cannot materialize and records
+  // the downstream tile/width decisions exactly once.
+  pointwise_utils::BreakPointInfo native;
+  std::unique_ptr<PointwiseParams> native_params;
+  if (mode == scheduler::jev::Mode::Record) {
+    native = pointwise_utils::getBreakPoint(
+        fusion, prop, data_cache, /*is_tma=*/true);
+    native_params = getPointwiseHeuristicsForBreakPoint(
+        fusion, runtime_info, data_cache, prop, native, mode);
+    if (native_params == nullptr) {
+      return nullptr;
+    }
+  }
+
+  const auto search = pointwise_utils::getTmaBreakPointSearch(prop, data_cache);
+  if (prop.elem_counts.size() > 32) {
+    if (mode == scheduler::jev::Mode::Record) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.breakpoint", "more than 32 loop dimensions");
+      return native_params;
+    }
+    NVF_ERROR(false, "PW4.breakpoint supports at most 32 loop dimensions");
+  }
+
+  const auto availability =
+      materializeTmaBreakPointAvailability(fusion, runtime_info, prop, search);
+  const auto menu = remoteRouteableTmaBreakPoints(
+      availability,
+      prop.n_elems,
+      prop.elem_counts.size(),
+      prop.min_dtype_size_bit_for_vectorization);
+  const auto& options = menu.options;
+  const auto& plans = menu.plans;
+
+  if (mode == scheduler::jev::Mode::Record) {
+    const auto native_id = "bp" + std::to_string(native.break_point);
+    const auto skip_reason =
+        tmaRecordBreakPointCoverageReason(availability, menu, native_id);
+    if (!skip_reason.empty()) {
+      scheduler::jev::recordCoverageSkip(
+          "PW4.breakpoint", skip_reason);
+      return native_params;
+    }
+    (void)scheduler::jev::chooseDecision(
+        "PW4.breakpoint", menu.state, options, native_id);
+    return native_params;
+  }
+
+  NVF_ERROR(
+      !options.empty(),
+      menu.remote_filter_applied
+          ? "PW4.breakpoint has no Remote-routeable TMA plan"
+          : "PW4.breakpoint has no native-valid TMA plan");
+  const auto selected = scheduler::jev::chooseDecision(
+      "PW4.breakpoint", menu.state, options);
+  for (size_t i = 0; i < options.size(); ++i) {
+    if (options[i].id != selected) {
+      continue;
+    }
+    // The API selects only from plans that passed native materialization.
+    // Rebuild the selected plan in remote mode for the downstream Choices.
+    return getPointwiseHeuristicsForBreakPoint(
+        fusion, runtime_info, data_cache, prop, plans[i], mode);
+  }
+  NVF_ERROR(false, "PW4.breakpoint response is outside the materialized menu");
 }
 
 // TODO: Inline intermediate operations (avoid inlining unrolled/vectorized

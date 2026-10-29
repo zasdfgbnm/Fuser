@@ -359,6 +359,37 @@ struct PersistentBufferSizeReturn {
   int64_t projected_persistent_buffer_size_bit = 0;
 };
 
+// Optional, passive evidence for the two buffer-size calculations above.
+// Entries retain IR pointers only inside the current computeHeuristics call;
+// the JSON exporter below uses deterministic Val names, never pointer values.
+// This records size and liveness only. A model-facing projection request also
+// needs recomputation paths, projectable-buffer relationships, and the capacity
+// operands; this incomplete ledger must not be presented as a full plan.
+struct PersistentProjectionBufferEntry {
+  TensorView* buffer = nullptr;
+  int64_t size_bit = 0;
+  bool included_without_projection = false;
+  bool included_with_projection = false;
+};
+
+struct PersistentProjectionScopeEntry {
+  Val* scope = nullptr;
+  std::vector<bool> active_buffers;
+  int64_t size_without_projection_bit = 0;
+  int64_t size_with_projection_bit = 0;
+};
+
+struct PersistentProjectionLedger {
+  std::vector<PersistentProjectionBufferEntry> buffers;
+  std::vector<PersistentProjectionScopeEntry> scopes;
+  PersistentBufferSizeReturn maxima;
+};
+
+// Deterministic, pointer-free source facts for a future IP1 semantic request.
+// This does not choose a projection or send a Jev request.
+std::string persistentProjectionLedgerJson(
+    const PersistentProjectionLedger& ledger);
+
 // Compute the amount of register space would be needed to perform this kernel
 // persistently, only based on buffers that must be persistent, and based on the
 // maximum of all minimum size requirement. i.e. if must be persistent, only
@@ -367,7 +398,8 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     const PersistentBufferInfo& persistent_buffers,
-    HeuristicDataCache* data_cache = nullptr);
+    HeuristicDataCache* data_cache = nullptr,
+    PersistentProjectionLedger* ledger = nullptr);
 
 // Merges tensor view to the form:
 // [IterationDomain, ReductionDomain] Returns if <iteration dimensions,
@@ -405,6 +437,10 @@ void applyPDL(
 std::vector<std::pair<TensorView*, int64_t>> cacheInputs(
     Fusion* fusion,
     bool unroll);
+
+// Read-only form of cacheInputs' input eligibility check. This applies to the
+// current fusion; callers must account for any graph edits before cacheInputs.
+bool canCacheFusionInput(TensorView* input);
 
 // Returns the pairs of <cache, output_index> for each cached fusion output.
 // output_index is the position in fusion->outputs(). Otherwise return empty

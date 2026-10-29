@@ -10,7 +10,9 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <regex>
 #include <vector>
@@ -1160,11 +1162,20 @@ NVF_API CompiledKernel::CompiledKernel(
   if (lowered_->kernel()->summary().has_argsort ||
       lowered_->kernel()->summary().has_scan ||
       lowered_->kernel()->summary().has_topk) {
-    compile_params_.include_paths.emplace_back("/usr/local/cuda/include");
+    const char* cuda_root = std::getenv("CUDA_HOME");
+    if (cuda_root == nullptr || *cuda_root == '\0') {
+      cuda_root = std::getenv("CUDA_PATH");
+    }
+    const std::filesystem::path include_dir =
+        (cuda_root != nullptr && *cuda_root != '\0'
+             ? std::filesystem::path(cuda_root)
+             : std::filesystem::path("/usr/local/cuda")) /
+        "include";
+    compile_params_.include_paths.emplace_back(include_dir.string());
     // As of CUDA 13, the CUB header files are moved to the cccl
     // subdirectory. This include path is not necessary pre 13 but is
     // added anyway as it should be just a no-op.
-    compile_params_.include_paths.emplace_back("/usr/local/cuda/include/cccl");
+    compile_params_.include_paths.emplace_back((include_dir / "cccl").string());
   }
 }
 

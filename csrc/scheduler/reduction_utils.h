@@ -117,6 +117,35 @@ NVF_API std::vector<TensorView*> projectPersistentBuffers(
     const scheduler_utils::PersistentBufferInfo& persistent_info,
     const bool project_to_inputs);
 
+// Passive source facts for a future IP1 projection request. The paths and
+// non-reduction uses describe pre-schedule recomputation intent. Projecting
+// another buffer may subsequently clone expressions, so these are not measured
+// generated instructions or an exact execution cost. IR pointers stay local;
+// JSON uses deterministic Val keys and Fusion::exprs() positions. This does
+// not project a buffer or choose a schedule.
+struct PersistentProjectionRecomputeEntry {
+  TensorView* buffer = nullptr;
+  int64_t persistent_index = -1;
+  std::vector<TensorView*> inputs;
+  std::vector<TensorView*> persisted_inputs;
+  std::vector<Val*> recompute_roots;
+  std::vector<TensorView*> resolution_points;
+  std::vector<Val*> persistent_uses;
+  std::vector<int64_t> recompute_expr_indices;
+};
+
+struct PersistentProjectionRecomputeEvidence {
+  std::vector<PersistentProjectionRecomputeEntry> projectable_buffers;
+  bool projection_with_exp_op = false;
+  bool projection_with_rng_op = false;
+};
+
+PersistentProjectionRecomputeEvidence persistentProjectionRecomputeEvidence(
+    Fusion* fusion,
+    const scheduler_utils::PersistentBufferInfo& persistent_info);
+std::string persistentProjectionRecomputeJson(
+    const PersistentProjectionRecomputeEvidence& evidence);
+
 //! Get reduction types based on the given fusion or reduction tvs.
 //! If there are no reduction tvs, return None.
 //! If there are only inner reduction tvs, return Inner.

@@ -17,7 +17,8 @@ std::unique_ptr<PointwiseParams> getPointwiseHeuristics(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     HeuristicDataCache* data_cache,
-    const pointwise_utils::FusionRuntimeProperties& prop);
+    const pointwise_utils::FusionRuntimeProperties& prop,
+    bool emit_debug = true);
 
 void schedulePointwise(Fusion* fusion, const PointwiseParams* pparams);
 } // namespace non_tma

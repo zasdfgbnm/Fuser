@@ -6,9 +6,16 @@
  */
 // clang-format on
 #include <algorithm>
+#include <array>
 #include <complex>
+#include <cstdlib>
+#include <fstream>
+#include <optional>
 #include <sstream>
+#include <string_view>
 #include <thread>
+#include <vector>
+#include <unistd.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
@@ -38,10 +45,15 @@
 #include "kernel_ir_dispatch.h"
 #include "logical_domain_map.h"
 #include "ops/all_ops.h"
+#include "options.h"
 #include "runtime/executor.h"
 #include "runtime/executor_params.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/jev_client.h"
+#include "scheduler/normalization_inner_projection_route.h"
+#include "scheduler/normalization_utils.h"
+#include "scheduler/reduction_non_tma.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/utils.h"
@@ -56,6 +68,38 @@ namespace nvfuser {
 using namespace at::indexing;
 
 using Gpu1Test = NVFuserTest;
+
+namespace {
+
+class ScopedJevEnv {
+ public:
+  ScopedJevEnv(const char* name, const char* value) : name_(name) {
+    if (const char* previous = std::getenv(name)) {
+      previous_ = previous;
+    }
+    NVF_CHECK(::setenv(name, value, 1) == 0);
+  }
+  ~ScopedJevEnv() {
+    if (previous_.has_value()) {
+      ::setenv(name_.c_str(), previous_->c_str(), 1);
+    } else {
+      ::unsetenv(name_.c_str());
+    }
+  }
+
+ private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
+
+// Exact alternate caps are fixtures for the numeric harness, not a contract
+// for an arbitrary remote decision server.
+bool isJevAlternateNumericCase(std::string_view expected) {
+  const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+  return case_key != nullptr && std::string_view(case_key) == expected;
+}
+
+} // namespace
 
 // A few smoke tests for IrGraphGenerator
 // (These tests exercise IrGraphGenerator through a non-trivial IR,
@@ -5659,6 +5703,1807 @@ TEST_F(Gpu1Test, FusionReductionScheduler_CUDA) {
       cg_results.heuristic_params->lparams);
 }
 
+// Exercise an outer reduction large enough to use a grid plan but small
+// enough to fit the SM89 L2 cache. The odd output extent exercises masked
+// iteration-grid coverage. The alternate numeric harness forces the opposite
+// logical-warp target after both native grid plans pass hard bounds.
+TEST_F(Gpu1Test, JevAlternateOuterWarp_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 513;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// Native ragged-wave cleanup contracts this complete g8 outer reduction grid
+// to g7 on SM89. Keep g8 through RD9.stride and verify the reduction against
+// the same high-precision ATen reference.
+TEST_F(Gpu1Test, JevAlternateOuterRagged_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 513;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// The aligned output axis admits four float32 values per vector. Force a
+// smaller legal RD9.width through the local Choice server and compare the
+// completed reduction against an ATen double-precision reference.
+TEST_F(Gpu1Test, JevAlternateOuterWidth_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 512;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  std::unique_ptr<HeuristicParams> native;
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+    SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+    auto scheduler =
+        SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  if (native != nullptr) {
+    ASSERT_NE(results.heuristic_params, nullptr);
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(native->lparams, results.heuristic_params->lparams);
+  }
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// RD8 may choose a block plan before any grid-only RD9 decision is made. A
+// local test server forces block in Remote; the fixture checks both the
+// numerical reduction and the absence of discarded grid-branch requests.
+TEST_F(Gpu1Test, JevOuterPlanBlock_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({16384, 512}, options);
+  const auto jev_mode = scheduler::jev::mode();
+  const char* log_path = nullptr;
+  std::streampos log_start = 0;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    log_path = std::getenv("NVFUSER_JEV_LOG");
+    ASSERT_NE(log_path, nullptr);
+    std::ifstream existing_log(log_path, std::ios::ate);
+    if (existing_log.good()) {
+      log_start = existing_log.tellg();
+    }
+  }
+  std::unique_ptr<HeuristicParams> native;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+    auto scheduler =
+        SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  ASSERT_NE(results.heuristic_params, nullptr);
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  if (jev_mode == scheduler::jev::Mode::Record) {
+    ASSERT_NE(native, nullptr);
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(native->lparams, results.heuristic_params->lparams);
+    EXPECT_TRUE(rparams->cross_grid_inner_reduction);
+  } else if (jev_mode == scheduler::jev::Mode::Remote) {
+    EXPECT_FALSE(rparams->cross_grid_inner_reduction);
+  }
+
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::ifstream decision_log(log_path);
+    ASSERT_TRUE(decision_log.good());
+    decision_log.seekg(log_start);
+    std::vector<std::string> sites;
+    std::string row;
+    bool saw_v2_rd8 = false;
+    while (std::getline(decision_log, row)) {
+      if (row.rfind("{\"site\":\"", 0) != 0) {
+        continue;
+      }
+      const auto end = row.find('"', 9);
+      ASSERT_NE(end, std::string::npos);
+      const auto site = row.substr(9, end - 9);
+      sites.push_back(site);
+      if (site == "RD8") {
+        saw_v2_rd8 |=
+            row.find("reduction.outer_plan.v2") != std::string::npos &&
+            row.find(jev_mode == scheduler::jev::Mode::Record
+                         ? "\"selected\":\"grid\""
+                         : "\"selected\":\"block\"") != std::string::npos;
+      }
+    }
+    EXPECT_TRUE(saw_v2_rd8);
+    EXPECT_EQ(std::count(sites.begin(), sites.end(), "RD8"), 1);
+    const auto rd8 = std::find(sites.begin(), sites.end(), "RD8");
+    ASSERT_NE(rd8, sites.end());
+    for (const char* child : {
+             "RD9.waves",
+             "RD9.warp",
+             "RD9.cta",
+             "RD9.grid_base",
+             "RD9.unroll",
+             "RD9.ragged",
+             "RD9.stride"}) {
+      const auto found = std::find(sites.begin(), sites.end(), child);
+      if (jev_mode == scheduler::jev::Mode::Record) {
+        EXPECT_NE(found, sites.end()) << child;
+        if (found != sites.end()) {
+          EXPECT_LT(rd8, found) << child;
+        }
+      } else {
+        EXPECT_EQ(found, sites.end()) << child;
+      }
+    }
+  }
+}
+
+// The native grid plan puts four aligned output elements in each thread.
+// Force one output element so that the remaining unroll budget moves to the
+// reduction axis, then validate the complete reduction against ATen.
+TEST_F(Gpu1Test, JevAlternateOuterUnroll_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 512;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// The quarter-SM CTA target produces a 512-thread grid block here. Force the
+// eighth-SM target, whose complete grid plan uses 256 threads per block, and
+// compare both schedules against the same high-precision ATen reduction.
+TEST_F(Gpu1Test, JevAlternateOuterCta_CUDA) {
+  constexpr int reduction_size = 16384;
+  constexpr int output_size = 512;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({reduction_size, output_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({0});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// Keep the output dimension small enough that the inner reduction grid has
+// both one- and two-block plans on SM89. The alternate Choice test exercises
+// the non-native plan and checks its result against the ATen reference.
+TEST_F(Gpu1Test, JevAlternateInnerGrid_CUDA) {
+  constexpr int output_size = 32;
+  constexpr int reduction_size = 4096;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// A large 2D inner reduction reaches RD3's concrete target menu and leaves
+// enough work for the later remainder planner to exercise nontrivial unroll.
+// The alternate HTTP probe forces u8 or u16 and validates against ATen.
+TEST_F(Gpu1Test, JevCompactInnerUnrollTarget_CUDA) {
+  constexpr int output_size = 160;
+  constexpr int reduction_size = 262144;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->schedule_3d);
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// A 64-element reduction has a complete one-CTA remainder plan for every
+// offered target. On SM89 the native target is 256 threads; force the fully
+// checked 64-thread plan and compare both against the same ATen reduction.
+TEST_F(Gpu1Test, JevAlternateInnerCtaEnvelope_CUDA) {
+  constexpr int output_size = 1024;
+  constexpr int reduction_size = 64;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_FALSE(rparams->cross_grid_inner_reduction);
+  ASSERT_EQ(
+      rparams->lparams.nThreads(),
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 64 : 256);
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// A large output axis keeps the 2D inner reduction on one block per tile.
+// Force a second output per thread and compare the completed block schedule
+// with an ATen reduction; the native measured preference remains one.
+TEST_F(Gpu1Test, JevAlternateInnerIterUnroll_CUDA) {
+  constexpr int output_size = 1024;
+  constexpr int reduction_size = 1024;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->cross_grid_inner_reduction);
+  ASSERT_EQ(
+      rparams->unroll_factor_iter_dom,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 2 : 1);
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// An odd reduction extent disables vector loads and enters the 2D remainder
+// scan. On SM89 the native logical minimum is eight; the alternate sixteen
+// changes the legal scan widths and therefore the selected CTA x dimension.
+TEST_F(Gpu1Test, JevAlternateInnerWarpTarget_CUDA) {
+  constexpr int output_size = 1024;
+  constexpr int reduction_size = 1025;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({output_size, reduction_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->schedule_3d);
+  const auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// The model can fix the CTA width at 128 threads while retaining several
+// legal remainder unroll factors. Exercise that path with a listed remote
+// answer and compare the result against the same ATen reduction in all modes.
+TEST_F(Gpu1Test, JevSingleWidthRemainderUnroll_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {1}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4096, 4096}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->fastest_dim);
+  ASSERT_FALSE(rparams->schedule_3d);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    ASSERT_EQ(rparams->lparams.bdimx(), 128);
+    ASSERT_EQ(rparams->unroll_factor_inner_reduction, 1);
+  }
+  auto reference = aten_input.to(at::kDouble).sum({1});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// Force a second preflighted logical warp target in a genuine 3D reduction.
+// The native cache target m8 uses 32 threads on x; m4 uses 16.
+TEST_F(Gpu1Test, JevAlternateInner3dWarpTarget_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 32, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(
+      rparams->lparams.bdimx(),
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 16 : 32);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// Change only the preflighted CTA thread target; rebuild all dependent 3D
+// dimensions through the ordinary native heuristic after the Choice.
+TEST_F(Gpu1Test, JevAlternateInner3dCtaTarget_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 32, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(rparams->lparams.bdimx(), 32);
+  ASSERT_EQ(
+      rparams->lparams.bdimz(),
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote
+          ? 2
+          : 1);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// Exercise a preflighted CTA target beyond the original neighboring menu.
+// The same shape grows from one to four z reduction threads per block.
+TEST_F(Gpu1Test, JevAlternateInner3dCtaFull_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 32, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(rparams->lparams.bdimx(), 32);
+  ASSERT_EQ(
+      rparams->lparams.bdimz(),
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 4 : 1);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// The native work split assigns its first factor to reduction unroll (4,2).
+// Assigning it to serial iterations (2,4) rebuilds the complete 3D CTA/grid:
+// physical x grows from 16 to 32 and the outer grid shrinks from 8 to 2.
+TEST_F(Gpu1Test, JevAlternateInner3dWorkSplit_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 8, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  const bool remote = scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  ASSERT_EQ(rparams->lparams.bdimx(), remote ? 32 : 16);
+  ASSERT_EQ(rparams->lparams.gdimz(), remote ? 2 : 8);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+TEST(ReductionInner3DWaveTarget, DeduplicatesEquivalentCaps) {
+  using reduction::non_tma::Inner3DWaveCandidate;
+  using reduction::non_tma::Inner3DWaveTarget;
+  const auto check = [](int64_t n_elems,
+                        int64_t uncapped_blocks,
+                        int64_t initial_threads,
+                        const std::array<Inner3DWaveTarget, 3>& expected,
+                        const std::vector<int64_t>& retained) {
+    std::vector<Inner3DWaveCandidate> candidates;
+    for (int64_t waves : {2, 4, 8}) {
+      candidates.push_back(
+          {waves,
+           reduction::non_tma::previewInner3DWaveTarget(
+               n_elems, uncapped_blocks, initial_threads, 4, 4, 8, 128, 1536,
+               waves)});
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      EXPECT_EQ(candidates[i].target, expected[i]);
+    }
+    std::vector<int64_t> actual;
+    for (const auto& candidate :
+         reduction::non_tma::distinctInner3DWaveCandidates(candidates)) {
+      actual.push_back(candidate.waves);
+    }
+    EXPECT_EQ(actual, retained);
+  };
+  // The retained c21 geometry has three hard-valid caps with one effect.
+  check(512 * 32, 128, 64, {{{128, 32}, {128, 32}, {128, 32}}}, {4});
+  // Waves4 and waves8 tie, while waves2 remains distinct.
+  check(512 * 96, 384, 64, {{{256, 48}, {384, 32}, {384, 32}}}, {2, 4});
+  // The existing forced-wave numerical fixture retains all three choices.
+  check(1024 * 65, 520, 128, {{{256, 72}, {512, 40}, {520, 32}}},
+        {2, 4, 8});
+}
+
+TEST(ReductionNativeLaunchFields, IncludesBothZDimensionsAndRawBindings) {
+  const LaunchParams baseline(4, 5, 6, 32, 4, 2);
+  const LaunchParams grid_z(4, 5, 7, 32, 4, 2);
+  const LaunchParams block_z(4, 5, 6, 32, 4, 3);
+  const LaunchParams unbound_z(4, 5, 6, 32, 4);
+  // The existing LaunchParams equality ignores both z fields. The preview
+  // signature must detect them and preserve unbound versus explicit binding.
+  EXPECT_EQ(baseline, grid_z);
+  EXPECT_EQ(baseline, block_z);
+  EXPECT_NE(
+      reduction::non_tma::nativeLaunchFields(baseline),
+      reduction::non_tma::nativeLaunchFields(grid_z));
+  EXPECT_NE(
+      reduction::non_tma::nativeLaunchFields(baseline),
+      reduction::non_tma::nativeLaunchFields(block_z));
+  EXPECT_NE(
+      reduction::non_tma::nativeLaunchFields(baseline),
+      reduction::non_tma::nativeLaunchFields(unbound_z));
+}
+
+TEST(ReductionOuterCtaMenu, OffersValidQ8WhenNativeQ4FailsPreflight) {
+  // Injected resource state, independent of the host GPU. The q4 soft seed
+  // exceeds the complete CTA bound, while q8 remains a legal grid plan.
+  const reduction::non_tma::OuterCtaState state{/*reduction_numel=*/1024,
+                                                /*iteration_numel=*/1,
+                                                /*max_dtype_bits=*/32,
+                                                /*sm_count=*/1,
+                                                /*max_threads_per_sm=*/512,
+                                                /*max_threads_per_block=*/64,
+                                                /*max_unroll=*/1,
+                                                /*vector_width=*/1,
+                                                /*waves=*/4,
+                                                /*logical_warp=*/16};
+  EXPECT_EQ(
+      reduction::non_tma::hardValidOuterCtaShares(state),
+      std::vector<int64_t>{8});
+}
+
+TEST_F(Gpu1Test, JevInner3dEquivalentWavesRecordNative_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->multiProcessorCount != 128 ||
+      device->maxThreadsPerMultiProcessor != 1536 ||
+      device->maxThreadsPerBlock != 1024) {
+    GTEST_SKIP()
+        << "The retained no-op witness needs SM128 and 1536 threads/SM";
+  }
+  char log_path[] = "/tmp/nvfuser-rd5-wave-dedup-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  // A standalone run defaults to the historic text protocol. Keep an
+  // explicitly requested semantic-v3 protocol for a retained source request.
+  std::optional<ScopedJevEnv> local_protocol;
+  if (std::getenv("NVFUSER_JEV_PROTOCOL") == nullptr) {
+    local_protocol.emplace("NVFUSER_JEV_PROTOCOL", "text-v1");
+  }
+  const bool semantic_v3 =
+      std::string_view(std::getenv("NVFUSER_JEV_PROTOCOL")) == "semantic-v3";
+  // Keep the outer numeric harness's log path so it can compare the Record
+  // and Remote requests. Standalone GTest runs use a temporary local log.
+  std::optional<ScopedJevEnv> local_log;
+  const char* inherited_log = std::getenv("NVFUSER_JEV_LOG");
+  if (inherited_log == nullptr || *inherited_log == '\0') {
+    local_log.emplace("NVFUSER_JEV_LOG", log_path);
+  }
+  const std::string decision_log_path =
+      local_log.has_value() ? log_path : inherited_log;
+  const bool test_remote =
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(3);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input));
+  const auto tensor = at::randn(
+      {4, 32, 128}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results = [&] {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", test_remote ? "remote" : "record");
+    return scheduleAndRun(&fusion, SchedulerType::Reduction, {tensor});
+  }();
+  ASSERT_NE(native, nullptr);
+  ASSERT_NE(results.heuristic_params, nullptr);
+  EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+  EXPECT_EQ(
+      reduction::non_tma::nativeLaunchFields(native->lparams),
+      reduction::non_tma::nativeLaunchFields(
+          results.heuristic_params->lparams));
+  EXPECT_EQ(
+      native->lparams.toString(), results.heuristic_params->lparams.toString());
+  EXPECT_EQ(native->toString(), results.heuristic_params->toString());
+  EXPECT_TRUE(results.heuristic_params->as<ReductionParams>()->schedule_3d);
+  auto reference = tensor.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+
+  std::ifstream decision_log(decision_log_path);
+  std::string row;
+  bool saw_parent_first_rd4 = false;
+  bool saw_versioned_hardware = false;
+  bool saw_wave_request = false;
+  bool saw_iter_unroll_request = false;
+  std::vector<std::string> choice_sites;
+  while (std::getline(decision_log, row)) {
+    if (row.rfind("{\"site\":\"", 0) == 0) {
+      const auto end = row.find('"', 9);
+      ASSERT_NE(end, std::string::npos);
+      const auto site = row.substr(9, end - 9);
+      EXPECT_EQ(
+          std::find(choice_sites.begin(), choice_sites.end(), site),
+          choice_sites.end())
+          << site << " was emitted twice by the native preview";
+      choice_sites.push_back(site);
+      if (site == "RD4") {
+        saw_parent_first_rd4 |=
+            row.find("reduction.inner_mapping.v2") != std::string::npos &&
+            row.find("\"selected\":\"3d\"") != std::string::npos &&
+            row.find("\"compute_event_index\":1") != std::string::npos;
+        saw_versioned_hardware |=
+            row.find("\"schema\":\"nvfuser.hardware.v2\"") !=
+                std::string::npos &&
+            row.find(
+                "\"l2_cache_bytes\":" + std::to_string(device->l2CacheSize)) !=
+                std::string::npos &&
+            row.find(
+                "\"shared_memory_per_block_optin_bytes\":" +
+                std::to_string(device->sharedMemPerBlockOptin)) !=
+                std::string::npos &&
+            row.find(
+                "\"registers_per_block\":" +
+                std::to_string(device->regsPerBlock)) != std::string::npos &&
+            row.find(
+                "\"max_grid_z\":" + std::to_string(device->maxGridSize[2])) !=
+                std::string::npos;
+      }
+    }
+    saw_wave_request |=
+        row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
+        row.find("\"request\":") != std::string::npos;
+    saw_iter_unroll_request |=
+        row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos;
+  }
+  std::ifstream outcome_log(decision_log_path + ".outcome.jsonl");
+  bool saw_wave_no_choice = false;
+  bool saw_iter_unroll_no_choice = false;
+  int wave_no_choice_count = 0;
+  int iter_unroll_no_choice_count = 0;
+  while (std::getline(outcome_log, row)) {
+    wave_no_choice_count +=
+        row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos;
+    iter_unroll_no_choice_count +=
+        row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos;
+    saw_wave_no_choice |=
+        row.find("\"site\":\"RD5.waves\"") != std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos &&
+        row.find("wave caps have equal block and thread targets") !=
+            std::string::npos;
+    saw_iter_unroll_no_choice |=
+        row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos &&
+        row.find("\"kind\":\"no_choice\"") != std::string::npos &&
+        row.find("\"selected\":\"u1\"") != std::string::npos &&
+        row.find("only one hard-legal iteration unroll factor") !=
+            std::string::npos;
+  }
+  EXPECT_TRUE(saw_wave_no_choice);
+  EXPECT_TRUE(saw_iter_unroll_no_choice);
+  EXPECT_EQ(wave_no_choice_count, 1);
+  EXPECT_EQ(iter_unroll_no_choice_count, 1);
+  EXPECT_FALSE(saw_wave_request);
+  EXPECT_FALSE(saw_iter_unroll_request);
+  ASSERT_FALSE(choice_sites.empty());
+  EXPECT_EQ(choice_sites.front(), "RD4");
+  EXPECT_TRUE(saw_parent_first_rd4);
+  if (semantic_v3) {
+    EXPECT_TRUE(saw_versioned_hardware);
+  }
+}
+
+// The same supported 3D fusion can be flattened before any RD5 child choice.
+// Check either legal Remote answer; a local Choice server separately forces
+// flat2d. Record keeps 3D and both branches must reduce numerically to ATen.
+TEST_F(Gpu1Test, JevInnerMappingFlat2D_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->multiProcessorCount != 128 ||
+      device->maxThreadsPerMultiProcessor != 1536 ||
+      device->maxThreadsPerBlock != 1024) {
+    GTEST_SKIP() << "The retained RD4 carrier needs SM128 and 1536 threads/SM";
+  }
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(3);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input));
+  const auto tensor = at::randn(
+      {4, 32, 128}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  const auto jev_mode = scheduler::jev::mode();
+  const char* log_path = nullptr;
+  std::streampos log_start = 0;
+  std::streampos outcome_start = 0;
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    log_path = std::getenv("NVFUSER_JEV_LOG");
+    ASSERT_NE(log_path, nullptr);
+    std::ifstream existing_log(log_path, std::ios::ate);
+    if (existing_log.good()) {
+      log_start = existing_log.tellg();
+    }
+    std::ifstream existing_outcomes(
+        std::string(log_path) + ".outcome.jsonl", std::ios::ate);
+    if (existing_outcomes.good()) {
+      outcome_start = existing_outcomes.tellg();
+    }
+  }
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  ASSERT_NE(native, nullptr);
+  EXPECT_TRUE(native->as<ReductionParams>()->schedule_3d);
+  auto results = scheduleAndRun(&fusion, SchedulerType::Reduction, {tensor});
+  ASSERT_NE(results.heuristic_params, nullptr);
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  if (jev_mode != scheduler::jev::Mode::Remote) {
+    EXPECT_TRUE(rparams->schedule_3d);
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(
+        reduction::non_tma::nativeLaunchFields(native->lparams),
+        reduction::non_tma::nativeLaunchFields(
+            results.heuristic_params->lparams));
+  }
+  auto reference = tensor.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {tensor},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+
+  if (jev_mode != scheduler::jev::Mode::Off) {
+    std::ifstream decision_log(log_path);
+    ASSERT_TRUE(decision_log.good());
+    decision_log.seekg(log_start);
+    std::vector<std::string> sites;
+    std::string row;
+    std::string selected_rd4;
+    bool saw_parent_first_rd4 = false;
+    while (std::getline(decision_log, row)) {
+      if (row.rfind("{\"site\":\"", 0) != 0) {
+        continue;
+      }
+      const auto end = row.find('"', 9);
+      ASSERT_NE(end, std::string::npos);
+      const auto site = row.substr(9, end - 9);
+      sites.push_back(site);
+      if (site == "RD4") {
+        saw_parent_first_rd4 |=
+            row.find("reduction.inner_mapping.v2") != std::string::npos &&
+            row.find("\"compute_event_index\":1") != std::string::npos;
+        if (row.find("\"selected\":\"flat2d\"") != std::string::npos) {
+          selected_rd4 = "flat2d";
+        } else if (row.find("\"selected\":\"3d\"") != std::string::npos) {
+          selected_rd4 = "3d";
+        }
+      }
+    }
+    ASSERT_FALSE(sites.empty());
+    EXPECT_EQ(sites.front(), "RD4");
+    EXPECT_EQ(std::count(sites.begin(), sites.end(), "RD4"), 1);
+    EXPECT_TRUE(saw_parent_first_rd4);
+    ASSERT_TRUE(selected_rd4 == "3d" || selected_rd4 == "flat2d");
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      EXPECT_EQ(selected_rd4, "3d");
+    }
+    if (selected_rd4 == "flat2d") {
+      EXPECT_FALSE(rparams->schedule_3d);
+    }
+    for (const auto& site : sites) {
+      if (selected_rd4 == "flat2d") {
+        EXPECT_NE(site.rfind("RD5.", 0), 0) << site;
+      } else if (rparams->schedule_3d) {
+        EXPECT_NE(site.rfind("RD3.", 0), 0) << site;
+      }
+    }
+    EXPECT_TRUE(std::any_of(sites.begin(), sites.end(), [&](const auto& site) {
+      return site.rfind(selected_rd4 == "flat2d" ? "RD3." : "RD5.", 0) == 0;
+    }));
+    std::ifstream outcome_log(std::string(log_path) + ".outcome.jsonl");
+    ASSERT_TRUE(outcome_log.good());
+    outcome_log.seekg(outcome_start);
+    bool saw_selected_3d_fallback = false;
+    while (std::getline(outcome_log, row)) {
+      if (selected_rd4 == "flat2d") {
+        EXPECT_EQ(row.find("\"site\":\"RD5."), std::string::npos);
+      } else if (rparams->schedule_3d) {
+        EXPECT_EQ(row.find("\"site\":\"RD3."), std::string::npos);
+      }
+      saw_selected_3d_fallback |=
+          row.find("\"site\":\"RD4.realized_topology\"") != std::string::npos &&
+          row.find("selected_3d_descendants_hit_hard_fallback") !=
+              std::string::npos;
+    }
+    if (selected_rd4 == "3d" && !rparams->schedule_3d) {
+      EXPECT_TRUE(saw_selected_3d_fallback);
+    }
+  }
+}
+
+// The wave cap changes the complete CTA: four waves target five outer
+// reduction threads, while eight waves target four for this bounded shape.
+TEST_F(Gpu1Test, JevAlternateInner3dWaves_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, 65, 4}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(rparams->lparams.bdimx(), 8);
+  ASSERT_TRUE(rparams->cross_grid_outer_reduction);
+  ASSERT_EQ(rparams->lparams.gdimz(), 2);
+  ASSERT_EQ(
+      rparams->lparams.bdimz(),
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 4 : 5);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// On SM89 this layout makes two raw inner-reduction grid pieces across 65
+// outputs. Native ragged-wave cleanup folds the grid to one piece; the remote
+// alternate keeps both complete grids and must still match the ATen sum.
+TEST_F(Gpu1Test, JevAlternateInner3dGridWave_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({2, 65, 8192}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_EQ(
+      rparams->cross_grid_inner_reduction,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// With a scalar innermost reduction, the native register policy unrolls four
+// outer reduction elements per thread. The bounded alternate leaves that
+// work to the outer grid while keeping the same CTA and numerical result.
+TEST_F(Gpu1Test, JevAlternateInner3dOuterUnroll_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 32, 3}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  const bool remote = scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  ASSERT_EQ(rparams->unroll_factor_inner_reduction, 1);
+  ASSERT_EQ(rparams->unroll_factor_outer_reduction, remote ? 1 : 4);
+  ASSERT_EQ(rparams->lparams.gdimz(), remote ? 8 : 2);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+TEST_F(Gpu1Test, JevInner3dIterUnrollRollback_CUDA) {
+  char log_path[] = "/tmp/nvfuser-rd5-iter-rollback-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  std::optional<ScopedJevEnv> local_protocol;
+  const char* inherited_protocol = std::getenv("NVFUSER_JEV_PROTOCOL");
+  if (inherited_protocol == nullptr || *inherited_protocol == '\0') {
+    local_protocol.emplace("NVFUSER_JEV_PROTOCOL", "text-v1");
+  }
+  std::optional<ScopedJevEnv> local_log;
+  const char* inherited_log = std::getenv("NVFUSER_JEV_LOG");
+  if (inherited_log == nullptr || *inherited_log == '\0') {
+    local_log.emplace("NVFUSER_JEV_LOG", log_path);
+  }
+  const std::string decision_log_path =
+      local_log.has_value() ? log_path : inherited_log;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  fusion.addOutput(reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input));
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({2, 512, 8193}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler = SchedulerEntry::makeSchedulerInstance(SchedulerType::Reduction);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedJevEnv mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_NE(native, nullptr);
+  EXPECT_EQ(native->toString(), results.heuristic_params->toString());
+  EXPECT_EQ(rparams->unroll_factor_outer_reduction, 2);
+  EXPECT_EQ(rparams->unroll_factor_iter_dom, 1);
+  EXPECT_EQ(rparams->lparams.gdimx(), 6);
+  EXPECT_TRUE(rparams->cross_grid_inner_reduction);
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Off) {
+    std::ifstream decision_log(decision_log_path);
+    std::string row;
+    bool saw_selected_u2 = false;
+    while (std::getline(decision_log, row)) {
+      saw_selected_u2 |=
+          row.find("\"site\":\"RD5.iter_unroll\"") != std::string::npos &&
+          row.find("\"selected\":\"u2\"") != std::string::npos &&
+          row.find("reduction.inner3d_iter_unroll.v2") != std::string::npos;
+    }
+    EXPECT_TRUE(saw_selected_u2);
+    if (std::getenv("NVFUSER_JEV_PROTOCOL") != nullptr &&
+        std::string(std::getenv("NVFUSER_JEV_PROTOCOL")) == "semantic-v3") {
+      std::ifstream semantic_log(decision_log_path);
+      bool saw_distinct_grid_effects = false;
+      while (std::getline(semantic_log, row)) {
+        saw_distinct_grid_effects |=
+            row.find("\"site\":\"RD5.iter_unroll\"") !=
+                std::string::npos &&
+            row.find("\"clean_gridim\":1") != std::string::npos &&
+            row.find("\"clean_gridim\":6") != std::string::npos &&
+            row.find("\"final_unroll_if_clean\":1") !=
+                std::string::npos;
+      }
+      EXPECT_TRUE(saw_distinct_grid_effects);
+    }
+  }
+}
+
+// Hold the native 3D reduction block/grid plan fixed while the local API
+// chooses a smaller, still aligned vector width for its innermost axis.
+TEST_F(Gpu1Test, JevAlternateInner3dWidth_CUDA) {
+  constexpr int outer_reduction = 32;
+  constexpr int outputs = 32;
+  constexpr int inner_reduction = 128;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* output = reductionOp(
+      BinaryOpType::Add, {0, 2}, IrBuilder::create<Val>(0.0), input);
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input =
+      at::randn({outer_reduction, outputs, inner_reduction}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::Reduction, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_GT(rparams->unroll_factor_inner_reduction, 1);
+  // The forced remote w1 choice deliberately turns vectorization into unrolling.
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Remote) {
+    ASSERT_TRUE(rparams->vectorize_inner_reduction);
+  }
+  auto reference =
+      aten_input.to(at::kDouble).sum(std::vector<int64_t>{0, 2});
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// The injected Hopper route checks the TMA fallback that this SM89 host
+// cannot execute. The numerical control below verifies the existing path.
+TEST_F(Gpu1Test, InnerPersistentProjectionRoute) {
+  using normalization_inner::projectionPropertyRoute;
+  using scheduler::jev::Mode;
+  const auto hopper_record_fallback =
+      projectionPropertyRoute(9, true, Mode::Record, true);
+  EXPECT_TRUE(hopper_record_fallback.may_attempt_tma);
+  EXPECT_FALSE(hopper_record_fallback.enable_projection_on_initial_properties);
+  EXPECT_TRUE(hopper_record_fallback.recompute_projection_on_non_tma_fallback);
+  const auto hopper_remote_tma =
+      projectionPropertyRoute(9, true, Mode::Remote, false);
+  EXPECT_TRUE(hopper_remote_tma.may_attempt_tma);
+  EXPECT_FALSE(hopper_remote_tma.enable_projection_on_initial_properties);
+  EXPECT_FALSE(hopper_remote_tma.recompute_projection_on_non_tma_fallback);
+  const auto hopper_off_fallback =
+      projectionPropertyRoute(9, true, Mode::Off, true);
+  EXPECT_FALSE(hopper_off_fallback.enable_projection_on_initial_properties);
+  EXPECT_FALSE(hopper_off_fallback.recompute_projection_on_non_tma_fallback);
+  const auto pre_hopper_record =
+      projectionPropertyRoute(8, true, Mode::Record, true);
+  EXPECT_FALSE(pre_hopper_record.may_attempt_tma);
+  EXPECT_TRUE(pre_hopper_record.enable_projection_on_initial_properties);
+  EXPECT_FALSE(pre_hopper_record.recompute_projection_on_non_tma_fallback);
+  const auto hopper_option_off =
+      projectionPropertyRoute(9, false, Mode::Remote, true);
+  EXPECT_FALSE(hopper_option_off.may_attempt_tma);
+  EXPECT_TRUE(hopper_option_off.enable_projection_on_initial_properties);
+  EXPECT_FALSE(hopper_option_off.recompute_projection_on_non_tma_fallback);
+}
+
+// Reproduce the SM90 fallback's two property passes with one cache on this
+// SM89 host. The first pass cannot ask IP1; the second may ask it exactly once.
+TEST_F(Gpu1Test, InnerPersistentProjectionTwoPassCache_CUDA) {
+  char log_path[] = "/tmp/nvfuser-ip1-two-pass-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  ScopedJevEnv mode("NVFUSER_JEV_MODE", "record");
+  ScopedJevEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+  ScopedJevEnv log("NVFUSER_JEV_LOG", log_path);
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto* exponentials = exp(maybeCastOp(DataType::Float, input));
+  auto* sums = sum(exponentials, {1});
+  auto* sums_bcast = broadcast(sums, {false, true});
+  fusion.addOutput(maybeCastOp(
+      DataType::Half, div(exponentials, sums_bcast)));
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const at::Tensor aten_input = at::randn({128, 256}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  HeuristicDataCache cache;
+  const auto first =
+      normalization_scheduler_utils::getPersistentKernelProperties(
+          &fusion,
+          runtime_info,
+          &cache,
+          SchedulerType::InnerPersistent,
+          /*enable_jev_projection=*/false);
+  {
+    std::ifstream request_log(log_path);
+    std::stringstream rows;
+    rows << request_log.rdbuf();
+    EXPECT_TRUE(rows.str().empty());
+  }
+  const auto second =
+      normalization_scheduler_utils::getPersistentKernelProperties(
+          &fusion,
+          runtime_info,
+          &cache,
+          SchedulerType::InnerPersistent,
+          /*enable_jev_projection=*/true);
+  EXPECT_EQ(first.inner_most_dimension_numel, second.inner_most_dimension_numel);
+  EXPECT_EQ(first.total_reduction_numel, second.total_reduction_numel);
+  EXPECT_EQ(first.total_iteration_numel, second.total_iteration_numel);
+  EXPECT_EQ(first.vectorize_factor, second.vectorize_factor);
+  EXPECT_EQ(first.index_type, second.index_type);
+  EXPECT_EQ(first.n_tensor_inputs, second.n_tensor_inputs);
+  EXPECT_EQ(first.max_dtype_size_bit, second.max_dtype_size_bit);
+  EXPECT_EQ(first.has_exp_op, second.has_exp_op);
+  normalization_scheduler_utils::PersistentKernelProperties fresh;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    fresh = normalization_scheduler_utils::getPersistentKernelProperties(
+        &fusion,
+        runtime_info,
+        nullptr,
+        SchedulerType::InnerPersistent,
+        /*enable_jev_projection=*/true);
+  }
+  EXPECT_EQ(
+      second.project_persistent_buffers, fresh.project_persistent_buffers);
+  EXPECT_EQ(
+      second.max_persistent_buffer_size_bit,
+      fresh.max_persistent_buffer_size_bit);
+  EXPECT_EQ(
+      second.disable_project_to_avoid_recompute,
+      fresh.disable_project_to_avoid_recompute);
+  EXPECT_EQ(second.persistent_buffers, fresh.persistent_buffers);
+  std::ifstream request_log(log_path);
+  std::stringstream rows;
+  rows << request_log.rdbuf();
+  const std::string marker = "\"site\":\"IP1.projection\"";
+  const auto first_choice = rows.str().find(marker);
+  ASSERT_NE(first_choice, std::string::npos);
+  EXPECT_EQ(
+      rows.str().find(marker, first_choice + marker.size()),
+      std::string::npos);
+}
+
+TEST_F(Gpu1Test, InnerPersistentProjectionPreHopperControl_CUDA) {
+  if (at::cuda::getCurrentDeviceProperties()->major >= 9) {
+    GTEST_SKIP() << "The numerical control requires a pre-Hopper GPU";
+  }
+  char log_path[] = "/tmp/nvfuser-ip1-route-XXXXXX";
+  const int fd = ::mkstemp(log_path);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  struct FileCleanup {
+    const char* path;
+    ~FileCleanup() {
+      ::unlink(path);
+      ::unlink((std::string(path) + ".outcome.jsonl").c_str());
+    }
+  } file_cleanup{log_path};
+  EnableOptionsGuard::getCurOptions().set(EnableOption::TmaInnerPersistent);
+  ScopedJevEnv log("NVFUSER_JEV_LOG", log_path);
+  ScopedJevEnv protocol("NVFUSER_JEV_PROTOCOL", "text-v1");
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto* exponentials = exp(maybeCastOp(DataType::Float, input));
+  auto* sums = sum(exponentials, {1});
+  auto* sums_bcast = broadcast(sums, {false, true});
+  fusion.addOutput(maybeCastOp(
+      DataType::Half, div(exponentials, sums_bcast)));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const at::Tensor aten_input = at::randn({128, 256}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::InnerPersistent);
+  std::unique_ptr<HeuristicParams> off_params;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    off_params = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  ScopedJevEnv record_mode("NVFUSER_JEV_MODE", "record");
+  auto result =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  ASSERT_NE(off_params, nullptr);
+  ASSERT_NE(result.heuristic_params, nullptr);
+  const auto* off = off_params->as<ReductionParams>();
+  const auto* recorded = result.heuristic_params->as<ReductionParams>();
+  EXPECT_TRUE(recorded->sameAs(off));
+  const at::Tensor e = at::exp(aten_input.to(at::kFloat));
+  const at::Tensor reference = (e / e.sum(1, true)).to(at::kHalf);
+  testValidate(
+      &fusion,
+      result.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      result.heuristic_params->lparams);
+  std::ifstream request_log(log_path);
+  std::stringstream requests;
+  requests << request_log.rdbuf();
+  const std::string rows = requests.str();
+  const std::string marker = "\"site\":\"IP1.projection\"";
+  const auto first = rows.find(marker);
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(rows.find(marker, first + marker.size()), std::string::npos);
+  EXPECT_THAT(rows, ::testing::HasSubstr("inner_persistent.projection.v1"));
+}
+
+// The v2 projection Choice may replace the native preference while the native
+// capacity and scheduler eligibility checks continue to guard correctness.
+// The companion loopback test forces project in Remote mode for this Exp graph.
+TEST_F(Gpu1Test, JevAlternateInnerProjectionV2_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto* exponentials = exp(maybeCastOp(DataType::Float, input));
+  auto* sums = sum(exponentials, {1});
+  auto* sums_bcast = broadcast(sums, {false, true});
+  fusion.addOutput(maybeCastOp(
+      DataType::Half, div(exponentials, sums_bcast)));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const auto aten_input = at::randn({128, 256}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::InnerPersistent);
+  std::unique_ptr<HeuristicParams> off_params;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    off_params = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto result = scheduleAndRun(
+      &fusion, SchedulerType::InnerPersistent, {aten_input});
+  ASSERT_NE(off_params, nullptr);
+  ASSERT_NE(result.heuristic_params, nullptr);
+  const auto* params = result.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(params->persistent_kernel);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+    EXPECT_TRUE(params->sameAs(off_params->as<ReductionParams>()));
+  }
+  ASSERT_EQ(
+      params->project_persistent_buffers,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote);
+  const at::Tensor exponentials_ref = at::exp(aten_input.to(at::kFloat));
+  const at::Tensor reference =
+      (exponentials_ref / exponentials_ref.sum(1, true)).to(at::kHalf);
+  testValidate(
+      &fusion,
+      result.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      result.heuristic_params->lparams);
+}
+
+// Exercise a register-backed 3D persistent reduction with an alternate
+// cache-derived warp target. The exponential is used by both the reduction
+// and output, so it is a genuine persistent buffer.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentWarp_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 32, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// A smaller, layout-safe width must rebuild the complete 3D persistent plan
+// before the selected plan reaches the ordinary wave/occupancy/warp choices.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentWidth_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 32, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_TRUE(rparams->vectorize_inner_reduction);
+  ASSERT_EQ(
+      rparams->unroll_factor_inner_reduction,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 2 : 4);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// The two small 3D persistent reductions retain native hard singleton choices.
+// Other IP6 choices still use the Record or Remote path selected by the harness.
+namespace {
+void runJevInner3dHardSingleton(const std::vector<int64_t>& input_shape) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn(input_shape, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::InnerPersistent);
+  std::unique_ptr<HeuristicParams> native;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    native = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  ASSERT_NE(native, nullptr);
+  ASSERT_NE(results.heuristic_params, nullptr);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+    EXPECT_TRUE(native->sameAs(results.heuristic_params.get()));
+    EXPECT_EQ(
+        native->lparams.toString(),
+        results.heuristic_params->lparams.toString());
+  }
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+} // namespace
+
+TEST_F(Gpu1Test, JevInner3dHardWidthSingleton_CUDA) {
+  runJevInner3dHardSingleton({64, 32, 4});
+}
+
+TEST_F(Gpu1Test, JevInner3dHardRegisterSingleton_CUDA) {
+  runJevInner3dHardSingleton({4, 256, 16});
+}
+
+// The API may lower empirical outer reduction unrolling after the selected
+// vector width, wave cap, occupancy and warp target have been fixed.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentOuterUnroll_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 32, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_TRUE(rparams->vectorize_inner_reduction);
+  ASSERT_EQ(rparams->unroll_factor_inner_reduction, 4);
+  ASSERT_EQ(
+      rparams->unroll_factor_outer_reduction,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 2 : 4);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// On SM89 the native flip-flop gives unroll=4, iterations=2 for this 3D
+// persistent shape. Reversing the preference gives 2,4, which changes the
+// completed inner batch and CTA while retaining a hardware-valid plan.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentWorkSplit_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({8, 8, 128}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_TRUE(rparams->vectorize_inner_reduction);
+  ASSERT_EQ(
+      rparams->batches_per_block_inner_reduction,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 1 : 2);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// A larger estimated nonbuffer allowance may select a different NVRTC
+// register cap only after the completed register-backed 3D plan is checked.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentRegisterOverhead_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 256, 5120}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_GT(rparams->batches_per_block_inner_reduction, 1);
+  ASSERT_NE(results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->schedulerType(),
+      SchedulerType::InnerPersistent);
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      isJevAlternateNumericCase(
+          "jev_alternate_numeric_inner3d_persistent_register_overhead")) {
+    EXPECT_EQ(
+        rparams->cparams.maxrregcount,
+        scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 168 : 96);
+  }
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// A small 3D reduction with many outputs makes the empirical 4-warp CTA
+// floor put two outputs in one block. The 1-warp floor retains a resource-safe
+// plan with one output per block and must give the same numerical result.
+TEST_F(Gpu1Test, JevAlternateInner3dPersistentCtaFloor_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(3);
+  fusion.addInput(input);
+  TensorView* exponentials = exp(input);
+  TensorView* sums = sum(exponentials, {0, 2});
+  TensorView* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(div(exponentials, sums_bcast));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({4, 256, 16}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_EQ(
+      rparams->multiple_reds_per_blk,
+      scheduler::jev::mode() != scheduler::jev::Mode::Remote);
+
+  at::Tensor exp_reference = at::exp(aten_input.to(at::kDouble));
+  at::Tensor reference =
+      exp_reference / exp_reference.sum(std::vector<int64_t>{0, 2}, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 // This test checks if our system could correctly handles the case where both
 // reduction and trivial reduction exist in the fusion. Trivial reduction
 // deserve testing because trivial reduction is handled by doing a squeeze
@@ -6645,6 +8490,41 @@ TEST_F(Gpu1Test, FusionMagicSchedulerSoftmax_CUDA) {
   }
 }
 
+// These are the exact two benchmark shapes whose native IP5 plan is retained
+// when its Jev candidate menu cannot be proved. Compare the result with ATen
+// as well as checking the typed plan in jev_ip5_native_fallback.py.
+static void runJevIP5NativeFallbackSoftmax(int64_t batch) {
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+  auto input = makeContigTensor(2, DataType::Float);
+  fusion->addInput(input);
+  fusion->addOutput(softmax(input, 1));
+
+  at::manual_seed(0);
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({batch, 32768}, options);
+  auto aten_output = at::_softmax(aten_input.to(at::kDouble), 1, false);
+  KernelArgumentHolder args({aten_input});
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto cg_outputs = executor_cache.runFusionWithInputs(args);
+  testValidate(
+      executor_cache.fusion(),
+      cg_outputs,
+      args,
+      {aten_output},
+      __LINE__,
+      __FILE__);
+}
+
+TEST_F(Gpu1Test, JevIP5NativeFallbackSoftmax160_CUDA) {
+  runJevIP5NativeFallbackSoftmax(160);
+}
+
+TEST_F(Gpu1Test, JevIP5NativeFallbackSoftmax320_CUDA) {
+  runJevIP5NativeFallbackSoftmax(320);
+}
+
 TEST_F(Gpu1Test, FusionTestMaskSoftmax_CUDA) {
   // This test is testing the usage of all padding tokens
   // with softmax like Bert might might use in a full padding
@@ -6922,6 +8802,317 @@ TEST_F(Gpu1Test, FusionMagicSchedulerRMSNormalization_CUDA) {
       "");
 }
 
+// At this fp16 shape the checked register-backed batch menu contains only b1.
+// Later API choices still exercise the schedule and the result is checked
+// against a double-precision RMSNorm reference.
+TEST_F(Gpu1Test, JevInnerRegisterBatchSingleton_CUDA) {
+  constexpr int64_t norm_size = 128;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto input = makeContigTensor(2, DataType::Half);
+  auto weight = makeContigTensor(1, DataType::Half);
+  fusion.addInput(input);
+  fusion.addInput(weight);
+  auto result = rms_norm(
+      castOp(DataType::Float, input),
+      1,
+      castOp(DataType::Float, weight),
+      IrBuilder::create<Val>(eps));
+  fusion.addOutput(castOp(DataType::Half, result.output));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  auto aten_input = at::randn({128, norm_size}, options);
+  auto aten_weight = at::randn({norm_size}, options);
+  auto results = scheduleAndRun(
+      &fusion,
+      SchedulerType::InnerPersistent,
+      {aten_input, aten_weight});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  const auto x = aten_input.to(at::kDouble);
+  const auto w = aten_weight.to(at::kDouble);
+  const auto reference =
+      (x * at::pow(at::pow(x, 2).mean({1}, true) + eps, -0.5) * w)
+          .to(at::kHalf);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input, aten_weight},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      rparams->lparams);
+}
+
+// P=1025 and batch=2 make the score CTA 512 threads but the physical,
+// warp-padded CTA 544 threads. The 16-warp target asks for 128 registers per
+// thread, which fits the score CTA and exceeds the SM89 physical block budget.
+// Keep that alternate policy out of the API menu while testing the remaining
+// hard-valid policies numerically.
+TEST_F(Gpu1Test, JevInner2DTargetPhysicalGate_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major != 8 || device->minor != 9) {
+    GTEST_SKIP() << "The physical CTA/register boundary is specific to SM89";
+  }
+  constexpr int64_t norm_size = 1025;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  const std::vector<int64_t> norm_shape{norm_size};
+  auto result = rms_norm(
+      input, norm_shape, nullptr, IrBuilder::create<Val>(eps));
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.invstd);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({64, norm_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+
+  auto squared = at::pow(aten_input.to(at::kDouble), 2);
+  auto invstd = at::pow(squared.mean(-1, true) + eps, -0.5);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {aten_input.to(at::kDouble) * invstd, invstd},
+      __LINE__,
+      __FILE__,
+      "",
+      rparams->lparams);
+}
+
+// On SM89 the original 2D register policy stops at batch 10, while batch 12
+// has a complete CTA/register/grid plan. Exercise both choices numerically.
+TEST_F(Gpu1Test, JevAlternateInnerRegisterBatchCap_CUDA) {
+  constexpr int64_t norm_size = 8192;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  const std::vector<int64_t> norm_shape{norm_size};
+  auto result = rms_norm(
+      input, norm_shape, nullptr, IrBuilder::create<Val>(eps));
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.invstd);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, norm_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_NE(results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      rparams->cparams.maxrregcount);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    ASSERT_EQ(rparams->batches_per_block_inner_reduction, 12);
+  } else {
+    ASSERT_LE(rparams->batches_per_block_inner_reduction, 10);
+  }
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      isJevAlternateNumericCase(
+          "jev_alternate_numeric_inner_register_batch_cap")) {
+    EXPECT_EQ(rparams->cparams.maxrregcount, 64);
+  }
+
+  auto squared = at::pow(aten_input.to(at::kDouble), 2);
+  auto invstd = at::pow(squared.mean(-1, true) + eps, -0.5);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {aten_input.to(at::kDouble) * invstd, invstd},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// The 128-thread minimum is an empirical seed. A proved 512-thread seed
+// reduces the register-backed batch from eight to four for this RMS case.
+TEST_F(Gpu1Test, JevAlternateInnerRegisterCTASeed_CUDA) {
+  constexpr int64_t norm_size = 8192;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  const std::vector<int64_t> norm_shape{norm_size};
+  auto result = rms_norm(
+      input, norm_shape, nullptr, IrBuilder::create<Val>(eps));
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.invstd);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, norm_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_EQ(rparams->unroll_factor_inner_reduction, 4);
+  ASSERT_NE(results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      rparams->cparams.maxrregcount);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      rparams->cparams.maxrregcount);
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      isJevAlternateNumericCase(
+          "jev_alternate_numeric_inner_register_cta_seed")) {
+    EXPECT_EQ(rparams->cparams.maxrregcount, 64);
+  }
+  const int64_t physical_x = ceilDiv(
+      norm_size / rparams->unroll_factor_inner_reduction,
+      rparams->batches_per_block_inner_reduction);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    ASSERT_EQ(rparams->batches_per_block_inner_reduction, 4);
+    ASSERT_EQ(physical_x, 512);
+  } else {
+    ASSERT_EQ(rparams->batches_per_block_inner_reduction, 8);
+    ASSERT_EQ(physical_x, 256);
+  }
+
+  auto squared = at::pow(aten_input.to(at::kDouble), 2);
+  auto invstd = at::pow(squared.mean(-1, true) + eps, -0.5);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {aten_input.to(at::kDouble) * invstd, invstd},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// Keep a projectable exp buffer instead of recomputing it from the Half input.
+// This exposes the native 2D register magic-zero preference, while its two
+// code forms must produce the same normalized exponential.
+TEST_F(Gpu1Test, JevAlternateInnerRegisterMagicZero_CUDA) {
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  if (device->major != 8 || device->minor != 9) {
+    GTEST_SKIP() << "SM89-specific magic-zero Choice fixture";
+  }
+  // Four-way vectorization leaves 1025 elements per row, requiring at least
+  // two persistent batches per CTA and an unrolled batch index in codegen.
+  constexpr int64_t feature = 4100;
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto exp_value = exp(castOp(DataType::Float, input));
+  auto exp_sum = sum(exp_value, {1});
+  auto broadcast_sum = broadcast(exp_sum, {false, true});
+  fusion.addOutput(castOp(DataType::Half, div(exp_value, broadcast_sum)));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, feature}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  ASSERT_FALSE(rparams->project_persistent_buffers);
+  ASSERT_TRUE(rparams->smem_persistent_buffers.empty());
+  ASSERT_GT(rparams->batches_per_block_inner_reduction, 1);
+  const bool expect_zero = scheduler::jev::mode() != scheduler::jev::Mode::Remote;
+  EXPECT_EQ(rparams->cparams.enable_magic_zero, expect_zero);
+  EXPECT_EQ(
+      results.kernel_executor->compiledKernel()
+          ->compileParams()
+          .enable_magic_zero,
+      expect_zero);
+  const auto code = results.kernel_executor->compiledKernel()->kernelString();
+  EXPECT_EQ(
+      code.find("NVFUSER_DEFINE_MAGIC_ZERO;") != std::string::npos,
+      expect_zero);
+
+  auto reference_exp = at::exp(aten_input.to(at::kDouble));
+  auto reference = reference_exp / reference_exp.sum(-1, true);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
+// Both persistent storage modes fit on SM89 for this RMS normalization. A
+// forced shared plan must execute and match the same ATen numerical reference.
+TEST_F(Gpu1Test, JevAlternateInnerStorage_CUDA) {
+  constexpr int64_t norm_size = 8192;
+  constexpr float eps = 1e-6f;
+
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  TensorView* input = makeContigTensor(2);
+  fusion.addInput(input);
+  const std::vector<int64_t> norm_shape{norm_size};
+  auto result = rms_norm(
+      input, norm_shape, nullptr, IrBuilder::create<Val>(eps));
+  fusion.addOutput(result.output);
+  fusion.addOutput(result.invstd);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor aten_input = at::randn({256, norm_size}, options);
+  auto results =
+      scheduleAndRun(&fusion, SchedulerType::InnerPersistent, {aten_input});
+  const auto* rparams = results.heuristic_params->as<ReductionParams>();
+  ASSERT_FALSE(rparams->schedule_3d);
+  ASSERT_TRUE(rparams->persistent_kernel);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    ASSERT_FALSE(rparams->smem_persistent_buffers.empty());
+  } else {
+    ASSERT_TRUE(rparams->smem_persistent_buffers.empty());
+  }
+
+  auto squared = at::pow(aten_input.to(at::kDouble), 2);
+  auto invstd = at::pow(squared.mean(-1, true) + eps, -0.5);
+  testValidate(
+      &fusion,
+      results.outputs,
+      {aten_input},
+      {aten_input.to(at::kDouble) * invstd, invstd},
+      __LINE__,
+      __FILE__,
+      "",
+      results.heuristic_params->lparams);
+}
+
 TEST_F(Gpu1Test, FusionMagicSchedulerBatchNormalization_CUDA) {
   if (!deviceMajorMinorCheck(7)) {
     GTEST_SKIP() << "skipping tests on pre-Volta GPUs";
@@ -6990,6 +9181,67 @@ TEST_F(Gpu1Test, FusionMagicSchedulerBatchNormalization_CUDA) {
       __LINE__,
       __FILE__,
       "");
+}
+
+// Match the ordinal 44 benchmark graph and inputs, then check its output
+// against ATen after the native IP6 fallback has run.
+TEST_F(Gpu1Test, JevIP6NativeFallbackBatchNorm_CUDA) {
+  constexpr float kMomentum = 0.1f;
+  constexpr float kEps = 1e-5f;
+  auto fusion = std::make_unique<Fusion>();
+  FusionGuard fg(fusion.get());
+  auto input = makeContigTensor(4, DataType::Float);
+  auto weight = makeContigTensor(1, DataType::Float);
+  auto bias = makeContigTensor(1, DataType::Float);
+  auto running_mean = makeContigTensor(1, DataType::Float);
+  auto running_var = makeContigTensor(1, DataType::Float);
+  fusion->addInput(input);
+  fusion->addInput(weight);
+  fusion->addInput(bias);
+  fusion->addInput(running_mean);
+  fusion->addInput(running_var);
+  auto result = batch_norm(
+      input,
+      weight,
+      bias,
+      running_mean,
+      running_var,
+      true,
+      IrBuilder::create<Val>(kMomentum),
+      IrBuilder::create<Val>(kEps));
+  fusion->addOutput(result.output);
+
+  at::manual_seed(0);
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor at_x = at::randn({8, 32, 64, 64}, options);
+  at::Tensor at_weight = at::ones({32}, options);
+  at::Tensor at_bias = at::zeros({32}, options);
+  at::Tensor at_run_mean = at::zeros({32}, options);
+  at::Tensor at_run_var = at::ones({32}, options);
+  auto ref_mean = at_run_mean.clone();
+  auto ref_var = at_run_var.clone();
+  auto aten_outputs = at::native_batch_norm(
+      at_x,
+      c10::optional<at::Tensor>(at_weight),
+      c10::optional<at::Tensor>(at_bias),
+      c10::optional<at::Tensor>(ref_mean),
+      c10::optional<at::Tensor>(ref_var),
+      true,
+      kMomentum,
+      kEps);
+
+  KernelArgumentHolder args = {
+      at_x, at_weight, at_bias, at_run_mean, at_run_var};
+  FusionExecutorCache executor_cache(std::move(fusion));
+  auto cg_outputs = executor_cache.runFusionWithInputs(args);
+  testValidate(
+      executor_cache.fusion(),
+      cg_outputs,
+      args,
+      {std::get<0>(aten_outputs)},
+      __LINE__,
+      __FILE__);
 }
 
 TEST_F(Gpu1Test, FusionMagicSchedulerInstanceNormalization_CUDA) {

@@ -8,6 +8,9 @@
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <string_view>
+
 #include "exceptions.h"
 #include "fusion.h"
 #include "ops/all_ops.h"
@@ -16,9 +19,14 @@
 #include "runtime/executor.h"
 #include "runtime/executor_utils.h"
 #include "runtime/fusion_executor_cache.h"
+#include "scheduler/compute_invocation_input.h"
+#include "scheduler/jev_client.h"
+#include "scheduler/resize_heuristic.h"
+#include "scheduler/runtime_info.h"
 #include "scheduler/tools/inlining.h"
 #include "scheduler/tools/loop_domain_scheduler.h"
 #include "scheduler/tools/resize_utils.h"
+#include "scheduler/utils.h"
 #include "tests/cpp/utils.h"
 #include "tests/cpp/validator.h"
 
@@ -54,6 +62,356 @@ void checkLoopDomainEquivalence(
 } // namespace
 
 using ResizeTest = NVFuserTest;
+
+TEST(ComputeInvocationIrMetadata, OutputAliasUsesStableValKey) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({2, 3});
+  fusion.addInput(input);
+  auto* output = set(input);
+  fusion.addOutput(output);
+  fusion.aliasOutputToInput(output, input, AllocationType::ReuseBuffer);
+
+  const auto metadata =
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion);
+  ASSERT_TRUE(metadata.available());
+  const std::string input_key =
+      "[" + std::to_string(static_cast<int64_t>(input->vtype())) + "," +
+      std::to_string(input->name()) + "]";
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"alias\":{\"type\":\"reuse_buffer\",\"target_val\":" +
+          input_key + ",\"visibility\":\"visible\"}"));
+  EXPECT_EQ(
+      metadata.text,
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion).text);
+  Fusion clone(fusion);
+  EXPECT_EQ(
+      metadata.text,
+      scheduler::compute_invocation_input::captureIrMetadata(&clone).text);
+}
+
+TEST(ComputeInvocationIrMetadata, EvaluateOutputMayHaveNoAliasTarget) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({2, 3});
+  fusion.addInput(input);
+  auto* output = set(input);
+  fusion.addOutput(output);
+  fusion.aliasOutputToInput(output, nullptr, AllocationType::Evaluate);
+
+  const auto metadata =
+      scheduler::compute_invocation_input::captureIrMetadata(&fusion);
+  ASSERT_TRUE(metadata.available());
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"alias\":{\"type\":\"evaluate\",\"target_val\":null,"
+          "\"visibility\":\"visible\"}"));
+}
+
+TEST_F(ResizeTest, ComputeInvocationSnapshotV2_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+
+  using namespace scheduler::compute_invocation_input;
+  const auto v1 = capture(&fusion, runtime_info);
+  const auto explicit_v1 = capture(&fusion, runtime_info, Format::V1);
+  const auto v2 = capture(&fusion, runtime_info, Format::V2);
+  const auto metadata = captureIrMetadata(&fusion);
+  ASSERT_TRUE(v1.available());
+  ASSERT_TRUE(v2.available()) << reasonName(v2.reason);
+  ASSERT_TRUE(metadata.available()) << reasonName(metadata.reason);
+  EXPECT_EQ(v1.text, explicit_v1.text);
+  constexpr std::string_view v1_magic =
+      "nvfuser.compute_invocation_input.v1\nfusion ";
+  constexpr std::string_view v2_magic =
+      "nvfuser.compute_invocation_input.v2\nfusion ";
+  ASSERT_EQ(v1.text.substr(0, v1_magic.size()), v1_magic);
+  ASSERT_EQ(v2.text.substr(0, v2_magic.size()), v2_magic);
+  const std::string expected_suffix =
+      "\nir_meta " + std::to_string(metadata.text.size()) + ':' + metadata.text;
+  EXPECT_EQ(
+      v2.text.substr(v2_magic.size()),
+      v1.text.substr(v1_magic.size()) + expected_suffix);
+
+  const std::string input_axes =
+      "\"logical\":[" + std::to_string(input->axis(0)->name()) + ',' +
+      std::to_string(input->axis(1)->name()) + ',' +
+      std::to_string(input->axis(2)->name()) + "],\"loop\":[" +
+      std::to_string(input->axis(0)->name()) + ',' +
+      std::to_string(input->axis(1)->name()) + ',' +
+      std::to_string(input->axis(2)->name()) + "],\"allocation\":[" +
+      std::to_string(input->axis(1)->name()) + ',' +
+      std::to_string(input->axis(0)->name()) + ',' +
+      std::to_string(input->axis(2)->name()) +
+      "],\"allocation_explicit\":true,\"contiguity\":[true,true,true]";
+  EXPECT_THAT(metadata.text, testing::HasSubstr(input_axes));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"alias\":{\"type\":\"new\",\"target_val\":null,"
+          "\"visibility\":\"visible\"}"));
+  EXPECT_THAT(
+      metadata.text,
+      testing::HasSubstr(
+          "\"kind\":\"other\",\"op\":null,\"cache\":null"));
+  EXPECT_THAT(metadata.text, testing::HasSubstr("\"is_const_scalar\":true"));
+
+  Fusion clone(fusion);
+  SchedulerRuntimeInfo clone_runtime_info(&clone, {tensor});
+  const auto clone_v2 = capture(&clone, clone_runtime_info, Format::V2);
+  ASSERT_TRUE(clone_v2.available());
+  EXPECT_EQ(v2.text, clone_v2.text);
+}
+
+TEST_F(ResizeTest, ComputeInvocationAliasedSnapshotV2_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({2, 3});
+  fusion.addInput(input);
+  auto* output = set(input);
+  fusion.addOutput(output);
+  fusion.aliasOutputToInput(output, input, AllocationType::ReuseBuffer);
+  const auto tensor = at::randn(
+      {2, 3}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0));
+  SchedulerRuntimeInfo runtime_info(&fusion, {tensor});
+  const auto v2 = scheduler::compute_invocation_input::capture(
+      &fusion, runtime_info, scheduler::compute_invocation_input::Format::V2);
+  ASSERT_TRUE(v2.available());
+
+  Fusion clone(fusion);
+  SchedulerRuntimeInfo clone_runtime_info(&clone, {tensor});
+  const auto clone_v2 = scheduler::compute_invocation_input::capture(
+      &clone,
+      clone_runtime_info,
+      scheduler::compute_invocation_input::Format::V2);
+  ASSERT_TRUE(clone_v2.available());
+  EXPECT_EQ(v2.text, clone_v2.text);
+  EXPECT_THAT(v2.text, testing::HasSubstr("\"type\":\"reuse_buffer\""));
+}
+
+TEST_F(ResizeTest, JevAlternateCta_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeSymbolicTensor(2);
+  fusion.addInput(input);
+  auto* output = pad(
+      input, {IrBuilder::create<Val>(1L), IrBuilder::create<Val>(2L)});
+  fusion.addOutput(output);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({37, 1001}, options);
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  EXPECT_TRUE(params->cta_threads == 64 || params->cta_threads == 128);
+  EXPECT_FALSE(params->split_grid_x_dim);
+
+  // The selected parameter must reach the actual TIDx split; the reference
+  // checks every padded element for both native and forced API choices.
+  auto tidx = std::ranges::find_if(output->getLoopDomain(), [](IterDomain* id) {
+    return id->getParallelType() == ParallelType::TIDx;
+  });
+  ASSERT_NE(tidx, output->getLoopDomain().end());
+  EXPECT_EQ((*tidx)->extent()->evaluate(), params->cta_threads);
+  const auto launch = result.kernel_executor->lastLaunchParams();
+  EXPECT_EQ(launch.bdimx(), params->cta_threads);
+  EXPECT_EQ(
+      launch.gdimx(),
+      (37 * 1004 + params->vectorization_factor * params->cta_threads - 1) /
+          (params->vectorization_factor * params->cta_threads));
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {1, 2})},
+      __LINE__,
+      __FILE__);
+}
+
+TEST_F(ResizeTest, JevAlternateOuterReorder_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+
+  // The first two logical axes differ from the input's physical outer order.
+  // A native keep must therefore change the loop order, while skip preserves
+  // it. Keep the innermost axis and vectorization constraints identical.
+  const auto native_permutation = scheduler_utils::reorderDomainLike(
+      {output->getLogicalDomain().at(0), output->getLogicalDomain().at(1)},
+      input->getMaybeAllocationDomain());
+  ASSERT_EQ(native_permutation, (std::vector<int64_t>{1, 0}));
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  ASSERT_EQ(tensor.size(0), 5);
+  ASSERT_EQ(tensor.size(1), 7);
+  ASSERT_EQ(tensor.size(2), 64);
+  ASSERT_EQ(tensor.stride(0), 64);
+  ASSERT_EQ(tensor.stride(1), 320);
+  ASSERT_EQ(tensor.stride(2), 1);
+
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  const bool skip = scheduler::jev::mode() == scheduler::jev::Mode::Remote;
+  EXPECT_EQ(params->largest_input, skip ? -1 : 0);
+
+  // Inspect the actual reference schedule: TIDx comes from a flattened
+  // three-axis domain, whose first merge retains the chosen outer order.
+  auto tidx = std::ranges::find_if(output->getLoopDomain(), [](IterDomain* id) {
+    return id->getParallelType() == ParallelType::TIDx;
+  });
+  ASSERT_NE(tidx, output->getLoopDomain().end());
+  auto* thread_split = dynamic_cast<Split*>((*tidx)->definition());
+  ASSERT_NE(thread_split, nullptr);
+  auto* last_merge = dynamic_cast<Merge*>(thread_split->in()->definition());
+  ASSERT_NE(last_merge, nullptr);
+  auto* outer_merge = dynamic_cast<Merge*>(last_merge->outer()->definition());
+  ASSERT_NE(outer_merge, nullptr);
+  IdModel id_model(&fusion, /*build_graphs=*/false);
+  const auto& exact = id_model.buildExactGraph();
+  EXPECT_EQ(
+      exact.toGroup(outer_merge->outer()),
+      exact.toGroup(output->getLogicalDomain().at(skip ? 0 : 1)));
+  EXPECT_EQ(
+      exact.toGroup(outer_merge->inner()),
+      exact.toGroup(output->getLogicalDomain().at(skip ? 1 : 0)));
+
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {0, 8})},
+      __LINE__,
+      __FILE__);
+}
+
+// The direct rank-three right Pad is the semantic-v3 terminal RS1.cta
+// fixture. Its complete t64/t128/t256 plans share the same selected width and
+// keep reorder, but compile with distinct physical CTA and grid dimensions.
+TEST_F(ResizeTest, JevDirectPadTerminalCta_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  ASSERT_EQ(tensor.sizes(), (at::IntArrayRef{5, 7, 64}));
+  ASSERT_EQ(tensor.strides(), (at::IntArrayRef{64, 320, 1}));
+
+  int64_t expected_threads = 128;
+  int64_t expected_largest_input = 0;
+  int64_t expected_width = 4;
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Remote) {
+    const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+    ASSERT_NE(case_key, nullptr);
+    const std::string_view key(case_key);
+    ASSERT_TRUE(
+        key.ends_with("_t64") || key.ends_with("_t128") ||
+        key.ends_with("_t256"));
+    expected_threads = key.ends_with("_t64")
+        ? 64
+        : key.ends_with("_t128") ? 128 : 256;
+    expected_largest_input = key.find("_skip_") != std::string_view::npos
+        ? -1
+        : 0;
+    expected_width = key.find("_w1_") != std::string_view::npos
+        ? 1
+        : key.find("_w2_") != std::string_view::npos ? 2 : 4;
+  }
+
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  EXPECT_EQ(params->largest_input, expected_largest_input);
+  EXPECT_EQ(params->vectorization_factor, expected_width);
+  EXPECT_EQ(params->cta_threads, expected_threads);
+  EXPECT_FALSE(params->split_grid_x_dim);
+  const auto launch = result.kernel_executor->lastLaunchParams();
+  EXPECT_EQ(launch.bdimx(), expected_threads);
+  EXPECT_EQ(
+      launch.gdimx(),
+      (2520 + expected_width * expected_threads - 1) /
+          (expected_width * expected_threads));
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {0, 8})},
+      __LINE__,
+      __FILE__);
+}
+
+// Keep the c19 graph and runtime fixed while allowing a real model to choose
+// any hard-valid width, reorder branch, and CTA. The resulting launch must
+// agree with the selected terminal Resize plan and the padded ATen output.
+TEST_F(ResizeTest, JevDirectPadAnyTerminalChoice_CUDA) {
+  Fusion fusion;
+  FusionGuard guard(&fusion);
+  auto* input = makeContigConcreteTensor({5, 7, 64});
+  input->setAllocationDomain(
+      {input->axis(1), input->axis(0), input->axis(2)}, true);
+  fusion.addInput(input);
+  auto* output = pad(input, {fusion.zeroVal(), IrBuilder::create<Val>(8L)});
+  fusion.addOutput(output);
+
+  const auto options =
+      at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  auto tensor = at::randn({7, 5, 64}, options).permute({1, 0, 2});
+  ASSERT_EQ(tensor.sizes(), (at::IntArrayRef{5, 7, 64}));
+  ASSERT_EQ(tensor.strides(), (at::IntArrayRef{64, 320, 1}));
+
+  auto result = scheduleAndRun(&fusion, SchedulerType::Resize, {tensor});
+  const auto* params = result.heuristic_params->as<ResizeParams>();
+  ASSERT_NE(params, nullptr);
+  ASSERT_TRUE(params->cparams.index_type.has_value());
+  ASSERT_TRUE(
+      params->vectorization_factor == 1 ||
+      params->vectorization_factor == 2 ||
+      params->vectorization_factor == 4);
+  EXPECT_TRUE(params->largest_input == -1 || params->largest_input == 0);
+  ASSERT_TRUE(
+      params->cta_threads == 64 || params->cta_threads == 128 ||
+      params->cta_threads == 256);
+  EXPECT_FALSE(params->split_grid_x_dim);
+
+  const auto launch = result.kernel_executor->lastLaunchParams();
+  EXPECT_EQ(launch.bdimx(), params->cta_threads);
+  EXPECT_EQ(
+      launch.gdimx(),
+      (2520 + params->vectorization_factor * params->cta_threads - 1) /
+          (params->vectorization_factor * params->cta_threads));
+  testValidate(
+      &fusion,
+      result.outputs,
+      {tensor},
+      {at::pad(tensor, {0, 8})},
+      __LINE__,
+      __FILE__);
+}
 
 using ResizeSchedulerTest = NVFuserFixtureParamTest<bool>;
 

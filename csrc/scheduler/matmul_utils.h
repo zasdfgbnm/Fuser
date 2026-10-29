@@ -7,6 +7,9 @@
 // clang-format on
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include "exceptions.h"
 #include "fusion.h"
 #include "scheduler/matmul_heuristic.h"
@@ -18,6 +21,20 @@ class HeuristicDataCache;
 class MatmulParams;
 
 namespace matmul_utils {
+// Shared-memory budget of a default Hopper warp-specialized tile after
+// reserving all output tiles. The stage bytes include two 8-byte mbarriers.
+struct HopperTileStageBudget {
+  int64_t output_smem_reserve_bytes = 0;
+  int64_t operand_stage_bytes = 0;
+  int64_t max_operand_stages = 0;
+};
+
+NVF_API HopperTileStageBudget defaultHopperTileStageBudget(
+    const GemmTile& cta_tile,
+    int64_t smem_per_block_bytes,
+    int64_t output_dtype_bytes_sum,
+    size_t num_problems);
+
 //! An implementation of functionality that will prepare heuristics for fusion
 //!  that represents matmul. May return empty object if any of conditions are
 //!  not met.

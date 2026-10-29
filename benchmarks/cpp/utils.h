@@ -24,6 +24,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 using namespace nvfuser;
 
 std::string toString(const ReductionParams* rparams);
@@ -51,6 +53,12 @@ int64_t runBenchmarkIterations(
     const KernelArgumentHolder& args,
     const LaunchParams& launch_constraints = LaunchParams(),
     CompileParams compile_params = CompileParams());
+
+// The batch reporter uses this count to identify registrations that bypass
+// both benchmark iteration helpers and explicitly mark them unsupported by
+// the optional native numerical validation gate.
+uint64_t numericGateEvidenceCount() noexcept;
+void recordUncoveredNumericGate();
 
 void addCasesOneWave128To32K(benchmark::internal::Benchmark* b);
 void addCases16Wave128To32K(benchmark::internal::Benchmark* b);

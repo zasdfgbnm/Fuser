@@ -307,6 +307,7 @@ list(APPEND NVFUSER_SRCS
   ${NVFUSER_SRCS_DIR}/scheduler/cache_policy_refiner.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/cutlass.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/heuristic.cpp
+  ${NVFUSER_SRCS_DIR}/scheduler/jev_client.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/greedy.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/mark_aliases.cpp
   ${NVFUSER_SRCS_DIR}/scheduler/matmul.cpp
@@ -788,6 +789,7 @@ list(APPEND JIT_TEST_SRCS
   ${NVFUSER_ROOT}/tests/cpp/test_tensor_factories.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_tmem.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_transpose.cpp
+  ${NVFUSER_ROOT}/tests/cpp/test_transpose_virtual_axes.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_unary.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_utils.cpp
   ${NVFUSER_ROOT}/tests/cpp/test_vectorization.cpp
@@ -902,7 +904,7 @@ function(add_test_without_main TEST_NAME TEST_SRC ADDITIONAL_LINK)
   endif()
 endfunction()
 
-function(add_test TEST_NAME TEST_SRC ADDITIONAL_LINK)
+function(add_nvfuser_test TEST_NAME TEST_SRC ADDITIONAL_LINK)
   list(APPEND ADDITIONAL_LINK "GTest::gtest_main")
   add_test_without_main("${TEST_NAME}" "${TEST_SRC}" "${ADDITIONAL_LINK}")
 
@@ -934,17 +936,18 @@ function(add_isolated_test TEST_NAME TEST_SRC ADDITIONAL_LINK)
       "Expected: ${TEST_NAME}.cpp")
   endif()
 
-  # Call the standard add_test function
+  # Call the standard nvFuser test executable helper
   message(STATUS "Creating isolated test: ${TEST_NAME} with single source: ${TEST_SRC}")
-  add_test("${TEST_NAME}" "${TEST_SRC}" "${ADDITIONAL_LINK}")
+  add_nvfuser_test("${TEST_NAME}" "${TEST_SRC}" "${ADDITIONAL_LINK}")
 endfunction()
 
 if(BUILD_TEST)
+  enable_testing()
   set(TEST_BINARIES)
-  add_test(test_nvfuser "${JIT_TEST_SRCS}" "")
+  add_nvfuser_test(test_nvfuser "${JIT_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_nvfuser)
 
-  add_test(test_rng ${NVFUSER_ROOT}/tests/cpp/test_rng.cpp ${RNG_TEST_KERNELS})
+  add_nvfuser_test(test_rng ${NVFUSER_ROOT}/tests/cpp/test_rng.cpp ${RNG_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_rng)
 
   set(ARGSORT_TEST_SRCS)
@@ -952,7 +955,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_argsort.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_argsort_device_func.cpp
   )
-  add_test(test_argsort "${ARGSORT_TEST_SRCS}" ${ARGSORT_TEST_KERNELS})
+  add_nvfuser_test(test_argsort "${ARGSORT_TEST_SRCS}" ${ARGSORT_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_argsort)
 
   set(SCAN_TEST_SRCS)
@@ -960,7 +963,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_scan.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_scan_device_func.cpp
   )
-  add_test(test_scan "${SCAN_TEST_SRCS}" ${SCAN_TEST_KERNELS})
+  add_nvfuser_test(test_scan "${SCAN_TEST_SRCS}" ${SCAN_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_scan)
 
   set(CLUSTER_TEST_SRCS)
@@ -968,7 +971,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_cluster.cpp
     ${NVFUSER_ROOT}/tests/cpp/cluster_runtime_test/test_cluster_device_func.cpp
   )
-  add_test(test_cluster "${CLUSTER_TEST_SRCS}" ${CLUSTER_TEST_KERNELS})
+  add_nvfuser_test(test_cluster "${CLUSTER_TEST_SRCS}" ${CLUSTER_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_cluster)
 
   set(TOPK_TEST_SRCS)
@@ -976,14 +979,14 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_topk.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_topk_device_func.cpp
   )
-  add_test(test_topk "${TOPK_TEST_SRCS}" ${TOPK_TEST_KERNELS})
+  add_nvfuser_test(test_topk "${TOPK_TEST_SRCS}" ${TOPK_TEST_KERNELS})
   list(APPEND TEST_BINARIES test_topk)
 
   set(MOE_TEST_SRCS)
   list(APPEND MOE_TEST_SRCS
     ${NVFUSER_ROOT}/tests/cpp/test_moe.cpp
   )
-  add_test(test_moe "${MOE_TEST_SRCS}" "")
+  add_nvfuser_test(test_moe "${MOE_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_moe)
 
   set(MULTIDEVICE_TEST_SRCS)
@@ -1021,10 +1024,10 @@ if(BUILD_TEST)
   add_test_without_main(test_multidevice_tutorial "${MULTIDEVICE_TUTORIAL_SRCS}" "")
   list(APPEND TEST_BINARIES test_multidevice_tutorial)
 
-  add_test(test_reshape "${NVFUSER_ROOT}/tests/cpp/test_reshape.cpp" "")
+  add_nvfuser_test(test_reshape "${NVFUSER_ROOT}/tests/cpp/test_reshape.cpp" "")
   list(APPEND TEST_BINARIES test_reshape)
 
-  add_test(test_layout_op ${NVFUSER_ROOT}/tests/cpp/test_layout_op.cpp "")
+  add_nvfuser_test(test_layout_op ${NVFUSER_ROOT}/tests/cpp/test_layout_op.cpp "")
   list(APPEND TEST_BINARIES test_layout_op)
 
   # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -1057,13 +1060,13 @@ if(BUILD_TEST)
       ${NVFUSER_ROOT}/tests/cpp/test_cutlass_scheduler.cpp
     )
   endif()
-  add_test(test_matmul "${MATMUL_TEST_SRCS}" "")
+  add_nvfuser_test(test_matmul "${MATMUL_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_matmul)
 
-  add_test(test_greedy "${NVFUSER_ROOT}/tests/cpp/test_greedy.cpp" "")
+  add_nvfuser_test(test_greedy "${NVFUSER_ROOT}/tests/cpp/test_greedy.cpp" "")
   list(APPEND TEST_BINARIES test_greedy)
 
-  add_test(test_external_src "${NVFUSER_ROOT}/tests/cpp/test_external_src.cpp" "")
+  add_nvfuser_test(test_external_src "${NVFUSER_ROOT}/tests/cpp/test_external_src.cpp" "")
   list(APPEND TEST_BINARIES test_external_src)
 
   set(TUTORIAL_SRCS)
@@ -1072,7 +1075,7 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/tutorial_cute_tv_layout.cpp
     ${NVFUSER_ROOT}/tests/cpp/tutorial_tmem.cpp
     ${NVFUSER_ROOT}/tests/cpp/tutorial_ldmatrix_stmatrix.cpp)
-  add_test(test_tutorial "${TUTORIAL_SRCS}" "")
+  add_nvfuser_test(test_tutorial "${TUTORIAL_SRCS}" "")
   list(APPEND TEST_BINARIES test_tutorial)
 
   set(HOSTIR_TEST_SRCS)
@@ -1082,23 +1085,1336 @@ if(BUILD_TEST)
     ${NVFUSER_ROOT}/tests/cpp/test_host_ir_stream_lowering.cpp
     ${NVFUSER_ROOT}/tests/cpp/test_host_irs.cpp
   )
-  add_test(test_host_ir "${HOSTIR_TEST_SRCS}" "")
+  add_nvfuser_test(test_host_ir "${HOSTIR_TEST_SRCS}" "")
   list(APPEND TEST_BINARIES test_host_ir)
 
   set(LLVM_COMPILE_TEST_SRCS)
   list(APPEND LLVM_COMPILE_TEST_SRCS
     ${NVFUSER_ROOT}/tests/cpp/test_host_ir_jit.cpp
   )
-  add_test(test_host_ir_jit "${LLVM_COMPILE_TEST_SRCS}" "")
+  add_nvfuser_test(test_host_ir_jit "${LLVM_COMPILE_TEST_SRCS}" "")
   target_link_libraries(test_host_ir_jit PUBLIC LLVM_JIT)
   list(APPEND TEST_BINARIES test_host_ir_jit)
 
 
   # We don't link CUPTI for MSVC
   if(NOT MSVC)
-    add_test(test_profiler "${NVFUSER_ROOT}/tests/cpp/test_fusion_profiler.cpp" "")
+    add_nvfuser_test(test_profiler "${NVFUSER_ROOT}/tests/cpp/test_fusion_profiler.cpp" "")
     list(APPEND TEST_BINARIES test_profiler)
   endif()
+
+  # Protocol tests run without a CUDA context or the codegen library.
+  add_executable(test_jev_client_standalone
+    ${NVFUSER_ROOT}/tests/cpp/test_jev_client_standalone.cpp
+    ${NVFUSER_SRCS_DIR}/scheduler/jev_client.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(test_jev_client_standalone PRIVATE Threads::Threads)
+  target_include_directories(test_jev_client_standalone PRIVATE ${NVFUSER_SRCS_DIR})
+  set_property(TARGET test_jev_client_standalone PROPERTY CXX_STANDARD ${NVFUSER_CPP_STANDARD})
+  list(APPEND TEST_BINARIES test_jev_client_standalone)
+  add_test(NAME jev_client_standalone
+    COMMAND $<TARGET_FILE:test_jev_client_standalone>)
+
+  add_executable(test_bounded_snapshot_stream_standalone
+    ${NVFUSER_ROOT}/tests/cpp/test_bounded_snapshot_stream_standalone.cpp)
+  target_include_directories(test_bounded_snapshot_stream_standalone PRIVATE
+    ${NVFUSER_SRCS_DIR})
+  set_property(TARGET test_bounded_snapshot_stream_standalone PROPERTY
+    CXX_STANDARD ${NVFUSER_CPP_STANDARD})
+  list(APPEND TEST_BINARIES test_bounded_snapshot_stream_standalone)
+
+  # These run an existing scheduler GTest and compare kernel output with a
+  # numerical reference. They are a focused smoke suite, not the full nvFuser
+  # test inventory. A resource lock keeps GPU work serial even with ctest -j.
+  add_test(NAME jev_numeric_pointwise
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu2Test.FusionPointwiseBroadcast_CUDA)
+  add_test(NAME jev_numeric_reduction
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA)
+  add_test(NAME jev_numeric_transpose
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=TransposeTest.FusionScheduleTransposeSmall:Gpu3Test.JevTransposeFp16Inner3D12Ordinal11833_CUDA)
+  add_test(NAME jev_numeric_inner_persistent
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA)
+  add_test(NAME jev_numeric_outer_persistent
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.TemplateFunctionTypeMismatch)
+  add_test(NAME jev_numeric_inner_outer_persistent
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv)
+  # Exact registry shapes that previously aborted while forming OP3.cta.
+  add_test(NAME jev_numeric_op3_instance_norm_half
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA)
+  add_test(NAME jev_numeric_op3_instance_norm_float
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.JevInstanceNormNhwcFloatCta_CUDA)
+  add_test(NAME jev_numeric_op3_softmax_dropout_outer_half
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=Gpu3Test.JevSoftmaxDropoutOuterHalfCta_CUDA)
+  set_tests_properties(
+    jev_numeric_pointwise jev_numeric_reduction jev_numeric_transpose
+    jev_numeric_inner_persistent jev_numeric_outer_persistent
+    jev_numeric_inner_outer_persistent
+    PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu
+      # A misspelled GTest filter exits successfully after running zero tests.
+      FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
+  set_tests_properties(
+    jev_numeric_op3_instance_norm_half
+    jev_numeric_op3_instance_norm_float
+    jev_numeric_op3_softmax_dropout_outer_half
+    PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu
+      ENVIRONMENT "NVFUSER_JEV_MODE=off"
+      FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
+  set_tests_properties(jev_numeric_transpose PROPERTIES
+    ENVIRONMENT "NVFUSER_JEV_MODE=off"
+    FAIL_REGULAR_EXPRESSION "Running [01] tests?|\\[  PASSED  \\] [01] tests?\\.")
+
+  # TMA parameter analysis runs on any CUDA device; no Hopper kernel executes.
+  add_test(NAME jev_pointwise_tma_analysis
+    COMMAND $<TARGET_FILE:test_nvfuser>
+      --gtest_filter=PointwiseTest.TmaBreakpointPreflightDebugOnlyFinalPlan:PointwiseTest.TmaDomainTargetCompletePlanAnalysis)
+  set_tests_properties(jev_pointwise_tma_analysis PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu
+    FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
+
+  # Each remote test runs the same numerical GTests twice (native record and
+  # local API), then checks the complete decision exchange. The harness needs
+  # an explicit parity-module directory and CUDA loader from its environment;
+  # no machine-specific workspace path is embedded in this source tree.
+  function(add_jev_remote_numeric_test FAMILY GTEST_FILTER SITE_PREFIX)
+    set(TEST_NAME "jev_remote_numeric_${FAMILY}")
+    set(REQUIRED_SITE_ARG)
+    if(ARGC GREATER 3)
+      list(APPEND REQUIRED_SITE_ARG --required-site "${ARGV3}")
+    endif()
+    add_test(NAME ${TEST_NAME}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+        --binary "$<TARGET_FILE:test_nvfuser>"
+        --gtest-filter "${GTEST_FILTER}"
+        --case-key "${TEST_NAME}"
+        --site-prefix "${SITE_PREFIX}"
+        ${REQUIRED_SITE_ARG}
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+    set_tests_properties(${TEST_NAME} PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  endfunction()
+  add_jev_remote_numeric_test(pointwise
+    "Gpu2Test.FusionPointwiseBroadcast_CUDA" "PW")
+  add_jev_remote_numeric_test(resize
+    "ResizeTest.JevAlternateCta_CUDA" "RS" "RS1.cta")
+  foreach(RS1_CTA_THREADS IN ITEMS 64 256)
+    add_test(NAME jev_rs1_terminal_t${RS1_CTA_THREADS}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+        --binary "$<TARGET_FILE:test_nvfuser>"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+        --threads ${RS1_CTA_THREADS})
+    set_tests_properties(jev_rs1_terminal_t${RS1_CTA_THREADS}
+      PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  endforeach()
+  add_test(NAME jev_rs1_reorder_terminal_skip
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+      --threads 128 --reorder skip)
+  set_tests_properties(jev_rs1_reorder_terminal_skip
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_rs1_width_terminal_w1
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+      --width 1 --reorder keep --threads 64)
+  set_tests_properties(jev_rs1_width_terminal_w1
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_rs1_width_terminal_w2
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+      --width 2 --reorder skip --threads 256)
+  set_tests_properties(jev_rs1_width_terminal_w2
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_rs1_any_terminal_choice_smoke
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_rs1_terminal_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_rs1_terminal"
+      --width 2 --reorder skip --threads 256
+      --gtest ResizeTest.JevDirectPadAnyTerminalChoice_CUDA)
+  set_tests_properties(jev_rs1_any_terminal_choice_smoke
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_resize_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RS1.cta --alternate t64
+      --gtest ResizeTest.JevAlternateCta_CUDA
+      --case-key jev_alternate_numeric_resize_cta)
+  set_tests_properties(jev_alternate_numeric_resize_cta PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_resize_reorder
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RS1.reorder --alternate skip
+      --gtest ResizeTest.JevAlternateOuterReorder_CUDA
+      --case-key jev_alternate_numeric_resize_reorder
+      --require-resize-reorder)
+  set_tests_properties(jev_alternate_numeric_resize_reorder PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_resize_reorder_v2
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RS1.reorder --alternate skip
+      --gtest ResizeTest.JevAlternateOuterReorder_CUDA
+      --case-key jev_alternate_numeric_resize_reorder_v2
+      --require-resize-reorder --protocol semantic-v3)
+  set_tests_properties(jev_alternate_numeric_resize_reorder_v2 PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  foreach(CTA_THREADS IN ITEMS 32 64)
+    add_test(NAME jev_alternate_numeric_pointwise_1d_cta_x${CTA_THREADS}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+        --binary "$<TARGET_FILE:test_nvfuser>"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+        --site PW3.cta_1d --alternate x${CTA_THREADS}
+        --gtest PointwiseTest.JevAlternateOneDimensionalCta_CUDA
+        --case-key jev_alternate_numeric_pointwise_1d_cta_x${CTA_THREADS}
+        --require-pointwise-1d-cta)
+    set_tests_properties(jev_alternate_numeric_pointwise_1d_cta_x${CTA_THREADS}
+      PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  endforeach()
+  add_test(NAME jev_alternate_numeric_pointwise_unroll_u2
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site PW3.unroll --alternate u2
+      --gtest PointwiseTest.JevAlternateOneDimensionalCta_CUDA
+      --case-key jev_alternate_numeric_pointwise_unroll_u2)
+  set_tests_properties(jev_alternate_numeric_pointwise_unroll_u2
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_jev_remote_numeric_test(reduction
+    "Gpu1Test.FusionReductionScheduler_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimFastest_CUDA:Gpu1Test.FusionReductionSchedulerMultiDimNonFastest_CUDA" "RD")
+  # A source-offered singleton stays local in semantic-v3 while subsequent
+  # choices still reach the API with that decision in their prior history.
+  add_test(NAME jev_remote_numeric_source_singleton_inner_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu1Test.FusionReductionScheduler_CUDA
+      --case-key jev_remote_numeric_source_singleton_inner_cta
+      --site-prefix RD --required-site RD3.warp
+      --protocol semantic-v3
+      --expect-no-choice RD3.cta=t512
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton
+      --expect-prior-in RD3.warp)
+  set_tests_properties(jev_remote_numeric_source_singleton_inner_cta
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_source_singleton_outer_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_remote_numeric_source_singleton_outer_unroll
+      --site-prefix RD --required-site RD9.ragged
+      --protocol semantic-v3
+      --expect-no-choice RD9.unroll=u1
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton
+      --expect-prior-in RD9.ragged)
+  set_tests_properties(jev_remote_numeric_source_singleton_outer_unroll
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_outer_stride_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_remote_numeric_outer_stride_singleton
+      --site-prefix RD --required-site RD9.ragged
+      --protocol semantic-v3
+      --expect-no-choice RD9.stride=g7
+      --expect-no-choice-reason "baseline and stride-capped grids have the same block count"
+      --expect-no-choice-source hard_legal_singleton
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_outer_stride_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner3d_iter_unroll_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dEquivalentWavesRecordNative_CUDA
+      --case-key jev_remote_numeric_inner_three_d_iter_unroll_singleton
+      --site-prefix RD
+      --expect-no-choice RD5.iter_unroll=u1
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner3d_iter_unroll_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_jev_remote_numeric_test(transpose
+    "TransposeTest.FusionScheduleTransposeSmall:Gpu3Test.JevTransposeFp16Inner3D12Ordinal11833_CUDA" "TR")
+  foreach(SITE_SUFFIX IN ITEMS tile width1 width2)
+    if(SITE_SUFFIX STREQUAL "tile")
+      set(SINGLETON_SELECTED tile32)
+      set(SINGLETON_REASON "only the native transpose tile satisfies hard bounds")
+      set(DEPENDENT_SITE TR2.unroll)
+      set(CASE_SUFFIX tile)
+    else()
+      set(SINGLETON_SELECTED w1)
+      set(SINGLETON_REASON "only one hard-valid transpose group width")
+      set(DEPENDENT_SITE TR2.cta)
+      if(SITE_SUFFIX STREQUAL "width1")
+        set(CASE_SUFFIX width_one)
+      else()
+        set(CASE_SUFFIX width_two)
+      endif()
+    endif()
+    add_test(NAME jev_remote_numeric_transpose_${CASE_SUFFIX}_singleton
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+        --binary "$<TARGET_FILE:test_nvfuser>"
+        --gtest-filter TransposeTest.FusionScheduleTransposeSmall
+        --case-key jev_remote_numeric_transpose_${CASE_SUFFIX}_singleton
+        --site-prefix TR --required-site ${DEPENDENT_SITE}
+        --protocol semantic-v3
+        --expect-no-choice TR2.${SITE_SUFFIX}=${SINGLETON_SELECTED}
+        --expect-no-choice-reason "${SINGLETON_REASON}"
+        --expect-no-choice-source hard_legal_singleton
+        --expect-prior-in ${DEPENDENT_SITE}
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+    set_tests_properties(jev_remote_numeric_transpose_${CASE_SUFFIX}_singleton
+      PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  endforeach()
+  add_jev_remote_numeric_test(transpose_virtual_changed
+    "TransposeTest.FusionScheduleTransposeSmall" "TR" "TR1")
+  add_test(NAME jev_remote_numeric_transpose_virtual_one_wave_no_choice
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter TransposeTest.JevTransposeVirtualOneWaveNoChoice_CUDA
+      --case-key jev_remote_numeric_transpose_virtual_one_wave_no_choice
+      --site-prefix TR
+      --expect-no-choice TR1=original
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_transpose_virtual_one_wave_no_choice
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_transpose_original_prior
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter TransposeTest.FusionScheduleTransposeTileChoice
+      --case-key jev_remote_numeric_transpose_original_prior
+      --site-prefix TR --required-site TR2.tile
+      --protocol semantic-v3
+      --expect-no-choice TR1=original
+      --expect-no-choice-reason virtual_axis_constructor_no_effect
+      --expect-no-choice-source native_axis_plan
+      --expect-prior-in TR2.tile
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_transpose_original_prior
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_transpose_virtual_axes
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site TR1 --alternate original
+      --gtest TransposeTest.FusionScheduleTransposeSmall
+      --case-key jev_alternate_numeric_transpose_virtual_axes
+      --protocol semantic-v3
+      --require-transpose-virtual)
+  set_tests_properties(jev_alternate_numeric_transpose_virtual_axes PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_transpose_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site TR2.cta --alternate t256
+      --gtest TransposeTest.FusionScheduleTransposeSmall
+      --case-key jev_alternate_numeric_transpose_cta)
+  set_tests_properties(jev_alternate_numeric_transpose_cta PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_transpose_cta_64
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site TR2.cta --alternate t64
+      --gtest TransposeTest.FusionScheduleTransposeSmall
+      --case-key jev_alternate_numeric_transpose_cta_64)
+  set_tests_properties(jev_alternate_numeric_transpose_cta_64 PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_transpose_tile
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site TR2.tile --alternate tile16
+      --gtest TransposeTest.FusionScheduleTransposeTileChoice
+      --case-key jev_alternate_numeric_transpose_tile
+      --require-transpose-tile)
+  set_tests_properties(jev_alternate_numeric_transpose_tile PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_jev_remote_numeric_test(inner_persistent
+    "Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA:Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA" "IP")
+  add_test(NAME jev_remote_numeric_inner_hard_singleton_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dHardWidthSingleton_CUDA
+      --case-key jev_remote_numeric_inner_hard_singleton_width
+      --site-prefix IP --required-site IP6.waves
+      --protocol semantic-v3
+      --expect-no-choice IP6.width=w4
+      --expect-no-choice-reason "only one hard-valid vector width"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in IP6.waves
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_hard_singleton_width
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_hard_singleton_register
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dHardRegisterSingleton_CUDA
+      --case-key jev_remote_numeric_inner_hard_singleton_register
+      --site-prefix IP --required-site IP6.cta_floor
+      --protocol semantic-v3
+      --expect-no-choice IP6.reg_overhead=r32
+      --expect-no-choice-reason "only one hard-valid register allowance"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in IP6.cta_floor
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_hard_singleton_register
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_outer_redu_unroll_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu3Test.JevInstanceNormNhwcHalfReductionSingleton_CUDA
+      --case-key jev_remote_numeric_outer_redu_unroll_singleton
+      --site-prefix OP --required-site OP3.unroll
+      --protocol semantic-v3
+      --expect-no-choice OP3.redu_unroll=r1
+      --expect-no-choice-count 2
+      --expect-no-choice-reason "only one hard-valid reduction unroll factor"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in OP3.unroll
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_outer_redu_unroll_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_batch_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInnerRegisterBatchSingleton_CUDA
+      --case-key jev_remote_numeric_inner_batch_singleton
+      --site-prefix IP --required-site IP5.width
+      --protocol semantic-v3
+      --expect-no-choice IP5.batch=b1
+      --expect-no-choice-reason "only one hard-valid persistent batch plan"
+      --expect-no-choice-source hard_legal_singleton
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_batch_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_fixed_work_split_context
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter Gpu1Test.JevInner3dHardWidthSingleton_CUDA
+      --case-key jev_remote_numeric_inner_fixed_work_split_context
+      --site-prefix IP --required-site IP6.outer_unroll
+      --protocol semantic-v3
+      --expect-no-choice IP6.work_split=unroll_first
+      --expect-no-choice-reason "no distinct, resource-valid 3D work split"
+      --expect-no-choice-source native_unroll_first_branch
+      --expect-prior-in IP6.outer_unroll
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric")
+  set_tests_properties(jev_remote_numeric_inner_fixed_work_split_context
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_ip6_local_previews
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu1Test.JevAlternateInner3dPersistentWarp_CUDA
+      --case-key jev_remote_numeric_ip_local_previews
+      --site-prefix IP --required-site IP6.width
+      --protocol semantic-v3 --check-ip6-local-previews)
+  set_tests_properties(jev_remote_numeric_ip6_local_previews
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_jev_remote_numeric_test(outer_persistent
+    "Gpu3Test.TemplateFunctionTypeMismatch" "OP")
+  add_jev_remote_numeric_test(op_instance_norm_half
+    "Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA" "OP" "OP3.cta")
+  add_jev_remote_numeric_test(op_instance_norm_float
+    "Gpu3Test.JevInstanceNormNhwcFloatCta_CUDA" "OP" "OP3.cta")
+  add_test(NAME jev_remote_numeric_source_singleton_outer_persistent_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter Gpu3Test.JevSoftmaxDropoutOuterHalfCta_CUDA
+      --case-key jev_remote_numeric_source_singleton_outer_persistent_cta
+      --site-prefix OP --required-site OP3.unroll
+      --protocol semantic-v3
+      --expect-no-choice OP3.cta=x64_y2_b6
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton)
+  set_tests_properties(jev_remote_numeric_source_singleton_outer_persistent_cta
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_jev_remote_numeric_test(op_softmax_dropout_outer_half
+    "Gpu3Test.JevSoftmaxDropoutOuterHalfCta_CUDA" "OP" "OP3.cta")
+  add_jev_remote_numeric_test(inner_outer_persistent
+    "CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv" "IOP")
+  add_test(NAME jev_remote_numeric_source_singleton_inner_outer_tmp_read
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_source_singleton_inner_outer_tmp_read
+      --site-prefix IOP --required-site IOP3.grid_rows
+      --protocol semantic-v3
+      --expect-no-choice IOP3.tmp_read_width=w1
+      --expect-no-choice-reason "only one source-offered candidate at this step"
+      --expect-no-choice-source source_menu_singleton
+      --expect-prior-in IOP3.grid_rows)
+  set_tests_properties(jev_remote_numeric_source_singleton_inner_outer_tmp_read
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_outer_singleton_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_inner_outer_singleton_width
+      --site-prefix IOP
+      --expect-no-choice IOP3.inner_width=w1)
+  set_tests_properties(jev_remote_numeric_inner_outer_singleton_width
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_outer_fixed_width_context
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_inner_outer_fixed_width_context
+      --site-prefix IOP --required-site IOP3.storage
+      --protocol semantic-v3
+      --expect-no-choice IOP3.inner_width=w1
+      --expect-no-choice-reason "only the native width is hard-valid"
+      --expect-no-choice-source native_inner_width
+      --expect-prior-in IOP3.storage)
+  set_tests_properties(jev_remote_numeric_inner_outer_fixed_width_context
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_outer_cta_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.JevLayerNormBackwardSingletonCta
+      --case-key jev_remote_numeric_inner_outer_cta_singleton
+      --site-prefix IOP --required-site IOP3.tmp_write_width
+      --protocol semantic-v3
+      --expect-no-choice IOP3.cta=t64
+      --expect-no-choice-reason "only one hard-valid inner-outer CTA plan"
+      --expect-no-choice-source hard_legal_singleton
+      --expect-prior-in IOP3.tmp_write_width)
+  set_tests_properties(jev_remote_numeric_inner_outer_cta_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_remote_numeric_inner_outer_tmp_write_singleton
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_numeric"
+      --gtest-filter CombinedSchedulerTest.InnerOuterSingletonVectorWidth
+      --case-key jev_remote_numeric_inner_outer_tmp_write_singleton
+      --site-prefix IOP --required-site IOP3.storage
+      --protocol semantic-v3
+      --expect-no-choice IOP3.tmp_write_width=w1
+      --expect-no-choice-reason "only one hard-valid temporary write width"
+      --expect-no-choice-source hard_legal_singleton)
+  set_tests_properties(jev_remote_numeric_inner_outer_tmp_write_singleton
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_min_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.min_batch --alternate b1
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_min_batch
+      --require-iop3-min-batch)
+  set_tests_properties(jev_alternate_numeric_inner_outer_min_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_grid_rows
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.grid_rows --alternate r4
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_grid_rows
+      --require-iop3-grid-rows)
+  set_tests_properties(jev_alternate_numeric_inner_outer_grid_rows PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_iop3_compact_grid_rows
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.grid_rows --alternate r4
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_iop3_grid_compact
+      --protocol semantic-v3 --require-iop3-grid-rows)
+  set_tests_properties(jev_alternate_numeric_iop3_compact_grid_rows PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_inner_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.inner_width --alternate w2
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_inner_width
+      --require-iop3-inner-width)
+  set_tests_properties(jev_alternate_numeric_inner_outer_inner_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_iop3_singleton_lineage
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.inner_width --alternate w2
+      --gtest CombinedSchedulerTest.JevLayerNormBackwardSingletonCta
+      --case-key jev_alternate_numeric_iop3_singleton_lineage
+      --protocol semantic-v3 --require-iop3-singleton-lineage)
+  set_tests_properties(jev_alternate_numeric_iop3_singleton_lineage
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_storage
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.storage --alternate register
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_storage
+      --require-iop3-storage)
+  set_tests_properties(jev_alternate_numeric_inner_outer_storage PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_tmp_write_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.tmp_write_width --alternate w2
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_tmp_write_width
+      --require-iop3-tmp-write)
+  set_tests_properties(jev_alternate_numeric_inner_outer_tmp_write_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_tmp_read_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.tmp_read_width --alternate w1
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_tmp_read_width
+      --require-iop3-tmp-read)
+  set_tests_properties(jev_alternate_numeric_inner_outer_tmp_read_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_outer_tmp_read_width_4
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IOP3.tmp_read_width --alternate w4
+      --gtest CombinedSchedulerTest.InnerOuterNoOuterBroadcastTv
+      --case-key jev_alternate_numeric_inner_outer_tmp_read_width_4
+      --require-iop3-tmp-read)
+  set_tests_properties(jev_alternate_numeric_inner_outer_tmp_read_width_4 PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+
+  # This exercises the TMA parameter decisions through the real API on SM89.
+  # The GTest constructs scheduler parameters but never launches a TMA kernel.
+  add_test(NAME jev_remote_analysis_pointwise_tma
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_remote_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --gtest-filter "PointwiseTest.TmaDomainTargetExternalModeAnalysis"
+      --case-key jev_remote_numeric_pointwise_tma_analysis
+      --site-prefix PW --required-site PW4.domain_inner --analysis-only
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_remote_analysis")
+  set_tests_properties(jev_remote_analysis_pointwise_tma PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+
+  # A focused, test-only API override chooses a legal non-native inner-grid
+  # candidate and checks the exact GTest's numerical reference and wire logs.
+  add_test(NAME jev_alternate_numeric_inner_grid
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric")
+  set_tests_properties(jev_alternate_numeric_inner_grid PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_cta_envelope
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD3.cta --alternate t64
+      --gtest Gpu1Test.JevAlternateInnerCtaEnvelope_CUDA
+      --case-key jev_alternate_numeric_inner_cta_envelope
+      --require-inner-cta-envelope)
+  set_tests_properties(jev_alternate_numeric_inner_cta_envelope PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_iter_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD3.iter_unroll --alternate u2
+      --gtest Gpu1Test.JevAlternateInnerIterUnroll_CUDA
+      --case-key jev_alternate_numeric_inner_iter_unroll
+      --require-inner-iter-unroll)
+  set_tests_properties(jev_alternate_numeric_inner_iter_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_warp_target
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD3.warp --alternate m16
+      --gtest Gpu1Test.JevAlternateInnerWarpTarget_CUDA
+      --case-key jev_alternate_numeric_inner_warp_target
+      --require-inner-warp-target)
+  set_tests_properties(jev_alternate_numeric_inner_warp_target PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_warp_target
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.warp --alternate m4
+      --gtest Gpu1Test.JevAlternateInner3dWarpTarget_CUDA
+      --case-key jev_alternate_numeric_inner3d_warp_target
+      --require-inner3d-warp-target)
+  set_tests_properties(jev_alternate_numeric_inner3d_warp_target PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_warp_target_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.warp --alternate m4
+      --gtest Gpu1Test.JevAlternateInner3dWarpTarget_CUDA
+      --case-key jev_alternate_numeric_inner3d_warp_target_v3_effects
+      --protocol semantic-v3 --require-rd5-warp-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_warp_target_v3_effects
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_inner3d_cta_target
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.cta --alternate t64
+      --gtest Gpu1Test.JevAlternateInner3dCtaTarget_CUDA
+      --case-key jev_alternate_numeric_inner3d_cta_target
+      --require-inner3d-cta-target)
+  set_tests_properties(jev_alternate_numeric_inner3d_cta_target PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_cta_target_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.cta --alternate t64
+      --gtest Gpu1Test.JevAlternateInner3dCtaTarget_CUDA
+      --case-key jev_alternate_numeric_inner3d_cta_target_v3_effects
+      --protocol semantic-v3 --require-rd5-cta-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_cta_target_v3_effects
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_inner3d_cta_full
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.cta --alternate t128
+      --gtest Gpu1Test.JevAlternateInner3dCtaFull_CUDA
+      --case-key jev_alternate_numeric_inner3d_cta_full
+      --require-inner3d-cta-full)
+  set_tests_properties(jev_alternate_numeric_inner3d_cta_full PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_cta_full_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.cta --alternate t128
+      --gtest Gpu1Test.JevAlternateInner3dCtaFull_CUDA
+      --case-key jev_alternate_numeric_inner3d_cta_full_v3_effects
+      --protocol semantic-v3 --require-rd5-cta-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_cta_full_v3_effects
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_inner3d_work_split
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.work_split --alternate iter_first
+      --gtest Gpu1Test.JevAlternateInner3dWorkSplit_CUDA
+      --case-key jev_alternate_numeric_inner3d_work_split
+      --require-reduction-inner3d-work-split)
+  set_tests_properties(jev_alternate_numeric_inner3d_work_split PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_waves
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.waves --alternate waves8
+      --gtest Gpu1Test.JevAlternateInner3dWaves_CUDA
+      --case-key jev_alternate_numeric_inner3d_waves
+      --require-reduction-inner3d-waves)
+  set_tests_properties(jev_alternate_numeric_inner3d_waves PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_grid_wave
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.grid --alternate raw
+      --gtest Gpu1Test.JevAlternateInner3dGridWave_CUDA
+      --case-key jev_alternate_numeric_inner3d_grid_wave
+      --require-inner3d-grid-wave)
+  set_tests_properties(jev_alternate_numeric_inner3d_grid_wave PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_outer_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.outer_unroll --alternate u1
+      --gtest Gpu1Test.JevAlternateInner3dOuterUnroll_CUDA
+      --case-key jev_alternate_numeric_inner3d_outer_unroll
+      --require-reduction-inner3d-outer-unroll)
+  set_tests_properties(jev_alternate_numeric_inner3d_outer_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.width
+      --alternate w1
+      --gtest Gpu1Test.JevAlternateInner3dWidth_CUDA
+      --case-key jev_alternate_numeric_inner3d_width)
+  set_tests_properties(jev_alternate_numeric_inner3d_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_width_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.width --alternate w1
+      --gtest Gpu1Test.JevAlternateInner3dWidth_CUDA
+      --case-key jev_alternate_numeric_inner3d_width_v3_effects
+      --protocol semantic-v3 --require-rd5-width-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_width_v3_effects PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_inner3d_width_v3_partial
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD5.width --alternate w2
+      --gtest Gpu1Test.JevAlternateInner3dWidth_CUDA
+      --case-key jev_alternate_numeric_inner3d_width_v3_partial
+      --protocol semantic-v3 --require-rd5-width-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner3d_width_v3_partial PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_outer_warp
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.warp --alternate warp32
+      --gtest Gpu1Test.JevAlternateOuterWarp_CUDA
+      --case-key jev_alternate_numeric_outer_warp --require-grid)
+  set_tests_properties(jev_alternate_numeric_outer_warp PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.width --alternate w1
+      --gtest Gpu1Test.JevAlternateOuterWidth_CUDA
+      --case-key jev_alternate_numeric_outer_width --require-outer-width)
+  set_tests_properties(jev_alternate_numeric_outer_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.unroll --alternate u1
+      --gtest Gpu1Test.JevAlternateOuterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_unroll
+      --require-outer-unroll)
+  set_tests_properties(jev_alternate_numeric_outer_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_unroll_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.unroll --alternate u1
+      --gtest Gpu1Test.JevAlternateOuterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_unroll_v3_effects
+      --protocol semantic-v3 --require-rd9-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_outer_unroll_v3_effects PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_outer_cta
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.cta --alternate q8
+      --gtest Gpu1Test.JevAlternateOuterCta_CUDA
+      --case-key jev_alternate_numeric_outer_cta --require-outer-cta)
+  set_tests_properties(jev_alternate_numeric_outer_cta PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_ragged
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.ragged --alternate raw
+      --gtest Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_alternate_numeric_outer_ragged --require-outer-ragged)
+  set_tests_properties(jev_alternate_numeric_outer_ragged PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_ragged_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.ragged --alternate raw
+      --gtest Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_alternate_numeric_outer_ragged_v3_effects
+      --protocol semantic-v3 --require-rd9-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_outer_ragged_v3_effects PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_reduction_outer_grid_base
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.grid_base --alternate wave
+      --gtest Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_alternate_numeric_reduction_outer_grid_base
+      --require-outer-grid-base)
+  set_tests_properties(jev_alternate_numeric_reduction_outer_grid_base PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_reduction_outer_grid_base_v3_effects
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site RD9.grid_base --alternate wave
+      --gtest Gpu1Test.JevAlternateOuterRagged_CUDA
+      --case-key jev_alternate_numeric_reduction_outer_grid_base_v3_effects
+      --protocol semantic-v3 --require-rd9-effects --require-sm89)
+  set_tests_properties(jev_alternate_numeric_reduction_outer_grid_base_v3_effects
+    PROPERTIES RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_outer_grid_base
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP2.base
+      --alternate x16_y8_b8
+      --gtest Gpu3Test.TemplateFunctionTypeMismatch
+      --case-key jev_alternate_numeric_outer_grid_base)
+  set_tests_properties(jev_alternate_numeric_outer_grid_base PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_grid_register_envelope
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP2.base
+      --alternate x11_y11_b16
+      --gtest Gpu3Test.TemplateFunctionTypeMismatch
+      --case-key jev_alternate_numeric_outer_grid_register_envelope)
+  set_tests_properties(jev_alternate_numeric_outer_grid_register_envelope PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_grid_unswitch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP2.unswitch
+      --alternate u4
+      --gtest Gpu3Test.TemplateFunctionTypeMismatch
+      --case-key jev_alternate_numeric_outer_grid_unswitch)
+  set_tests_properties(jev_alternate_numeric_outer_grid_unswitch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_targets
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.targets --alternate o32_w16
+      --gtest Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA
+      --case-key jev_alternate_numeric_inner_targets --require-inner-targets)
+  set_tests_properties(jev_alternate_numeric_inner_targets PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_targets_v2
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.targets --alternate o32_w16
+      --gtest Gpu1Test.FusionMagicSchedulerLayerNormalization_CUDA
+      --case-key jev_alternate_numeric_inner_targets_v2
+      --protocol semantic-v3 --require-inner-targets)
+  set_tests_properties(jev_alternate_numeric_inner_targets_v2 PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_targets_v2_multibatch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.targets --alternate o32_w16
+      --gtest Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA
+      --case-key jev_alternate_numeric_inner_targets_v2_multibatch
+      --protocol semantic-v3 --require-inner-targets)
+  set_tests_properties(jev_alternate_numeric_inner_targets_v2_multibatch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_target_physical_gate
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.targets --alternate o32_w28
+      --gtest Gpu1Test.JevInner2DTargetPhysicalGate_CUDA
+      --case-key jev_inner_target_physical_gate
+      --protocol semantic-v3 --require-sm89
+      --require-inner-target-physical-gate)
+  set_tests_properties(jev_alternate_numeric_inner_target_physical_gate PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_inner_register_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.width --alternate w1
+      --gtest Gpu1Test.FusionMagicSchedulerRMSNormalization_CUDA
+      --case-key jev_alternate_numeric_inner_register_width
+      --require-inner-width)
+  set_tests_properties(jev_alternate_numeric_inner_register_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_register_batch_cap
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.batch --alternate b12
+      --gtest Gpu1Test.JevAlternateInnerRegisterBatchCap_CUDA
+      --case-key jev_alternate_numeric_inner_register_batch_cap
+      --require-inner-batch-cap)
+  set_tests_properties(jev_alternate_numeric_inner_register_batch_cap PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_register_cta_seed
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.cta_seed --alternate t512
+      --gtest Gpu1Test.JevAlternateInnerRegisterCTASeed_CUDA
+      --case-key jev_alternate_numeric_inner_register_cta_seed
+      --require-inner-cta-seed)
+  set_tests_properties(jev_alternate_numeric_inner_register_cta_seed PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner_register_magic_zero
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP5.magic_zero --alternate off
+      --gtest Gpu1Test.JevAlternateInnerRegisterMagicZero_CUDA
+      --case-key jev_alternate_numeric_inner_register_magic_zero
+      --require-inner-magic-zero --require-sm89)
+  set_tests_properties(jev_alternate_numeric_inner_register_magic_zero PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+  add_test(NAME jev_alternate_numeric_inner_storage
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP4.storage --alternate shared
+      --gtest Gpu1Test.JevAlternateInnerStorage_CUDA
+      --case-key jev_alternate_numeric_inner_storage
+      --require-inner-storage)
+  set_tests_properties(jev_alternate_numeric_inner_storage PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_warp
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.warp --alternate warp16
+      --gtest Gpu1Test.JevAlternateInner3dPersistentWarp_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_warp
+      --require-inner3d-warp)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_warp PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_occupancy
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.occupancy --alternate occ16
+      --gtest Gpu1Test.JevAlternateInner3dPersistentWarp_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_occupancy
+      --require-inner3d-occupancy)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_occupancy PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_width
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.width --alternate w2
+      --gtest Gpu1Test.JevAlternateInner3dPersistentWidth_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_width
+      --require-inner3d-width)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_width PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_outer_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.outer_unroll --alternate u2
+      --gtest Gpu1Test.JevAlternateInner3dPersistentOuterUnroll_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_outer_unroll
+      --require-inner3d-outer-unroll)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_outer_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_work_split
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.work_split --alternate iter_first
+      --gtest Gpu1Test.JevAlternateInner3dPersistentWorkSplit_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_work_split
+      --require-inner3d-work-split)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_work_split PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_register_overhead
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.reg_overhead --alternate r40
+      --gtest Gpu1Test.JevAlternateInner3dPersistentRegisterOverhead_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_register_overhead
+      --require-inner3d-register-overhead)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_register_overhead PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_inner3d_persistent_cta_floor
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site IP6.cta_floor --alternate floor32
+      --gtest Gpu1Test.JevAlternateInner3dPersistentCtaFloor_CUDA
+      --case-key jev_alternate_numeric_inner3d_persistent_cta_floor)
+  set_tests_properties(jev_alternate_numeric_inner3d_persistent_cta_floor PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_iter_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.unroll --alternate u2
+      --gtest Gpu3Test.JevAlternateOuterIterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_iter_unroll)
+  set_tests_properties(jev_alternate_numeric_outer_iter_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_iter_unroll_semantic_v3
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.unroll --alternate u2
+      --protocol semantic-v3 --require-outer-iter-unroll-effects
+      --gtest Gpu3Test.JevAlternateOuterIterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_iter_unroll_semantic_v3)
+  set_tests_properties(jev_alternate_numeric_outer_iter_unroll_semantic_v3 PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_batch_menu
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.cta --alternate x16_y8_b16
+      --gtest Gpu3Test.JevAlternateOuterIterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_batch_menu
+      --require-outer-batch-menu)
+  set_tests_properties(jev_alternate_numeric_outer_batch_menu PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  # Force the earlier legal CTA split for the exact seven-batch native case.
+  # The GTest computes this same plan twice; require both Choice responses to
+  # select the alternate and check the generated output against fp32 ATen.
+  add_test(NAME jev_alternate_numeric_op3_instance_norm_half
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.cta --alternate x32_y4_b13
+      --expected-site-calls 2
+      --gtest Gpu3Test.JevInstanceNormNhwcHalfCta_CUDA
+      --case-key jev_alternate_numeric_op3_instance_norm_half
+      --require-sm89)
+  set_tests_properties(jev_alternate_numeric_op3_instance_norm_half PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu
+    SKIP_RETURN_CODE 77
+    FAIL_REGULAR_EXPRESSION "Running 0 tests|\\[  PASSED  \\] 0 tests?\\.")
+  add_test(NAME jev_alternate_numeric_outer_redu_unroll
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.redu_unroll --alternate r2
+      --gtest Gpu3Test.JevAlternateOuterIterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_redu_unroll)
+  set_tests_properties(jev_alternate_numeric_outer_redu_unroll PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_outer_redu_unroll_four
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_nvfuser>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site OP3.redu_unroll --alternate r4
+      --gtest Gpu3Test.JevAlternateOuterIterUnroll_CUDA
+      --case-key jev_alternate_numeric_outer_redu_unroll_four)
+  set_tests_properties(jev_alternate_numeric_outer_redu_unroll_four PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_greedy_argsort_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_greedy>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site GR1.argsort_batch --alternate b4
+      --gtest GreedySchedulerTest.JevAlternateArgsortBatch_CUDA
+      --case-key jev_alternate_numeric_greedy_argsort_batch)
+  set_tests_properties(jev_alternate_numeric_greedy_argsort_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_greedy_scatter_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_greedy>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site GR1.scatter_batch --alternate b4
+      --gtest GreedySchedulerTest.JevAlternateScatterBatch_CUDA
+      --case-key jev_alternate_numeric_greedy_scatter_batch)
+  set_tests_properties(jev_alternate_numeric_greedy_scatter_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_greedy_multi_scan_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_greedy>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site GR1.multi_scan_batch --alternate b4
+      --gtest GreedySchedulerTest.JevAlternateMultiScanBatch_CUDA
+      --case-key jev_alternate_numeric_greedy_multi_scan_batch)
+  set_tests_properties(jev_alternate_numeric_greedy_multi_scan_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_greedy_three_scan_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_greedy>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site GR1.multi_scan_batch --alternate b4
+      --gtest GreedySchedulerTest.JevAlternateThreeScanBatch_CUDA
+      --case-key jev_alternate_numeric_greedy_three_scan_batch)
+  set_tests_properties(jev_alternate_numeric_greedy_three_scan_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+  add_test(NAME jev_alternate_numeric_greedy_four_scan_batch
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+      --binary "$<TARGET_FILE:test_greedy>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+      --site GR1.multi_scan_batch --alternate b4
+      --gtest GreedySchedulerTest.JevAlternateFourScanBatch_CUDA
+      --case-key jev_alternate_numeric_greedy_four_scan_batch)
+  set_tests_properties(jev_alternate_numeric_greedy_four_scan_batch PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu)
+
+  foreach(scan_count RANGE 1 4)
+    if(scan_count EQUAL 1)
+      set(scan_site GR1.scan_batch)
+      set(scan_fixture JevAlternateSingleScanBatch_CUDA)
+    elseif(scan_count EQUAL 2)
+      set(scan_site GR1.multi_scan_batch)
+      set(scan_fixture JevAlternateMultiScanBatch_CUDA)
+    elseif(scan_count EQUAL 3)
+      set(scan_site GR1.multi_scan_batch)
+      set(scan_fixture JevAlternateThreeScanBatch_CUDA)
+    else()
+      set(scan_site GR1.multi_scan_batch)
+      set(scan_fixture JevAlternateFourScanBatch_CUDA)
+    endif()
+    set(scan_test jev_alternate_numeric_greedy_scan_effects_${scan_count})
+    add_test(NAME ${scan_test}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+        --binary "$<TARGET_FILE:test_greedy>"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+        --site ${scan_site} --alternate b4
+        --gtest GreedySchedulerTest.${scan_fixture}
+        --case-key ${scan_test}
+        --protocol semantic-v3 --require-sm89
+        --scan-count ${scan_count} --require-greedy-scan-effects)
+    set_tests_properties(${scan_test} PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+
+    set(scan_b8_test jev_alternate_numeric_greedy_scan_effects_b8_${scan_count})
+    add_test(NAME ${scan_b8_test}
+      COMMAND "${Python_EXECUTABLE}"
+        "${NVFUSER_ROOT}/tests/cpp/jev_alternate_numeric.py"
+        --binary "$<TARGET_FILE:test_greedy>"
+        --artifacts-root "${CMAKE_BINARY_DIR}/jev_alternate_numeric"
+        --site ${scan_site} --alternate b8
+        --gtest GreedySchedulerTest.${scan_fixture}
+        --case-key ${scan_b8_test}
+        --protocol semantic-v3 --require-sm89
+        --scan-count ${scan_count} --require-greedy-scan-effects)
+    set_tests_properties(${scan_b8_test} PROPERTIES
+      RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77
+      ENVIRONMENT "JEV_EXPECTED_SCAN_BATCH=8")
+  endforeach()
 
   add_custom_target(tests DEPENDS ${TEST_BINARIES})
 endif()
@@ -1116,9 +2432,11 @@ if(BUILD_NVFUSER_BENCHMARK)
     ${NVFUSER_ROOT}/benchmarks/cpp/broadcast.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/gelu_backward.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/gelu_backward_reduction.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/greedy.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/heuristic_cache.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/heuristic_lookup.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/indexselect.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/inner_persistent_3d_jev.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/instance_norm.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/layer_norm.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/layer_norm_backward.cpp
@@ -1127,7 +2445,11 @@ if(BUILD_NVFUSER_BENCHMARK)
     ${NVFUSER_ROOT}/benchmarks/cpp/main.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/many_pointwise_ops.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/matmul.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/outer_persistent_2welford_jev.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/reduction.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/reduction_2d_odd_jev.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/reduction_3d_jev.cpp
+    ${NVFUSER_ROOT}/benchmarks/cpp/resize.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/rms_norm.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/rms_norm_backward.cpp
     ${NVFUSER_ROOT}/benchmarks/cpp/scale_bias_relu.cpp
@@ -1162,6 +2484,9 @@ if(BUILD_NVFUSER_BENCHMARK)
   target_include_directories(nvfuser_bench SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/benchmark/include
     ${CMAKE_SOURCE_DIR}/third_party/googletest/googletest/include
+    # Keep compiler CUDA headers ahead of transitive CUDA/Torch headers.
+    ${CMAKE_SOURCE_DIR}/third_party/googletest/googletest
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
   )
   target_include_directories(nvfuser_bench PUBLIC ${NVFUSER_ROOT})
   target_link_libraries(nvfuser_bench PRIVATE
@@ -1205,6 +2530,41 @@ if(BUILD_NVFUSER_BENCHMARK)
       )
     endif()
   endif()
+endif()
+
+if(BUILD_TEST AND BUILD_NVFUSER_BENCHMARK)
+  # Check the optional pre-timing native reference against representative
+  # benchmark families, including one Remote plan that differs from native.
+  # A separate JSONL sidecar must not alter Remote decision/outcome lineage.
+  add_test(NAME jev_benchmark_numeric_gate
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_benchmark_numeric_gate.py"
+      --binary "$<TARGET_FILE:nvfuser_bench>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_benchmark_numeric_gate")
+  set_tests_properties(jev_benchmark_numeric_gate PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+
+  # The native batch-norm 3D plan can run even when the stricter Choice-menu
+  # resource check rejects its register estimate. Both traced modes must keep
+  # that exact native plan without contacting the API.
+  add_test(NAME ip6_native_preflight_fallback
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_ip6_native_fallback.py"
+      --binary "$<TARGET_FILE:nvfuser_bench>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_ip6_native_fallback")
+  set_tests_properties(ip6_native_preflight_fallback PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+
+  # The native inner 2D plan also remains valid when its Choice-menu proof
+  # rejects the two large softmax shapes. Keep this outside the Jev 80-test
+  # denominator and check its fallback independently.
+  add_test(NAME ip5_native_preflight_fallback
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_ip5_native_fallback.py"
+      --binary "$<TARGET_FILE:nvfuser_bench>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_ip5_native_fallback")
+  set_tests_properties(ip5_native_preflight_fallback PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
 endif()
 
 # --- generate runtime files

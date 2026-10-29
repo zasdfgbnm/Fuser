@@ -6,8 +6,11 @@
  */
 // clang-format on
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -21,10 +24,12 @@
 
 #include "exceptions.h"
 #include "grouped_reduction.h"
+#include "ir/builder.h"
 #include "ir/utils.h"
 #include "ops/all_ops.h"
 #include "runtime/fusion_executor_cache.h"
 #include "scheduler/all_schedulers.h"
+#include "scheduler/jev_client.h"
 #include "scheduler/normalization_utils.h"
 #include "scheduler/reduction_utils.h"
 #include "scheduler/tools/inlining.h"
@@ -921,6 +926,24 @@ TEST_F(CombinedSchedulerTest, InnerOuterNoOuterBroadcastTv) {
   NVF_CHECK(
       !persistent_params->project_persistent_buffers,
       "Shouldn't project persistent buffers to inputs!");
+  ASSERT_NE(cg_results.kernel_executor->compiledKernel(), nullptr);
+  EXPECT_EQ(
+      cg_results.kernel_executor->compiledKernel()->compileParams().maxrregcount,
+      persistent_params->cparams.maxrregcount);
+  EXPECT_EQ(
+      cg_results.kernel_executor->compiledKernel()->maxrregcountHighWatermark(),
+      persistent_params->cparams.maxrregcount);
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  const char* case_key = std::getenv("NVFUSER_JEV_CASE_KEY");
+  if (device->major == 8 && device->minor == 9 &&
+      device->multiProcessorCount == 128 &&
+      case_key != nullptr &&
+      std::string_view(case_key) ==
+          "jev_alternate_numeric_inner_outer_min_batch") {
+    EXPECT_EQ(
+        persistent_params->cparams.maxrregcount,
+        scheduler::jev::mode() == scheduler::jev::Mode::Remote ? 128 : 255);
+  }
 
   auto t1 = t0.sum({1});
   auto t2 = t1.unsqueeze(-1);
@@ -935,6 +958,131 @@ TEST_F(CombinedSchedulerTest, InnerOuterNoOuterBroadcastTv) {
       __FILE__,
       "",
       persistent_params->lparams);
+}
+
+// Match the small fp16 LayerNorm backward benchmark whose native multiwave
+// search has exactly one hard-valid CTA. Keep the numerical reference here so
+// a local singleton decision still exercises the complete generated kernel.
+TEST_F(CombinedSchedulerTest, JevLayerNormBackwardSingletonCta) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  constexpr int64_t batch_size = 160, hidden_size = 512;
+  const std::vector<int64_t> norm_shape{hidden_size};
+  const std::vector<int64_t> input_shape{batch_size, hidden_size};
+
+  auto grad_out = makeContigTensor(2, DataType::Half);
+  auto input = makeContigTensor(2, DataType::Half);
+  auto weight = makeContigTensor(1, DataType::Half);
+  auto bias = makeContigTensor(1, DataType::Half);
+  auto mean = TensorViewBuilder()
+                  .contiguity({false, std::nullopt})
+                  .shape({-1, 1})
+                  .dtype(DataType::Float)
+                  .build();
+  auto rstd = TensorViewBuilder()
+                  .contiguity({false, std::nullopt})
+                  .shape({-1, 1})
+                  .dtype(DataType::Float)
+                  .build();
+  fusion.addInput(grad_out);
+  fusion.addInput(input);
+  fusion.addInput(weight);
+  fusion.addInput(bias);
+  fusion.addInput(mean);
+  fusion.addInput(rstd);
+
+  auto grad_out_fp32 = castOp(DataType::Float, grad_out);
+  auto input_fp32 = castOp(DataType::Float, input);
+  auto weight_fp32 = castOp(DataType::Float, weight);
+  auto bias_fp32 = castOp(DataType::Float, bias);
+  auto grads = layer_norm_backward(
+      grad_out_fp32,
+      input_fp32,
+      {1},
+      mean,
+      rstd,
+      weight_fp32,
+      bias_fp32,
+      {true, true, true});
+  fusion.addOutput(castOp(DataType::Half, grads.grad_input));
+  fusion.addOutput(castOp(DataType::Half, grads.grad_bias));
+  fusion.addOutput(castOp(DataType::Half, grads.grad_weight));
+
+  auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  auto grad_out_at = at::randn(input_shape, options);
+  auto input_at = at::randn(input_shape, options);
+  auto weight_at = at::randn(norm_shape, options);
+  auto bias_at = at::randn(norm_shape, options);
+  constexpr float epsilon = 1e-5;
+  auto stats = at::native_layer_norm(
+      input_at, norm_shape, weight_at, bias_at, epsilon);
+  auto mean_at = std::get<1>(stats);
+  auto rstd_at = std::get<2>(stats);
+  auto result = scheduleAndRun(
+      &fusion,
+      SchedulerType::InnerOuterPersistent,
+      {grad_out_at, input_at, weight_at, bias_at, mean_at, rstd_at});
+  auto reference = at::native_layer_norm_backward(
+      grad_out_at,
+      input_at,
+      norm_shape,
+      mean_at,
+      rstd_at,
+      weight_at,
+      bias_at,
+      {true, true, true});
+  testValidate(
+      &fusion,
+      result.outputs,
+      {grad_out_at, input_at, weight_at, bias_at, mean_at, rstd_at},
+      {std::get<0>(reference),
+       std::get<2>(reference),
+       std::get<1>(reference)},
+      __LINE__,
+      __FILE__,
+      "",
+      result.heuristic_params->lparams);
+}
+
+// An odd inner extent has a hard maximum vector width of one. The native
+// multiwave plan is the only IOP3.inner_width candidate and still has to run
+// in remote mode, with downstream choices delegated as usual.
+TEST_F(CombinedSchedulerTest, InnerOuterSingletonVectorWidth) {
+  std::unique_ptr<Fusion> fusion_ptr = std::make_unique<Fusion>();
+  Fusion& fusion = *fusion_ptr;
+  FusionGuard fg(&fusion);
+
+  constexpr int64_t dim0 = 1024, dim1 = 1987;
+  auto tv0 = makeContigTensor(2);
+  fusion.addInput(tv0);
+  auto tv1 = sum(tv0, {1});
+  auto tv2 = broadcast(tv1, {false, true});
+  auto tv3 = add(tv2, tv0);
+  auto tv4 = sum(tv0, {0});
+  fusion.addOutput(tv3);
+  fusion.addOutput(tv4);
+
+  auto options = at::TensorOptions().dtype(at::kFloat).device(at::kCUDA, 0);
+  at::Tensor input = at::randn({dim0, dim1}, options);
+  auto result =
+      scheduleAndRun(&fusion, SchedulerType::InnerOuterPersistent, {input});
+  const auto* params = result.heuristic_params->as<ReductionParams>();
+  NVF_CHECK(
+      params->unroll_factor_inner_reduction == 1,
+      "Odd inner extent must have a singleton vector width");
+
+  auto inner_sum = input.sum({1});
+  auto expected_pointwise = input + inner_sum.unsqueeze(-1);
+  auto expected_outer_sum = input.sum({0});
+  testValidate(
+      &fusion,
+      result.outputs,
+      {input},
+      {expected_pointwise, expected_outer_sum},
+      __LINE__,
+      __FILE__,
+      "",
+      params->lparams);
 }
 
 // Reproduce error found in:

@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <locale>
 #include <queue>
 #include <ranges>
+#include <sstream>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -911,6 +913,10 @@ getScopePersistenceFactors(
   // Processing projectable persistent buffers is a little more complex, simply
   // because we have to line up inputs with their persistent buffers.
 
+  NVF_ERROR(
+      persistent_buffer_resolution_points.size() == persistent_buffers.size(),
+      "Persistent buffers and resolution points must correspond");
+
   // Offset into the bool vector
   size_t bool_vector_offset = persistent_buffers.size();
   for (auto projectable_persistent_buffer_i :
@@ -918,6 +924,19 @@ getScopePersistenceFactors(
     auto projectable_persistent_buffer =
         projectable_persistent_buffers[projectable_persistent_buffer_i];
     auto inputs = ir_utils::inputTvsOf(projectable_persistent_buffer);
+
+    // projectable_persistent_buffers is a filtered subset, not necessarily a
+    // prefix of persistent_buffers. Resolution points use the full buffer
+    // order, so recover that index by TV identity before looking them up.
+    auto persistent_it = std::ranges::find(
+        persistent_buffers, projectable_persistent_buffer);
+    NVF_ERROR(
+        persistent_it != persistent_buffers.end(),
+        "Projectable buffer is missing from persistent buffers");
+    const auto persistent_buffer_i =
+        std::distance(persistent_buffers.begin(), persistent_it);
+    const auto& resolution_points =
+        persistent_buffer_resolution_points[persistent_buffer_i];
 
     for (auto input : inputs) {
       auto input_it = std::ranges::find(projectable_buffer_inputs, input);
@@ -936,9 +955,6 @@ getScopePersistenceFactors(
       // If we project persistence from the persistent buffers to the inputs,
       // then it would have to be active from the resolution points of the
       // persistent buffer all the way back to the projected inputs.
-      auto resolution_points =
-          persistent_buffer_resolution_points[projectable_persistent_buffer_i];
-
       for (auto val : DependencyCheck::getAllValsBetween(
                {input}, {resolution_points.begin(), resolution_points.end()})) {
         // Persistent normalization kernels imply that all persistent buffers
@@ -1034,8 +1050,13 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     const PersistentBufferInfo& persistent_buffer_info,
-    HeuristicDataCache* data_cache) {
+    HeuristicDataCache* data_cache,
+    PersistentProjectionLedger* ledger) {
   FUSER_PERF_SCOPE("scheduler_utils::persistentBufferSizeBit");
+
+  if (ledger != nullptr) {
+    *ledger = {};
+  }
 
   if (persistent_buffer_info.persistent_buffers.empty()) {
     PersistentBufferSizeReturn empty_sizes;
@@ -1084,6 +1105,17 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
     if (std::ranges::find(projectable_buffers, buffer) !=
         projectable_buffers.end()) {
       projected_mask[buffer_i] = false;
+    }
+  }
+
+  if (ledger != nullptr) {
+    ledger->buffers.reserve(all_buffers.size());
+    for (auto buffer_i : arange(all_buffers.size())) {
+      ledger->buffers.push_back({
+          all_buffers[buffer_i],
+          persistent_buffer_sizes_bit[buffer_i],
+          persistent_mask[buffer_i],
+          projected_mask[buffer_i]});
     }
   }
 
@@ -1141,6 +1173,25 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
         all_buffers);
     max_proj_persistence_size_bit =
         std::max(max_proj_persistence_size_bit, projected_buffer_size_bit);
+    if (ledger != nullptr) {
+      ledger->scopes.push_back({
+          entry.first,
+          std::move(active_buffers),
+          persistent_buffer_size_bit,
+          projected_buffer_size_bit});
+    }
+  }
+
+  if (ledger != nullptr) {
+    // The native maximum is independent of unordered-map iteration order.
+    // A stable scope order makes a later wire exporter deterministic.
+    std::ranges::sort(ledger->scopes, [](const auto& left, const auto& right) {
+      if (left.scope->vtype() != right.scope->vtype()) {
+        return static_cast<int64_t>(left.scope->vtype()) <
+            static_cast<int64_t>(right.scope->vtype());
+      }
+      return left.scope->name() < right.scope->name();
+    });
   }
 
   PersistentBufferSizeReturn persistent_buffer_size_bit;
@@ -1148,7 +1199,56 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
       max_persistence_size_bit;
   persistent_buffer_size_bit.projected_persistent_buffer_size_bit =
       max_proj_persistence_size_bit;
+  if (ledger != nullptr) {
+    ledger->maxima = persistent_buffer_size_bit;
+  }
   return persistent_buffer_size_bit;
+}
+
+std::string persistentProjectionLedgerJson(
+    const PersistentProjectionLedger& ledger) {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  const auto val_key = [&out](const Val* val) {
+    NVF_ERROR(val != nullptr, "Persistent projection ledger has a null Val");
+    out << '[' << static_cast<int64_t>(val->vtype()) << ',' << val->name()
+        << ']';
+  };
+  out << "{\"schema\":\"nvfuser.inner_persistent.projection_ledger.v1\","
+         "\"buffers\":[";
+  for (size_t i = 0; i < ledger.buffers.size(); ++i) {
+    const auto& buffer = ledger.buffers[i];
+    if (i != 0) out << ',';
+    out << "{\"val_key\":";
+    val_key(buffer.buffer);
+    out << ",\"size_bit\":" << buffer.size_bit
+        << ",\"keep\":"
+        << (buffer.included_without_projection ? "true" : "false")
+        << ",\"project\":"
+        << (buffer.included_with_projection ? "true" : "false") << '}';
+  }
+  out << "],\"scopes\":[";
+  for (size_t i = 0; i < ledger.scopes.size(); ++i) {
+    const auto& scope = ledger.scopes[i];
+    NVF_ERROR(
+        scope.active_buffers.size() == ledger.buffers.size(),
+        "Persistent projection ledger scope width differs");
+    if (i != 0) out << ',';
+    out << "{\"val_key\":";
+    val_key(scope.scope);
+    out << ",\"active\":[";
+    for (size_t j = 0; j < scope.active_buffers.size(); ++j) {
+      if (j != 0) out << ',';
+      out << (scope.active_buffers[j] ? "true" : "false");
+    }
+    out << "],\"keep_bits\":" << scope.size_without_projection_bit
+        << ",\"project_bits\":" << scope.size_with_projection_bit << '}';
+  }
+  out << "],\"maxima\":{\"keep_bits\":"
+      << ledger.maxima.persistent_buffer_size_bit
+      << ",\"project_bits\":"
+      << ledger.maxima.projected_persistent_buffer_size_bit << "}}";
+  return out.str();
 }
 
 std::pair<bool, bool> canonicalizeReduction(
@@ -1438,6 +1538,47 @@ void applyPDL(
   }
 }
 
+namespace {
+
+// Keep this predicate shared with the read-only eligibility query. The
+// returned uses are exactly those that cacheInputs replaces with its cache.
+std::vector<Expr*> cacheableInputUses(TensorView* tv) {
+  if (tv == nullptr || tv->nDims() == 0 || tv->uses().empty() ||
+      ir_utils::isIndexSelectLookupTv(tv) ||
+      ir_utils::isTvUsedByOpsOfType<SelectOp>(tv)) {
+    // Select/gather/index-select lookup tensors must remain in global memory.
+    return {};
+  }
+
+  // Pad and Slice inputs are vectorized directly. Gather lookups and grouped
+  // matmul offsets must likewise remain in global memory.
+  auto is_gather_lookup_use = [tv](Expr* use) {
+    return use->isA<GatherOp>() && use->as<GatherOp>()->lookupTv() == tv;
+  };
+  auto is_group_offsets_use = [tv](Expr* use) {
+    if (auto op = dynamic_cast<PreprocessGroupedMatmulInputSf*>(use)) {
+      return tv == op->inputOffsets() || tv == op->outputOffsets();
+    } else if (auto op = dynamic_cast<GroupedBlockQuantizationOp*>(use)) {
+      return tv == op->inputOffsets() || tv == op->outputOffsets();
+    }
+    return false;
+  };
+  std::vector<Expr*> cached_uses;
+  for (auto* use : tv->uses()) {
+    if (!use->isOneOf<PadOp, SliceOp>() && !is_gather_lookup_use(use) &&
+        !is_group_offsets_use(use)) {
+      cached_uses.push_back(use);
+    }
+  }
+  return cached_uses;
+}
+
+} // namespace
+
+bool canCacheFusionInput(TensorView* input) {
+  return !cacheableInputUses(input).empty();
+}
+
 // Returns the pairs of <cache, input_index> for each cached fusion input.
 // input_index is the position in fusion->inputs(). Otherwise return empty
 // vector.
@@ -1451,65 +1592,16 @@ std::vector<std::pair<TensorView*, int64_t>> cacheInputs(
   std::vector<std::pair<TensorView*, int64_t>> cached_inputs;
   // If we're going to unroll, make a cache of the inputs
   for (auto [input_idx, input] : enumerate(fusion->inputs())) {
-    auto tv = dynamic_cast<TensorView*>(input);
-    if (!tv) {
-      continue;
-    }
-
-    if (tv->nDims() == 0 || tv->uses().empty() ||
-        ir_utils::isIndexSelectLookupTv(tv) ||
-        ir_utils::isTvUsedByOpsOfType<SelectOp>(tv)) {
-      // Right now, tensors that are input to the select, gather and
-      // index_select ops can't be cached as they must be in global memory.
-      continue;
-    }
-
-    // TODO: might need to reverse this when scheduler handles pad directly
-    // Do not insert a cache for pad as vectorization needs to be
-    // done directly.
-    //
-    // Note that this means that if an input is padded and also is
-    // used without padding, it will be read twice, once for pad and
-    // once more for caching load. It would make sense to use the PTX
-    // caching load instructions.
-    // For gatherOp, the lookupTv should stay in global memory, don't replace
-    // the original lookupTv with the cached_tv.
-    auto isGatherLookUpTvInUse = [tv](Expr* use) {
-      if (!use->isA<GatherOp>()) {
-        return false;
-      }
-      return use->as<GatherOp>()->lookupTv() == tv;
-    };
-
-    // TODO: we might need to explicitly promote offsets to global memory
-    // We expect offsets to remain in global memory, so we do not add it to
-    // cache
-    auto isGroupOffsets = [tv](Expr* use) {
-      if (auto op = dynamic_cast<PreprocessGroupedMatmulInputSf*>(use)) {
-        return tv == op->inputOffsets() || tv == op->outputOffsets();
-      } else if (auto op = dynamic_cast<GroupedBlockQuantizationOp*>(use)) {
-        return tv == op->inputOffsets() || tv == op->outputOffsets();
-      }
-      return false;
-    };
-    std::vector<Expr*> cached_uses;
-    for (auto use : tv->uses()) {
-      if (!use->isOneOf<PadOp, SliceOp>() && !isGatherLookUpTvInUse(use) &&
-          !isGroupOffsets(use)) {
-        cached_uses.push_back(use);
-      }
-    }
-
+    auto* tv = dynamic_cast<TensorView*>(input);
+    auto cached_uses = cacheableInputUses(tv);
     if (cached_uses.empty()) {
       continue;
     }
-
-    auto cached_tv = tv->cacheAfter(
+    auto* cached_tv = tv->cacheAfter(
         /*op_type=*/LoadStoreOpType::Set,
         /*cache_op=*/CacheOp::Unspecified,
         /*propagate_allocation_domain=*/true,
         /*cached_uses=*/cached_uses);
-
     cached_inputs.emplace_back(cached_tv, input_idx);
   }
   return cached_inputs;

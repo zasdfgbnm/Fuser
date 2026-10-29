@@ -24,7 +24,8 @@ void getHeuristics(
     const int64_t hp_threads_per_block_min,
     const int64_t hp_threads_per_block_max,
     const bool project_to_input,
-    const PrimDataType index_type);
+    const PrimDataType index_type,
+    const bool enable_jev_choice = true);
 
 void scheduleFusion(Fusion* fusion, const ReductionParams* rparams);
 } // namespace inner_outer_multi_wave
