@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <locale>
 #include <queue>
 #include <ranges>
+#include <sstream>
 
 #include <ATen/cuda/CUDAContext.h>
 
@@ -1034,8 +1036,13 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
     Fusion* fusion,
     SchedulerRuntimeInfo& runtime_info,
     const PersistentBufferInfo& persistent_buffer_info,
-    HeuristicDataCache* data_cache) {
+    HeuristicDataCache* data_cache,
+    PersistentProjectionLedger* ledger) {
   FUSER_PERF_SCOPE("scheduler_utils::persistentBufferSizeBit");
+
+  if (ledger != nullptr) {
+    *ledger = {};
+  }
 
   if (persistent_buffer_info.persistent_buffers.empty()) {
     PersistentBufferSizeReturn empty_sizes;
@@ -1084,6 +1091,17 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
     if (std::ranges::find(projectable_buffers, buffer) !=
         projectable_buffers.end()) {
       projected_mask[buffer_i] = false;
+    }
+  }
+
+  if (ledger != nullptr) {
+    ledger->buffers.reserve(all_buffers.size());
+    for (auto buffer_i : arange(all_buffers.size())) {
+      ledger->buffers.push_back({
+          all_buffers[buffer_i],
+          persistent_buffer_sizes_bit[buffer_i],
+          persistent_mask[buffer_i],
+          projected_mask[buffer_i]});
     }
   }
 
@@ -1141,6 +1159,25 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
         all_buffers);
     max_proj_persistence_size_bit =
         std::max(max_proj_persistence_size_bit, projected_buffer_size_bit);
+    if (ledger != nullptr) {
+      ledger->scopes.push_back({
+          entry.first,
+          std::move(active_buffers),
+          persistent_buffer_size_bit,
+          projected_buffer_size_bit});
+    }
+  }
+
+  if (ledger != nullptr) {
+    // The native maximum is independent of unordered-map iteration order.
+    // A stable scope order makes a later wire exporter deterministic.
+    std::ranges::sort(ledger->scopes, [](const auto& left, const auto& right) {
+      if (left.scope->vtype() != right.scope->vtype()) {
+        return static_cast<int64_t>(left.scope->vtype()) <
+            static_cast<int64_t>(right.scope->vtype());
+      }
+      return left.scope->name() < right.scope->name();
+    });
   }
 
   PersistentBufferSizeReturn persistent_buffer_size_bit;
@@ -1148,7 +1185,56 @@ PersistentBufferSizeReturn persistentBufferSizeBit(
       max_persistence_size_bit;
   persistent_buffer_size_bit.projected_persistent_buffer_size_bit =
       max_proj_persistence_size_bit;
+  if (ledger != nullptr) {
+    ledger->maxima = persistent_buffer_size_bit;
+  }
   return persistent_buffer_size_bit;
+}
+
+std::string persistentProjectionLedgerJson(
+    const PersistentProjectionLedger& ledger) {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  const auto val_key = [&out](const Val* val) {
+    NVF_ERROR(val != nullptr, "Persistent projection ledger has a null Val");
+    out << '[' << static_cast<int64_t>(val->vtype()) << ',' << val->name()
+        << ']';
+  };
+  out << "{\"schema\":\"nvfuser.inner_persistent.projection_ledger.v1\","
+         "\"buffers\":[";
+  for (size_t i = 0; i < ledger.buffers.size(); ++i) {
+    const auto& buffer = ledger.buffers[i];
+    if (i != 0) out << ',';
+    out << "{\"val_key\":";
+    val_key(buffer.buffer);
+    out << ",\"size_bit\":" << buffer.size_bit
+        << ",\"keep\":"
+        << (buffer.included_without_projection ? "true" : "false")
+        << ",\"project\":"
+        << (buffer.included_with_projection ? "true" : "false") << '}';
+  }
+  out << "],\"scopes\":[";
+  for (size_t i = 0; i < ledger.scopes.size(); ++i) {
+    const auto& scope = ledger.scopes[i];
+    NVF_ERROR(
+        scope.active_buffers.size() == ledger.buffers.size(),
+        "Persistent projection ledger scope width differs");
+    if (i != 0) out << ',';
+    out << "{\"val_key\":";
+    val_key(scope.scope);
+    out << ",\"active\":[";
+    for (size_t j = 0; j < scope.active_buffers.size(); ++j) {
+      if (j != 0) out << ',';
+      out << (scope.active_buffers[j] ? "true" : "false");
+    }
+    out << "],\"keep_bits\":" << scope.size_without_projection_bit
+        << ",\"project_bits\":" << scope.size_with_projection_bit << '}';
+  }
+  out << "],\"maxima\":{\"keep_bits\":"
+      << ledger.maxima.persistent_buffer_size_bit
+      << ",\"project_bits\":"
+      << ledger.maxima.projected_persistent_buffer_size_bit << "}}";
+  return out.str();
 }
 
 std::pair<bool, bool> canonicalizeReduction(

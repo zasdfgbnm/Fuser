@@ -145,8 +145,10 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation2_CUDA) {
 
   // Schedule through magic scheduler
   SchedulerRuntimeInfo runtime_info(&fusion, {aten_t0});
+  scheduler_utils::PersistentProjectionLedger ledger;
   auto persistent_buffer_size_bit =
-      persistentBufferSizeBit(&fusion, runtime_info, persistent_buffer_info);
+      persistentBufferSizeBit(
+          &fusion, runtime_info, persistent_buffer_info, nullptr, &ledger);
 
   NVF_ERROR(
       persistent_buffer_size_bit.persistent_buffer_size_bit ==
@@ -154,6 +156,57 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation2_CUDA) {
   NVF_ERROR(
       persistent_buffer_size_bit.projected_persistent_buffer_size_bit ==
       static_cast<int64_t>(aten_t0.size(1) * dataTypeSizeBit(DataType::Half)));
+
+  // The optional ledger preserves the exact native maxima and names the
+  // competing float buffer and half input without changing the computation.
+  ASSERT_EQ(ledger.buffers.size(), 2);
+  EXPECT_EQ(ledger.buffers[0].buffer, tv1);
+  EXPECT_EQ(ledger.buffers[1].buffer, tv0);
+  EXPECT_TRUE(ledger.buffers[0].included_without_projection);
+  EXPECT_FALSE(ledger.buffers[0].included_with_projection);
+  EXPECT_FALSE(ledger.buffers[1].included_without_projection);
+  EXPECT_TRUE(ledger.buffers[1].included_with_projection);
+  EXPECT_EQ(ledger.maxima.persistent_buffer_size_bit,
+            persistent_buffer_size_bit.persistent_buffer_size_bit);
+  EXPECT_EQ(ledger.maxima.projected_persistent_buffer_size_bit,
+            persistent_buffer_size_bit.projected_persistent_buffer_size_bit);
+  int64_t replay_keep_max = 0;
+  int64_t replay_project_max = 0;
+  for (const auto& scope : ledger.scopes) {
+    ASSERT_EQ(scope.active_buffers.size(), ledger.buffers.size());
+    int64_t keep_bits = 0;
+    int64_t project_bits = 0;
+    for (size_t i = 0; i < ledger.buffers.size(); ++i) {
+      if (!scope.active_buffers[i]) {
+        continue;
+      }
+      if (ledger.buffers[i].included_without_projection) {
+        keep_bits += ledger.buffers[i].size_bit;
+      }
+      if (ledger.buffers[i].included_with_projection) {
+        project_bits += ledger.buffers[i].size_bit;
+      }
+    }
+    EXPECT_EQ(scope.size_without_projection_bit, keep_bits);
+    EXPECT_EQ(scope.size_with_projection_bit, project_bits);
+    replay_keep_max = std::max(replay_keep_max, keep_bits);
+    replay_project_max = std::max(replay_project_max, project_bits);
+  }
+  EXPECT_EQ(replay_keep_max, ledger.maxima.persistent_buffer_size_bit);
+  EXPECT_EQ(replay_project_max,
+            ledger.maxima.projected_persistent_buffer_size_bit);
+  auto ledger_json = scheduler_utils::persistentProjectionLedgerJson(ledger);
+  EXPECT_NE(ledger_json.find(
+                "\"schema\":\"nvfuser.inner_persistent.projection_ledger.v1\""),
+            std::string::npos);
+  EXPECT_EQ(ledger_json.find("0x"), std::string::npos);
+  scheduler_utils::PersistentProjectionLedger second_ledger;
+  auto second_size = persistentBufferSizeBit(
+      &fusion, runtime_info, persistent_buffer_info, nullptr, &second_ledger);
+  EXPECT_EQ(second_size.persistent_buffer_size_bit,
+            persistent_buffer_size_bit.persistent_buffer_size_bit);
+  EXPECT_EQ(scheduler_utils::persistentProjectionLedgerJson(second_ledger),
+            ledger_json);
 }
 
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation3_CUDA) {
@@ -238,6 +291,7 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation3_CUDA) {
       persistent_buffer_size_bit.projected_persistent_buffer_size_bit ==
       static_cast<int64_t>(
           aten_t0.size(1) * dataTypeSizeBit(DataType::Half) * 2));
+
 }
 
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation4_CUDA) {
