@@ -117,11 +117,12 @@ NVF_API std::vector<TensorView*> projectPersistentBuffers(
     const scheduler_utils::PersistentBufferInfo& persistent_info,
     const bool project_to_inputs);
 
-// Passive source facts for a future IP1 projection request. The projector
-// recomputes each listed expression path at each non-reduction persistent use.
-// IR pointers are retained only locally; the JSON form uses deterministic Val
-// keys and expression positions from Fusion::exprs(). This does not project a
-// buffer, choose a schedule, or claim generated-code cost.
+// Passive source facts for a future IP1 projection request. The paths and
+// non-reduction uses describe pre-schedule recomputation intent. Projecting
+// another buffer may subsequently clone expressions, so these are not measured
+// generated instructions or an exact execution cost. IR pointers stay local;
+// JSON uses deterministic Val keys and Fusion::exprs() positions. This does
+// not project a buffer or choose a schedule.
 struct PersistentProjectionRecomputeEntry {
   TensorView* buffer = nullptr;
   int64_t persistent_index = -1;

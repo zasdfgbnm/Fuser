@@ -30,6 +30,44 @@ using testing::UnorderedElementsAre;
 
 using PersistentBufferTest = NVFuserTest;
 
+namespace {
+void expectProjectionCapacityEquation(
+    const normalization_scheduler_utils::PersistentProjectionCapacityEvidence&
+        evidence) {
+  for (const auto* branch : {&evidence.keep, &evidence.project}) {
+    if (!evidence.can_use_shared_persistence) {
+      EXPECT_TRUE(branch->roundup_buffers.empty());
+      EXPECT_EQ(branch->roundup_overhead_bits, 0);
+      EXPECT_EQ(branch->shared_capacity_bits, 0);
+      EXPECT_EQ(branch->available_bits, evidence.register_capacity_bits);
+      EXPECT_EQ(
+          branch->margin_bits, branch->available_bits - branch->required_bits);
+      continue;
+    }
+    int64_t raw_roundup = 0;
+    for (const auto& buffer : branch->roundup_buffers) {
+      EXPECT_NE(buffer.buffer, nullptr);
+      EXPECT_GT(buffer.dtype_bits, 0);
+      EXPECT_GE(buffer.rounded_shared_bits, buffer.logical_bits);
+      raw_roundup += buffer.rounded_shared_bits - buffer.logical_bits;
+    }
+    EXPECT_EQ(
+        branch->roundup_overhead_bits, alignSharedMemoryBits(raw_roundup));
+    EXPECT_EQ(
+        branch->shared_capacity_bits,
+        evidence.shared_memory_per_block_optin_bits -
+            evidence.reduction_workspace_bits -
+            branch->roundup_overhead_bits - evidence.static_shared_bits);
+    EXPECT_EQ(
+        branch->available_bits,
+        std::max(
+            evidence.register_capacity_bits, branch->shared_capacity_bits));
+    EXPECT_EQ(
+        branch->margin_bits, branch->available_bits - branch->required_bits);
+  }
+}
+} // namespace
+
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation1_CUDA) {
   Fusion fusion;
   FusionGuard fg(&fusion);
@@ -232,6 +270,49 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation2_CUDA) {
       reduction_scheduler_utils::persistentProjectionRecomputeJson(
           reduction_scheduler_utils::persistentProjectionRecomputeEvidence(
               &fusion, persistent_buffer_info)));
+
+  const auto reduction_tvs = scheduler_utils::getReductionTvs(&fusion);
+  ASSERT_EQ(reduction_tvs.size(), 1);
+  const auto properties = scheduler_utils::getReductionProperties(
+      &fusion, runtime_info, reduction_tvs[0]);
+  const bool can_use_shared =
+      properties.inner_most_dimension_numel ==
+      properties.total_reduction_numel;
+  const auto capacity =
+      normalization_scheduler_utils::persistentProjectionCapacityEvidence(
+          &fusion,
+          runtime_info,
+          reduction_tvs,
+          persistent_buffer_info,
+          persistent_buffer_size_bit,
+          can_use_shared);
+  expectProjectionCapacityEquation(capacity);
+  EXPECT_EQ(
+      capacity.keep.required_bits, ledger.maxima.persistent_buffer_size_bit);
+  EXPECT_EQ(
+      capacity.project.required_bits,
+      ledger.maxima.projected_persistent_buffer_size_bit);
+  EXPECT_GE(capacity.keep.margin_bits, 0);
+  EXPECT_GE(capacity.project.margin_bits, 0);
+  const auto capacity_json =
+      normalization_scheduler_utils::persistentProjectionCapacityJson(capacity);
+  ASSERT_FALSE(capacity.keep.roundup_buffers.empty());
+  ASSERT_FALSE(capacity.project.roundup_buffers.empty());
+  EXPECT_NE(capacity_json.find("\"val_key\":["), std::string::npos);
+  EXPECT_NE(
+      capacity_json.find("nvfuser.inner_persistent.projection_capacity.v1"),
+      std::string::npos);
+  EXPECT_EQ(capacity_json.find("0x"), std::string::npos);
+  EXPECT_EQ(
+      capacity_json,
+      normalization_scheduler_utils::persistentProjectionCapacityJson(
+          normalization_scheduler_utils::persistentProjectionCapacityEvidence(
+              &fusion,
+              runtime_info,
+              reduction_tvs,
+              persistent_buffer_info,
+              persistent_buffer_size_bit,
+              can_use_shared)));
 }
 
 TEST_F(PersistentBufferTest, ProjectionRecomputeExp_CUDA) {
@@ -265,6 +346,64 @@ TEST_F(PersistentBufferTest, ProjectionRecomputeExp_CUDA) {
       reduction_scheduler_utils::persistentProjectionRecomputeJson(evidence)
           .find("0x"),
       std::string::npos);
+
+  const auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const auto aten_input = at::randn({128, 256}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  const auto sizes =
+      persistentBufferSizeBit(&fusion, runtime_info, info);
+  const auto reduction_tvs = scheduler_utils::getReductionTvs(&fusion);
+  ASSERT_EQ(reduction_tvs.size(), 1);
+  const auto properties = scheduler_utils::getReductionProperties(
+      &fusion, runtime_info, reduction_tvs[0]);
+  const auto capacity =
+      normalization_scheduler_utils::persistentProjectionCapacityEvidence(
+          &fusion,
+          runtime_info,
+          reduction_tvs,
+          info,
+          sizes,
+          properties.inner_most_dimension_numel ==
+              properties.total_reduction_numel);
+  expectProjectionCapacityEquation(capacity);
+  EXPECT_EQ(capacity.keep.required_bits, sizes.persistent_buffer_size_bit);
+  EXPECT_EQ(
+      capacity.project.required_bits,
+      sizes.projected_persistent_buffer_size_bit);
+}
+
+TEST_F(PersistentBufferTest, ProjectionCapacity3dRegisterOnly_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeSymbolicTensor(3, DataType::Half);
+  fusion.addInput(input);
+  auto* converted = castOp(DataType::Float, input);
+  auto* sums = sum(converted, {0, 2});
+  auto* sums_bcast = broadcast(sums, {true, false, true});
+  fusion.addOutput(add(converted, sums_bcast));
+
+  const auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const auto aten_input = at::randn({2, 3, 8}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  const auto info = scheduler_utils::persistentBuffers(&fusion);
+  const auto sizes = persistentBufferSizeBit(&fusion, runtime_info, info);
+  const auto reduction_tvs = scheduler_utils::getReductionTvs(&fusion);
+  ASSERT_EQ(reduction_tvs.size(), 1);
+  const auto properties = scheduler_utils::getReductionProperties(
+      &fusion, runtime_info, reduction_tvs[0]);
+  ASSERT_NE(
+      properties.inner_most_dimension_numel,
+      properties.total_reduction_numel);
+  const auto capacity =
+      normalization_scheduler_utils::persistentProjectionCapacityEvidence(
+          &fusion, runtime_info, reduction_tvs, info, sizes, false);
+  expectProjectionCapacityEquation(capacity);
+  EXPECT_EQ(capacity.max_vectorization_bits, 0);
+  EXPECT_EQ(capacity.reduction_workspace_bits, 0);
+  EXPECT_EQ(
+      capacity.keep.available_bits, scheduler_utils::register_file_size_bit);
+  EXPECT_EQ(
+      capacity.project.available_bits, scheduler_utils::register_file_size_bit);
 }
 
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation3_CUDA) {
@@ -388,6 +527,22 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation3_CUDA) {
               Contains(std::distance(
                   fusion_exprs.begin(),
                   std::ranges::find(fusion_exprs, tv7->definition()))));
+  const auto reduction_tvs = scheduler_utils::getReductionTvs(&fusion);
+  ASSERT_EQ(reduction_tvs.size(), 2);
+  const auto properties = scheduler_utils::getReductionProperties(
+      &fusion, runtime_info, reduction_tvs[0]);
+  const auto capacity =
+      normalization_scheduler_utils::persistentProjectionCapacityEvidence(
+          &fusion,
+          runtime_info,
+          reduction_tvs,
+          nonprefix_info,
+          nonprefix_sizes,
+          properties.inner_most_dimension_numel ==
+              properties.total_reduction_numel);
+  expectProjectionCapacityEquation(capacity);
+  ASSERT_EQ(capacity.project.roundup_buffers.size(), 1);
+  EXPECT_EQ(capacity.project.roundup_buffers[0].buffer, tv5);
 }
 
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation4_CUDA) {

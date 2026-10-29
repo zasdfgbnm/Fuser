@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <locale>
 #include <ranges>
+#include <sstream>
 #include <string>
 
 #include <ATen/cuda/CUDAContext.h>
@@ -1397,6 +1399,143 @@ int64_t getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
           project_to_inputs,
           candidate_batch,
           candidate_padded_threads));
+}
+
+PersistentProjectionCapacityEvidence persistentProjectionCapacityEvidence(
+    Fusion* fusion,
+    SchedulerRuntimeInfo& runtime_info,
+    const std::vector<TensorView*>& reduction_tvs,
+    const scheduler_utils::PersistentBufferInfo& persistent_buffer_info,
+    const scheduler_utils::PersistentBufferSizeReturn& sizes,
+    bool can_use_shared_persistence) {
+  NVF_ERROR(fusion != nullptr, "Projection capacity requires a fusion");
+  const auto* device = at::cuda::getCurrentDeviceProperties();
+  PersistentProjectionCapacityEvidence evidence;
+  evidence.can_use_shared_persistence = can_use_shared_persistence;
+  evidence.register_capacity_bits = scheduler_utils::register_file_size_bit;
+  evidence.shared_memory_per_block_optin_bits =
+      static_cast<int64_t>(device->sharedMemPerBlockOptin) * 8;
+  evidence.max_threads_per_block = device->maxThreadsPerBlock;
+  // The native helper returns the register cap immediately for non-shared
+  // persistence. Do not evaluate shared-memory analyses on that branch just
+  // to produce optional evidence; they are neither used nor guaranteed valid.
+  if (can_use_shared_persistence) {
+    evidence.max_vectorization_bits = getMaxVectorizationSizeInBit();
+    evidence.reduction_workspace_bits =
+        scheduler_utils::getReductionSmemWorkspaceBit(fusion, reduction_tvs);
+  }
+  evidence.static_shared_bits = scheduler_utils::static_smem_usage_in_bits;
+
+  const auto fill_branch = [&](bool projected,
+                               int64_t required_bits,
+                               PersistentProjectionCapacityBranch& branch) {
+    branch.project_to_inputs = projected;
+    branch.required_bits = required_bits;
+    if (!can_use_shared_persistence) {
+      branch.available_bits = evidence.register_capacity_bits;
+      branch.margin_bits = branch.available_bits - branch.required_bits;
+      NVF_ERROR(
+          branch.available_bits ==
+              getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+                  fusion,
+                  runtime_info,
+                  reduction_tvs,
+                  persistent_buffer_info,
+                  can_use_shared_persistence,
+                  projected),
+          "Register-only projection capacity disagrees with native hard gate");
+      return;
+    }
+    const auto& buffers = projected
+        ? persistent_buffer_info.projectable_buffer_inputs
+        : persistent_buffer_info.persistent_buffers;
+    int64_t raw_roundup_overhead = 0;
+    branch.roundup_buffers.reserve(buffers.size());
+    for (TensorView* buffer : buffers) {
+      const int64_t logical_bits =
+          scheduler_utils::getPersistentBufferSizeBitOfTensor(
+              buffer, runtime_info, persistent_buffer_info);
+      const int64_t dtype_bits = dataTypeSizeBit(buffer->getDataType());
+      const int64_t rounded_bits =
+          roundUpSharedMemory(logical_bits, dtype_bits, 0, 0);
+      raw_roundup_overhead += rounded_bits - logical_bits;
+      branch.roundup_buffers.push_back(
+          {buffer, logical_bits, dtype_bits, rounded_bits});
+    }
+    branch.roundup_overhead_bits =
+        alignSharedMemoryBits(raw_roundup_overhead);
+    NVF_ERROR(
+        branch.roundup_overhead_bits == sharedMemoryRoundUpOverheadBit(
+            runtime_info, persistent_buffer_info, projected, 0, 0),
+        "Projection roundup operands disagree with native capacity");
+    branch.shared_capacity_bits =
+        evidence.shared_memory_per_block_optin_bits -
+        evidence.reduction_workspace_bits - branch.roundup_overhead_bits -
+        evidence.static_shared_bits;
+    branch.available_bits =
+        std::max(evidence.register_capacity_bits, branch.shared_capacity_bits);
+    NVF_ERROR(
+        branch.available_bits ==
+            getMaxRegOrSharedMemorySizeBitForPersistentBuffer(
+                fusion,
+                runtime_info,
+                reduction_tvs,
+                persistent_buffer_info,
+                can_use_shared_persistence,
+                projected),
+        "Projection capacity operands disagree with native hard gate");
+    branch.margin_bits = branch.available_bits - branch.required_bits;
+  };
+  fill_branch(false, sizes.persistent_buffer_size_bit, evidence.keep);
+  fill_branch(
+      true,
+      sizes.projected_persistent_buffer_size_bit,
+      evidence.project);
+  return evidence;
+}
+
+std::string persistentProjectionCapacityJson(
+    const PersistentProjectionCapacityEvidence& evidence) {
+  std::ostringstream out;
+  out.imbue(std::locale::classic());
+  out << "{\"schema\":\"nvfuser.inner_persistent.projection_capacity.v1\","
+         "\"can_use_shared\":"
+      << (evidence.can_use_shared_persistence ? "true" : "false")
+      << ",\"register_capacity_bits\":" << evidence.register_capacity_bits
+      << ",\"shared_memory_per_block_optin_bits\":"
+      << evidence.shared_memory_per_block_optin_bits
+      << ",\"max_threads_per_block\":" << evidence.max_threads_per_block
+      << ",\"max_vectorization_bits\":" << evidence.max_vectorization_bits
+      << ",\"reduction_workspace_bits\":"
+      << evidence.reduction_workspace_bits
+      << ",\"static_shared_bits\":" << evidence.static_shared_bits;
+  const auto write_branch = [&out](
+                                const char* name,
+                                const PersistentProjectionCapacityBranch& branch) {
+    out << ",\"" << name << "\":{\"required_bits\":"
+        << branch.required_bits
+        << ",\"roundup_overhead_bits\":" << branch.roundup_overhead_bits
+        << ",\"shared_capacity_bits\":" << branch.shared_capacity_bits
+        << ",\"available_bits\":" << branch.available_bits
+        << ",\"margin_bits\":" << branch.margin_bits
+        << ",\"roundup_buffers\":[";
+    for (size_t i = 0; i < branch.roundup_buffers.size(); ++i) {
+      const auto& buffer = branch.roundup_buffers[i];
+      NVF_ERROR(buffer.buffer != nullptr, "Null projection roundup buffer");
+      if (i != 0) out << ',';
+      out << "{\"val_key\":["
+          << static_cast<int64_t>(buffer.buffer->vtype()) << ','
+          << buffer.buffer->name() << "],\"logical_bits\":"
+          << buffer.logical_bits << ",\"dtype_bits\":"
+          << buffer.dtype_bits << ",\"rounded_shared_bits\":"
+          << buffer.rounded_shared_bits << '}';
+    }
+    out << "]}";
+  };
+  write_branch("keep", evidence.keep);
+  write_branch("project", evidence.project);
+  out << '}';
+  return out.str();
 }
 
 // Returns BufferProjectionStrategy based on buffer size, hardware, and fusion
