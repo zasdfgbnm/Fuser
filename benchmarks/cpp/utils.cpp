@@ -11,11 +11,21 @@
 
 #include <fusion_profiler.h>
 #include <scheduler/all_schedulers.h>
+#include <scheduler/jev_client.h>
+#include <scheduler/native_diagnostic_jsonl.h>
 #include <scheduler/resize_heuristic.h>
 #include <tests/cpp/utils.h>
+#include <validator_utils.h>
 
+#include <atomic>
 #include <cstdlib>
+#include <exception>
+#include <memory>
 #include <sstream>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 using namespace nvfuser;
 
@@ -162,6 +172,8 @@ std::string toString(LaunchParams lparams) {
 
 namespace {
 
+std::atomic<uint64_t> numeric_evidence_count{0};
+
 int64_t getSizeOfArgs(const KernelArgumentHolder& args) {
   int64_t bytes = 0;
   for (const auto& inp : args) {
@@ -175,12 +187,153 @@ int64_t getSizeOfArgs(const KernelArgumentHolder& args) {
   return bytes;
 }
 
+struct NumericGate {
+  bool enabled = false;
+  std::string log_path;
+  std::string case_key;
+};
+
+NumericGate numericGate() {
+  const char* requested = std::getenv("NVFUSER_JEV_VALIDATE_NATIVE");
+  if (requested == nullptr || requested[0] == '\0' ||
+      std::string_view(requested) == "0") {
+    return {};
+  }
+  NVF_ERROR(
+      std::string_view(requested) == "1",
+      "NVFUSER_JEV_VALIDATE_NATIVE must be 0 or 1");
+  if (scheduler::jev::mode() != scheduler::jev::Mode::Remote) {
+    return {};
+  }
+  const char* log = std::getenv("NVFUSER_JEV_NUMERIC_LOG");
+  const char* key = std::getenv("NVFUSER_JEV_CASE_KEY");
+  NVF_ERROR(
+      log != nullptr && log[0] != '\0',
+      "Remote numerical validation requires NVFUSER_JEV_NUMERIC_LOG");
+  NVF_ERROR(
+      key != nullptr && key[0] != '\0',
+      "Remote numerical validation requires NVFUSER_JEV_CASE_KEY");
+  return {true, log, key};
+}
+
+void recordNumericGate(
+    const NumericGate& gate,
+    std::string_view path,
+    std::string_view status,
+    std::string_view reason,
+    int64_t output_count) {
+  if (!gate.enabled) {
+    return;
+  }
+  scheduler::native_diagnostic::Object row;
+  row.add("schema", "nvfuser.jev.benchmark_numeric.v1");
+  row.add("case_key", gate.case_key);
+  row.add("mode", "remote");
+  row.add("path", path);
+  row.add("status", status);
+  row.add("reason", reason);
+  row.add("reference", "native_off_same_inputs");
+  row.add("output_count", output_count);
+  NVF_ERROR(
+      scheduler::native_diagnostic::appendLineToPath(
+          gate.log_path, row.str()),
+      "Could not append the benchmark numerical validation result");
+  numeric_evidence_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string numericUnsupportedReason(const Fusion* fusion) {
+  for (const auto* expr : fusion->exprs()) {
+    if (expr->isA<RNGOp>()) {
+      return "rng_op";
+    }
+  }
+  for (const auto* output : fusion->outputs()) {
+    if (fusion->getOutputAlias(output).type != AllocationType::New) {
+      return "output_alias";
+    }
+  }
+  return {};
+}
+
+struct NativeReference {
+  std::vector<at::Tensor> cpu_outputs;
+  std::string unsupported;
+};
+
+NativeReference nativeReferenceOutputs(
+    Fusion* fusion,
+    const KernelArgumentHolder& args) {
+  KernelArgumentHolder native_outputs;
+  {
+    // Both scopes are thread-local. The native cache must not reuse the
+    // Remote cache, and its compute/outcome events must not enter Remote logs.
+    scheduler::native_diagnostic::ScopedSuppressedDiagnostics suppress;
+    scheduler::jev::ScopedNativeDecisions native;
+    FusionExecutorCache native_cache(std::make_unique<Fusion>(*fusion));
+    native_outputs = native_cache.runFusionWithInputs(args);
+  }
+  // Do not retain an entire native output set on the GPU while compiling and
+  // running the Remote plan. Copies are outside the timed loop. A bounded host
+  // reference keeps unusually large output sets explicit coverage skips.
+  constexpr int64_t kMaxReferenceBytes = 256LL * 1024 * 1024;
+  if (native_outputs.empty()) {
+    return {{}, "empty_native_outputs"};
+  }
+  if (getSizeOfArgs(native_outputs) > kMaxReferenceBytes) {
+    return {{}, "native_output_exceeds_256mib"};
+  }
+  std::vector<at::Tensor> tensors;
+  tensors.reserve(native_outputs.size());
+  for (const auto& output : native_outputs) {
+    if (!output.is<at::Tensor>()) {
+      return {{}, "non_tensor_native_output"};
+    }
+    tensors.push_back(output.as<at::Tensor>().cpu());
+  }
+  return {std::move(tensors), {}};
+}
+
 } // namespace
+
+uint64_t numericGateEvidenceCount() noexcept {
+  return numeric_evidence_count.load(std::memory_order_relaxed);
+}
+
+void recordUncoveredNumericGate() {
+  const auto gate = numericGate();
+  recordNumericGate(
+      gate, "benchmark_registration", "unsupported",
+      "benchmark_did_not_use_validation_helper", 0);
+}
 
 int64_t runBenchmarkIterations(
     benchmark::State& benchmark_state,
     FusionExecutorCache* executor_cache,
     const KernelArgumentHolder& args) {
+  const auto gate = numericGate();
+  const auto* fusion = executor_cache->fusion();
+  std::string unsupported;
+  std::vector<at::Tensor> native_outputs;
+  if (gate.enabled) {
+    unsupported = numericUnsupportedReason(fusion);
+    if (unsupported.empty()) {
+      try {
+        auto reference = nativeReferenceOutputs(executor_cache->fusion(), args);
+        native_outputs = std::move(reference.cpu_outputs);
+        unsupported = std::move(reference.unsupported);
+      } catch (const std::exception& error) {
+        recordNumericGate(
+            gate, "fusion_executor_cache", "failed",
+            std::string("native_reference_error: ") + error.what(), 0);
+        throw;
+      } catch (...) {
+        recordNumericGate(
+            gate, "fusion_executor_cache", "failed",
+            "native_reference_unknown_error", 0);
+        throw;
+      }
+    }
+  }
   c10::cuda::CUDACachingAllocator::emptyCache();
   executor_cache->profile(true);
 
@@ -188,8 +341,73 @@ int64_t runBenchmarkIterations(
 
   // Segment and compile the fusion
   {
-    auto cg_outputs = executor_cache->runFusionWithInputs(args);
+    KernelArgumentHolder cg_outputs;
+    try {
+      cg_outputs = executor_cache->runFusionWithInputs(args);
+    } catch (const std::exception& error) {
+      recordNumericGate(
+          gate, "fusion_executor_cache", "failed",
+          std::string("remote_warmup_error: ") + error.what(), 0);
+      throw;
+    } catch (...) {
+      recordNumericGate(
+          gate, "fusion_executor_cache", "failed", "remote_warmup_unknown_error",
+          0);
+      throw;
+    }
     io_bytes += getSizeOfArgs(cg_outputs);
+    if (gate.enabled) {
+      if (!unsupported.empty()) {
+        recordNumericGate(
+            gate, "fusion_executor_cache", "unsupported", unsupported,
+            static_cast<int64_t>(cg_outputs.size()));
+      } else {
+        try {
+          NVF_ERROR(
+              cg_outputs.size() ==
+                  static_cast<int64_t>(native_outputs.size()),
+              "Native and Remote output counts differ");
+          for (auto i : arange(native_outputs.size())) {
+            NVF_ERROR(
+                cg_outputs[i].is<at::Tensor>(),
+                "Remote output is not a tensor at index ",
+                i);
+            const auto& remote = cg_outputs[i].as<at::Tensor>();
+            NVF_ERROR(
+                remote.scalar_type() == native_outputs[i].scalar_type() &&
+                    remote.sizes() == native_outputs[i].sizes(),
+                "Native and Remote output metadata differ at index ",
+                i);
+          }
+          KernelArgumentHolder cpu_remote_outputs;
+          for (const auto& output : cg_outputs) {
+            cpu_remote_outputs.push(output.as<at::Tensor>().cpu());
+          }
+          testValidate(
+              executor_cache->fusion(),
+              cpu_remote_outputs,
+              args,
+              native_outputs,
+              __LINE__,
+              __FILE__,
+              "Native and Remote benchmark outputs differ");
+          recordNumericGate(
+              gate, "fusion_executor_cache", "passed", "",
+              static_cast<int64_t>(cg_outputs.size()));
+        } catch (const std::exception& error) {
+          recordNumericGate(
+              gate, "fusion_executor_cache", "failed", error.what(),
+              static_cast<int64_t>(cg_outputs.size()));
+          throw;
+        } catch (...) {
+          recordNumericGate(
+              gate, "fusion_executor_cache", "failed",
+              "validation_unknown_error",
+              static_cast<int64_t>(cg_outputs.size()));
+          throw;
+        }
+      }
+    }
   }
 
   bool segmented =
@@ -237,6 +455,10 @@ int64_t runBenchmarkIterations(
     const KernelArgumentHolder& args,
     const LaunchParams& launch_constraints,
     CompileParams compile_params) {
+  const auto gate = numericGate();
+  recordNumericGate(
+      gate, "kernel_executor", "unsupported",
+      "direct_kernel_executor_has_no_unscheduled_fusion_cache", 0);
   int64_t io_bytes = getSizeOfArgs(args);
   {
     // Warm-up run

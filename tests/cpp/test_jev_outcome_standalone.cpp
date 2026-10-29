@@ -101,9 +101,52 @@ int main() {
   assert(std::count(explicit_data.begin(), explicit_data.end(), '\n') == 1);
   assert(explicit_data.find("\"mode\":\"off\"") != std::string::npos);
 
+  // A native reference run inside a Remote benchmark must leave no Remote
+  // compute/outcome rows. Nested scopes restore the outer thread state.
+  assert(::setenv(diag::kModeEnvironment, "remote", 1) == 0);
+  assert(::unsetenv(diag::kLogEnvironment) == 0);
+  {
+    diag::ScopedSuppressedDiagnostics outer;
+    assert(!diag::enabled());
+    assert(std::string(diag::logMode()) == "off");
+    diag::recordOutcome(outcome);
+    {
+      diag::ScopedSuppressedDiagnostics inner;
+      assert(!diag::enabled());
+      diag::recordOutcome(outcome);
+    }
+    assert(!diag::enabled());
+  }
+  assert(diag::enabled());
+  diag::recordOutcome(outcome);
+  std::ifstream after_suppression(outcome_path);
+  const std::string after_suppression_data(
+      (std::istreambuf_iterator<char>(after_suppression)),
+      std::istreambuf_iterator<char>());
+  assert(std::count(
+             after_suppression_data.begin(),
+             after_suppression_data.end(),
+             '\n') == 3);
+
+  // The numerical sidecar uses the same safe append without changing the
+  // scheduler outcome path or requiring a global mode change.
+  char numeric_path[] = "/tmp/nvfuser-jev-numeric-XXXXXX";
+  const int numeric_fd = ::mkstemp(numeric_path);
+  assert(numeric_fd >= 0);
+  assert(::close(numeric_fd) == 0);
+  assert(::unlink(numeric_path) == 0);
+  assert(diag::appendLineToPath(numeric_path, "{\"status\":\"passed\"}"));
+  assert(!diag::appendLineToPath("/tmp", "{\"status\":\"failed\"}"));
+  std::ifstream numeric_stream(numeric_path);
+  const std::string numeric_data(
+      (std::istreambuf_iterator<char>(numeric_stream)),
+      std::istreambuf_iterator<char>());
+  assert(numeric_data == "{\"status\":\"passed\"}\n");
+
   // The diagnostic must ignore a path it cannot use, including a directory.
   assert(::setenv(diag::kLogEnvironment, "/tmp", 1) == 0);
   diag::recordOutcome(outcome);
   assert(::unlink(outcome_path.c_str()) == 0);
   assert(::unlink(explicit_path) == 0);
+  assert(::unlink(numeric_path) == 0);
 }

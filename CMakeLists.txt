@@ -2522,6 +2522,17 @@ if(BUILD_NVFUSER_BENCHMARK)
 endif()
 
 if(BUILD_TEST AND BUILD_NVFUSER_BENCHMARK)
+  # Check the optional pre-timing native reference against representative
+  # benchmark families, including one Remote plan that differs from native.
+  # A separate JSONL sidecar must not alter Remote decision/outcome lineage.
+  add_test(NAME jev_benchmark_numeric_gate
+    COMMAND "${Python_EXECUTABLE}"
+      "${NVFUSER_ROOT}/tests/cpp/jev_benchmark_numeric_gate.py"
+      --binary "$<TARGET_FILE:nvfuser_bench>"
+      --artifacts-root "${CMAKE_BINARY_DIR}/jev_benchmark_numeric_gate")
+  set_tests_properties(jev_benchmark_numeric_gate PROPERTIES
+    RESOURCE_LOCK nvfuser_gpu SKIP_RETURN_CODE 77)
+
   # The native batch-norm 3D plan can run even when the stricter Choice-menu
   # resource check rejects its register estimate. Both traced modes must keep
   # that exact native plan without contacting the API.

@@ -21,12 +21,42 @@ inline constexpr char kLogEnvironment[] = "NVFUSER_JEV_OUTCOME_LOG";
 inline constexpr char kDecisionLogEnvironment[] = "NVFUSER_JEV_LOG";
 inline constexpr char kModeEnvironment[] = "NVFUSER_JEV_MODE";
 
+// A benchmark may execute a separate native reference fusion while its outer
+// process is in Remote mode. Suppress only that thread's scheduler diagnostics
+// so the reference cannot be mistaken for an additional Remote invocation.
+inline thread_local bool diagnostics_suppressed = false;
+
+class ScopedSuppressedDiagnostics final {
+ public:
+  ScopedSuppressedDiagnostics() noexcept
+      : previous_(diagnostics_suppressed) {
+    diagnostics_suppressed = true;
+  }
+
+  ~ScopedSuppressedDiagnostics() noexcept {
+    diagnostics_suppressed = previous_;
+  }
+
+  ScopedSuppressedDiagnostics(const ScopedSuppressedDiagnostics&) = delete;
+  ScopedSuppressedDiagnostics& operator=(const ScopedSuppressedDiagnostics&) =
+      delete;
+
+ private:
+  bool previous_;
+};
+
 inline const char* logMode() noexcept {
+  if (diagnostics_suppressed) {
+    return "off";
+  }
   const char* mode = std::getenv(kModeEnvironment);
   return mode != nullptr && mode[0] != '\0' ? mode : "off";
 }
 
 inline bool enabled() noexcept {
+  if (diagnostics_suppressed) {
+    return false;
+  }
   const char* path = std::getenv(kLogEnvironment);
   if (path != nullptr && path[0] != '\0') {
     return true;
@@ -161,6 +191,42 @@ bool appendLocked(int fd, std::string_view line, Writer&& writer) noexcept {
 
 } // namespace detail
 
+// Append to an exact task-owned path with the same line-atomicity and
+// no-symlink protections as scheduler diagnostics. The benchmark numerical
+// gate checks the result so a missing evidence row cannot be called a pass.
+inline bool appendLineToPath(
+    std::string_view path,
+    std::string_view line) noexcept {
+  if (path.empty()) {
+    return false;
+  }
+  try {
+    const std::string owned_path(path);
+    int fd = ::open(
+        owned_path.c_str(),
+        O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+        0600);
+    if (fd < 0) {
+      return false;
+    }
+    struct stat info {};
+    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
+      ::close(fd);
+      return false;
+    }
+    if (::flock(fd, LOCK_EX) != 0) {
+      ::close(fd);
+      return false;
+    }
+    const bool appended = detail::appendLocked(fd, line, ::write);
+    (void)::flock(fd, LOCK_UN);
+    ::close(fd);
+    return appended;
+  } catch (...) {
+    return false;
+  }
+}
+
 // Diagnostics must never change a schedule or throw from computeHeuristics.
 // An advisory lock and rollback preserve line boundaries across cooperating
 // benchmark processes. A nonregular file or failed write is ignored.
@@ -169,29 +235,7 @@ inline void appendLine(std::string_view line) noexcept {
     return;
   }
   try {
-    const std::string path = logPath();
-    if (path.empty()) {
-      return;
-    }
-    int fd = ::open(
-        path.c_str(),
-        O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
-        0600);
-    if (fd < 0) {
-      return;
-    }
-    struct stat info {};
-    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode)) {
-      ::close(fd);
-      return;
-    }
-    if (::flock(fd, LOCK_EX) != 0) {
-      ::close(fd);
-      return;
-    }
-    (void)detail::appendLocked(fd, line, ::write);
-    (void)::flock(fd, LOCK_UN);
-    ::close(fd);
+    (void)appendLineToPath(logPath(), line);
   } catch (...) {
     // Even a failed path allocation cannot affect scheduler results.
   }

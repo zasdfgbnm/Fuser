@@ -203,6 +203,18 @@ class BatchCaseReporter : public ::benchmark::ConsoleReporter {
         reports.front().run_name.str() != cases_[next_].name) {
       throw std::runtime_error("batch reporter registration order mismatch");
     }
+    if (!reports.front().error_occurred &&
+        cases_[next_].name.starts_with("NvFuserScheduler_")) {
+      const uint64_t recorded = numericGateEvidenceCount() - evidence_before_;
+      if (recorded == 0) {
+        // Setup-only benchmarks may compute heuristics without going through
+        // either iteration helper. Their lack of output parity is explicit.
+        recordUncoveredNumericGate();
+      } else if (recorded != 1) {
+        throw std::runtime_error(
+            "batch registration emitted multiple numeric evidence rows");
+      }
+    }
     ConsoleReporter::ReportRuns(reports);
     ++next_;
     if (next_ < cases_.size()) {
@@ -229,10 +241,12 @@ class BatchCaseReporter : public ::benchmark::ConsoleReporter {
     if (::setenv("NVFUSER_JEV_CASE_KEY", key.c_str(), 1) != 0) {
       throw std::runtime_error("cannot set batch case key");
     }
+    evidence_before_ = numericGateEvidenceCount();
   }
 
   std::vector<BatchCase> cases_;
   size_t next_ = 0;
+  uint64_t evidence_before_ = 0;
 };
 
 } // namespace
