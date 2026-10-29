@@ -7143,6 +7143,57 @@ TEST_F(Gpu1Test, InnerPersistentProjectionPreHopperControl_CUDA) {
   EXPECT_THAT(rows, ::testing::HasSubstr("inner_persistent.projection.v1"));
 }
 
+// The v2 projection Choice may replace the native preference while the native
+// capacity and scheduler eligibility checks continue to guard correctness.
+// The companion loopback test forces project in Remote mode for this Exp graph.
+TEST_F(Gpu1Test, JevAlternateInnerProjectionV2_CUDA) {
+  Fusion fusion;
+  FusionGuard fg(&fusion);
+  auto* input = makeContigTensor(2, DataType::Half);
+  fusion.addInput(input);
+  auto* exponentials = exp(maybeCastOp(DataType::Float, input));
+  auto* sums = sum(exponentials, {1});
+  auto* sums_bcast = broadcast(sums, {false, true});
+  fusion.addOutput(maybeCastOp(
+      DataType::Half, div(exponentials, sums_bcast)));
+
+  const auto options =
+      at::TensorOptions().dtype(at::kHalf).device(at::kCUDA, 0);
+  const auto aten_input = at::randn({128, 256}, options);
+  SchedulerRuntimeInfo runtime_info(&fusion, {aten_input});
+  auto scheduler =
+      SchedulerEntry::makeSchedulerInstance(SchedulerType::InnerPersistent);
+  std::unique_ptr<HeuristicParams> off_params;
+  {
+    ScopedJevEnv off_mode("NVFUSER_JEV_MODE", "off");
+    off_params = scheduler->computeHeuristics(&fusion, runtime_info);
+  }
+  auto result = scheduleAndRun(
+      &fusion, SchedulerType::InnerPersistent, {aten_input});
+  ASSERT_NE(off_params, nullptr);
+  ASSERT_NE(result.heuristic_params, nullptr);
+  const auto* params = result.heuristic_params->as<ReductionParams>();
+  ASSERT_TRUE(params->persistent_kernel);
+  if (scheduler::jev::mode() == scheduler::jev::Mode::Record) {
+    EXPECT_TRUE(params->sameAs(off_params->as<ReductionParams>()));
+  }
+  ASSERT_EQ(
+      params->project_persistent_buffers,
+      scheduler::jev::mode() == scheduler::jev::Mode::Remote);
+  const at::Tensor exponentials_ref = at::exp(aten_input.to(at::kFloat));
+  const at::Tensor reference =
+      (exponentials_ref / exponentials_ref.sum(1, true)).to(at::kHalf);
+  testValidate(
+      &fusion,
+      result.outputs,
+      {aten_input},
+      {reference},
+      __LINE__,
+      __FILE__,
+      "",
+      result.heuristic_params->lparams);
+}
+
 // Exercise a register-backed 3D persistent reduction with an alternate
 // cache-derived warp target. The exponential is used by both the reduction
 // and output, so it is a genuine persistent buffer.

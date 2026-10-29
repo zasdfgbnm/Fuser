@@ -1781,8 +1781,11 @@ PersistentKernelProperties getPersistentKernelProperties(
           &memory_clock_khz, cudaDevAttrMemoryClockRate, device_index);
       cudaDeviceGetAttribute(
           &gpu_clock_khz, cudaDevAttrClockRate, device_index);
-      const std::string state =
-          "inner_persistent.projection.v1\noriginal_bits=" +
+      const bool source_evidence = scheduler::jev::semanticV3Enabled();
+      std::string state =
+          std::string(source_evidence ? "inner_persistent.projection.v2"
+                                      : "inner_persistent.projection.v1") +
+          "\noriginal_bits=" +
           std::to_string(original_bits) + "\nprojected_bits=" +
           std::to_string(projected_bits) + "\nprojection_has_exp=" +
           (persistent_buffer_info.projection_with_exp_op ? "1" : "0") +
@@ -1792,6 +1795,40 @@ PersistentKernelProperties getPersistentKernelProperties(
           "\nmemory_bus_bits=" + std::to_string(device->memoryBusWidth) +
           "\nmemory_clock_khz=" + std::to_string(memory_clock_khz) +
           "\ngpu_clock_khz=" + std::to_string(gpu_clock_khz);
+      if (source_evidence) {
+        scheduler_utils::PersistentProjectionLedger ledger;
+        const auto ledger_sizes = scheduler_utils::persistentBufferSizeBit(
+            fusion, runtime_info, persistent_buffer_info, data_cache, &ledger);
+        NVF_ERROR(
+            ledger_sizes.persistent_buffer_size_bit == original_bits &&
+                ledger_sizes.projected_persistent_buffer_size_bit ==
+                    projected_bits,
+            "Projection source ledger differs from native buffer maxima");
+        const auto recompute =
+            reduction_scheduler_utils::persistentProjectionRecomputeEvidence(
+                fusion, persistent_buffer_info);
+        const auto capacity = persistentProjectionCapacityEvidence(
+            fusion,
+            runtime_info,
+            reduction_tvs,
+            persistent_buffer_info,
+            persistent_buffer_size_info,
+            can_use_smem_persistent);
+        state += "\noriginal_buffer_count=" +
+            std::to_string(persistent_buffer_info.persistent_buffers.size()) +
+            "\nprojectable_input_count=" +
+            std::to_string(
+                persistent_buffer_info.projectable_buffer_inputs.size()) +
+            "\nsource_has_view_ops=" +
+            std::string(persistent_buffer_info.has_view_ops ? "1" : "0") +
+            "\nprojection_ledger_json=" +
+            scheduler_utils::persistentProjectionLedgerJson(ledger) +
+            "\nprojection_recompute_json=" +
+            reduction_scheduler_utils::persistentProjectionRecomputeJson(
+                recompute) +
+            "\nprojection_capacity_json=" +
+            persistentProjectionCapacityJson(capacity);
+      }
       const std::vector<scheduler::jev::ChoiceOption> options = {
           {"project", "Recompute persistent buffers from cached inputs"},
           {"keep", "Keep the original persistent buffers"}};
