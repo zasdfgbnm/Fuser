@@ -520,6 +520,37 @@ int main() {
   using nvfuser::scheduler::jev::chooseDecision;
   const std::vector<ChoiceOption> options{{"bp0", "one dimensional"}, {"bp1", "split"}};
   const std::string state = "pointwise.breakpoint.v1\nelements=2,256\n";
+  const auto fixed_rd3_x =
+      nvfuser::reduction::non_tma::proveFixedInnerRemainderWidth(
+          1025, 128, 8, 8, 128, 16, 128, 32, 1024, 128, 128);
+  require(
+      nvfuser::reduction::non_tma::innerGridStateTag(false) ==
+              "reduction.inner_grid.v1\n" &&
+          nvfuser::reduction::non_tma::innerIterUnrollStateTag(false) ==
+              "reduction.inner_iter_unroll.v1\n" &&
+          nvfuser::reduction::non_tma::innerGridStateTag(true) ==
+              "reduction.inner_grid.v2\n" &&
+          nvfuser::reduction::non_tma::innerIterUnrollStateTag(true) ==
+              "reduction.inner_iter_unroll.v2\n",
+      "RD3 non-singleton v1 or singleton v2 state tag changed");
+  require(
+      fixed_rd3_x.stateFields() ==
+          "fixed_remainder_x_index=1\nfixed_remainder_x_bdimx=128\n"
+          "fixed_remainder_x_seed_bdimx=128\nfixed_remainder_x_after_vect=1025\n"
+          "fixed_remainder_x_initial_bdimx=128\n"
+          "fixed_remainder_x_initial_inner_unroll=8\n"
+          "fixed_remainder_x_target_unroll=8\nfixed_remainder_x_target_cta=128\n"
+          "fixed_remainder_x_min_warp=16\nfixed_remainder_x_scan_first=128\n",
+      "c25-like RD3 singleton width witness lost its exact wire basis");
+  bool rejected_invalid_rd3_witness = false;
+  try {
+    (void)nvfuser::reduction::non_tma::proveFixedInnerRemainderWidth(
+        1025, 128, 4, 8, 128, 16, 128, 32, 1024, 128, 128);
+  } catch (const std::invalid_argument&) {
+    rejected_invalid_rd3_witness = true;
+  }
+  require(rejected_invalid_rd3_witness,
+          "RD3 singleton width accepted a false initial-unroll proof");
   char path[] = "/tmp/nvfuser-jev-client-XXXXXX";
   int log_fd = ::mkstemp(path);
   require(log_fd >= 0, "mkstemp failed");
@@ -537,6 +568,8 @@ int main() {
   {
     nvfuser::scheduler::jev::ComputeHeuristicsScope scope("off input", {});
     require(!scope.observing(), "off mode enabled compute observation");
+    nvfuser::reduction::non_tma::recordFixedInnerRemainderWidth(
+        fixed_rd3_x, Mode::Off);
     nvfuser::scheduler::jev::recordNoChoiceDecision(
         "RD5.work_split", "unroll_first", "equal_work_factors",
         "native_unroll_first_branch");
@@ -1276,6 +1309,70 @@ int main() {
                 outcomes.find("\"compute_event_index\":3,\"scheduler_type\":"
                               "\"Reduction\"") != std::string::npos,
             "semantic-v3 Record singleton outcome or event sequence is incomplete");
+  }
+  {
+    // {1024,1025} with width 1, cap 8, CTA 128, and warp target 16 has
+    // exactly one physical remainder width x128. The index u1 and physical
+    // witness must reach the later stateless tail request without an X API call.
+    const std::string choices_before = readFile(path);
+    const std::string outcomes_before = readFile(std::string(path) + ".outcome.jsonl");
+    nvfuser::scheduler::jev::ComputeHeuristicsScope scope(
+        "c25-like reduction input", {}, v3_hardware);
+    nvfuser::reduction::non_tma::recordFixedInnerRemainderWidth(
+        fixed_rd3_x, Mode::Record);
+    require(
+        nvfuser::reduction::non_tma::chooseInnerRemainderRange(
+            "RD3.remainder_u",
+            "reduction.inner_remainder_u.v1\nafter_vect=1025\n"
+            "target_inner_unroll=8\nchosen_bdimx=128\n",
+            1, 8, 5, Mode::Record) == 5,
+        "c25-like RD3 remainder factor changed in Record");
+    const std::vector<ChoiceOption> grid_only{
+        {"g1", "Use one block per output tile"}};
+    require(
+        chooseDecision(
+            "RD3.grid",
+            "reduction.inner_grid.v2\ngodim=1024\ninner_remainder=2\n"
+            "sm_count=128\ny_grid_limit=65535\n" +
+                fixed_rd3_x.stateFields(),
+            grid_only, "g1") == "g1",
+        "c25-like RD3 single-grid continuation changed");
+    const std::vector<ChoiceOption> iter_options{
+        {"u1", "Unroll 1 output(s) per thread in the completed block plan"},
+        {"u2", "Unroll 2 output(s) per thread in the completed block plan"},
+        {"u4", "Unroll 4 output(s) per thread in the completed block plan"}};
+    const std::string iter_state =
+        "reduction.inner_iter_unroll.v2\niteration_numel=1024\n"
+        "bdimy=1\npre_unroll_godim=1024\ngrid_reduction_factor=1\n"
+        "max_grid_x=2147483647\n" + fixed_rd3_x.stateFields();
+    require(chooseDecision("RD3.iter_unroll", iter_state, iter_options, "u1") ==
+                "u1",
+            "c25-like RD3 output unroll changed in Record");
+    const std::string delta = readFile(path).substr(choices_before.size());
+    const auto iter_start = delta.find("{\"site\":\"RD3.iter_unroll\"");
+    require(
+        delta.find("\n{\"site\":\"RD3.remainder_x\"") == std::string::npos &&
+            delta.rfind("{\"site\":\"RD3.remainder_x\"", 0) != 0 &&
+            iter_start != std::string::npos &&
+            loggedRequest(delta.substr(iter_start)).find(
+                "\"prior_choices\":[{\"site\":\"RD3.remainder_x\","
+                "\"choice\":\"u1\"},{\"site\":\"RD3.remainder_u\","
+                "\"choice\":\"u5\"},{\"site\":\"RD3.grid\","
+                "\"choice\":\"g1\"}]") != std::string::npos &&
+            loggedRequest(delta.substr(iter_start)).find(
+                "fixed_remainder_x_bdimx=128\\n") != std::string::npos &&
+            loggedRequest(delta.substr(iter_start)).find(
+                "fixed_remainder_x_initial_inner_unroll=8\\n") !=
+                std::string::npos,
+        "c25-like RD3 request omitted fixed physical width or true lineage");
+    scope.complete("Reduction");
+    const std::string outcomes =
+        readFile(std::string(path) + ".outcome.jsonl")
+            .substr(outcomes_before.size());
+    require(
+        outcomes.find("\"site\":\"RD3.remainder_x\",\"selected\":\"x128\"") !=
+            std::string::npos,
+        "c25-like RD3 lost its physical no-choice outcome");
   }
   {
     const std::string choices_before = readFile(path);

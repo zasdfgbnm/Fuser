@@ -718,8 +718,13 @@ void recordHardSingletonDecision(
     std::string_view site,
     std::string_view selected,
     std::string_view reason,
-    std::string_view selection_source) {
-  recordNoChoiceDecision(site, selected, reason, selection_source);
+    std::string_view selection_source,
+    std::string_view diagnostic_selected) {
+  recordNoChoiceDecision(
+      site,
+      diagnostic_selected.empty() ? selected : diagnostic_selected,
+      reason,
+      selection_source);
   if (mode() != Mode::Off && semanticV3Enabled() &&
       active_compute_scope != nullptr) {
     active_compute_scope->recordSelectedChoice(site, selected);

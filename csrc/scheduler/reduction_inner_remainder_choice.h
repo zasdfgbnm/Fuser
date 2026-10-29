@@ -152,6 +152,109 @@ inline int64_t chooseInnerRemainderRange(
   }
 }
 
+// The width menu contains the seed plus one CTA width per warp step. When it
+// has exactly one physical width, the skipped RD3.remainder_x Choice would
+// have selected index u1. Retain that canonical index in semantic-v3 prior
+// choices and send the physical width and its enumeration basis to later tail
+// requests. The no_choice diagnostic keeps its physical xN spelling.
+struct FixedInnerRemainderWidthWitness {
+  int64_t bdimx;
+  int64_t seed_bdimx;
+  int64_t after_vect;
+  int64_t initial_bdimx;
+  int64_t initial_inner_unroll;
+  int64_t target_unroll;
+  int64_t target_cta;
+  int64_t min_warp;
+  int64_t scan_first;
+
+  std::string stateFields() const {
+    return "fixed_remainder_x_index=1\nfixed_remainder_x_bdimx=" +
+        std::to_string(bdimx) + "\nfixed_remainder_x_seed_bdimx=" +
+        std::to_string(seed_bdimx) + "\nfixed_remainder_x_after_vect=" +
+        std::to_string(after_vect) + "\nfixed_remainder_x_initial_bdimx=" +
+        std::to_string(initial_bdimx) +
+        "\nfixed_remainder_x_initial_inner_unroll=" +
+        std::to_string(initial_inner_unroll) +
+        "\nfixed_remainder_x_target_unroll=" +
+        std::to_string(target_unroll) + "\nfixed_remainder_x_target_cta=" +
+        std::to_string(target_cta) + "\nfixed_remainder_x_min_warp=" +
+        std::to_string(min_warp) + "\nfixed_remainder_x_scan_first=" +
+        std::to_string(scan_first) + '\n';
+  }
+};
+
+inline std::string_view innerGridStateTag(bool fixed_remainder_x) {
+  return fixed_remainder_x ? "reduction.inner_grid.v2\n"
+                           : "reduction.inner_grid.v1\n";
+}
+
+inline std::string_view innerIterUnrollStateTag(bool fixed_remainder_x) {
+  return fixed_remainder_x ? "reduction.inner_iter_unroll.v2\n"
+                           : "reduction.inner_iter_unroll.v1\n";
+}
+
+inline FixedInnerRemainderWidthWitness proveFixedInnerRemainderWidth(
+    int64_t after_vect,
+    int64_t initial_bdimx,
+    int64_t initial_inner_unroll,
+    int64_t target_unroll,
+    int64_t target_cta,
+    int64_t min_warp,
+    int64_t scan_first,
+    int64_t warp_size,
+    int64_t max_threads_per_block,
+    int64_t seed_bdimx,
+    int64_t selected_bdimx) {
+  if (after_vect < 1 || target_unroll < 2 || min_warp < 1 ||
+      min_warp > 16 || warp_size < 1 || warp_size > 1024 ||
+      min_warp > warp_size || max_threads_per_block < 1 ||
+      scan_first != 4 * warp_size || target_cta < scan_first ||
+      target_cta > max_threads_per_block || initial_bdimx < 1 ||
+      initial_inner_unroll < 1 || seed_bdimx < 1) {
+    throw std::invalid_argument(
+        "RD3 fixed remainder width lacks a singleton enumeration proof");
+  }
+  const auto ceil_div = [](int64_t numerator, int64_t denominator) {
+    return numerator / denominator + (numerator % denominator != 0);
+  };
+  const int64_t expected_initial_bdimx =
+      std::min(std::max(after_vect, min_warp), scan_first);
+  const int64_t expected_initial_unroll =
+      std::min(ceil_div(after_vect, expected_initial_bdimx), target_unroll);
+  const int64_t expected_seed =
+      std::min(ceil_div(after_vect, expected_initial_unroll), target_cta);
+  const int64_t expected_remainder =
+      ceil_div(ceil_div(after_vect, expected_seed), expected_initial_unroll);
+  if (initial_bdimx != expected_initial_bdimx ||
+      initial_inner_unroll != expected_initial_unroll ||
+      seed_bdimx != expected_seed || seed_bdimx != scan_first ||
+      target_cta - scan_first >= min_warp ||
+      selected_bdimx != seed_bdimx || expected_remainder <= 1) {
+    throw std::invalid_argument(
+        "RD3 fixed remainder width lacks a singleton enumeration proof");
+  }
+  return {selected_bdimx, seed_bdimx, after_vect,
+          initial_bdimx, initial_inner_unroll, target_unroll,
+          target_cta, min_warp, scan_first};
+}
+
+inline void recordFixedInnerRemainderWidth(
+    const FixedInnerRemainderWidthWitness& witness,
+    scheduler::jev::Mode jev_mode) {
+  if (jev_mode == scheduler::jev::Mode::Off) {
+    return;
+  }
+  scheduler::jev::recordHardSingletonDecision(
+      "RD3.remainder_x",
+      "u1",
+      "single_cta_width",
+      jev_mode == scheduler::jev::Mode::Record
+          ? "native_remainder_scan"
+          : "remote_remainder_seed",
+      "x" + std::to_string(witness.bdimx));
+}
+
 // Unlike the generic (a + b - 1) form, this stays in range for positive
 // int64 dimensions close to INT64_MAX.
 inline int64_t positiveCeilDiv(int64_t dividend, int64_t divisor) {

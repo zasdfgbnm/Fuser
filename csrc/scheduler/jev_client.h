@@ -144,11 +144,14 @@ void recordNoChoiceDecision(
 // A hard-filtered singleton is not an API Choice, but its fixed selection is
 // still part of the schedule seen by later stateless semantic-v3 requests.
 // Unlike passive diagnostics, retaining that context must fail closed.
+// diagnostic_selected may preserve a physical value when selected is the
+// canonical index of a singleton source menu.
 void recordHardSingletonDecision(
     std::string_view site,
     std::string_view selected,
     std::string_view reason,
-    std::string_view selection_source);
+    std::string_view selection_source,
+    std::string_view diagnostic_selected = {});
 
 // A v3 invocation without its complete workload or hardware stays native.
 // Keep this explicit in the primary decision log even without an outcome log.

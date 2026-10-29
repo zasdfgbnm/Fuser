@@ -534,9 +534,11 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // to leave some room for unrolling.
   bdimx = std::max(getInnerRemainder(), min_warp_size);
   bdimx = std::min(bdimx, four_warps);
+  const int64_t initial_bdimx = bdimx;
 
   // Put inner remainder to unroll, but don't go over target_inner_unroll
   inner_unroll = std::min(getInnerRemainder(), target_inner_unroll);
+  const int64_t initial_inner_unroll = inner_unroll;
 
   // Put inner remainder to bdimx, but don't go over target_threads_per_block
   bdimx = std::min(
@@ -548,6 +550,7 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
   // Check all possible bdimx and unroll, choose the one with smallest remainder
   const bool remainder_scan_needed = getInnerRemainder() > 1;
   std::string_view remainder_no_choice_reason;
+  std::optional<FixedInnerRemainderWidthWitness> fixed_remainder_x;
   if (remainder_scan_needed) {
     const int64_t seed_bdimx = bdimx;
     if (jev_mode != scheduler::jev::Mode::Remote) {
@@ -623,19 +626,21 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
             jev_mode);
         selected_bdimx = widths.at(chosen_index - 1);
       } else {
-        // A fixed CTA width does not fix the performance unroll factor. Record
-        // the physical width before asking for the still-variable factor.
-        try {
-          scheduler::jev::recordNoChoiceDecision(
-              "RD3.remainder_x",
-              "x" + std::to_string(selected_bdimx),
-              "single_cta_width",
-              jev_mode == scheduler::jev::Mode::Record
-                  ? "native_remainder_scan"
-                  : "remote_remainder_seed");
-        } catch (...) {
-          // Passive outcome observation cannot change scheduling.
-        }
+        // The only physical width is source-proved. Its skipped Choice index
+        // is u1; the still-variable remainder factor follows below.
+        fixed_remainder_x = proveFixedInnerRemainderWidth(
+            after_vect,
+            initial_bdimx,
+            initial_inner_unroll,
+            target_inner_unroll,
+            target_threads_per_block,
+            min_warp_size,
+            four_warps,
+            threads_per_warp,
+            max_threads_per_block,
+            seed_bdimx,
+            selected_bdimx);
+        recordFixedInnerRemainderWidth(*fixed_remainder_x, jev_mode);
       }
 
       std::string factor_state = "reduction.inner_remainder_u.v1\n" + fields;
@@ -744,12 +749,15 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
       }
     }
 
-    std::string state = "reduction.inner_grid.v1\n";
+    std::string state(innerGridStateTag(fixed_remainder_x.has_value()));
     state += "godim=" + std::to_string(godim) + '\n';
     state += "inner_remainder=" + std::to_string(inner_remainder) + '\n';
     state += "sm_count=" + std::to_string(sm_count) + '\n';
     state += "y_grid_limit=" +
         std::to_string(scheduler_utils::y_grid_limit) + '\n';
+    if (fixed_remainder_x) {
+      state += fixed_remainder_x->stateFields();
+    }
     const std::string native_choice = jev_mode == scheduler::jev::Mode::Record
         ? "g" + std::to_string(grdim)
         : std::string();
@@ -811,7 +819,7 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
            "Unroll " + std::to_string(factor) +
                " output(s) per thread in the completed block plan"});
     }
-    std::string state = "reduction.inner_iter_unroll.v1\n";
+    std::string state(innerIterUnrollStateTag(fixed_remainder_x.has_value()));
     state += "iteration_numel=" +
         std::to_string(total_iteration_numel) + '\n';
     state += "bdimy=" + std::to_string(bdimy) + '\n';
@@ -819,6 +827,9 @@ std::unique_ptr<ReductionParams> inner2dReductionHeuristic(
     state += "grid_reduction_factor=" + std::to_string(grdim) + '\n';
     state += "max_grid_x=" +
         std::to_string(scheduler_utils::x_grid_limit) + '\n';
+    if (fixed_remainder_x) {
+      state += fixed_remainder_x->stateFields();
+    }
     const auto selected = scheduler::jev::chooseDecision(
         "RD3.iter_unroll",
         state,
