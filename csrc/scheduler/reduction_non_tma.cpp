@@ -3280,15 +3280,29 @@ OuterReductionParams getGridOuterReduction(
   // regression for compute bound kernels. Not much change for memory bound.
   int64_t n_waves = 0;
   const auto jev_mode = scheduler::jev::mode();
+  const int64_t l2_cache_bytes =
+      at::cuda::getCurrentDeviceProperties()->l2CacheSize;
   if (jev_mode == scheduler::jev::Mode::Off) {
     n_waves = n_elems >= (int64_t)64 * 1024 * 1024 ? 8 : 4;
   } else {
     // RD9 delegates only the empirical wave target. The native algorithm
     // still turns that target into block, unroll, and grid dimensions.
+    // Supply the selected upstream budget/width effect and GPU resources so
+    // a stateless backend can compare complete conditional grid plans.
+    // None of these fields is the native wave preference or a final plan.
     const std::string state =
-        "reduction.outer_waves.v1\nreduction_numel=" +
+        "reduction.outer_waves.v2\nreduction_numel=" +
         std::to_string(total_reduction_numel) +
-        "\niteration_numel=" + std::to_string(total_iteration_numel);
+        "\niteration_numel=" + std::to_string(total_iteration_numel) +
+        "\ndtype_bits=" +
+        std::to_string(max_dtype_size_bit_for_vectorization) +
+        "\nn_tensor_inputs=" + std::to_string(n_tensor_inputs) +
+        "\nvector_width=" + std::to_string(vectorize_factor) +
+        "\nmax_unroll=" + std::to_string(max_unroll) +
+        "\nsm_count=" + std::to_string(sm_count) +
+        "\nmax_threads_per_sm=" + std::to_string(max_threads_per_sm) +
+        "\nmax_threads_per_block=" + std::to_string(max_threads_per_block) +
+        "\nl2_cache_bytes=" + std::to_string(l2_cache_bytes);
     const std::vector<scheduler::jev::ChoiceOption> options = {
         {"waves4", "Target four waves of SM blocks"},
         {"waves8", "Target eight waves of SM blocks"}};
@@ -3306,8 +3320,6 @@ OuterReductionParams getGridOuterReduction(
 
   // L2 residency is an empirical preference for a 16-thread logical warp.
   // The planner and hard bounds above make either target a legal schedule.
-  const int64_t l2_cache_bytes =
-      at::cuda::getCurrentDeviceProperties()->l2CacheSize;
   int64_t native_min_warp_size = 0;
   if (jev_mode != scheduler::jev::Mode::Remote) {
     const bool fits_in_l2 =
