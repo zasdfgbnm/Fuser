@@ -1363,7 +1363,7 @@ IOP3_CTA_FIELDS = {
 def iop3_cta_plan_fields(row: dict[str, Any], width: int
                          ) -> list[tuple[int, ...]]:
     """Read repeated CTA plans while keeping scalar fields strict."""
-    lines = row["request"]["state"].splitlines()
+    lines = iop3_analysis_text(row["request"]["state"]).splitlines()
     if not lines or lines[0] != "inner_outer_multi_wave.cta.v2":
         raise ValueError(f"unexpected IOP3.cta state version: {lines[:1]}")
     fields: dict[str, str] = {}
@@ -1417,10 +1417,22 @@ def iop3_cta_plan_fields(row: dict[str, Any], width: int
     return plans
 
 
-def iop3_rows_expected_cta(state: str, rows: int
+def iop3_analysis_text(state: str | dict[str, Any]) -> str:
+    if isinstance(state, dict):
+        if state.get("schema") != "nvfuser.systemone.context.v3":
+            raise ValueError("IOP3 lost semantic-v3 analysis context")
+        state = state.get("decision", {}).get("analysis_inputs_text")
+    if not isinstance(state, str):
+        raise ValueError("IOP3 analysis inputs are not text")
+    return state
+
+
+def iop3_rows_expected_cta(state: str | dict[str, Any], rows: int
                            ) -> tuple[dict[str, str], list[tuple[int, ...]]]:
-    lines = state.splitlines()
-    if not lines or lines[0] != "inner_outer_multi_wave.grid_rows.v1":
+    lines = iop3_analysis_text(state).splitlines()
+    if not lines or lines[0] not in {
+            "inner_outer_multi_wave.grid_rows.v1",
+            "inner_outer_multi_wave.grid_rows.v3"}:
         raise ValueError("unexpected IOP3.grid_rows state version")
     scalars: dict[str, str] = {}
     plans: list[tuple[int, ...]] = []
@@ -1434,6 +1446,8 @@ def iop3_rows_expected_cta(state: str, rows: int
                 raise ValueError("incomplete IOP3.grid_rows CTA plan")
             if fields[0] == rows:
                 plans.append(fields[3:])
+        elif key == "class" and lines[0].endswith("v3"):
+            continue
         elif key in scalars:
             raise ValueError(f"repeated IOP3.grid_rows field: {key}")
         else:
@@ -1763,11 +1777,11 @@ def check_iop3_singleton_lineage(
         raise ValueError("IOP3 singleton fixture changed its numeric shape")
 
     expected_issues = {(intended["kind"], intended["site"])}
-    for dependent in ("IOP3.storage", "IOP3.min_batch",
-                      "IOP3.tmp_read_width", "IOP3.grid_rows"):
+    for dependent in ("IOP3.storage", "IOP3.tmp_read_width"):
         expected_issues |= {("record_only_state", dependent),
                             ("remote_only_state", dependent)}
-    expected_issues |= {("remote_only_state", "IOP3.cta"),
+    expected_issues |= {("remote_only_state", "IOP3.min_batch"),
+                        ("remote_only_state", "IOP3.cta"),
                         ("record_only_state", "IOP3.tmp_write_width")}
     if (len(issues) != len(expected_issues) or
             {(item["kind"], item["site"]) for item in issues} != expected_issues):
@@ -1779,26 +1793,40 @@ def check_iop3_singleton_lineage(
         initial = [row for row in choices if row.get("site") == "IOP3.inner_width"]
         cta = [row for row in choices if row.get("site") == "IOP3.cta"]
         write = [row for row in choices if row.get("site") == "IOP3.tmp_write_width"]
-        local = [row for row in outcomes if row.get("kind") == "no_choice" and
-                 row.get("site") in ("IOP3.cta", "IOP3.tmp_write_width")]
+        local = {row.get("site"): row for row in outcomes
+                 if row.get("kind") == "no_choice" and
+                 row.get("site", "").startswith("IOP3.")}
         final = [row for row in outcomes if
                  row.get("schema") == "nvfuser.native_outcome.v2" and
                  row.get("kind") == "final"]
-        if len(initial) != 1 or len(local) != 1 or len(final) != 1:
+        expected_local = ({"IOP3.min_batch", "IOP3.grid_rows", "IOP3.cta"}
+                          if arm == "record" else
+                          {"IOP3.grid_rows", "IOP3.tmp_write_width"})
+        if len(initial) != 1 or set(local) != expected_local or len(final) != 1:
             raise ValueError(f"{arm} lost the IOP3 numeric invocation")
         invocation = initial[0]["compute_invocation_id"]
-        if (local[0].get("compute_invocation_id") != invocation or
+        if (any(row.get("compute_invocation_id") != invocation
+                for row in local.values()) or
                 final[0].get("compute_invocation_id") != invocation or
-                local[0].get("selection_source") != "hard_legal_singleton"):
+                local["IOP3.grid_rows"].get("selected") != "r4" or
+                local["IOP3.grid_rows"].get("selection_source") !=
+                "source_menu_singleton"):
             raise ValueError(f"{arm} singleton escaped its compute invocation")
         if arm == "record":
-            if (cta or len(write) != 1 or local[0].get("site") != "IOP3.cta" or
-                    local[0].get("selected") != "t64" or
-                    local[0].get("reason") !=
+            if (cta or len(write) != 1 or
+                    local["IOP3.min_batch"].get("selected") != "b1" or
+                    local["IOP3.min_batch"].get("selection_source") !=
+                    "source_menu_singleton" or
+                    local["IOP3.cta"].get("selected") != "t64" or
+                    local["IOP3.cta"].get("reason") !=
                     "only one hard-valid inner-outer CTA plan" or
+                    local["IOP3.cta"].get("selection_source") !=
+                    "hard_legal_singleton" or
                     write[0]["candidates"] != ["w2", "w4"] or
                     write[0]["selected"] != "w4" or
                     {"site": "IOP3.cta", "choice": "t64"} not in
+                    write[0]["state"]["current_schedule"]["prior_choices"] or
+                    {"site": "IOP3.grid_rows", "choice": "r4"} not in
                     write[0]["state"]["current_schedule"]["prior_choices"] or
                     final[0]["launch"]["block_x_raw"] != 64 or
                     final[0]["scheduler_fields"]
@@ -1807,20 +1835,26 @@ def check_iop3_singleton_lineage(
         elif (len(cta) != 1 or write or
               cta[0]["candidates"] != ["t256", "t128"] or
               cta[0]["selected"] != "t256" or
-              local[0].get("site") != "IOP3.tmp_write_width" or
-              local[0].get("selected") != "w2" or
-              local[0].get("reason") !=
+              local["IOP3.tmp_write_width"].get("selected") != "w2" or
+              local["IOP3.tmp_write_width"].get("reason") !=
               "only one hard-valid temporary write width" or
-              local[0]["compute_event_index"] <=
+              local["IOP3.tmp_write_width"].get("selection_source") !=
+              "hard_legal_singleton" or
+              {"site": "IOP3.grid_rows", "choice": "r4"} not in
+              cta[0]["state"]["current_schedule"]["prior_choices"] or
+              local["IOP3.tmp_write_width"]["compute_event_index"] <=
               cta[0]["compute_event_index"] or
               final[0]["launch"]["block_x_raw"] != 256 or
               final[0]["scheduler_fields"]
               ["vectorization_factor_tmp_gmem_write"] != 2):
             raise ValueError("Remote lost its multi-choice CTA or local write")
     served = [row for row in trace_rows(server_log)
-              if server_site(row) in ("IOP3.cta", "IOP3.tmp_write_width")]
-    if len(served) != 1 or server_site(served[0]) != "IOP3.cta" or \
-            served[0].get("status") != 200:
+              if server_site(row) in ("IOP3.min_batch", "IOP3.grid_rows",
+                                      "IOP3.cta", "IOP3.tmp_write_width")]
+    if (len(served) != 2 or
+            [server_site(row) for row in served] !=
+            ["IOP3.min_batch", "IOP3.cta"] or
+            any(row.get("status") != 200 for row in served)):
         raise ValueError("singleton reached HTTP or multi-choice CTA did not")
 
 
@@ -3830,9 +3864,10 @@ def check_alternate_report(report: dict[str, Any],
             raise ValueError("inner-outer fixture lacks checked rows alternatives")
         scalar, native_plans = iop3_rows_expected_cta(event["state"], 8)
         _, selected_plans = iop3_rows_expected_cta(event["state"], 4)
+        rows_text = iop3_analysis_text(event["state"])
         upstream = dict(line.split("=", 1) for line in
-                        event["state"].splitlines()[1:]
-                        if not line.startswith("plan="))
+                        rows_text.splitlines()[1:]
+                        if not line.startswith(("plan=", "class=")))
         if (scalar["inner_dim"] != "2048" or scalar["outer_dim"] != "1024" or
                 scalar["selected_outer_read_width"] != "2" or
                 upstream["selected_min_batch"] != "2" or
@@ -3855,7 +3890,7 @@ def check_alternate_report(report: dict[str, Any],
             report, "IOP3.cta")
         for row, expected, side in ((record_cta, native_plans, "record"),
                                     (remote_cta, selected_plans, "remote")):
-            cta_lines = row["request"]["state"].splitlines()
+            cta_lines = iop3_analysis_text(row["request"]["state"]).splitlines()
             if cta_lines[0] != "inner_outer_multi_wave.cta.v2":
                 raise ValueError("unexpected rows-dependent CTA version")
             actual_scalar = dict(line.split("=", 1) for line in cta_lines[1:]
@@ -3864,12 +3899,28 @@ def check_alternate_report(report: dict[str, Any],
                     iop3_cta_plan_fields(row, 2) != expected or
                     row[side] != {"t256": 1}):
                 raise ValueError("CTA did not materialize the selected rows plan")
-        writes = [row for row in report["multiplicity"]
-                  if row["site"] == "IOP3.tmp_write_width"]
-        if (len(writes) != 1 or writes[0]["record"] != {"w4": 1} or
-                writes[0]["remote"] != {"w4": 1}):
-            raise ValueError("rows changed the downstream temporary write width")
-        if sorted(issues, key=str) != sorted([intended, *cta_issues], key=str):
+        compact = rows_text.splitlines()[0].endswith("v3")
+        write_issues = []
+        if compact:
+            record_write, remote_write, write_issues = paired_state_rows(
+                report, "IOP3.tmp_write_width")
+            if (record_write["record"] != {"w4": 1} or
+                    remote_write["remote"] != {"w4": 1} or
+                    iop3_analysis_text(record_write["request"]["state"]
+                                       ).splitlines()[0] !=
+                    "inner_outer_multi_wave.tmp_write_width.v2" or
+                    iop3_analysis_text(remote_write["request"]["state"]
+                                       ).splitlines()[0] !=
+                    "inner_outer_multi_wave.tmp_write_width.v2"):
+                raise ValueError("rows alternate changed temporary write width")
+        else:
+            writes = [row for row in report["multiplicity"]
+                      if row["site"] == "IOP3.tmp_write_width"]
+            if (len(writes) != 1 or writes[0]["record"] != {"w4": 1} or
+                    writes[0]["remote"] != {"w4": 1}):
+                raise ValueError("rows changed the downstream temporary write width")
+        if sorted(issues, key=str) != sorted(
+                [intended, *cta_issues, *write_issues], key=str):
             raise ValueError(f"unexpected rows-dependent decisions: {issues}")
     elif require_iop3_tmp_write:
         if (site != "IOP3.tmp_write_width" or event["native"] != "w4" or

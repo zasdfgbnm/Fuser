@@ -392,6 +392,13 @@ void getHeuristics(
         std::to_string(tmp_gmem_dtype_size_bit) +
         "\nbaseline_read_width=" +
         std::to_string(native_outer_read_width);
+    const std::string state_header = state;
+    struct BatchSearch {
+      int64_t batch;
+      int64_t max_threads;
+      int64_t plan_count;
+    };
+    std::vector<BatchSearch> safe_searches;
     if (valid_batch_bounds) {
       for (int64_t batch = 1; batch <= 4; ++batch) {
         const int64_t max_threads = max_threads_for_batch(batch);
@@ -408,6 +415,7 @@ void getHeuristics(
           ++plan_count;
         }
         if (full_search_safe && plan_count >= 1 && plan_count <= 7) {
+          safe_searches.push_back({batch, max_threads, plan_count});
           options.push_back({
               "b" + std::to_string(batch),
               "Use minimum batch " + std::to_string(batch) +
@@ -419,10 +427,76 @@ void getHeuristics(
         }
       }
     }
-    const std::string native_choice =
-        jev_mode == scheduler::jev::Mode::Record
-        ? "b" + std::to_string(batch_min)
-        : "";
+    // The minimum batch is only a bound on the later CTA search. Batches
+    // producing the same complete search cannot change any final parameter.
+    // In semantic-v3, send one representative per distinct search and record
+    // the omitted equivalent thresholds for stateless verification.
+    bool compacted = false;
+    if (scheduler::jev::semanticV3Enabled() && safe_searches.size() == 4) {
+      std::vector<BatchSearch> representatives;
+      std::vector<std::vector<int64_t>> equivalent_batches;
+      for (const auto& search : safe_searches) {
+        const auto found = std::find_if(
+            representatives.begin(),
+            representatives.end(),
+            [&](const BatchSearch& candidate) {
+              return candidate.max_threads == search.max_threads;
+            });
+        if (found == representatives.end()) {
+          representatives.push_back(search);
+          equivalent_batches.push_back({search.batch});
+        } else {
+          equivalent_batches.at(std::distance(representatives.begin(), found))
+              .push_back(search.batch);
+        }
+      }
+      compacted = representatives.size() < safe_searches.size();
+      if (compacted) {
+        constexpr std::string_view kV1Tag =
+            "inner_outer_multi_wave.minimum_batch.v1";
+        state = "inner_outer_multi_wave.minimum_batch.v2" +
+            state_header.substr(kV1Tag.size());
+        options.clear();
+        for (size_t i = 0; i < representatives.size(); ++i) {
+          const auto& search = representatives.at(i);
+          options.push_back({
+              "b" + std::to_string(search.batch),
+              "Use minimum batch " + std::to_string(search.batch) +
+                  " with CTA search " + std::to_string(search.max_threads) +
+                  " down to " + std::to_string(threads_per_block_min)});
+          state += "\nplan=" + std::to_string(search.batch) + ":" +
+              std::to_string(search.max_threads) + ":" +
+              std::to_string(search.plan_count);
+          state += "\nclass=" + std::to_string(search.batch) + ":";
+          for (const int64_t equivalent : equivalent_batches.at(i)) {
+            if (state.back() != ':') {
+              state += ',';
+            }
+            state += std::to_string(equivalent);
+          }
+        }
+      }
+    }
+    std::string native_choice;
+    if (jev_mode == scheduler::jev::Mode::Record) {
+      const int64_t native_max_threads = max_threads_for_batch(batch_min);
+      const auto native = std::find_if(
+          safe_searches.begin(),
+          safe_searches.end(),
+          [&](const BatchSearch& search) {
+            return search.batch == batch_min;
+          });
+      if (native != safe_searches.end()) {
+        const auto representative = std::find_if(
+            options.begin(), options.end(), [&](const auto& option) {
+              const int64_t batch = std::stoll(option.id.substr(1));
+              return max_threads_for_batch(batch) == native_max_threads;
+            });
+        if (representative != options.end()) {
+          native_choice = representative->id;
+        }
+      }
+    }
     const bool native_offered =
         jev_mode != scheduler::jev::Mode::Record ||
         std::any_of(options.begin(), options.end(), [&](const auto& option) {
@@ -442,7 +516,7 @@ void getHeuristics(
           options.begin(), options.end(),
           [&](const auto& option) { return option.id == selected; });
       NVF_ERROR(it != options.end(), "Unknown IOP3 minimum batch");
-      if (jev_mode == scheduler::jev::Mode::Remote) {
+      if (jev_mode == scheduler::jev::Mode::Remote || compacted) {
         batch_min = std::stoll(selected.substr(1));
       }
     }
@@ -543,6 +617,7 @@ void getHeuristics(
     std::vector<scheduler::jev::ChoiceOption> options;
     constexpr char kGridRowsV1Tag[] = "inner_outer_multi_wave.grid_rows.v1";
     constexpr char kGridRowsV2Tag[] = "inner_outer_multi_wave.grid_rows.v2";
+    constexpr char kGridRowsV3Tag[] = "inner_outer_multi_wave.grid_rows.v3";
     std::string state =
         std::string(kGridRowsV1Tag) + "\ninner_dim=" +
         std::to_string(inner_dim_numel) + "\nouter_dim=" +
@@ -563,10 +638,19 @@ void getHeuristics(
         "\nsmem_total_bits=" +
         std::to_string(smem_buffer_size_bit + smem_overhead_bit) +
         "\nsmem_limit_bits=" + std::to_string(smem_limit_bit);
+    const std::string state_header = state;
+    struct RowsSearch {
+      int64_t rows;
+      int64_t plan_count;
+      std::string state;
+      std::string normalized_plans;
+    };
+    std::vector<RowsSearch> safe_searches;
     if (valid_rows_bounds) {
       for (int64_t rows : {4l, 8l, 16l}) {
         bool full_search_safe = true;
         std::string rows_state;
+        std::string normalized_plans;
         int64_t plan_count = 0;
         for (int64_t threads = threads_per_block_max;
              full_search_safe && threads >= threads_per_block_min;
@@ -586,7 +670,7 @@ void getHeuristics(
               candidate.inner_vect,
               plan->final_bdimx * plan->final_bdimy,
               candidate.inner_batch);
-          rows_state += "\nplan=" + std::to_string(rows) + ":" +
+          const std::string plan_suffix =
               std::to_string(capacity) + ":" +
               std::to_string(final_capacity) + ":" +
               std::to_string(candidate.threads_per_block) + ":" +
@@ -603,9 +687,13 @@ void getHeuristics(
               std::to_string(plan->final_bdimx) + ":" +
               std::to_string(plan->final_bdimy) + ":" +
               std::to_string(plan->final_gdimy);
+          rows_state += "\nplan=" + std::to_string(rows) + ":" + plan_suffix;
+          normalized_plans += "\nplan=" + plan_suffix;
           ++plan_count;
         }
         if (full_search_safe && plan_count >= 1 && plan_count <= 7) {
+          safe_searches.push_back(
+              {rows, plan_count, rows_state, normalized_plans});
           options.push_back({
               "r" + std::to_string(rows),
               "Require at least " + std::to_string(rows) +
@@ -628,6 +716,58 @@ void getHeuristics(
       scheduler::jev::recordCoverageSkip(
           "IOP3.grid_rows", "native rows lack complete safe CTA plans");
     } else {
+      bool compacted = false;
+      int64_t native_representative = 8;
+      // A rows threshold only reaches the final plan through getGdimy.
+      // Group complete searches with exactly the same plan fields; a
+      // different threshold in such a group cannot alter the selected CTA.
+      if (scheduler::jev::semanticV3Enabled() &&
+          admission == GridRowsAdmission::OfferWithNative &&
+          safe_searches.size() == 3) {
+        std::vector<RowsSearch> representatives;
+        std::vector<std::vector<int64_t>> equivalent_rows;
+        for (const auto& search : safe_searches) {
+          const auto found = std::find_if(
+              representatives.begin(),
+              representatives.end(),
+              [&](const RowsSearch& candidate) {
+                return candidate.normalized_plans == search.normalized_plans;
+              });
+          if (found == representatives.end()) {
+            representatives.push_back(search);
+            equivalent_rows.push_back({search.rows});
+          } else {
+            equivalent_rows.at(std::distance(representatives.begin(), found))
+                .push_back(search.rows);
+          }
+        }
+        compacted = representatives.size() < safe_searches.size();
+        if (compacted) {
+          state = std::string(kGridRowsV3Tag) +
+              state_header.substr(sizeof(kGridRowsV1Tag) - 1);
+          options.clear();
+          for (size_t i = 0; i < representatives.size(); ++i) {
+            const auto& search = representatives.at(i);
+            options.push_back({
+                "r" + std::to_string(search.rows),
+                "Require at least " + std::to_string(search.rows) +
+                    " outer rows per grid-Y block across " +
+                    std::to_string(search.plan_count) +
+                    " complete CTA plans"});
+            state += search.state;
+            state += "\nclass=" + std::to_string(search.rows) + ":";
+            for (const int64_t equivalent : equivalent_rows.at(i)) {
+              if (state.back() != ':') {
+                state += ',';
+              }
+              state += std::to_string(equivalent);
+              if (equivalent == 8) {
+                native_representative = search.rows;
+              }
+            }
+          }
+        }
+      }
       // A missing r8 is a soft preference miss. The complete r4/r16 plans
       // remain legal, and v2 tells the stateless service that the native
       // eight-row preference is intentionally absent from this Remote menu.
@@ -638,13 +778,15 @@ void getHeuristics(
           "IOP3.grid_rows",
           state,
           options,
-          jev_mode == scheduler::jev::Mode::Record ? "r8" : "");
+          jev_mode == scheduler::jev::Mode::Record
+              ? "r" + std::to_string(native_representative)
+              : "");
       const auto option = std::find_if(
           options.begin(), options.end(), [&](const auto& candidate) {
             return candidate.id == selected;
           });
       NVF_ERROR(option != options.end(), "IOP3 rows are outside proved plans");
-      if (jev_mode == scheduler::jev::Mode::Remote) {
+      if (jev_mode == scheduler::jev::Mode::Remote || compacted) {
         outer_iter_min = std::stoll(selected.substr(1));
       }
     }
