@@ -292,6 +292,29 @@ TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation3_CUDA) {
       static_cast<int64_t>(
           aten_t0.size(1) * dataTypeSizeBit(DataType::Half) * 2));
 
+  // Only the second persistent buffer is projectable. Its resolution point
+  // is tv13, so the projected input tv5 must remain live while tv12 is made.
+  // At tv9, tv1 (float) and tv5 (half) overlap: 101 * (32 + 16) bits.
+  ASSERT_EQ(buffers, (std::vector<TensorView*>{tv1, tv7}));
+  ASSERT_EQ(resolution[0], (std::vector<TensorView*>{tv9}));
+  ASSERT_EQ(resolution[1], (std::vector<TensorView*>{tv13}));
+  auto nonprefix_info = persistent_buffer_info;
+  nonprefix_info.projectable_persistent_buffers = {tv7};
+  nonprefix_info.projectable_buffer_inputs = {tv5};
+  scheduler_utils::PersistentProjectionLedger nonprefix_ledger;
+  auto nonprefix_sizes = persistentBufferSizeBit(
+      &fusion, runtime_info, nonprefix_info, nullptr, &nonprefix_ledger);
+  const auto scope_at_tv12 = std::find_if(
+      nonprefix_ledger.scopes.begin(),
+      nonprefix_ledger.scopes.end(),
+      [tv12](const auto& scope) { return scope.scope == tv12; });
+  ASSERT_NE(scope_at_tv12, nonprefix_ledger.scopes.end());
+  ASSERT_EQ(scope_at_tv12->active_buffers.size(), 3);
+  EXPECT_TRUE(scope_at_tv12->active_buffers[2]);
+  EXPECT_EQ(
+      nonprefix_sizes.projected_persistent_buffer_size_bit,
+      aten_t0.size(1) * (dataTypeSizeBit(DataType::Float) +
+                         dataTypeSizeBit(DataType::Half)));
 }
 
 TEST_F(PersistentBufferTest, FusionPersistentBufferCalculation4_CUDA) {

@@ -913,6 +913,10 @@ getScopePersistenceFactors(
   // Processing projectable persistent buffers is a little more complex, simply
   // because we have to line up inputs with their persistent buffers.
 
+  NVF_ERROR(
+      persistent_buffer_resolution_points.size() == persistent_buffers.size(),
+      "Persistent buffers and resolution points must correspond");
+
   // Offset into the bool vector
   size_t bool_vector_offset = persistent_buffers.size();
   for (auto projectable_persistent_buffer_i :
@@ -920,6 +924,19 @@ getScopePersistenceFactors(
     auto projectable_persistent_buffer =
         projectable_persistent_buffers[projectable_persistent_buffer_i];
     auto inputs = ir_utils::inputTvsOf(projectable_persistent_buffer);
+
+    // projectable_persistent_buffers is a filtered subset, not necessarily a
+    // prefix of persistent_buffers. Resolution points use the full buffer
+    // order, so recover that index by TV identity before looking them up.
+    auto persistent_it = std::ranges::find(
+        persistent_buffers, projectable_persistent_buffer);
+    NVF_ERROR(
+        persistent_it != persistent_buffers.end(),
+        "Projectable buffer is missing from persistent buffers");
+    const auto persistent_buffer_i =
+        std::distance(persistent_buffers.begin(), persistent_it);
+    const auto& resolution_points =
+        persistent_buffer_resolution_points[persistent_buffer_i];
 
     for (auto input : inputs) {
       auto input_it = std::ranges::find(projectable_buffer_inputs, input);
@@ -938,9 +955,6 @@ getScopePersistenceFactors(
       // If we project persistence from the persistent buffers to the inputs,
       // then it would have to be active from the resolution points of the
       // persistent buffer all the way back to the projected inputs.
-      auto resolution_points =
-          persistent_buffer_resolution_points[projectable_persistent_buffer_i];
-
       for (auto val : DependencyCheck::getAllValsBetween(
                {input}, {resolution_points.begin(), resolution_points.end()})) {
         // Persistent normalization kernels imply that all persistent buffers
